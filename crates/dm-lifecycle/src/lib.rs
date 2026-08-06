@@ -6,12 +6,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dm_compiler::Compilation;
 use dm_core::{FileId, SourceSpan};
+use dm_map::MapVariableAssignment;
 use dm_object_tree::{NodeId, NodeKind};
 use dm_runtime::RuntimeImage;
 use dm_semantics::{Procedure, ProcedureId, ProcedureImplementationId, ProcedureRegistry};
-use dm_value::{DatumId, TypePath, Value};
-use dm_vm::{ExecutionContext, ExecutionState, RuntimeError, execute_module_in_context};
-use dm_world::{AtomCategory, InitializerResolution, WorldAllocation, WorldCoordinate, WorldPlan};
+use dm_value::{DatumId, FieldName, TypePath, Value};
+use dm_vm::{ExecutionContext, RuntimeError, execute_module_in_context};
+use dm_world::{
+    AtomCategory, InitializerResolution, WorldAllocation, WorldAllocationWorkKind, WorldCoordinate,
+    WorldPlan,
+};
 
 /// Lifecycle entry points resolved for every runtime type.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -348,6 +352,12 @@ pub struct PlannedAtom {
     pub type_path: String,
     /// World atom category inferred by the map planner.
     pub category: AtomCategory,
+    /// Ordered, lossless map variable assignments for this atom placement.
+    ///
+    /// The values remain unevaluated until map initialization execution. Each
+    /// assignment retains its target and value source spans, along with its raw
+    /// source text, through [`MapVariableAssignment`].
+    pub variables: Vec<MapVariableAssignment>,
     /// Exact map placement source and coordinate context.
     pub placement: MapPlacementContext,
 }
@@ -501,6 +511,17 @@ pub enum InitializationExecutionError {
     WorldPath(dm_value::ValueError),
     /// A world lifecycle event was present but no singleton datum was allocated.
     MissingWorldDatum,
+    /// A deferred map field expression could not be applied before lifecycle hooks.
+    MapExpression {
+        /// Index into [`InitializationPlan::map_atoms`].
+        atom_index: usize,
+        /// Target field name from the map assignment.
+        field: String,
+        /// Original map source range for the full assignment.
+        span: SourceSpan,
+        /// Original lowering or execution failure.
+        error: Box<dm_runtime::RuntimeImageError>,
+    },
     /// The runtime image cannot allocate the singleton `/world` datum.
     WorldAllocation(dm_runtime::RuntimeImageError),
     /// VM execution failed with its original source-mapped call stack.
@@ -538,6 +559,16 @@ impl std::fmt::Display for InitializationExecutionError {
             Self::MissingWorldDatum => {
                 formatter.write_str("world lifecycle event has no allocated datum")
             }
+            Self::MapExpression {
+                atom_index,
+                field,
+                span,
+                error,
+            } => write!(
+                formatter,
+                "map expression for atom {atom_index} field {field} at {}..{} failed: {error}",
+                span.start, span.end
+            ),
             Self::WorldAllocation(error) => write!(formatter, "world allocation failed: {error}"),
             Self::Runtime { target, error, .. } => {
                 write!(
@@ -556,6 +587,7 @@ impl std::error::Error for InitializationExecutionError {
             Self::Compile(error) => Some(error),
             Self::WorldPath(error) => Some(error),
             Self::WorldAllocation(error) => Some(error),
+            Self::MapExpression { error, .. } => Some(error),
             Self::Runtime { error, .. } => Some(error),
             Self::MissingMapDatum { .. }
             | Self::MissingTarget { .. }
@@ -613,8 +645,9 @@ pub fn execute_initialization_plan(
         None
     };
 
-    let mut state = ExecutionState::from_heap(std::mem::take(runtime.heap_mut()));
+    let mut state = runtime.take_execution_state();
     let execution = (|| {
+        apply_dynamic_map_overrides(plan, allocation, &bindings, runtime, &mut state)?;
         let mut result = InitializationExecution {
             world,
             ..InitializationExecution::default()
@@ -675,8 +708,67 @@ pub fn execute_initialization_plan(
         }
         Ok(result)
     })();
-    *runtime.heap_mut() = state.into_heap();
+    runtime.restore_execution_state(state);
     execution
+}
+
+fn apply_dynamic_map_overrides(
+    plan: &InitializationPlan,
+    allocation: &WorldAllocation,
+    bindings: &[Option<DatumId>],
+    runtime: &RuntimeImage,
+    state: &mut dm_vm::ExecutionState,
+) -> Result<(), InitializationExecutionError> {
+    for (atom_index, atom) in plan.map_atoms.iter().enumerate() {
+        let Some(datum) = bindings.get(atom_index).and_then(|datum| *datum) else {
+            continue;
+        };
+        for assignment in &atom.variables {
+            if !is_dynamic_map_assignment(allocation, atom, assignment) {
+                continue;
+            }
+            let field = FieldName::parse(&assignment.name).map_err(|error| {
+                InitializationExecutionError::MapExpression {
+                    atom_index,
+                    field: assignment.name.clone(),
+                    span: assignment.span,
+                    error: Box::new(dm_runtime::RuntimeImageError::Value(error)),
+                }
+            })?;
+            let value = runtime
+                .evaluate_datum_expression(datum, &assignment.value.raw, state)
+                .map_err(|error| InitializationExecutionError::MapExpression {
+                    atom_index,
+                    field: assignment.name.clone(),
+                    span: assignment.span,
+                    error: Box::new(error),
+                })?;
+            state
+                .heap_mut()
+                .set_datum_field(datum, field, value)
+                .map_err(|error| InitializationExecutionError::MapExpression {
+                    atom_index,
+                    field: assignment.name.clone(),
+                    span: assignment.span,
+                    error: Box::new(dm_runtime::RuntimeImageError::Value(error)),
+                })?;
+        }
+    }
+    Ok(())
+}
+
+fn is_dynamic_map_assignment(
+    allocation: &WorldAllocation,
+    atom: &PlannedAtom,
+    assignment: &MapVariableAssignment,
+) -> bool {
+    allocation.work_items().iter().any(|item| {
+        matches!(item.kind, WorldAllocationWorkKind::DynamicOverride(_))
+            && item.coordinate == atom.placement.coordinate
+            && item.initializer_path.as_deref() == Some(atom.type_path.as_str())
+            && item.field.as_deref() == Some(assignment.name.as_str())
+            && item.raw_value.as_deref() == Some(assignment.value.raw.as_str())
+    })
 }
 
 fn event_kind(event: InitializationEvent) -> LifecycleKind {
@@ -833,6 +925,7 @@ fn plan_map_atoms(
                 type_index,
                 type_path: initializer.path.clone(),
                 category,
+                variables: initializer.variables.clone(),
                 placement: MapPlacementContext {
                     map_path: map_path.to_owned(),
                     key: cell.key.clone(),
@@ -1110,7 +1203,7 @@ mod tests {
         );
         let (_fixture, compilation, runtime, index) = index(source);
         let map = parse(concat!(
-            "\"a\" = (/obj/test, /turf/test, /area/test)\n",
+            "\"a\" = (/obj/test{name = \"crate\"; dir = 4}, /turf/test, /area/test)\n",
             "(5,7,2) = {\"\na\n\"}\n",
         ))
         .expect("map should parse");
@@ -1123,6 +1216,15 @@ mod tests {
             WorldCoordinate { x: 5, y: 7, z: 2 }
         );
         assert_eq!(plan.map_atoms[0].placement.map_path, "test.dmm");
+        assert_eq!(plan.map_atoms[0].variables.len(), 2);
+        assert_eq!(plan.map_atoms[0].variables[0].name, "name");
+        assert_eq!(plan.map_atoms[0].variables[0].value.raw, "\"crate\"");
+        assert_eq!(plan.map_atoms[0].variables[1].name, "dir");
+        assert_eq!(plan.map_atoms[0].variables[1].raw, "dir = 4");
+        assert!(
+            plan.map_atoms[0].variables[0].name_span.start
+                < plan.map_atoms[0].variables[0].span.end
+        );
         assert_eq!(plan.events[0], InitializationEvent::Globals);
         assert!(matches!(
             plan.events[1],
@@ -1151,9 +1253,10 @@ mod tests {
     #[test]
     fn executes_map_lifecycles_in_phase_order_without_compiling_unrelated_procs() {
         let source = concat!(
-            "/world/New()\n\tsrc.stage = 5\n",
+            "var/global/lifecycle_count = 1\n",
+            "/world/New()\n\tsrc.stage = 5\n\tglobal.lifecycle_count += 1\n",
             "/atom/proc/New()\n\tsrc.stage = 10\n",
-            "/atom/proc/Initialize()\n\tsrc.stage += 1\n",
+            "/atom/proc/Initialize()\n\tsrc.stage += 1\n\tglobal.lifecycle_count += 1\n",
             "/atom/proc/LateInitialize()\n\tsrc.stage += 100\n",
             "/area/test\n/turf/test\n/obj/test\n",
             "/proc/not_a_lifecycle_proc()\n\tspawn(1) return 0\n",
@@ -1209,6 +1312,15 @@ mod tests {
         assert_eq!(
             runtime.heap().datum_field(world_id, &stage),
             Ok(&Value::number(5.0))
+        );
+        assert_eq!(
+            runtime
+                .variables()
+                .iter()
+                .find(|variable| variable.path.ends_with("/lifecycle_count"))
+                .expect("global should remain materialized")
+                .value,
+            Value::number(5.0)
         );
         for datum in allocation.allocation_order() {
             assert_eq!(

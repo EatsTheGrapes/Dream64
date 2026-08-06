@@ -92,3 +92,14 @@ Measure current bytecode-lowering coverage across a complete project:
 ```powershell
 cargo run -p dm-conformance -- compile-check path\to\world.dme
 ```
+
+Build a map allocation and execute the supported deterministic startup hooks:
+
+```powershell
+cargo run -p dm-lifecycle -- boot path\to\world.dme path\to\map.dmm
+```
+
+This currently runs the supported `New()`, `Initialize()`, and
+`LateInitialize()` bodies against the allocated `/world`, areas, turfs, and
+movables. The output is a deterministic summary; it is not yet a persistent
+server loop.

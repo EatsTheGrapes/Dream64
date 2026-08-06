@@ -20,7 +20,7 @@ use dm_lexer::{TokenKind, lex};
 use dm_object_tree::NodeKind;
 use dm_value::{DatumDefaults, DatumId, FieldName, TypePath, Value, ValueError, ValueHeap};
 use dm_vm::{
-    ExecutionContext, ExecutionState, InitializerBinding, compile_initializer,
+    ExecutionContext, ExecutionState, InitializerBinding, RuntimeError, compile_initializer,
     execute_module_in_context,
 };
 
@@ -140,6 +140,7 @@ pub struct RuntimeImage {
     heap: ValueHeap,
     variables: Vec<RuntimeVariable>,
     types: BTreeMap<TypePath, RuntimeType>,
+    binding_index: RuntimeBindingIndex,
     diagnostics: Vec<RuntimeInitializerDiagnostic>,
     stats: RuntimeImageStats,
 }
@@ -207,6 +208,7 @@ impl RuntimeImage {
             heap: ValueHeap::new(),
             variables: Vec::new(),
             types: runtime_types(compilation)?,
+            binding_index,
             diagnostics: Vec::new(),
             stats: RuntimeImageStats {
                 variables: registry.entries().len(),
@@ -240,7 +242,7 @@ impl RuntimeImage {
                     image.stats.constants_materialized += 1;
                 }
                 ConstantEvaluation::Unsupported(unsupported) => {
-                    match image.execute_dynamic_initializer(&binding_index, entry, step) {
+                    match image.execute_dynamic_initializer(entry, step) {
                         Ok(value) => {
                             image.apply_step_value(entry, step, value)?;
                             image.stats.dynamic_initializers_materialized += 1;
@@ -306,6 +308,49 @@ impl RuntimeImage {
     #[must_use]
     pub const fn stats(&self) -> &RuntimeImageStats {
         &self.stats
+    }
+
+    /// Transfers the shared heap and materialized DM globals into VM state.
+    ///
+    /// Type-static values are intentionally excluded until their type-qualified
+    /// storage identities are represented in the VM global namespace.
+    #[must_use]
+    pub fn take_execution_state(&mut self) -> ExecutionState {
+        let mut state = ExecutionState::from_heap(std::mem::take(&mut self.heap));
+        for variable in self
+            .variables
+            .iter()
+            .filter(|variable| variable.storage == StorageClass::Global)
+        {
+            if let Ok(field) = variable_field(&variable.path) {
+                state.set_global(field, variable.value.clone());
+            }
+        }
+        state
+    }
+
+    /// Restores VM heap state and captures mutations to materialized globals.
+    ///
+    /// Values written to globals unknown to this image are retained only by the
+    /// supplied state; declared globals are synchronized by their DM field name.
+    pub fn restore_execution_state(&mut self, state: ExecutionState) {
+        let globals: Vec<_> = state
+            .globals()
+            .map(|(field, value)| (field.clone(), value.clone()))
+            .collect();
+        self.heap = state.into_heap();
+        for variable in self
+            .variables
+            .iter_mut()
+            .filter(|variable| variable.storage == StorageClass::Global)
+        {
+            let Ok(field) = variable_field(&variable.path) else {
+                continue;
+            };
+            if let Some((_, value)) = globals.iter().find(|(name, _)| *name == field) {
+                variable.value.clone_from(value);
+            }
+        }
     }
 
     /// Allocates one datum with all constant ancestor defaults applied.
@@ -384,6 +429,63 @@ impl RuntimeImage {
         }
     }
 
+    /// Evaluates one raw expression against a live datum in an execution state.
+    ///
+    /// Bare identifiers resolve as fields inherited by `datum`'s runtime type,
+    /// or as declared global variables. The supplied state owns both the live
+    /// datum and the materialized global values, so writes performed by a later
+    /// expression or lifecycle procedure remain visible to this evaluation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeImageError::ExpressionLowering`] when the expression
+    /// cannot be represented by the initializer VM subset, and
+    /// [`RuntimeImageError::ExpressionExecution`] with the VM's source-mapped
+    /// call stack when evaluation fails. It also returns [`RuntimeImageError`]
+    /// when `datum` is stale or has an unknown runtime type.
+    pub fn evaluate_datum_expression(
+        &self,
+        datum: DatumId,
+        expression: &str,
+        state: &mut ExecutionState,
+    ) -> Result<Value, RuntimeImageError> {
+        let tokens = lex(expression).map_err(|error| RuntimeImageError::ExpressionLowering {
+            message: error.message,
+            source_span: error.span,
+        })?;
+        let tokens = tokens
+            .into_iter()
+            .filter(|token| {
+                !matches!(
+                    token.kind,
+                    TokenKind::LineStart { .. } | TokenKind::Newline | TokenKind::LineContinuation
+                )
+            })
+            .collect::<Vec<_>>();
+        let type_path = state.heap().datum(datum)?.type_path().clone();
+        let bindings = self.datum_expression_bindings(&type_path)?;
+        let program = compile_initializer(&tokens, &bindings, None).map_err(|error| {
+            let source_span = tokens
+                .first()
+                .zip(tokens.last())
+                .map_or(SourceSpan::new(0, 0), |(first, last)| {
+                    SourceSpan::new(first.span.start, last.span.end)
+                });
+            RuntimeImageError::ExpressionLowering {
+                message: error.message,
+                source_span,
+            }
+        })?;
+        execute_module_in_context(
+            program.module(),
+            program.entry(),
+            &[],
+            state,
+            &ExecutionContext::new(Value::Datum(datum), Value::Null),
+        )
+        .map_err(RuntimeImageError::ExpressionExecution)
+    }
+
     fn convert_constant(&mut self, constant: &ConstantValue) -> Result<Value, RuntimeImageError> {
         Ok(match constant {
             ConstantValue::Null => Value::Null,
@@ -452,7 +554,6 @@ impl RuntimeImage {
 
     fn execute_dynamic_initializer(
         &mut self,
-        binding_index: &RuntimeBindingIndex,
         entry: &VariableEntry,
         step: &InitializationStep,
     ) -> Result<Value, DynamicInitializerFailure> {
@@ -465,7 +566,7 @@ impl RuntimeImage {
                 expanded_span: entry.span,
             })?;
         let initializer_span = initializer.expanded_span;
-        let bindings = self.initializer_bindings(binding_index, entry)?;
+        let bindings = self.initializer_bindings(entry)?;
         let program =
             compile_initializer(&initializer.tokens, &bindings, None).map_err(|error| {
                 DynamicInitializerFailure {
@@ -503,7 +604,7 @@ impl RuntimeImage {
         };
 
         let mut state = ExecutionState::from_heap(std::mem::take(&mut self.heap));
-        for name in binding_index.globals.values() {
+        for name in self.binding_index.globals.values() {
             state.set_global(name.clone(), Value::Null);
         }
         for variable in &self.variables {
@@ -535,10 +636,10 @@ impl RuntimeImage {
 
     fn initializer_bindings(
         &self,
-        binding_index: &RuntimeBindingIndex,
         entry: &VariableEntry,
     ) -> Result<BTreeMap<String, InitializerBinding>, DynamicInitializerFailure> {
-        let mut bindings = binding_index
+        let mut bindings = self
+            .binding_index
             .globals
             .iter()
             .map(|(name, field)| (name.clone(), InitializerBinding::Global(field.clone())))
@@ -568,7 +669,42 @@ impl RuntimeImage {
         }
         owners.reverse();
         for owner in owners {
-            if let Some(fields) = binding_index.instance_fields.get(owner.as_str()) {
+            if let Some(fields) = self.binding_index.instance_fields.get(owner.as_str()) {
+                for (name, field) in fields {
+                    bindings.insert(name.clone(), InitializerBinding::SrcField(field.clone()));
+                }
+            }
+        }
+        Ok(bindings)
+    }
+
+    fn datum_expression_bindings(
+        &self,
+        type_path: &TypePath,
+    ) -> Result<BTreeMap<String, InitializerBinding>, RuntimeImageError> {
+        let mut bindings = self
+            .binding_index
+            .globals
+            .iter()
+            .map(|(name, field)| (name.clone(), InitializerBinding::Global(field.clone())))
+            .collect::<BTreeMap<_, _>>();
+        let mut owners = Vec::new();
+        let mut current = Some(type_path.clone());
+        let mut visited = BTreeSet::new();
+        while let Some(path) = current.take() {
+            if !visited.insert(path.clone()) {
+                return Err(RuntimeImageError::InheritanceCycle(path));
+            }
+            let runtime_type = self
+                .types
+                .get(&path)
+                .ok_or_else(|| RuntimeImageError::UnknownType(path.clone()))?;
+            owners.push(path);
+            current.clone_from(&runtime_type.parent);
+        }
+        owners.reverse();
+        for owner in owners {
+            if let Some(fields) = self.binding_index.instance_fields.get(owner.as_str()) {
                 for (name, field) in fields {
                     bindings.insert(name.clone(), InitializerBinding::SrcField(field.clone()));
                 }
@@ -698,6 +834,15 @@ pub enum RuntimeImageError {
     MissingOwner(String),
     /// An initialization entry referred to an absent project file.
     MissingSourceFile(FileId),
+    /// A raw live-datum expression could not be lexed or lowered.
+    ExpressionLowering {
+        /// Recoverable compiler detail.
+        message: String,
+        /// Expression-relative source span associated with the failure.
+        source_span: SourceSpan,
+    },
+    /// A raw live-datum expression failed in the VM.
+    ExpressionExecution(RuntimeError),
 }
 
 impl fmt::Display for RuntimeImageError {
@@ -725,6 +870,17 @@ impl fmt::Display for RuntimeImageError {
                     file.index()
                 )
             }
+            Self::ExpressionLowering {
+                message,
+                source_span,
+            } => write!(
+                formatter,
+                "expression lowering failed at source {}..{}: {message}",
+                source_span.start, source_span.end
+            ),
+            Self::ExpressionExecution(error) => {
+                write!(formatter, "expression execution failed: {error}")
+            }
         }
     }
 }
@@ -738,7 +894,9 @@ impl std::error::Error for RuntimeImageError {
             | Self::InheritanceCycle(_)
             | Self::MissingInitializer(_)
             | Self::MissingOwner(_)
-            | Self::MissingSourceFile(_) => None,
+            | Self::MissingSourceFile(_)
+            | Self::ExpressionLowering { .. } => None,
+            Self::ExpressionExecution(error) => Some(error),
         }
     }
 }
@@ -786,7 +944,9 @@ mod tests {
     use dm_globals::{StorageClass, UnsupportedCategory};
     use dm_value::{FieldName, TypePath, Value};
 
-    use super::{ConstantFieldApplication, InitializerFailurePhase, RuntimeImage};
+    use super::{
+        ConstantFieldApplication, InitializerFailurePhase, RuntimeImage, RuntimeImageError,
+    };
 
     static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
 
@@ -1114,5 +1274,51 @@ mod tests {
             Some(7.0)
         );
         assert_eq!(image.stats().datums_allocated, 1);
+    }
+
+    #[test]
+    fn evaluates_live_datum_expressions_with_materialized_globals() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "var/global/offset = 3\n/datum/base\n\tvar/base = 4\n/datum/base/child\n\tvar/value = 0\n",
+        );
+        let mut image = fixture.image();
+        let datum = image
+            .allocate_datum(&type_path("/datum/base/child"))
+            .expect("child datum should allocate");
+        let mut state = image.take_execution_state();
+
+        assert_eq!(
+            image
+                .evaluate_datum_expression(datum, "base + global.offset", &mut state)
+                .expect("expression should execute")
+                .as_number(),
+            Some(7.0)
+        );
+        state
+            .heap_mut()
+            .set_datum_field(datum, field("base"), Value::number(9.0))
+            .expect("datum should remain live in execution state");
+        assert_eq!(
+            image
+                .evaluate_datum_expression(datum, "base + offset", &mut state)
+                .expect("bare global should execute")
+                .as_number(),
+            Some(12.0)
+        );
+        state
+            .heap_mut()
+            .delete_datum_field(datum, &field("base"))
+            .expect("datum should remain live in execution state");
+        let error = image
+            .evaluate_datum_expression(datum, "base", &mut state)
+            .expect_err("missing field should retain VM failure details");
+        assert!(matches!(
+            error,
+            RuntimeImageError::ExpressionExecution(ref error)
+                if error.source_span.is_some() && !error.call_stack.is_empty()
+        ));
     }
 }

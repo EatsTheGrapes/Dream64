@@ -6,17 +6,46 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use dm_compiler::{Compilation, CompilerDatabase};
-use dm_lifecycle::{LifecycleIndex, LifecycleKind, LifecycleResolution, build_initialization_plan};
+use dm_lifecycle::{
+    LifecycleIndex, LifecycleKind, LifecycleResolution, build_initialization_plan,
+    execute_initialization_plan,
+};
 use dm_runtime::RuntimeImage;
 use dm_semantics::ProcedureRegistry;
+use dm_world::allocate_world;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Command {
+    Plan,
+    Boot,
+}
 
 fn main() -> ExitCode {
     let mut arguments = env::args_os().skip(1);
-    let Some(environment) = arguments.next().map(PathBuf::from) else {
-        eprintln!("usage: dm-lifecycle <world.dme> [map.dmm]");
+    let Some(first) = arguments.next() else {
+        eprintln!("usage: dm-lifecycle [plan|boot] <world.dme> [map.dmm]");
         return ExitCode::from(2);
     };
+    let (command, environment) = if first.as_os_str() == OsStr::new("plan") {
+        let Some(environment) = arguments.next() else {
+            eprintln!("usage: dm-lifecycle plan <world.dme> [map.dmm]");
+            return ExitCode::from(2);
+        };
+        (Command::Plan, PathBuf::from(environment))
+    } else if first.as_os_str() == OsStr::new("boot") {
+        let Some(environment) = arguments.next() else {
+            eprintln!("usage: dm-lifecycle boot <world.dme> [map.dmm]");
+            return ExitCode::from(2);
+        };
+        (Command::Boot, PathBuf::from(environment))
+    } else {
+        (Command::Plan, PathBuf::from(first))
+    };
     let requested_map = arguments.next().map(PathBuf::from);
+    if arguments.next().is_some() {
+        eprintln!("usage: dm-lifecycle [plan|boot] <world.dme> [map.dmm]");
+        return ExitCode::from(2);
+    }
     let compilation = match CompilerDatabase::new().compile(&environment) {
         Ok(compilation) => compilation,
         Err(error) => {
@@ -24,7 +53,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let runtime = match RuntimeImage::from_compilation(&compilation) {
+    let mut runtime = match RuntimeImage::from_compilation(&compilation) {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("runtime image: {error}");
@@ -50,6 +79,40 @@ fn main() -> ExitCode {
     let world = dm_world::build_plan(&map, &compilation);
     let plan = build_initialization_plan(&runtime, &index, &world, map_path.clone());
 
+    print_plan_summary(&map_path, &index, &procedures, &plan);
+    if command == Command::Boot {
+        let allocation = match allocate_world(&world, &mut runtime) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                eprintln!("world allocation: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let execution = match execute_initialization_plan(
+            &compilation,
+            &procedures,
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+        ) {
+            Ok(execution) => execution,
+            Err(error) => {
+                eprintln!("initialization: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        print_boot_summary(&allocation, &execution);
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_plan_summary(
+    map_path: &str,
+    index: &LifecycleIndex,
+    procedures: &ProcedureRegistry,
+    plan: &dm_lifecycle::InitializationPlan,
+) {
     println!("map={map_path}");
     println!("types={}", index.types().len());
     println!("procedures={}", procedures.procedures().len());
@@ -62,8 +125,8 @@ fn main() -> ExitCode {
         "global_unsupported={}",
         plan.globals.unsupported_initializers
     );
-    let type_counts = type_lifecycle_counts(&index);
-    let atom_counts = plan.map_lifecycle_counts(&index);
+    let type_counts = type_lifecycle_counts(index);
+    let atom_counts = plan.map_lifecycle_counts(index);
     for kind in [
         LifecycleKind::New,
         LifecycleKind::Initialize,
@@ -86,7 +149,39 @@ fn main() -> ExitCode {
     for (kind, count) in diagnostic_counts {
         println!("diagnostic_{kind:?}={count}");
     }
-    ExitCode::SUCCESS
+}
+
+fn print_boot_summary(
+    allocation: &dm_world::WorldAllocation,
+    execution: &dm_lifecycle::InitializationExecution,
+) {
+    let stats = allocation.stats();
+    println!("allocation_cells={}", stats.cells);
+    println!("allocation_datums={}", stats.datums_allocated);
+    println!("allocation_areas={}", stats.unique_areas);
+    println!("allocation_turfs={}", stats.turfs);
+    println!("allocation_movables={}", stats.movables);
+    println!("allocation_deferred={}", allocation.work_items().len());
+    println!("lifecycle_executed={}", execution.events.len());
+    println!("lifecycle_duplicates={}", execution.duplicate_map_events);
+    println!("world_allocated={}", usize::from(execution.world.is_some()));
+    let mut counts = BTreeMap::new();
+    for event in &execution.events {
+        let dm_lifecycle::InitializationEvent::Lifecycle { kind, .. } = event.event else {
+            continue;
+        };
+        *counts.entry(kind).or_insert(0usize) += 1;
+    }
+    for kind in [
+        LifecycleKind::New,
+        LifecycleKind::Initialize,
+        LifecycleKind::LateInitialize,
+    ] {
+        println!(
+            "executed_{kind:?}={}",
+            counts.get(&kind).copied().unwrap_or(0)
+        );
+    }
 }
 
 fn type_lifecycle_counts(index: &LifecycleIndex) -> BTreeMap<LifecycleKind, usize> {
