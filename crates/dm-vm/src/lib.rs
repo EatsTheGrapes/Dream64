@@ -104,6 +104,13 @@ pub enum Instruction {
     JumpIfFalse(usize),
     /// Jumps to an absolute instruction.
     Jump(usize),
+    /// Skips a parameter default when that argument was explicitly supplied.
+    JumpIfArgumentSupplied {
+        /// Zero-based declared parameter index.
+        parameter: u16,
+        /// Absolute instruction after the parameter's default initializer.
+        target: usize,
+    },
     /// Calls a procedure with positional values popped from the stack.
     Call {
         /// Stable module-local procedure identity.
@@ -321,6 +328,13 @@ fn compile_procedure_with_resolver(
     let mut instructions = Vec::new();
     let mut source_spans = Vec::new();
     let mut loops = Vec::new();
+    compile_parameter_defaults(
+        definition,
+        &locals,
+        &mut instructions,
+        &mut source_spans,
+        procedures,
+    )?;
     let falls_through = if let Some(first_line) = definition.body.first() {
         let block_indentation = indentation(first_line);
         let (next_line, falls_through) = compile_block(
