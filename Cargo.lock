@@ -28,6 +28,13 @@ name = "dm-core"
 version = "0.1.0"
 
 [[package]]
+name = "dm-dmf"
+version = "0.1.0"
+dependencies = [
+ "dm-core",
+]
+
+[[package]]
 name = "dm-lexer"
 version = "0.1.0"
 dependencies = [

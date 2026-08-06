@@ -1119,7 +1119,10 @@ fn complete_define(source: &str, start: usize, end: usize, name: &str) -> (Strin
     if replacement.starts_with("{\"") {
         (replacement.to_owned(), function_like)
     } else {
-        (splice_continuations(replacement), function_like)
+        (
+            strip_macro_comments(&splice_continuations(replacement)),
+            function_like,
+        )
     }
 }
 
@@ -1142,6 +1145,19 @@ fn splice_continuations(source: &str) -> String {
         offset += 1;
     }
     String::from_utf8(output).expect("removing ASCII continuations preserves UTF-8")
+}
+
+fn strip_macro_comments(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut in_block_comment = false;
+    for physical_line in source.split_inclusive('\n') {
+        let line = physical_line.strip_suffix('\n').unwrap_or(physical_line);
+        output.push_str(&remove_comments(line, &mut in_block_comment));
+        if physical_line.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    output.trim_end().to_owned()
 }
 
 fn extended_define_end(
@@ -1786,7 +1802,7 @@ mod tests {
         .expect("environment should be written");
         fs::write(
             scratch.path().join("defines.dm"),
-            "#define ROOT /datum\n#define NESTED ROOT/example\n#define FUNCTION(value) ROOT/value\n",
+            "#define ROOT /datum\n#define NESTED ROOT/example // replacement comment\n#define FUNCTION(value) ROOT/value\n",
         )
         .expect("macro definitions should be written");
         let uses = "NESTED\n\"NESTED\"\n// NESTED\n/* NESTED */\n{\"NESTED\"}\nFUNCTION(test)\n#undef NESTED\nNESTED\n";
