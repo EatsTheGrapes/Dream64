@@ -4,12 +4,17 @@ members = [
 	"crates/dm-compiler",
 	"crates/dm-core",
 	"crates/dm-dmf",
+	"crates/dm-globals",
 	"crates/dm-lexer",
+	"crates/dm-lowering",
+	"crates/dm-map",
 	"crates/dm-object-tree",
 	"crates/dm-project",
 	"crates/dm-semantics",
 	"crates/dm-syntax",
+	"crates/dm-value",
 	"crates/dm-vm",
+	"crates/dm-world",
 ]
 resolver = "2"
 

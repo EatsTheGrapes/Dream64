@@ -272,7 +272,11 @@ impl Parser {
                 },
                 &candidate,
             );
-            let parameters = parse_parameters(&line.tokens);
+            let parameters = if candidate.kind.owns_procedure_body() {
+                parse_parameters(&line.tokens)
+            } else {
+                Vec::new()
+            };
             let index = self.definitions.len();
             self.definitions.push(Definition {
                 path,
@@ -391,22 +395,26 @@ fn classify_line(line: &SourceLine) -> Option<Candidate> {
         return None;
     }
 
-    let has_parameters = line
+    let parameter_open = line
         .tokens
         .iter()
-        .any(|token| token.kind == TokenKind::Punctuation('('));
-    let has_assignment = line
+        .position(|token| token.kind == TokenKind::Punctuation('('));
+    let assignment = line
         .tokens
         .iter()
-        .any(|token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="));
+        .position(|token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="));
+    let has_parameters = parameter_open.is_some_and(|open_index| {
+        assignment.is_none_or(|assignment_index| open_index < assignment_index)
+    });
+    let has_assignment = assignment.is_some();
     let kind = if segments.iter().any(|segment| segment == "verb") {
         DefinitionKind::Verb
     } else if segments.iter().any(|segment| segment == "proc") {
         DefinitionKind::Procedure
-    } else if has_parameters {
-        DefinitionKind::ProcedureOverride
     } else if segments.iter().any(|segment| segment == "var") {
         DefinitionKind::Variable
+    } else if has_parameters {
+        DefinitionKind::ProcedureOverride
     } else if has_assignment {
         DefinitionKind::VariableOverride
     } else {
@@ -826,5 +834,99 @@ mod tests {
             ]
         );
         assert_eq!(syntax.definitions[1].body.len(), 1);
+    }
+
+    #[test]
+    fn distinguishes_initializer_calls_from_procedure_parameters() {
+        let source = r#"
+var/global/list/global_list = list("entry")
+var/global/global_new = new /datum/example()
+var/global/global_call = build_global()
+
+/datum/example
+	var/list/instance_list = list()
+	var/instance_new = new()
+	var/instance_call = build_instance()
+	var/static/list/static_list = list()
+	var/static/static_new = new /datum()
+	var/static/static_call = build_static()
+	override_list = list()
+	override_new = new()
+	override_call = build_override()
+	proc/declared(argument = list())
+		return argument
+	overridden(argument = build_default())
+		return argument
+"#;
+        let syntax = parse(source).expect("initializer expressions should parse");
+        let indexed: Vec<_> = syntax
+            .definitions
+            .iter()
+            .map(|definition| (definition.path.to_string(), definition.kind))
+            .collect();
+
+        assert_eq!(
+            indexed,
+            vec![
+                ("/var/global_list".to_owned(), DefinitionKind::Variable),
+                ("/var/global_new".to_owned(), DefinitionKind::Variable),
+                ("/var/global_call".to_owned(), DefinitionKind::Variable),
+                ("/datum/example".to_owned(), DefinitionKind::Type),
+                (
+                    "/datum/example/var/instance_list".to_owned(),
+                    DefinitionKind::Variable
+                ),
+                (
+                    "/datum/example/var/instance_new".to_owned(),
+                    DefinitionKind::Variable
+                ),
+                (
+                    "/datum/example/var/instance_call".to_owned(),
+                    DefinitionKind::Variable
+                ),
+                (
+                    "/datum/example/var/static_list".to_owned(),
+                    DefinitionKind::Variable
+                ),
+                (
+                    "/datum/example/var/static_new".to_owned(),
+                    DefinitionKind::Variable
+                ),
+                (
+                    "/datum/example/var/static_call".to_owned(),
+                    DefinitionKind::Variable
+                ),
+                (
+                    "/datum/example/var/override_list".to_owned(),
+                    DefinitionKind::VariableOverride
+                ),
+                (
+                    "/datum/example/var/override_new".to_owned(),
+                    DefinitionKind::VariableOverride
+                ),
+                (
+                    "/datum/example/var/override_call".to_owned(),
+                    DefinitionKind::VariableOverride
+                ),
+                (
+                    "/datum/example/proc/declared".to_owned(),
+                    DefinitionKind::Procedure
+                ),
+                (
+                    "/datum/example/proc/overridden".to_owned(),
+                    DefinitionKind::ProcedureOverride
+                ),
+            ]
+        );
+        assert!(
+            syntax.definitions[..13]
+                .iter()
+                .all(|definition| definition.parameters.is_empty() && definition.body.is_empty())
+        );
+        assert!(
+            syntax.definitions[13..]
+                .iter()
+                .all(|definition| definition.parameters.len() == 1 && definition.body.len() == 1)
+        );
     }
 }

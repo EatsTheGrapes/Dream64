@@ -15,7 +15,8 @@ both Dream Maker/Dream Daemon and this engine.
 - A loss-aware lexer for DM strings, raw text, line continuations,
 	indentation, and exact source spans.
 - A deterministic project loader that follows active includes, shared defines,
-	nested conditionals, and the target compiler-version macros.
+	nested conditionals, object/function macros, variadics, stringification,
+	token pasting, original-source mapping, and the target compiler-version macros.
 - A declaration parser that indexes paths, types, vars, procs, verbs,
 	parameters, overrides, and opaque procedure bodies across the full active
 	Monkestation source graph.
@@ -23,6 +24,10 @@ both Dream Maker/Dream Daemon and this engine.
 	project-wide object tree, and maps frontend diagnostics back to source spans.
 - A typed, loss-aware DMF skin parser validated against Monkestation's real
 	window, control, menu, and macro definitions.
+- A lossless DMM parser validated across every Monkestation map, including
+	typed value shapes and source-spanned per-atom variable assignments.
+- A shared generational value heap for binary32 numbers, text, type paths,
+	datums, and ordered positional/associative lists.
 - Portable stack bytecode and a deterministic reference interpreter supporting
 	explicit call frames, forward and recursive procedure calls, permissive DM
 	argument arity, parameters, locals, assignment, arithmetic, comparisons,

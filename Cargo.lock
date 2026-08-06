@@ -35,7 +35,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "dm-globals"
+version = "0.1.0"
+dependencies = [
+ "dm-compiler",
+ "dm-core",
+ "dm-lexer",
+ "dm-object-tree",
+ "dm-syntax",
+]
+
+[[package]]
 name = "dm-lexer"
+version = "0.1.0"
+dependencies = [
+ "dm-core",
+]
+
+[[package]]
+name = "dm-lowering"
+version = "0.1.0"
+dependencies = [
+ "dm-compiler",
+ "dm-core",
+ "dm-semantics",
+ "dm-vm",
+]
+
+[[package]]
+name = "dm-map"
 version = "0.1.0"
 dependencies = [
  "dm-core",
@@ -77,10 +105,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "dm-value"
+version = "0.1.0"
+dependencies = [
+ "dm-core",
+]
+
+[[package]]
 name = "dm-vm"
 version = "0.1.0"
 dependencies = [
  "dm-core",
  "dm-lexer",
  "dm-syntax",
+ "dm-value",
+]
+
+[[package]]
+name = "dm-world"
+version = "0.1.0"
+dependencies = [
+ "dm-compiler",
+ "dm-core",
+ "dm-map",
+ "dm-object-tree",
 ]

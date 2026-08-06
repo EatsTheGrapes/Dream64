@@ -8,52 +8,8 @@ use std::fmt;
 use dm_core::{DmNumberBits, SourceSpan};
 use dm_lexer::{SpannedToken, TokenKind};
 use dm_syntax::{Definition, DefinitionKind, SourceLine};
-
-/// A value supported by the initial executable DM subset.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Value {
-    /// DM `null`.
-    Null,
-    /// Compatibility-mode binary32 `num`.
-    Number(DmNumberBits),
-    /// Immutable text.
-    Text(String),
-}
-
-impl Value {
-    /// Creates a numeric value without widening it.
-    #[must_use]
-    pub const fn number(value: f32) -> Self {
-        Self::Number(DmNumberBits::from_f32(value))
-    }
-
-    /// Returns the stored number when this value is numeric.
-    #[must_use]
-    pub const fn as_number(&self) -> Option<f32> {
-        match self {
-            Self::Number(number) => Some(number.to_f32()),
-            Self::Null | Self::Text(_) => None,
-        }
-    }
-
-    fn truthy(&self) -> bool {
-        match self {
-            Self::Null => false,
-            Self::Number(number) => number.to_f32() != 0.0,
-            Self::Text(text) => !text.is_empty(),
-        }
-    }
-}
-
-impl fmt::Display for Value {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Null => formatter.write_str("null"),
-            Self::Number(number) => write!(formatter, "{}", number.to_f32()),
-            Self::Text(text) => write!(formatter, "{text:?}"),
-        }
-    }
-}
+pub use dm_value::Value;
+use dm_value::{ListId, ValueError, ValueHeap};
 
 /// One instruction in the portable reference bytecode.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,10 +20,26 @@ pub enum Instruction {
     PushNumber(DmNumberBits),
     /// Pushes a text constant.
     PushText(String),
+    /// Pops `count` values, allocates a list, and pushes its stable handle.
+    ///
+    /// Values retain their original source order in 1-based list positions.
+    MakeList(u16),
+    /// Builds a list whose positional values and associative keys may intermix.
+    MakeListEntries(Vec<ListEntryKind>),
+    /// Pops a numeric 1-based index and a list handle, then pushes the entry.
+    IndexList,
+    /// Pops a value, index/key, and list handle and updates that list.
+    SetListIndex,
+    /// Pops a list handle and pushes its deterministic iteration length.
+    ListLength,
     /// Pushes a local value.
     LoadLocal(u16),
     /// Pops into a local slot.
     StoreLocal(u16),
+    /// Pushes the current procedure's special `.` return value.
+    LoadResult,
+    /// Pops into the current procedure's special `.` return value.
+    StoreResult,
     /// Discards the top stack value.
     Pop,
     /// Numeric addition.
@@ -134,6 +106,15 @@ pub enum Instruction {
     },
     /// Returns the top stack value.
     Return,
+}
+
+/// Stack shape of one entry consumed by [`Instruction::MakeListEntries`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListEntryKind {
+    /// One value is consumed and appended.
+    Positional,
+    /// A key followed by its associated value are consumed.
+    Associative,
 }
 
 /// Stable procedure identity within one compiled module.
@@ -435,7 +416,7 @@ fn compile_procedure_with_resolver(
         push_instruction(
             &mut instructions,
             &mut source_spans,
-            Instruction::PushNull,
+            Instruction::LoadResult,
             definition.span,
         );
         push_instruction(
@@ -473,6 +454,12 @@ impl LocalTable {
         let slot = to_local_index(self.slot_count)?;
         self.slot_count += 1;
         self.names.insert(name, slot);
+        Ok(slot)
+    }
+
+    fn declare_hidden(&mut self) -> Result<u16, CompileError> {
+        let slot = to_local_index(self.slot_count)?;
+        self.slot_count += 1;
         Ok(slot)
     }
 
@@ -534,9 +521,14 @@ fn validate_parameter_default(expression: &Expression) -> Result<(), CompileErro
         Expression::Local(name) => Err(compile_error(format!(
             "parameter default reference {name:?} requires BYOND conformance confirmation"
         ))),
+        Expression::Result => Err(compile_error(
+            "special return value '.' is not supported in parameter defaults",
+        )),
         Expression::Call { .. }
         | Expression::CurrentCall { .. }
-        | Expression::ParentCall { .. } => Err(compile_error(
+        | Expression::ParentCall { .. }
+        | Expression::List(_)
+        | Expression::Index { .. } => Err(compile_error(
             "procedure calls in parameter defaults are not supported",
         )),
         Expression::Unary { operand, .. } => validate_parameter_default(operand),
@@ -683,18 +675,17 @@ fn compile_block(
                     instructions.len() - first_instruction,
                 ));
             }
-            TokenKind::Identifier(name)
-                if matches!(
-                    line.tokens.get(1).map(|token| &token.kind),
-                    Some(TokenKind::Operator(operator)) if operator == "="
-                ) =>
-            {
-                let slot = locals
-                    .get(name)
-                    .ok_or_else(|| compile_error(format!("unknown local {name:?}")))?;
+            TokenKind::Identifier(_) if top_level_assignment(&line.tokens).is_some() => {
                 let first_instruction = instructions.len();
-                compile_expression(&line.tokens[2..], locals, instructions, procedures)?;
-                instructions.push(Instruction::StoreLocal(slot));
+                compile_assignment_statement(&line.tokens, locals, instructions, procedures)?;
+                source_spans.extend(std::iter::repeat_n(
+                    line.span,
+                    instructions.len() - first_instruction,
+                ));
+            }
+            TokenKind::Operator(operator) if operator == "." => {
+                let first_instruction = instructions.len();
+                compile_result_assignment(&line.tokens, locals, instructions, procedures)?;
                 source_spans.extend(std::iter::repeat_n(
                     line.span,
                     instructions.len() - first_instruction,
@@ -710,6 +701,50 @@ fn compile_block(
         line_index += 1;
     }
     Ok((line_index, falls_through))
+}
+
+fn top_level_assignment(tokens: &[SpannedToken]) -> Option<usize> {
+    let mut depth = 0_usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match &token.kind {
+            TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+            TokenKind::Punctuation(')' | ']' | '}') => depth = depth.saturating_sub(1),
+            TokenKind::Operator(operator) if operator == "=" && depth == 0 => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn compile_assignment_statement(
+    tokens: &[SpannedToken],
+    locals: &LocalTable,
+    instructions: &mut Vec<Instruction>,
+    procedures: &HashMap<String, ProcedureId>,
+) -> Result<(), CompileError> {
+    let assignment = top_level_assignment(tokens)
+        .ok_or_else(|| compile_error("assignment statement requires '='"))?;
+    if assignment == 0 || assignment + 1 == tokens.len() {
+        return Err(compile_error("assignment requires a target and value"));
+    }
+    let target = ExpressionParser::new(&tokens[..assignment]).parse()?;
+    match target {
+        Expression::Local(name) => {
+            let slot = locals
+                .get(&name)
+                .ok_or_else(|| compile_error(format!("unknown local {name:?}")))?;
+            compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
+            instructions.push(Instruction::StoreLocal(slot));
+        }
+        Expression::Index { list, index } => {
+            emit_expression(&list, locals, instructions, procedures)?;
+            emit_expression(&index, locals, instructions, procedures)?;
+            compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
+            instructions.push(Instruction::SetListIndex);
+        }
+        _ => return Err(compile_error("assignment target is not writable")),
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -791,6 +826,20 @@ fn compile_for(
     loops: &mut Vec<LoopContext>,
 ) -> Result<usize, CompileError> {
     let line = &lines[line_index];
+    if let Some((local_name, iterable)) = for_in_parts(&line.tokens)? {
+        return compile_for_in(
+            lines,
+            line_index,
+            block_indentation,
+            locals,
+            instructions,
+            source_spans,
+            procedures,
+            loops,
+            &local_name,
+            iterable,
+        );
+    }
     let [initializer, condition, increment] = for_clauses(&line.tokens)?;
     let initializer_start = instructions.len();
     let scoped_local = compile_for_clause(initializer, true, locals, instructions, procedures)?;
@@ -868,6 +917,187 @@ fn compile_for(
         locals.remove(&scoped_local);
     }
     Ok(after_body)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn compile_for_in(
+    lines: &[SourceLine],
+    line_index: usize,
+    block_indentation: usize,
+    locals: &mut LocalTable,
+    instructions: &mut Vec<Instruction>,
+    source_spans: &mut Vec<SourceSpan>,
+    procedures: &HashMap<String, ProcedureId>,
+    loops: &mut Vec<LoopContext>,
+    local_name: &str,
+    iterable: &[SpannedToken],
+) -> Result<usize, CompileError> {
+    let line = &lines[line_index];
+    let item_slot = locals.declare(local_name.to_owned())?;
+    let list_slot = locals.declare_hidden()?;
+    let index_slot = locals.declare_hidden()?;
+
+    let initialization_start = instructions.len();
+    compile_expression(iterable, locals, instructions, procedures)?;
+    instructions.push(Instruction::StoreLocal(list_slot));
+    instructions.push(Instruction::PushNumber(DmNumberBits::from_f32(1.0)));
+    instructions.push(Instruction::StoreLocal(index_slot));
+    source_spans.extend(std::iter::repeat_n(
+        line.span,
+        instructions.len() - initialization_start,
+    ));
+
+    let condition_target = instructions.len();
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::LoadLocal(index_slot),
+        line.span,
+    );
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::LoadLocal(list_slot),
+        line.span,
+    );
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::ListLength,
+        line.span,
+    );
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::LessEqual,
+        line.span,
+    );
+    let false_jump = instructions.len();
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::JumpIfFalse(usize::MAX),
+        line.span,
+    );
+
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::LoadLocal(list_slot),
+        line.span,
+    );
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::LoadLocal(index_slot),
+        line.span,
+    );
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::IndexList,
+        line.span,
+    );
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::StoreLocal(item_slot),
+        line.span,
+    );
+
+    let child_index = line_index + 1;
+    let child = lines
+        .get(child_index)
+        .ok_or_else(|| compile_error("for-in statement requires an indented body"))?;
+    let child_indentation = indentation(child);
+    if child_indentation <= block_indentation {
+        return Err(compile_error("for-in statement requires an indented body"));
+    }
+    loops.push(LoopContext {
+        continue_target: None,
+        continue_jumps: Vec::new(),
+        break_jumps: Vec::new(),
+    });
+    let body = compile_block(
+        lines,
+        child_index,
+        child_indentation,
+        locals,
+        instructions,
+        source_spans,
+        procedures,
+        loops,
+    );
+    let loop_context = loops.pop().expect("the active for-in context was pushed");
+    let (after_body, _) = body?;
+
+    let increment_target = instructions.len();
+    for continue_jump in loop_context.continue_jumps {
+        patch_jump(instructions, continue_jump, increment_target)?;
+    }
+    for instruction in [
+        Instruction::LoadLocal(index_slot),
+        Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+        Instruction::Add,
+        Instruction::StoreLocal(index_slot),
+        Instruction::Jump(condition_target),
+    ] {
+        push_instruction(instructions, source_spans, instruction, line.span);
+    }
+    let end_target = instructions.len();
+    patch_jump(instructions, false_jump, end_target)?;
+    for break_jump in loop_context.break_jumps {
+        patch_jump(instructions, break_jump, end_target)?;
+    }
+    locals.remove(local_name);
+    Ok(after_body)
+}
+
+fn for_in_parts(
+    tokens: &[SpannedToken],
+) -> Result<Option<(String, &[SpannedToken])>, CompileError> {
+    let header = &tokens[1..];
+    if !matches!(
+        header.first().map(|token| &token.kind),
+        Some(TokenKind::Punctuation('('))
+    ) || !matches!(
+        header.last().map(|token| &token.kind),
+        Some(TokenKind::Punctuation(')'))
+    ) {
+        return Ok(None);
+    }
+    let clauses = &header[1..header.len() - 1];
+    if clauses
+        .iter()
+        .any(|token| token.kind == TokenKind::Punctuation(';'))
+    {
+        return Ok(None);
+    }
+    let Some(separator) = clauses.iter().position(
+        |token| matches!(&token.kind, TokenKind::Identifier(identifier) if identifier == "in"),
+    ) else {
+        return Ok(None);
+    };
+    let declaration = &clauses[..separator];
+    let iterable = &clauses[separator + 1..];
+    if iterable.is_empty() {
+        return Err(compile_error("for-in requires an iterable expression"));
+    }
+    if !matches!(
+        declaration.first().map(|token| &token.kind),
+        Some(TokenKind::Identifier(identifier)) if identifier == "var"
+    ) {
+        return Err(compile_error("for-in currently requires a declared var"));
+    }
+    let local_name = declaration
+        .iter()
+        .rev()
+        .find_map(|token| match &token.kind {
+            TokenKind::Identifier(identifier) if identifier != "var" => Some(identifier.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| compile_error("for-in variable declaration has no name"))?;
+    Ok(Some((local_name, iterable)))
 }
 
 fn for_clauses(tokens: &[SpannedToken]) -> Result<[&[SpannedToken]; 3], CompileError> {
@@ -1131,6 +1361,44 @@ fn patch_jump(
     }
 }
 
+fn compile_result_assignment(
+    tokens: &[SpannedToken],
+    locals: &LocalTable,
+    instructions: &mut Vec<Instruction>,
+    procedures: &HashMap<String, ProcedureId>,
+) -> Result<(), CompileError> {
+    let Some(TokenKind::Operator(assignment)) = tokens.get(1).map(|token| &token.kind) else {
+        return Err(compile_error(
+            "special return value '.' requires an assignment",
+        ));
+    };
+    if tokens.len() < 3 {
+        return Err(compile_error(
+            "special return value assignment requires an expression",
+        ));
+    }
+    if assignment != "=" {
+        instructions.push(Instruction::LoadResult);
+    }
+    compile_expression(&tokens[2..], locals, instructions, procedures)?;
+    if assignment != "=" {
+        instructions.push(match assignment.as_str() {
+            "+=" => Instruction::Add,
+            "-=" => Instruction::Subtract,
+            "*=" => Instruction::Multiply,
+            "/=" => Instruction::Divide,
+            "%=" => Instruction::Remainder,
+            _ => {
+                return Err(compile_error(format!(
+                    "unsupported special return value assignment operator {assignment:?}"
+                )));
+            }
+        });
+    }
+    instructions.push(Instruction::StoreResult);
+    Ok(())
+}
+
 fn compile_local(
     tokens: &[SpannedToken],
     locals: &mut LocalTable,
@@ -1189,6 +1457,7 @@ enum Expression {
     Number(DmNumberBits),
     Text(String),
     Local(String),
+    Result,
     Call {
         procedure: String,
         arguments: Vec<Self>,
@@ -1199,6 +1468,11 @@ enum Expression {
     ParentCall {
         arguments: Option<Vec<Self>>,
     },
+    List(Vec<ListExpressionEntry>),
+    Index {
+        list: Box<Self>,
+        index: Box<Self>,
+    },
     Unary {
         operator: String,
         operand: Box<Self>,
@@ -1208,6 +1482,12 @@ enum Expression {
         left: Box<Self>,
         right: Box<Self>,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ListExpressionEntry {
+    Positional(Expression),
+    Associative { key: Expression, value: Expression },
 }
 
 struct ExpressionParser<'a> {
@@ -1261,7 +1541,26 @@ impl<'a> ExpressionParser<'a> {
                 operand: Box::new(self.parse_unary()?),
             });
         }
-        self.parse_primary()
+        let mut expression = self.parse_primary()?;
+        while matches!(
+            self.tokens.get(self.index).map(|token| &token.kind),
+            Some(TokenKind::Punctuation('['))
+        ) {
+            self.index += 1;
+            let index = self.parse_binary(1)?;
+            if !matches!(
+                self.tokens.get(self.index).map(|token| &token.kind),
+                Some(TokenKind::Punctuation(']'))
+            ) {
+                return Err(compile_error("expected ']' after list index"));
+            }
+            self.index += 1;
+            expression = Expression::Index {
+                list: Box::new(expression),
+                index: Box::new(index),
+            };
+        }
+        Ok(expression)
     }
 
     fn parse_primary(&mut self) -> Result<Expression, CompileError> {
@@ -1303,22 +1602,33 @@ impl<'a> ExpressionParser<'a> {
                     },
                 })
             }
+            TokenKind::Operator(operator) if operator == "." => Ok(Expression::Result),
             TokenKind::Number(spelling) => parse_number(spelling).map(Expression::Number),
             TokenKind::String(text) | TokenKind::RawString(text) | TokenKind::TextBlock(text) => {
                 Ok(Expression::Text(text.clone()))
             }
             TokenKind::Identifier(identifier) if identifier == "null" => Ok(Expression::Null),
+            TokenKind::Identifier(identifier) if identifier == "TRUE" => {
+                Ok(Expression::Number(DmNumberBits::from_f32(1.0)))
+            }
+            TokenKind::Identifier(identifier) if identifier == "FALSE" => {
+                Ok(Expression::Number(DmNumberBits::from_f32(0.0)))
+            }
             TokenKind::Identifier(identifier)
                 if matches!(
                     self.tokens.get(self.index).map(|token| &token.kind),
                     Some(TokenKind::Punctuation('('))
                 ) =>
             {
-                let arguments = self.parse_call_arguments()?;
-                Ok(Expression::Call {
-                    procedure: identifier.clone(),
-                    arguments,
-                })
+                if identifier == "list" {
+                    Ok(Expression::List(self.parse_list_arguments()?))
+                } else {
+                    let arguments = self.parse_call_arguments()?;
+                    Ok(Expression::Call {
+                        procedure: identifier.clone(),
+                        arguments,
+                    })
+                }
             }
             TokenKind::Identifier(identifier) => Ok(Expression::Local(identifier.clone())),
             TokenKind::Punctuation('(') => {
@@ -1366,6 +1676,44 @@ impl<'a> ExpressionParser<'a> {
         Ok(arguments)
     }
 
+    fn parse_list_arguments(&mut self) -> Result<Vec<ListExpressionEntry>, CompileError> {
+        debug_assert!(matches!(
+            self.tokens.get(self.index).map(|token| &token.kind),
+            Some(TokenKind::Punctuation('('))
+        ));
+        self.index += 1;
+        let mut entries = Vec::new();
+        while !matches!(
+            self.tokens.get(self.index).map(|token| &token.kind),
+            Some(TokenKind::Punctuation(')'))
+        ) {
+            let key_or_value = self.parse_binary(1)?;
+            if matches!(self.current_operator(), Some("=")) {
+                self.index += 1;
+                let value = self.parse_binary(1)?;
+                entries.push(ListExpressionEntry::Associative {
+                    key: key_or_value,
+                    value,
+                });
+            } else {
+                entries.push(ListExpressionEntry::Positional(key_or_value));
+            }
+            match self.tokens.get(self.index).map(|token| &token.kind) {
+                Some(TokenKind::Punctuation(',')) => self.index += 1,
+                Some(TokenKind::Punctuation(')')) => break,
+                _ => return Err(compile_error("expected ',' or ')' after list entry")),
+            }
+        }
+        if !matches!(
+            self.tokens.get(self.index).map(|token| &token.kind),
+            Some(TokenKind::Punctuation(')'))
+        ) {
+            return Err(compile_error("expected ')' after list entries"));
+        }
+        self.index += 1;
+        Ok(entries)
+    }
+
     fn current_operator(&self) -> Option<&str> {
         match self.tokens.get(self.index).map(|token| &token.kind) {
             Some(TokenKind::Operator(operator)) => Some(operator),
@@ -1406,6 +1754,7 @@ const fn binary_precedence(operator: &str) -> Option<u8> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn emit_expression(
     expression: &Expression,
     locals: &LocalTable,
@@ -1422,6 +1771,7 @@ fn emit_expression(
                 .ok_or_else(|| compile_error(format!("unknown local {name:?}")))?;
             instructions.push(Instruction::LoadLocal(slot));
         }
+        Expression::Result => instructions.push(Instruction::LoadResult),
         Expression::Call {
             procedure,
             arguments,
@@ -1468,6 +1818,28 @@ fn emit_expression(
                 procedure: procedures.get("..").copied(),
                 argument_count,
             });
+        }
+        Expression::List(entries) => {
+            let mut kinds = Vec::with_capacity(entries.len());
+            for entry in entries {
+                match entry {
+                    ListExpressionEntry::Positional(value) => {
+                        emit_expression(value, locals, instructions, procedures)?;
+                        kinds.push(ListEntryKind::Positional);
+                    }
+                    ListExpressionEntry::Associative { key, value } => {
+                        emit_expression(key, locals, instructions, procedures)?;
+                        emit_expression(value, locals, instructions, procedures)?;
+                        kinds.push(ListEntryKind::Associative);
+                    }
+                }
+            }
+            instructions.push(Instruction::MakeListEntries(kinds));
+        }
+        Expression::Index { list, index } => {
+            emit_expression(list, locals, instructions, procedures)?;
+            emit_expression(index, locals, instructions, procedures)?;
+            instructions.push(Instruction::IndexList);
         }
         Expression::Unary { operator, operand } => {
             emit_expression(operand, locals, instructions, procedures)?;
@@ -1538,12 +1910,42 @@ impl Default for ExecutionLimits {
     }
 }
 
+/// Mutable heap state shared by executions in one runtime world.
+///
+/// Values contain only stable logical handles. All mutable list and datum
+/// storage remains here so aliases across calls resolve to one identity.
+#[derive(Default)]
+pub struct ExecutionState {
+    heap: ValueHeap,
+}
+
+impl ExecutionState {
+    /// Creates an execution state with an empty value heap.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the shared value heap.
+    #[must_use]
+    pub const fn heap(&self) -> &ValueHeap {
+        &self.heap
+    }
+
+    /// Returns the shared mutable value heap.
+    #[must_use]
+    pub const fn heap_mut(&mut self) -> &mut ValueHeap {
+        &mut self.heap
+    }
+}
+
 #[derive(Debug)]
 struct CallFrame {
     procedure: ProcedureId,
     instruction: usize,
     locals: Vec<Value>,
     stack: Vec<Value>,
+    result: Value,
     // Retain all supplied values for the future DM `args` list, including
     // extras beyond the declared parameter slots.
     arguments: Vec<Value>,
@@ -1562,6 +1964,19 @@ pub fn execute(program: &Program, arguments: &[Value]) -> Result<Value, RuntimeE
     execute_with_limits(program, arguments, ExecutionLimits::default())
 }
 
+/// Executes one standalone program against persistent runtime state.
+///
+/// # Errors
+///
+/// Returns [`RuntimeError`] for invalid bytecode or value operations.
+pub fn execute_in_state(
+    program: &Program,
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Result<Value, RuntimeError> {
+    execute_with_limits_in_state(program, arguments, ExecutionLimits::default(), state)
+}
+
 /// Executes one standalone program with explicit deterministic safety limits.
 ///
 /// # Errors
@@ -1573,13 +1988,29 @@ pub fn execute_with_limits(
     arguments: &[Value],
     limits: ExecutionLimits,
 ) -> Result<Value, RuntimeError> {
+    let mut state = ExecutionState::new();
+    execute_with_limits_in_state(program, arguments, limits, &mut state)
+}
+
+/// Executes one standalone program with persistent state and explicit limits.
+///
+/// # Errors
+///
+/// Returns [`RuntimeError`] for invalid bytecode, unsupported value operations,
+/// stale heap references, or safety-limit exhaustion.
+pub fn execute_with_limits_in_state(
+    program: &Program,
+    arguments: &[Value],
+    limits: ExecutionLimits,
+    state: &mut ExecutionState,
+) -> Result<Value, RuntimeError> {
     let entry = ProcedureId(0);
     let module = Module {
         procedures: vec![program.clone()],
         paths: vec!["<standalone>".to_owned()],
         names: HashMap::new(),
     };
-    execute_module_with_limits(&module, entry, arguments, limits)
+    execute_module_with_limits_in_state(&module, entry, arguments, limits, state)
 }
 
 /// Executes a procedure from a compiled module with default safety limits.
@@ -1600,6 +2031,20 @@ pub fn execute_module(
     execute_module_with_limits(module, entry, arguments, ExecutionLimits::default())
 }
 
+/// Executes a module procedure against persistent runtime state.
+///
+/// # Errors
+///
+/// Returns [`RuntimeError`] for the same failures as [`execute_module`].
+pub fn execute_module_in_state(
+    module: &Module,
+    entry: ProcedureId,
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Result<Value, RuntimeError> {
+    execute_module_with_limits_in_state(module, entry, arguments, ExecutionLimits::default(), state)
+}
+
 /// Executes a module procedure with explicit deterministic safety limits.
 ///
 /// # Errors
@@ -1610,6 +2055,23 @@ pub fn execute_module_with_limits(
     entry: ProcedureId,
     arguments: &[Value],
     limits: ExecutionLimits,
+) -> Result<Value, RuntimeError> {
+    let mut state = ExecutionState::new();
+    execute_module_with_limits_in_state(module, entry, arguments, limits, &mut state)
+}
+
+/// Executes a module procedure against persistent state with explicit limits.
+///
+/// # Errors
+///
+/// Returns [`RuntimeError`] for invalid bytecode, unsupported value operations,
+/// stale heap references, or safety-limit exhaustion.
+pub fn execute_module_with_limits_in_state(
+    module: &Module,
+    entry: ProcedureId,
+    arguments: &[Value],
+    limits: ExecutionLimits,
+    state: &mut ExecutionState,
 ) -> Result<Value, RuntimeError> {
     let Some(program) = module.procedure(entry) else {
         return Err(RuntimeError {
@@ -1629,7 +2091,7 @@ pub fn execute_module_with_limits(
     }
 
     let frames = vec![make_frame(entry, program, arguments)];
-    run_frames(module, frames, limits)
+    run_frames(module, frames, limits, state)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1637,6 +2099,7 @@ fn run_frames(
     module: &Module,
     mut frames: Vec<CallFrame>,
     limits: ExecutionLimits,
+    state: &mut ExecutionState,
 ) -> Result<Value, RuntimeError> {
     let mut remaining_steps = limits.max_steps;
     loop {
@@ -1671,7 +2134,140 @@ fn run_frames(
             Instruction::PushNumber(number) => {
                 frames[frame_index].stack.push(Value::Number(number));
             }
-            Instruction::PushText(text) => frames[frame_index].stack.push(Value::Text(text)),
+            Instruction::PushText(text) => frames[frame_index].stack.push(Value::text(text)),
+            Instruction::MakeList(item_count) => {
+                let count = usize::from(item_count);
+                let stack_length = frames[frame_index].stack.len();
+                if count > stack_length {
+                    return Err(execution_error(module, &frames, "bytecode stack underflow"));
+                }
+                let items = frames[frame_index].stack.split_off(stack_length - count);
+                let list = state.heap.allocate_list();
+                for item in items {
+                    state
+                        .heap
+                        .list_mut(list)
+                        .expect("a newly allocated list handle must be live")
+                        .add(item);
+                }
+                frames[frame_index].stack.push(Value::List(list));
+            }
+            Instruction::MakeListEntries(kinds) => {
+                let value_count = kinds.iter().try_fold(0_usize, |count, kind| {
+                    count.checked_add(match kind {
+                        ListEntryKind::Positional => 1,
+                        ListEntryKind::Associative => 2,
+                    })
+                });
+                let Some(value_count) = value_count else {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "list literal is too large",
+                    ));
+                };
+                let stack_length = frames[frame_index].stack.len();
+                if value_count > stack_length {
+                    return Err(execution_error(module, &frames, "bytecode stack underflow"));
+                }
+                let values = frames[frame_index]
+                    .stack
+                    .split_off(stack_length - value_count);
+                let list = state.heap.allocate_list();
+                let entries = state
+                    .heap
+                    .list_mut(list)
+                    .expect("a newly allocated list handle must be live");
+                let mut values = values.into_iter();
+                for kind in kinds {
+                    match kind {
+                        ListEntryKind::Positional => {
+                            entries.add(values.next().expect("validated literal stack shape"));
+                        }
+                        ListEntryKind::Associative => {
+                            let key = values.next().expect("validated literal stack shape");
+                            let value = values.next().expect("validated literal stack shape");
+                            entries.set_key(key, value);
+                        }
+                    }
+                }
+                frames[frame_index].stack.push(Value::List(list));
+            }
+            Instruction::IndexList => {
+                let key = match pop(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let list = match pop(&mut frames[frame_index].stack) {
+                    Ok(Value::List(list)) => list,
+                    Ok(value) => {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("list index operation received {value}"),
+                        ));
+                    }
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let value = match read_list_value(&state.heap, list, &key) {
+                    Ok(value) => value.clone(),
+                    Err(error) => {
+                        return Err(execution_error(module, &frames, error.to_string()));
+                    }
+                };
+                frames[frame_index].stack.push(value);
+            }
+            Instruction::SetListIndex => {
+                let value = match pop(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let key = match pop(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let list = match pop(&mut frames[frame_index].stack) {
+                    Ok(Value::List(list)) => list,
+                    Ok(value) => {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("list assignment received {value}"),
+                        ));
+                    }
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                if let Err(error) = write_list_value(&mut state.heap, list, key, value) {
+                    return Err(execution_error(module, &frames, error.to_string()));
+                }
+            }
+            Instruction::ListLength => {
+                let list = match pop(&mut frames[frame_index].stack) {
+                    Ok(Value::List(list)) => list,
+                    Ok(value) => {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("list length operation received {value}"),
+                        ));
+                    }
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let length = match state.heap.list(list) {
+                    Ok(values) => values.len(),
+                    Err(error) => {
+                        return Err(execution_error(module, &frames, error.to_string()));
+                    }
+                };
+                let length = length.to_string().parse::<f32>().map_err(|error| {
+                    execution_error(
+                        module,
+                        &frames,
+                        format!("list length cannot be represented as binary32: {error}"),
+                    )
+                })?;
+                frames[frame_index].stack.push(Value::number(length));
+            }
             Instruction::LoadLocal(slot) => {
                 let Some(value) = frames[frame_index].locals.get(usize::from(slot)).cloned() else {
                     return Err(execution_error(
@@ -1696,6 +2292,17 @@ fn run_frames(
                 };
                 *local = value;
             }
+            Instruction::LoadResult => {
+                let result = frames[frame_index].result.clone();
+                frames[frame_index].stack.push(result);
+            }
+            Instruction::StoreResult => {
+                let value = match pop(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                frames[frame_index].result = value;
+            }
             Instruction::Pop => {
                 if let Err(message) = pop(&mut frames[frame_index].stack) {
                     return Err(execution_error(module, &frames, message));
@@ -1713,9 +2320,11 @@ fn run_frames(
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
+                let is_truthy = runtime_truthy(&state.heap, &value)
+                    .map_err(|message| execution_error(module, &frames, message))?;
                 frames[frame_index]
                     .stack
-                    .push(Value::number(f32::from(!value.truthy())));
+                    .push(Value::number(f32::from(!is_truthy)));
             }
             Instruction::Add
             | Instruction::Subtract
@@ -1763,11 +2372,13 @@ fn run_frames(
             }
             Instruction::And | Instruction::Or => {
                 let right = match pop(&mut frames[frame_index].stack) {
-                    Ok(value) => value.truthy(),
+                    Ok(value) => runtime_truthy(&state.heap, &value)
+                        .map_err(|message| execution_error(module, &frames, message))?,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
                 let left = match pop(&mut frames[frame_index].stack) {
-                    Ok(value) => value.truthy(),
+                    Ok(value) => runtime_truthy(&state.heap, &value)
+                        .map_err(|message| execution_error(module, &frames, message))?,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
                 let result = if matches!(instruction, Instruction::And) {
@@ -1784,7 +2395,9 @@ fn run_frames(
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                if !condition.truthy() {
+                if !runtime_truthy(&state.heap, &condition)
+                    .map_err(|message| execution_error(module, &frames, message))?
+                {
                     if let Err(message) = validate_jump(target, program.instructions.len()) {
                         return Err(execution_error(module, &frames, message));
                     }
@@ -1924,6 +2537,7 @@ fn make_frame(procedure: ProcedureId, program: &Program, arguments: &[Value]) ->
         instruction: 0,
         locals,
         stack: Vec::new(),
+        result: Value::Null,
         arguments: arguments.to_vec(),
     }
 }
@@ -1988,14 +2602,56 @@ fn validate_jump(target: usize, instruction_count: usize) -> Result<(), String> 
 }
 
 fn values_equal(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Null, Value::Null) => true,
-        (Value::Number(left), Value::Number(right)) => {
-            left.to_f32().partial_cmp(&right.to_f32()) == Some(std::cmp::Ordering::Equal)
-        }
-        (Value::Text(left), Value::Text(right)) => left == right,
-        _ => false,
+    left.semantic_eq(right)
+}
+
+fn runtime_truthy(heap: &ValueHeap, value: &Value) -> Result<bool, String> {
+    heap.truthy(value).map_err(|error| error.to_string())
+}
+
+fn read_list_value<'heap>(
+    heap: &'heap ValueHeap,
+    list: ListId,
+    key: &Value,
+) -> Result<&'heap Value, ValueError> {
+    let values = heap.list(list)?;
+    if matches!(key, Value::Number(_)) {
+        let index = value_to_list_index(key).map_err(ValueError::InvalidListIndex)?;
+        values.get(index)
+    } else {
+        values.get_key(key)
     }
+}
+
+fn write_list_value(
+    heap: &mut ValueHeap,
+    list: ListId,
+    key: Value,
+    value: Value,
+) -> Result<(), ValueError> {
+    let values = heap.list_mut(list)?;
+    if matches!(key, Value::Number(_)) {
+        let index = value_to_list_index(&key).map_err(ValueError::InvalidListIndex)?;
+        values.set(index, value)?;
+    } else {
+        values.set_key(key, value);
+    }
+    Ok(())
+}
+
+fn value_to_list_index(value: &Value) -> Result<usize, String> {
+    let Some(number) = value.as_number() else {
+        return Err(format!("list index must be numeric, received {value}"));
+    };
+    if !number.is_finite() || number < 1.0 || number.fract() != 0.0 {
+        return Err(format!(
+            "list index must be a positive whole number, received {number}"
+        ));
+    }
+    number
+        .to_string()
+        .parse()
+        .map_err(|_| format!("list index {number} exceeds the host index range"))
 }
 
 fn pop(stack: &mut Vec<Value>) -> Result<Value, String> {
@@ -2013,17 +2669,155 @@ fn pop_number(stack: &mut Vec<Value>) -> Result<f32, String> {
 
 #[cfg(test)]
 mod tests {
+    use dm_core::{DmNumberBits, SourceSpan};
     use dm_syntax::parse;
 
     use super::{
-        ExecutionLimits, Instruction, Value, compile_module, compile_procedure, execute,
+        ExecutionLimits, ExecutionState, Instruction, ProcedureSpec, Program, Value,
+        compile_module, compile_module_specs, compile_procedure, execute, execute_in_state,
         execute_module, execute_module_with_limits, execute_with_limits,
+        execute_with_limits_in_state,
     };
 
     fn execute_source(source: &str, argument: f32) -> Value {
         let syntax = parse(source).expect("source should parse");
         let program = compile_procedure(&syntax.definitions[0]).expect("procedure should compile");
         execute(&program, &[Value::number(argument)]).expect("procedure should execute")
+    }
+
+    fn manual_program(instructions: Vec<Instruction>, parameter_count: usize) -> Program {
+        let instruction_count = instructions.len();
+        Program {
+            parameter_count,
+            local_count: parameter_count,
+            instructions,
+            source_spans: (0..instruction_count)
+                .map(|index| SourceSpan::new(index * 10, index * 10 + 1))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn shared_value_migration_preserves_scalar_execution() {
+        let program = manual_program(
+            vec![
+                Instruction::PushNumber(DmNumberBits::from_f32(2.0)),
+                Instruction::PushNumber(DmNumberBits::from_f32(3.0)),
+                Instruction::Add,
+                Instruction::Return,
+            ],
+            0,
+        );
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(5.0)));
+    }
+
+    #[test]
+    fn list_construction_allocates_heap_storage_in_source_order() {
+        let program = manual_program(
+            vec![
+                Instruction::PushNumber(DmNumberBits::from_f32(7.0)),
+                Instruction::PushText("second".to_owned()),
+                Instruction::MakeList(2),
+                Instruction::Return,
+            ],
+            0,
+        );
+        let mut state = ExecutionState::new();
+        let result = execute_in_state(&program, &[], &mut state).unwrap();
+        let Value::List(list) = result else {
+            panic!("MakeList must return a list handle");
+        };
+
+        let values = state.heap().list(list).unwrap();
+        assert!(values.get(1).unwrap().semantic_eq(&Value::number(7.0)));
+        assert!(values.get(2).unwrap().semantic_eq(&Value::text("second")));
+    }
+
+    #[test]
+    fn list_aliases_observe_heap_mutation_across_executions() {
+        let program = manual_program(
+            vec![
+                Instruction::LoadLocal(0),
+                Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+                Instruction::IndexList,
+                Instruction::Return,
+            ],
+            1,
+        );
+        let mut state = ExecutionState::new();
+        let list = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(list)
+            .unwrap()
+            .add(Value::number(4.0));
+        let alias = Value::List(list);
+
+        assert_eq!(
+            execute_in_state(&program, std::slice::from_ref(&alias), &mut state),
+            Ok(Value::number(4.0))
+        );
+        state
+            .heap_mut()
+            .list_mut(list)
+            .unwrap()
+            .set(1, Value::number(9.0))
+            .unwrap();
+        assert_eq!(
+            execute_in_state(&program, &[alias], &mut state),
+            Ok(Value::number(9.0))
+        );
+    }
+
+    #[test]
+    fn stale_list_indexing_maps_to_source_aware_runtime_error() {
+        let program = manual_program(
+            vec![
+                Instruction::LoadLocal(0),
+                Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+                Instruction::IndexList,
+                Instruction::Return,
+            ],
+            1,
+        );
+        let mut state = ExecutionState::new();
+        let stale_list = state.heap_mut().allocate_list();
+        state.heap_mut().destroy_list(stale_list).unwrap();
+        let error = execute_in_state(&program, &[Value::List(stale_list)], &mut state)
+            .expect_err("a stale handle must never resolve through the VM");
+
+        assert_eq!(error.message, format!("stale list handle {stale_list:?}"));
+        assert_eq!(error.instruction, 2);
+        assert_eq!(error.source_span, Some(SourceSpan::new(20, 21)));
+        assert_eq!(error.call_stack.len(), 1);
+    }
+
+    #[test]
+    fn list_instructions_consume_the_existing_shared_budget() {
+        let program = manual_program(
+            vec![
+                Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+                Instruction::MakeList(1),
+                Instruction::Return,
+            ],
+            0,
+        );
+        let mut state = ExecutionState::new();
+        let error = execute_with_limits_in_state(
+            &program,
+            &[],
+            ExecutionLimits {
+                max_steps: 2,
+                ..ExecutionLimits::default()
+            },
+            &mut state,
+        )
+        .expect_err("Return must require its own instruction-budget unit");
+
+        assert_eq!(error.message, "instruction budget of 2 exhausted");
+        assert_eq!(error.instruction, 2);
+        assert_eq!(error.source_span, Some(SourceSpan::new(20, 21)));
     }
 
     #[test]
@@ -2444,7 +3238,7 @@ mod tests {
     }
 
     #[test]
-    fn infinite_for_obeys_step_budget_and_for_in_has_precise_diagnostic() {
+    fn infinite_for_obeys_step_budget_and_for_in_compiles() {
         let source = "/proc/spin()\n\tfor(;;)\n\t\tcontinue\n";
         let syntax = parse(source).expect("source should parse");
         let for_span = syntax.definitions[0].body[0].span;
@@ -2464,9 +3258,76 @@ mod tests {
         let list_iteration =
             parse("/proc/list_loop(items)\n\tfor(var/item in items)\n\t\tcontinue\n")
                 .expect("source should parse");
-        let error = compile_procedure(&list_iteration.definitions[0])
-            .expect_err("for-in should remain a distinct unsupported form");
-        assert_eq!(error.message, "for-in list iteration is not implemented");
+        let program = compile_procedure(&list_iteration.definitions[0])
+            .expect("for-in list iteration should compile");
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::ListLength))
+        );
+    }
+
+    #[test]
+    fn list_literals_support_bracket_reads_and_writes() {
+        let source =
+            "/proc/list_access()\n\tvar/items = list(1, 2, 3)\n\titems[2] = 9\n\treturn items[2]\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("lists should compile");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(9.0)));
+    }
+
+    #[test]
+    fn list_assignment_preserves_alias_identity() {
+        let source = "/proc/update(items)\n\titems[1] = 12\n\treturn items[1]\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("indexing should compile");
+        let mut state = ExecutionState::new();
+        let list = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(list)
+            .unwrap()
+            .add(Value::number(1.0));
+
+        assert_eq!(
+            execute_in_state(&program, &[Value::List(list)], &mut state),
+            Ok(Value::number(12.0))
+        );
+        assert!(
+            state
+                .heap()
+                .list(list)
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .semantic_eq(&Value::number(12.0))
+        );
+    }
+
+    #[test]
+    fn associative_literals_lookup_update_and_iterate_in_source_order() {
+        let lookup = "/proc/lookup()\n\tvar/items = list(1, \"first\" = 10, 2, \"second\" = 20)\n\titems[\"first\"] = 11\n\treturn items[\"first\"]\n";
+        let syntax = parse(lookup).expect("source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("associations should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(11.0)));
+
+        let iteration = "/proc/order()\n\tvar/result = 0\n\tfor(var/item in list(1, \"key\" = 10, 2))\n\t\tif(item == \"key\")\n\t\t\tresult = result * 10 + 9\n\t\telse\n\t\t\tresult = result * 10 + item\n\treturn result\n";
+        let syntax = parse(iteration).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("iteration should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(192.0)));
+    }
+
+    #[test]
+    fn for_in_break_continue_and_nesting_target_the_innermost_loop() {
+        let source = "/proc/nested_lists()\n\tvar/total = 0\n\tfor(var/outer in list(1, 2))\n\t\tfor(var/inner in list(1, 2, 3, 4))\n\t\t\tif(inner == 2)\n\t\t\t\tcontinue\n\t\t\tif(inner == 4)\n\t\t\t\tbreak\n\t\t\ttotal = total + outer * inner\n\treturn total\n";
+        let syntax = parse(source).expect("source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("nested lists should compile");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(12.0)));
     }
 
     #[test]
@@ -2485,9 +3346,20 @@ mod tests {
         let text = parse("/proc/text_default(value = \"fallback\")\n\treturn value\n")
             .expect("source should parse");
         let program = compile_procedure(&text.definitions[0]).expect("procedure should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::text("fallback")));
+    }
+
+    #[test]
+    fn dm_boolean_constants_work_in_defaults_and_expressions() {
+        let source = "/proc/booleans(enabled = TRUE, disabled = FALSE)\n\tif(disabled)\n\t\treturn 99\n\treturn enabled + TRUE\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("DM boolean constants should compile as numeric literals");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(2.0)));
         assert_eq!(
-            execute(&program, &[]),
-            Ok(Value::Text("fallback".to_owned()))
+            execute(&program, &[Value::Null, Value::number(1.0)]),
+            Ok(Value::number(99.0))
         );
     }
 
@@ -2555,5 +3427,73 @@ mod tests {
             error.message,
             "procedure calls in parameter defaults are not supported"
         );
+    }
+
+    #[test]
+    fn special_result_starts_null_and_is_returned_on_fallthrough() {
+        let syntax = parse("/proc/empty()\n").expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("procedure should compile");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::Null));
+        assert!(matches!(program.instructions[0], Instruction::LoadResult));
+    }
+
+    #[test]
+    fn special_result_supports_reads_assignments_and_compound_assignments() {
+        let source = "/proc/result()\n\t. = 2\n\t. += 3\n\t. *= 4\n\treturn .\n";
+        let syntax = parse(source).expect("source should parse");
+        let assignment_span = syntax.definitions[0].body[0].span;
+        let program = compile_procedure(&syntax.definitions[0]).expect("procedure should compile");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(20.0)));
+        assert!(program.instructions.iter().zip(&program.source_spans).any(
+            |(instruction, span)| matches!(instruction, Instruction::StoreResult)
+                && *span == assignment_span
+        ));
+    }
+
+    #[test]
+    fn special_result_survives_branches_and_loops() {
+        let source = "/proc/accumulate(input)\n\t. = 0\n\twhile(input > 0)\n\t\tif(input == 2)\n\t\t\t. += 10\n\t\telse\n\t\t\t. += input\n\t\tinput = input - 1\n";
+
+        assert_eq!(execute_source(source, 3.0), Value::number(14.0));
+    }
+
+    #[test]
+    fn explicit_return_takes_precedence_over_special_result() {
+        let syntax = parse("/proc/result()\n\t. = 5\n\treturn 9\n").expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("procedure should compile");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(9.0)));
+    }
+
+    #[test]
+    fn special_result_can_receive_resolved_parent_call() {
+        let source = "/proc/base(value = 4)\n\t. = value\n/proc/child(value = 4)\n\t. = ..()\n";
+        let syntax = parse(source).expect("source should parse");
+        let parent_assignment_span = syntax.definitions[1].body[0].span;
+        let module = compile_module_specs(&[
+            ProcedureSpec {
+                path: "/proc/base@0".to_owned(),
+                definition: &syntax.definitions[0],
+                parent: None,
+            },
+            ProcedureSpec {
+                path: "/proc/child@1".to_owned(),
+                definition: &syntax.definitions[1],
+                parent: Some(0),
+            },
+        ])
+        .expect("resolved parent specs should compile");
+        let entry = module
+            .procedure_id_at(1)
+            .expect("child spec should have a VM identity");
+
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(4.0)));
+        let child = module.procedure(entry).expect("child program should exist");
+        assert!(child.instructions.iter().zip(&child.source_spans).any(
+            |(instruction, span)| matches!(instruction, Instruction::StoreResult)
+                && *span == parent_assignment_span
+        ));
     }
 }

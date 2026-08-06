@@ -620,13 +620,13 @@ impl Loader {
             DirectiveKind::Define {
                 name,
                 value,
-                function_like,
+                parameters,
             } if active => {
                 self.macros.insert(
                     name,
                     MacroDefinition {
                         replacement: value,
-                        function_like,
+                        parameters,
                     },
                 );
             }
@@ -740,7 +740,7 @@ enum DirectiveKind {
     Define {
         name: String,
         value: String,
-        function_like: bool,
+        parameters: Option<MacroParameters>,
     },
     Undef(String),
     If(String),
@@ -755,14 +755,20 @@ enum DirectiveKind {
 #[derive(Clone, Debug)]
 struct MacroDefinition {
     replacement: String,
-    function_like: bool,
+    parameters: Option<MacroParameters>,
+}
+
+#[derive(Clone, Debug)]
+struct MacroParameters {
+    fixed: Vec<String>,
+    variadic: Option<String>,
 }
 
 impl MacroDefinition {
     fn object(replacement: String) -> Self {
         Self {
             replacement,
-            function_like: false,
+            parameters: None,
         }
     }
 }
@@ -847,25 +853,45 @@ impl CompilerSourceBuilder {
             if is_identifier_start(byte) {
                 let identifier_end = identifier_end(text, offset);
                 let name = &text[offset..identifier_end];
-                if let Some(definition) = macros.get(name)
-                    && !definition.function_like
-                {
+                if let Some(definition) = macros.get(name) {
+                    let invocation_end = if definition.parameters.is_some() {
+                        let open = skip_horizontal_whitespace(text, identifier_end);
+                        if text.as_bytes().get(open) != Some(&b'(') {
+                            offset = identifier_end;
+                            continue;
+                        }
+                        parse_macro_arguments(text, open)
+                            .map_err(|message| ProjectError::MacroExpansion {
+                                path: path.to_path_buf(),
+                                offset: span.start + offset,
+                                message,
+                            })?
+                            .1
+                    } else {
+                        identifier_end
+                    };
                     self.append_original(
                         source,
                         SourceSpan::new(span.start + literal_start, span.start + offset),
                     );
                     let invocation =
-                        SourceSpan::new(span.start + offset, span.start + identifier_end);
+                        SourceSpan::new(span.start + offset, span.start + invocation_end);
+                    let arguments = definition.parameters.as_ref().map(|_| {
+                        let open = skip_horizontal_whitespace(text, identifier_end);
+                        parse_macro_arguments(text, open)
+                            .expect("arguments were validated above")
+                            .0
+                    });
                     let replacement =
-                        expand_macro(name, macros, &mut Vec::new()).map_err(|message| {
-                            ProjectError::MacroExpansion {
+                        expand_macro(name, arguments.as_deref(), macros, &mut Vec::new()).map_err(
+                            |message| ProjectError::MacroExpansion {
                                 path: path.to_path_buf(),
                                 offset: invocation.start,
                                 message,
-                            }
-                        })?;
+                            },
+                        )?;
                     self.append_replacement(&replacement, invocation);
-                    offset = identifier_end;
+                    offset = invocation_end;
                     literal_start = offset;
                     continue;
                 }
@@ -934,31 +960,34 @@ const MAX_MACRO_EXPANSION_DEPTH: usize = 64;
 
 fn expand_macro(
     name: &str,
+    arguments: Option<&[String]>,
     macros: &HashMap<String, MacroDefinition>,
     stack: &mut Vec<String>,
 ) -> Result<String, String> {
     if let Some(cycle_start) = stack.iter().position(|entry| entry == name) {
         let mut cycle = stack[cycle_start..].to_vec();
         cycle.push(name.to_owned());
-        return Err(format!(
-            "recursive object macro expansion: {}",
-            cycle.join(" -> ")
-        ));
+        return Err(format!("recursive macro expansion: {}", cycle.join(" -> ")));
     }
     if stack.len() >= MAX_MACRO_EXPANSION_DEPTH {
         return Err(format!(
-            "object macro expansion exceeded {MAX_MACRO_EXPANSION_DEPTH} levels while expanding {name}"
+            "macro expansion exceeded {MAX_MACRO_EXPANSION_DEPTH} levels while expanding {name}"
         ));
     }
     let Some(definition) = macros.get(name) else {
         return Ok(name.to_owned());
     };
-    if definition.function_like {
-        return Ok(name.to_owned());
-    }
-
     stack.push(name.to_owned());
-    let result = expand_replacement(&definition.replacement, macros, stack);
+    let result = if let Some(parameters) = &definition.parameters {
+        arguments.map_or_else(
+            || Err(format!("function macro {name} requires a call")),
+            |arguments| {
+                substitute_function_macro(name, definition, parameters, arguments, macros, stack)
+            },
+        )
+    } else {
+        expand_replacement(&definition.replacement, macros, stack)
+    };
     stack.pop();
     result
 }
@@ -980,11 +1009,23 @@ fn expand_replacement(
         if is_identifier_start(byte) {
             let end = identifier_end(replacement, offset);
             let name = &replacement[offset..end];
-            if macros
-                .get(name)
-                .is_some_and(|definition| !definition.function_like)
-            {
-                output.push_str(&expand_macro(name, macros, stack)?);
+            if let Some(definition) = macros.get(name) {
+                if definition.parameters.is_some() {
+                    let open = skip_horizontal_whitespace(replacement, end);
+                    if replacement.as_bytes().get(open) == Some(&b'(') {
+                        let (arguments, invocation_end) = parse_macro_arguments(replacement, open)?;
+                        if stack.iter().any(|active| active == name) {
+                            output.push_str(&replacement[offset..invocation_end]);
+                        } else {
+                            output.push_str(&expand_macro(name, Some(&arguments), macros, stack)?);
+                        }
+                        offset = invocation_end;
+                        continue;
+                    }
+                    output.push_str(name);
+                } else {
+                    output.push_str(&expand_macro(name, None, macros, stack)?);
+                }
             } else {
                 output.push_str(name);
             }
@@ -999,6 +1040,145 @@ fn expand_replacement(
         offset += character.len_utf8();
     }
     Ok(output)
+}
+
+fn substitute_function_macro(
+    name: &str,
+    definition: &MacroDefinition,
+    parameters: &MacroParameters,
+    arguments: &[String],
+    macros: &HashMap<String, MacroDefinition>,
+    stack: &mut Vec<String>,
+) -> Result<String, String> {
+    if arguments.len() < parameters.fixed.len()
+        || (parameters.variadic.is_none() && arguments.len() > parameters.fixed.len())
+    {
+        return Err(format!(
+            "function macro {name} expects {} argument{} but received {}",
+            parameters.fixed.len(),
+            if parameters.fixed.len() == 1 { "" } else { "s" },
+            arguments.len()
+        ));
+    }
+    let mut substitutions = HashMap::new();
+    for (parameter, argument) in parameters.fixed.iter().zip(arguments) {
+        substitutions.insert(parameter.as_str(), splice_continuations(argument.trim()));
+    }
+    if let Some(variadic) = &parameters.variadic {
+        substitutions.insert(
+            variadic.as_str(),
+            arguments[parameters.fixed.len()..]
+                .iter()
+                .map(|argument| splice_continuations(argument.trim()))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+
+    let replacement = &definition.replacement;
+    let mut substituted = String::with_capacity(replacement.len());
+    let mut offset = 0usize;
+    while offset < replacement.len() {
+        if let Some(end) = protected_text_end(replacement, offset) {
+            substituted.push_str(&replacement[offset..end]);
+            offset = end;
+            continue;
+        }
+        if replacement[offset..].starts_with("##") {
+            offset += 2;
+            continue;
+        }
+        if replacement.as_bytes()[offset] == b'#' {
+            let parameter_start = skip_horizontal_whitespace(replacement, offset + 1);
+            if replacement
+                .as_bytes()
+                .get(parameter_start)
+                .is_some_and(|byte| is_identifier_start(*byte))
+            {
+                let parameter_end = identifier_end(replacement, parameter_start);
+                let parameter = &replacement[parameter_start..parameter_end];
+                if let Some(argument) = substitutions.get(parameter) {
+                    substituted.push('"');
+                    for character in argument.chars() {
+                        if matches!(character, '\\' | '"') {
+                            substituted.push('\\');
+                        }
+                        substituted.push(character);
+                    }
+                    substituted.push('"');
+                    offset = parameter_end;
+                    continue;
+                }
+            }
+        }
+        if is_identifier_start(replacement.as_bytes()[offset]) {
+            let end = identifier_end(replacement, offset);
+            let parameter = &replacement[offset..end];
+            if let Some(argument) = substitutions.get(parameter) {
+                substituted.push_str(argument);
+            } else {
+                substituted.push_str(parameter);
+            }
+            offset = end;
+            continue;
+        }
+        let character = replacement[offset..]
+            .chars()
+            .next()
+            .expect("offset is inside function replacement text");
+        substituted.push(character);
+        offset += character.len_utf8();
+    }
+    expand_replacement(&substituted, macros, stack)
+}
+
+fn parse_macro_arguments(source: &str, open: usize) -> Result<(Vec<String>, usize), String> {
+    let mut arguments = Vec::new();
+    let mut stack = vec![b')'];
+    let mut offset = open + 1;
+    let mut argument_start = offset;
+    while offset < source.len() {
+        if let Some(end) = protected_text_end(source, offset) {
+            offset = end;
+            continue;
+        }
+        let byte = source.as_bytes()[offset];
+        match byte {
+            b'(' => stack.push(b')'),
+            b'[' => stack.push(b']'),
+            b'{' => stack.push(b'}'),
+            b')' | b']' | b'}' if stack.last() == Some(&byte) => {
+                stack.pop();
+                if stack.is_empty() {
+                    let final_argument = source[argument_start..offset].trim();
+                    if !final_argument.is_empty() || !arguments.is_empty() {
+                        arguments.push(final_argument.to_owned());
+                    }
+                    return Ok((arguments, offset + 1));
+                }
+            }
+            b',' if stack.len() == 1 => {
+                arguments.push(source[argument_start..offset].trim().to_owned());
+                argument_start = offset + 1;
+            }
+            _ => {}
+        }
+        offset += source[offset..]
+            .chars()
+            .next()
+            .expect("offset is inside macro invocation")
+            .len_utf8();
+    }
+    Err("unterminated function macro invocation".to_owned())
+}
+
+fn skip_horizontal_whitespace(source: &str, start: usize) -> usize {
+    start
+        + source[start..]
+            .chars()
+            .take_while(|character| matches!(*character, ' ' | '\t' | '\r' | '\n'))
+            .map(char::len_utf8)
+            .sum::<usize>()
 }
 
 fn protected_text_end(source: &str, offset: usize) -> Option<usize> {
@@ -1025,23 +1205,66 @@ fn protected_text_end(source: &str, offset: usize) -> Option<usize> {
         );
     }
     if matches!(source.as_bytes()[offset], b'\"' | b'\'') {
-        let delimiter = source.as_bytes()[offset];
-        let mut cursor = offset + 1;
-        let mut escaped = false;
-        while cursor < source.len() {
-            let byte = source.as_bytes()[cursor];
-            cursor += 1;
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == delimiter {
-                break;
-            }
-        }
-        return Some(cursor);
+        return Some(quoted_text_end(source, offset, source.as_bytes()[offset]));
     }
     None
+}
+
+fn quoted_text_end(source: &str, start: usize, delimiter: u8) -> usize {
+    let mut cursor = start + 1;
+    let mut escaped = false;
+    while cursor < source.len() {
+        let byte = source.as_bytes()[cursor];
+        if escaped {
+            escaped = false;
+            cursor += 1;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+            cursor += 1;
+            continue;
+        }
+        if delimiter == b'"' && byte == b'[' {
+            cursor = interpolation_end(source, cursor + 1);
+            continue;
+        }
+        cursor += 1;
+        if byte == delimiter {
+            break;
+        }
+    }
+    cursor
+}
+
+fn interpolation_end(source: &str, start: usize) -> usize {
+    let mut cursor = start;
+    let mut depth = 1usize;
+    while cursor < source.len() {
+        let byte = source.as_bytes()[cursor];
+        if matches!(byte, b'"' | b'\'') {
+            cursor = quoted_text_end(source, cursor, byte);
+            continue;
+        }
+        match byte {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                cursor += 1;
+                if depth == 0 {
+                    return cursor;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        cursor += source[cursor..]
+            .chars()
+            .next()
+            .expect("offset is inside string interpolation")
+            .len_utf8();
+    }
+    source.len()
 }
 
 const fn is_identifier_start(byte: u8) -> bool {
@@ -1074,13 +1297,13 @@ fn scan_directives(source: &str) -> Vec<Directive> {
             if let DirectiveKind::Define {
                 name,
                 value,
-                function_like,
+                parameters,
             } = &mut kind
             {
-                let (complete_value, complete_function_like) =
+                let (complete_value, complete_parameters) =
                     complete_define(source, offset, directive_end, name);
                 *value = complete_value;
-                *function_like = complete_function_like;
+                *parameters = complete_parameters;
             }
             directives.push(Directive {
                 kind,
@@ -1094,7 +1317,12 @@ fn scan_directives(source: &str) -> Vec<Directive> {
     directives
 }
 
-fn complete_define(source: &str, start: usize, end: usize, name: &str) -> (String, bool) {
+fn complete_define(
+    source: &str,
+    start: usize,
+    end: usize,
+    name: &str,
+) -> (String, Option<MacroParameters>) {
     let directive = source[start..end]
         .trim_end_matches(['\r', '\n'])
         .trim_start();
@@ -1107,23 +1335,47 @@ fn complete_define(source: &str, start: usize, end: usize, name: &str) -> (Strin
     let after_name = after_keyword
         .strip_prefix(name)
         .expect("parsed macro name is present in its directive");
-    let (replacement, function_like) = if after_name.starts_with('(') {
+    let (replacement, parameters) = if after_name.starts_with('(') {
         let parameters_end = after_name
             .find(')')
             .map_or(after_name.len(), |index| index + 1);
-        (&after_name[parameters_end..], true)
+        (
+            &after_name[parameters_end..],
+            Some(parse_macro_parameters(
+                &after_name[1..parameters_end.saturating_sub(1)],
+            )),
+        )
     } else {
-        (after_name, false)
+        (after_name, None)
     };
     let replacement = replacement.trim_start();
     if replacement.starts_with("{\"") {
-        (replacement.to_owned(), function_like)
+        (replacement.to_owned(), parameters)
     } else {
         (
             strip_macro_comments(&splice_continuations(replacement)),
-            function_like,
+            parameters,
         )
     }
+}
+
+fn parse_macro_parameters(source: &str) -> MacroParameters {
+    let mut fixed = Vec::new();
+    let mut variadic = None;
+    for parameter in source
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        if parameter == "..." {
+            variadic = Some("__VA_ARGS__".to_owned());
+        } else if let Some(name) = parameter.strip_suffix("...") {
+            variadic = Some(name.trim().to_owned());
+        } else {
+            fixed.push(parameter.to_owned());
+        }
+    }
+    MacroParameters { fixed, variadic }
 }
 
 fn splice_continuations(source: &str) -> String {
@@ -1132,6 +1384,10 @@ fn splice_continuations(source: &str) -> String {
     let mut offset = 0usize;
     while offset < bytes.len() {
         if bytes[offset] == b'\\' {
+            if offset + 1 == bytes.len() {
+                offset += 1;
+                continue;
+            }
             if bytes.get(offset + 1) == Some(&b'\n') {
                 offset += 2;
                 continue;
@@ -1274,7 +1530,10 @@ fn parse_directive_line(line: &str) -> Option<DirectiveKind> {
             Some(DirectiveKind::Define {
                 name,
                 value: macro_value.to_owned(),
-                function_like: value[name_end..].starts_with('('),
+                parameters: value[name_end..].starts_with('(').then(|| MacroParameters {
+                    fixed: Vec::new(),
+                    variadic: None,
+                }),
             })
         }
         "undef" => identifier(value).map(DirectiveKind::Undef),
@@ -1817,7 +2076,7 @@ mod tests {
 
         assert!(expanded.starts_with("/datum/example\n"));
         assert!(expanded.contains("\"NESTED\"\n// NESTED\n/* NESTED */\n{\"NESTED\"}"));
-        assert!(expanded.contains("FUNCTION(test)"));
+        assert!(expanded.contains("/datum/test"));
         assert!(expanded.ends_with("      \nNESTED\n"));
         let expanded_start = expanded
             .find("/datum/example")
@@ -1844,7 +2103,7 @@ mod tests {
             recursion,
             ProjectError::MacroExpansion { offset, ref message, .. }
                 if offset == recursive_source.rfind("FIRST").expect("invocation should exist")
-                    && message == "recursive object macro expansion: FIRST -> SECOND -> FIRST"
+                    && message == "recursive macro expansion: FIRST -> SECOND -> FIRST"
         ));
 
         let depth_scratch = ScratchDirectory::new();
@@ -1861,8 +2120,42 @@ mod tests {
         assert!(matches!(
             depth,
             ProjectError::MacroExpansion { ref message, .. }
-                if message == "object macro expansion exceeded 64 levels while expanding LEVEL_64"
+                if message == "macro expansion exceeded 64 levels while expanding LEVEL_64"
         ));
+    }
+
+    #[test]
+    fn expands_function_macros_with_nested_and_variadic_arguments() {
+        let scratch = ScratchDirectory::new();
+        let source = "#define ROOT /datum\n#define WRAP(first, second) list(first, second)\n#define FORWARD(arguments...) WRAP(arguments)\n#define STRINGIFY(value) #value\n#define TYPE(value) ROOT/##value\nWRAP(call(1, 2), \"comma, text\")\nFORWARD(alpha, list(beta, gamma))\nSTRINGIFY(alpha + beta)\nTYPE(example)\n";
+        fs::write(scratch.path().join("world.dme"), source)
+            .expect("function macros should be written");
+
+        let project =
+            Project::load(scratch.path().join("world.dme")).expect("function macros should expand");
+        let expanded = project.files[0]
+            .compiler_text()
+            .expect("expanded functions should be UTF-8");
+
+        assert!(expanded.contains("list(call(1, 2), \"comma, text\")"));
+        assert!(expanded.contains("list(alpha, list(beta, gamma))"));
+        assert!(expanded.contains("\"alpha + beta\""));
+        assert!(expanded.contains("/datum/example"));
+        assert!(!expanded.contains("WRAP("));
+        assert!(!expanded.contains("FORWARD("));
+        let invocation_start = source
+            .find("TYPE(example)")
+            .expect("type invocation should exist");
+        let expanded_start = expanded
+            .find("/datum/example")
+            .expect("expanded type should exist");
+        assert_eq!(
+            project.files[0].original_span(SourceSpan::new(
+                expanded_start,
+                expanded_start + "/datum/example".len(),
+            )),
+            SourceSpan::new(invocation_start, invocation_start + "TYPE(example)".len())
+        );
     }
 
     #[test]
