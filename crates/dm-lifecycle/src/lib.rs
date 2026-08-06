@@ -11,9 +11,7 @@ use dm_runtime::RuntimeImage;
 use dm_semantics::{Procedure, ProcedureId, ProcedureImplementationId, ProcedureRegistry};
 use dm_value::{DatumId, TypePath, Value};
 use dm_vm::{ExecutionContext, ExecutionState, RuntimeError, execute_module_in_context};
-use dm_world::{
-    AtomCategory, InitializerResolution, WorldAllocation, WorldCoordinate, WorldPlan,
-};
+use dm_world::{AtomCategory, InitializerResolution, WorldAllocation, WorldCoordinate, WorldPlan};
 
 /// Lifecycle entry points resolved for every runtime type.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -499,6 +497,10 @@ pub enum InitializationExecutionError {
         /// Canonical selected procedure path.
         procedure_path: String,
     },
+    /// The fixed `/world` path could not be represented by runtime values.
+    WorldPath(dm_value::ValueError),
+    /// A world lifecycle event was present but no singleton datum was allocated.
+    MissingWorldDatum,
     /// The runtime image cannot allocate the singleton `/world` datum.
     WorldAllocation(dm_runtime::RuntimeImageError),
     /// VM execution failed with its original source-mapped call stack.
@@ -506,9 +508,9 @@ pub enum InitializationExecutionError {
         /// Event being executed.
         event: InitializationEvent,
         /// Source-selected lifecycle target.
-        target: LifecycleTarget,
+        target: Box<LifecycleTarget>,
         /// Original VM failure.
-        error: RuntimeError,
+        error: Box<RuntimeError>,
     },
 }
 
@@ -521,14 +523,28 @@ impl std::fmt::Display for InitializationExecutionError {
                 "map lifecycle atom {atom_index} ({path}) has no allocated datum"
             ),
             Self::MissingTarget { type_index, kind } => {
-                write!(formatter, "lifecycle target {kind:?} is missing for type {type_index}")
+                write!(
+                    formatter,
+                    "lifecycle target {kind:?} is missing for type {type_index}"
+                )
             }
             Self::MissingVmTarget { procedure_path } => {
-                write!(formatter, "lifecycle VM target is missing for {procedure_path}")
+                write!(
+                    formatter,
+                    "lifecycle VM target is missing for {procedure_path}"
+                )
+            }
+            Self::WorldPath(error) => write!(formatter, "world type path is invalid: {error}"),
+            Self::MissingWorldDatum => {
+                formatter.write_str("world lifecycle event has no allocated datum")
             }
             Self::WorldAllocation(error) => write!(formatter, "world allocation failed: {error}"),
             Self::Runtime { target, error, .. } => {
-                write!(formatter, "lifecycle {} failed: {error}", target.procedure_path)
+                write!(
+                    formatter,
+                    "lifecycle {} failed: {error}",
+                    target.procedure_path
+                )
             }
         }
     }
@@ -538,11 +554,13 @@ impl std::error::Error for InitializationExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Compile(error) => Some(error),
+            Self::WorldPath(error) => Some(error),
             Self::WorldAllocation(error) => Some(error),
             Self::Runtime { error, .. } => Some(error),
             Self::MissingMapDatum { .. }
             | Self::MissingTarget { .. }
-            | Self::MissingVmTarget { .. } => None,
+            | Self::MissingVmTarget { .. }
+            | Self::MissingWorldDatum => None,
         }
     }
 }
@@ -575,14 +593,20 @@ pub fn execute_initialization_plan(
     let executable = procedures
         .compile_vm_implementations(compilation, targets)
         .map_err(InitializationExecutionError::Compile)?;
-    let world = if plan
-        .events
-        .iter()
-        .any(|event| matches!(event, InitializationEvent::Lifecycle { subject: EventSubject::World, .. }))
-    {
+    let world = if plan.events.iter().any(|event| {
+        matches!(
+            event,
+            InitializationEvent::Lifecycle {
+                subject: EventSubject::World,
+                ..
+            }
+        )
+    }) {
         Some(
             runtime
-                .allocate_datum(&TypePath::parse("/world").expect("/world is a valid type path"))
+                .allocate_datum(
+                    &TypePath::parse("/world").map_err(InitializationExecutionError::WorldPath)?,
+                )
                 .map_err(InitializationExecutionError::WorldAllocation)?,
         )
     } else {
@@ -601,7 +625,9 @@ pub fn execute_initialization_plan(
                 continue;
             };
             let datum = match subject {
-                EventSubject::World => world.expect("world event must allocate /world"),
+                EventSubject::World => {
+                    world.ok_or(InitializationExecutionError::MissingWorldDatum)?
+                }
                 EventSubject::MapAtom(atom_index) => bindings
                     .get(atom_index)
                     .and_then(|datum| *datum)
@@ -611,7 +637,9 @@ pub fn execute_initialization_plan(
                     })?,
                 EventSubject::Globals => continue,
             };
-            if matches!(subject, EventSubject::MapAtom(_)) && !seen.insert((datum, event_kind(*event))) {
+            if matches!(subject, EventSubject::MapAtom(_))
+                && !seen.insert((datum, event_kind(*event)))
+            {
                 result.duplicate_map_events += 1;
                 continue;
             }
@@ -621,11 +649,11 @@ pub fn execute_initialization_plan(
                     kind: event_kind(*event),
                 }
             })?;
-            let entry = executable.implementation(target.implementation).ok_or_else(|| {
-                InitializationExecutionError::MissingVmTarget {
+            let entry = executable
+                .implementation(target.implementation)
+                .ok_or_else(|| InitializationExecutionError::MissingVmTarget {
                     procedure_path: target.procedure_path.clone(),
-                }
-            })?;
+                })?;
             let value = execute_module_in_context(
                 executable.module(),
                 entry,
@@ -635,8 +663,8 @@ pub fn execute_initialization_plan(
             )
             .map_err(|error| InitializationExecutionError::Runtime {
                 event: *event,
-                target: target.clone(),
-                error,
+                target: Box::new(target.clone()),
+                error: Box::new(error),
             })?;
             result.events.push(ExecutedLifecycleEvent {
                 event: *event,
@@ -666,7 +694,10 @@ fn event_type_index(event: InitializationEvent) -> usize {
 }
 
 fn event_target(event: InitializationEvent, index: &LifecycleIndex) -> Option<&LifecycleTarget> {
-    let InitializationEvent::Lifecycle { kind, type_index, .. } = event else {
+    let InitializationEvent::Lifecycle {
+        kind, type_index, ..
+    } = event
+    else {
         return None;
     };
     match index.types.get(type_index)?.targets.get(kind) {
@@ -990,11 +1021,12 @@ mod tests {
     use dm_map::parse;
     use dm_runtime::RuntimeImage;
     use dm_semantics::ProcedureRegistry;
-    use dm_world::{WorldCoordinate, build_plan};
+    use dm_value::{FieldName, Value};
+    use dm_world::{WorldCoordinate, allocate_world, build_plan};
 
     use super::{
         EventSubject, InitializationEvent, LifecycleIndex, LifecycleKind, LifecycleResolution,
-        build_initialization_plan,
+        build_initialization_plan, execute_initialization_plan,
     };
 
     static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
@@ -1114,5 +1146,75 @@ mod tests {
             3
         );
         assert!(plan.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn executes_map_lifecycles_in_phase_order_without_compiling_unrelated_procs() {
+        let source = concat!(
+            "/world/New()\n\tsrc.stage = 5\n",
+            "/atom/proc/New()\n\tsrc.stage = 10\n",
+            "/atom/proc/Initialize()\n\tsrc.stage += 1\n",
+            "/atom/proc/LateInitialize()\n\tsrc.stage += 100\n",
+            "/area/test\n/turf/test\n/obj/test\n",
+            "/proc/not_a_lifecycle_proc()\n\tspawn(1) return 0\n",
+        );
+        let (_fixture, compilation, mut runtime, index) = index(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/obj/test, /turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .expect("map should parse");
+        let world = build_plan(&map, &compilation);
+        let plan = build_initialization_plan(&runtime, &index, &world, "test.dmm");
+        let allocation = allocate_world(&world, &mut runtime).expect("world should allocate");
+
+        let execution = execute_initialization_plan(
+            &compilation,
+            &procedures,
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+        )
+        .expect("lifecycle execution should succeed");
+
+        assert_eq!(execution.events.len(), 10);
+        assert_eq!(execution.duplicate_map_events, 0);
+        let kinds: Vec<_> = execution
+            .events
+            .iter()
+            .map(|event| match event.event {
+                InitializationEvent::Lifecycle { kind, .. } => kind,
+                InitializationEvent::Globals => panic!("globals are not executed as a hook"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                LifecycleKind::New,
+                LifecycleKind::New,
+                LifecycleKind::New,
+                LifecycleKind::New,
+                LifecycleKind::Initialize,
+                LifecycleKind::Initialize,
+                LifecycleKind::Initialize,
+                LifecycleKind::LateInitialize,
+                LifecycleKind::LateInitialize,
+                LifecycleKind::LateInitialize,
+            ]
+        );
+        let stage = FieldName::parse("stage").expect("stage should be a field name");
+        let world_id = execution.world.expect("world should be allocated");
+        assert_eq!(
+            runtime.heap().datum_field(world_id, &stage),
+            Ok(&Value::number(5.0))
+        );
+        for datum in allocation.allocation_order() {
+            assert_eq!(
+                runtime.heap().datum_field(*datum, &stage),
+                Ok(&Value::number(111.0))
+            );
+        }
     }
 }

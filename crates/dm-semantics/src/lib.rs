@@ -268,14 +268,12 @@ impl ProcedureRegistry {
     ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
         self.compile_vm_selected(
             compilation,
-            self.procedures
-                .iter()
-                .flat_map(|procedure| {
-                    procedure
-                        .implementations
-                        .iter()
-                        .map(|implementation| implementation.id)
-                }),
+            self.procedures.iter().flat_map(|procedure| {
+                procedure
+                    .implementations
+                    .iter()
+                    .map(|implementation| implementation.id)
+            }),
         )
     }
 
