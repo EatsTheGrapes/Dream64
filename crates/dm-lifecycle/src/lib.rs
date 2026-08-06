@@ -481,11 +481,24 @@ pub enum InitializationExecutionError {
     /// Selected lifecycle bodies could not be lowered to the reference VM.
     Compile(dm_vm::CompileError),
     /// A planned map atom has no matching allocated datum.
-    MissingMapDatum { atom_index: usize, path: String },
+    MissingMapDatum {
+        /// Index into [`InitializationPlan::map_atoms`].
+        atom_index: usize,
+        /// Canonical type expected by the lifecycle plan.
+        path: String,
+    },
     /// Lifecycle metadata did not retain an executable target.
-    MissingTarget { type_index: usize, kind: LifecycleKind },
+    MissingTarget {
+        /// Index into [`LifecycleIndex::types`].
+        type_index: usize,
+        /// Requested lifecycle phase.
+        kind: LifecycleKind,
+    },
     /// A selected semantic body was absent from the compiled VM module.
-    MissingVmTarget { procedure_path: String },
+    MissingVmTarget {
+        /// Canonical selected procedure path.
+        procedure_path: String,
+    },
     /// The runtime image cannot allocate the singleton `/world` datum.
     WorldAllocation(dm_runtime::RuntimeImageError),
     /// VM execution failed with its original source-mapped call stack.
@@ -667,7 +680,7 @@ fn map_datum_bindings(
     allocation: &WorldAllocation,
     runtime: &RuntimeImage,
 ) -> Vec<Option<DatumId>> {
-    let mut by_coordinate: BTreeMap<_, Vec<DatumId>> = allocation
+    let by_coordinate: BTreeMap<_, Vec<DatumId>> = allocation
         .snapshots()
         .iter()
         .map(|snapshot| (snapshot.coordinate, snapshot.source_order.clone()))
