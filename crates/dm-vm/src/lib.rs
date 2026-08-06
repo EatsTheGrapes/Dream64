@@ -124,6 +124,14 @@ pub enum Instruction {
         /// originally supplied argument vector.
         argument_count: Option<u16>,
     },
+    /// Calls the semantically resolved parent implementation.
+    CallParent {
+        /// Resolved module-local target, or `None` when no parent exists.
+        procedure: Option<ProcedureId>,
+        /// Explicit argument count, or `None` to reuse the complete original
+        /// argument vector of the current frame.
+        argument_count: Option<u16>,
+    },
     /// Returns the top stack value.
     Return,
 }
@@ -147,7 +155,7 @@ impl ProcedureId {
 /// A compiled procedure body.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Program {
-    /// Required positional argument count for this initial subset.
+    /// Declared positional parameter count.
     pub parameter_count: usize,
     /// Number of local slots, including parameters.
     pub local_count: usize,
@@ -183,6 +191,24 @@ impl Module {
     pub fn procedure_path(&self, procedure: ProcedureId) -> Option<&str> {
         self.paths.get(procedure.index()).map(String::as_str)
     }
+
+    /// Returns the stable identity at a procedure-spec index.
+    #[must_use]
+    pub fn procedure_id_at(&self, index: usize) -> Option<ProcedureId> {
+        self.procedures.get(index)?;
+        u32::try_from(index).ok().map(ProcedureId)
+    }
+}
+
+/// One independently identified procedure body supplied by a semantic layer.
+#[derive(Clone, Debug)]
+pub struct ProcedureSpec<'definition> {
+    /// Unique diagnostic path for stack traces and lookup.
+    pub path: String,
+    /// Parsed procedure definition to compile.
+    pub definition: &'definition Definition,
+    /// Index of the exact parent implementation in the same spec slice.
+    pub parent: Option<usize>,
 }
 
 /// Failure while compiling the initial executable subset.
@@ -242,9 +268,10 @@ impl std::error::Error for RuntimeError {}
 
 /// Compiles one procedure definition to portable stack bytecode.
 ///
-/// The current vertical slice supports positional parameters, local `var`
-/// declarations, assignment, `if`/`else`, `return`, numeric and text literals,
-/// local reads, unary operators, and common binary operators.
+/// The current vertical slice supports positional parameters and safe default
+/// expressions, local `var` declarations, assignment, structured control flow,
+/// numeric and text literals, local reads, procedure calls, unary operators,
+/// and common binary operators.
 ///
 /// # Errors
 ///
@@ -299,6 +326,56 @@ pub fn compile_module(definitions: &[Definition]) -> Result<Module, CompileError
     let procedures = definitions
         .iter()
         .map(|definition| compile_procedure_with_resolver(definition, &call_names))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Module {
+        procedures,
+        paths,
+        names,
+    })
+}
+
+/// Compiles procedure bodies whose exact parent implementations were resolved
+/// by an independent semantic layer.
+///
+/// Spec order defines stable module-local identities. Parent indices may point
+/// forward or backward, but must refer to this same slice. Diagnostic paths
+/// must be unique. Unqualified global call resolution remains the concern of
+/// [`compile_module`]; this API focuses on already-resolved implementation
+/// chains.
+///
+/// # Errors
+///
+/// Returns [`CompileError`] for duplicate paths, invalid parent indices, or
+/// procedure bodies outside the supported executable subset.
+pub fn compile_module_specs(specs: &[ProcedureSpec<'_>]) -> Result<Module, CompileError> {
+    let mut names = HashMap::new();
+    let mut paths = Vec::with_capacity(specs.len());
+    for (index, spec) in specs.iter().enumerate() {
+        let procedure = ProcedureId::from_index(index)?;
+        if names.insert(spec.path.clone(), procedure).is_some() {
+            return Err(compile_error(format!(
+                "duplicate procedure spec path {:?}",
+                spec.path
+            )));
+        }
+        if spec.parent.is_some_and(|parent| parent >= specs.len()) {
+            return Err(compile_error(format!(
+                "procedure spec {:?} has invalid parent index {:?}",
+                spec.path, spec.parent
+            )));
+        }
+        paths.push(spec.path.clone());
+    }
+
+    let procedures = specs
+        .iter()
+        .map(|spec| {
+            let mut targets = HashMap::new();
+            if let Some(parent) = spec.parent {
+                targets.insert("..".to_owned(), ProcedureId::from_index(parent)?);
+            }
+            compile_procedure_with_resolver(spec.definition, &targets)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Module {
         procedures,
@@ -405,6 +482,68 @@ impl LocalTable {
 
     fn remove(&mut self, name: &str) {
         self.names.remove(name);
+    }
+}
+
+fn compile_parameter_defaults(
+    definition: &Definition,
+    locals: &LocalTable,
+    instructions: &mut Vec<Instruction>,
+    source_spans: &mut Vec<SourceSpan>,
+    procedures: &HashMap<String, ProcedureId>,
+) -> Result<(), CompileError> {
+    for (parameter_index, parameter) in definition.parameters.iter().enumerate() {
+        let Some(assignment) = parameter.tokens.iter().position(
+            |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
+        ) else {
+            continue;
+        };
+        let default_tokens = &parameter.tokens[assignment + 1..];
+        if default_tokens.is_empty() {
+            return Err(compile_error("procedure parameter default is empty"));
+        }
+        let parameter_slot = to_local_index(parameter_index)?;
+        let default_jump = instructions.len();
+        push_instruction(
+            instructions,
+            source_spans,
+            Instruction::JumpIfArgumentSupplied {
+                parameter: parameter_slot,
+                target: usize::MAX,
+            },
+            parameter.span,
+        );
+        let expression = ExpressionParser::new(default_tokens).parse()?;
+        validate_parameter_default(&expression)?;
+        let first_default_instruction = instructions.len();
+        emit_expression(&expression, locals, instructions, procedures)?;
+        instructions.push(Instruction::StoreLocal(parameter_slot));
+        source_spans.extend(std::iter::repeat_n(
+            parameter.span,
+            instructions.len() - first_default_instruction,
+        ));
+        let end_target = instructions.len();
+        patch_jump(instructions, default_jump, end_target)?;
+    }
+    Ok(())
+}
+
+fn validate_parameter_default(expression: &Expression) -> Result<(), CompileError> {
+    match expression {
+        Expression::Null | Expression::Number(_) | Expression::Text(_) => Ok(()),
+        Expression::Local(name) => Err(compile_error(format!(
+            "parameter default reference {name:?} requires BYOND conformance confirmation"
+        ))),
+        Expression::Call { .. }
+        | Expression::CurrentCall { .. }
+        | Expression::ParentCall { .. } => Err(compile_error(
+            "procedure calls in parameter defaults are not supported",
+        )),
+        Expression::Unary { operand, .. } => validate_parameter_default(operand),
+        Expression::Binary { left, right, .. } => {
+            validate_parameter_default(left)?;
+            validate_parameter_default(right)
+        }
     }
 }
 
@@ -977,7 +1116,14 @@ fn patch_jump(
     target: usize,
 ) -> Result<(), CompileError> {
     match instructions.get_mut(instruction_index) {
-        Some(Instruction::JumpIfFalse(destination) | Instruction::Jump(destination)) => {
+        Some(
+            Instruction::JumpIfFalse(destination)
+            | Instruction::Jump(destination)
+            | Instruction::JumpIfArgumentSupplied {
+                target: destination,
+                ..
+            },
+        ) => {
             *destination = target;
             Ok(())
         }
@@ -1048,6 +1194,9 @@ enum Expression {
         arguments: Vec<Self>,
     },
     CurrentCall {
+        arguments: Option<Vec<Self>>,
+    },
+    ParentCall {
         arguments: Option<Vec<Self>>,
     },
     Unary {
@@ -1122,9 +1271,22 @@ impl<'a> ExpressionParser<'a> {
             .ok_or_else(|| compile_error("expected an expression"))?;
         self.index += 1;
         match &token.kind {
-            TokenKind::Operator(operator) if operator == ".." => Err(compile_error(
-                "parent procedure call ..() requires object-tree parent resolution",
-            )),
+            TokenKind::Operator(operator)
+                if operator == ".."
+                    && matches!(
+                        self.tokens.get(self.index).map(|token| &token.kind),
+                        Some(TokenKind::Punctuation('('))
+                    ) =>
+            {
+                let arguments = self.parse_call_arguments()?;
+                Ok(Expression::ParentCall {
+                    arguments: if arguments.is_empty() {
+                        None
+                    } else {
+                        Some(arguments)
+                    },
+                })
+            }
             TokenKind::Operator(operator)
                 if operator == "."
                     && matches!(
@@ -1290,6 +1452,22 @@ fn emit_expression(
                 None
             };
             instructions.push(Instruction::CallCurrent { argument_count });
+        }
+        Expression::ParentCall { arguments } => {
+            let argument_count = if let Some(arguments) = arguments {
+                let count = u16::try_from(arguments.len())
+                    .map_err(|_| compile_error("call has more than 65535 positional arguments"))?;
+                for argument in arguments {
+                    emit_expression(argument, locals, instructions, procedures)?;
+                }
+                Some(count)
+            } else {
+                None
+            };
+            instructions.push(Instruction::CallParent {
+                procedure: procedures.get("..").copied(),
+                argument_count,
+            });
         }
         Expression::Unary { operator, operand } => {
             emit_expression(operand, locals, instructions, procedures)?;
@@ -1621,6 +1799,15 @@ fn run_frames(
                 frames[frame_index].instruction = target;
                 continue;
             }
+            Instruction::JumpIfArgumentSupplied { parameter, target } => {
+                if frames[frame_index].arguments.len() > usize::from(parameter) {
+                    if let Err(message) = validate_jump(target, program.instructions.len()) {
+                        return Err(execution_error(module, &frames, message));
+                    }
+                    frames[frame_index].instruction = target;
+                    continue;
+                }
+            }
             Instruction::Call {
                 procedure: target,
                 argument_count,
@@ -1667,6 +1854,44 @@ fn run_frames(
                     frames[frame_index].arguments.clone()
                 };
                 frames.push(make_frame(procedure, program, &arguments));
+                continue;
+            }
+            Instruction::CallParent {
+                procedure: target,
+                argument_count,
+            } => {
+                if frames.len() >= limits.max_call_depth {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        format!("maximum call depth {} exceeded", limits.max_call_depth),
+                    ));
+                }
+                let Some(target) = target else {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "parent procedure call has no resolved target",
+                    ));
+                };
+                let arguments = if let Some(argument_count) = argument_count {
+                    let count = usize::from(argument_count);
+                    let stack_length = frames[frame_index].stack.len();
+                    if count > stack_length {
+                        return Err(execution_error(module, &frames, "bytecode stack underflow"));
+                    }
+                    frames[frame_index].stack.split_off(stack_length - count)
+                } else {
+                    frames[frame_index].arguments.clone()
+                };
+                let Some(target_program) = module.procedure(target) else {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        format!("invalid parent call target {}", target.index()),
+                    ));
+                };
+                frames.push(make_frame(target, target_program, &arguments));
                 continue;
             }
             Instruction::Return => {
@@ -1997,15 +2222,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_parent_calls_until_object_tree_resolution_is_integrated() {
+    fn unresolved_parent_call_reports_source_mapped_runtime_error() {
         let syntax = parse("/proc/child()\n\treturn ..()\n").expect("source should parse");
-        let error = compile_procedure(&syntax.definitions[0])
-            .expect_err("parent call should require semantic parent resolution");
+        let span = syntax.definitions[0].body[0].span;
+        let program = compile_procedure(&syntax.definitions[0]).expect("procedure should compile");
+        let error = execute(&program, &[]).expect_err("unresolved parent should fail at runtime");
 
         assert_eq!(
             error.message,
-            "parent procedure call ..() requires object-tree parent resolution"
+            "parent procedure call has no resolved target"
         );
+        assert_eq!(error.source_span, Some(span));
     }
 
     #[test]
@@ -2240,5 +2467,93 @@ mod tests {
         let error = compile_procedure(&list_iteration.definitions[0])
             .expect_err("for-in should remain a distinct unsupported form");
         assert_eq!(error.message, "for-in list iteration is not implemented");
+    }
+
+    #[test]
+    fn parameter_literal_default_applies_only_when_argument_is_omitted() {
+        let source = "/proc/defaulted(value = 5)\n\treturn value\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("procedure should compile");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(5.0)));
+        assert_eq!(execute(&program, &[Value::Null]), Ok(Value::Null));
+        assert_eq!(
+            execute(&program, &[Value::number(9.0)]),
+            Ok(Value::number(9.0))
+        );
+
+        let text = parse("/proc/text_default(value = \"fallback\")\n\treturn value\n")
+            .expect("source should parse");
+        let program = compile_procedure(&text.definitions[0]).expect("procedure should compile");
+        assert_eq!(
+            execute(&program, &[]),
+            Ok(Value::Text("fallback".to_owned()))
+        );
+    }
+
+    #[test]
+    fn multiple_parameter_defaults_evaluate_in_declaration_order() {
+        let source = "/proc/combine(first = 1 + 1, second = 3, third = 4)\n\treturn first + second + third\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("procedure should compile");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(9.0)));
+        assert_eq!(
+            execute(&program, &[Value::number(10.0)]),
+            Ok(Value::number(17.0))
+        );
+        let error = execute(
+            &program,
+            &[Value::number(10.0), Value::Null, Value::number(1.0)],
+        )
+        .expect_err("explicit null should suppress the second parameter default");
+        assert_eq!(error.message, "numeric operation received null");
+        assert_eq!(error.source_span, Some(syntax.definitions[0].body[0].span));
+    }
+
+    #[test]
+    fn defaults_interact_with_explicit_and_argument_reusing_current_calls() {
+        let countdown = "/proc/countdown(value = 3)\n\tif(value <= 0)\n\t\treturn 0\n\treturn 1 + .(value - 1)\n";
+        let syntax = parse(countdown).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("procedure should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(3.0)));
+
+        let reapply = "/proc/reapply(value = 1)\n\tvalue = 0\n\treturn .()\n";
+        let syntax = parse(reapply).expect("source should parse");
+        let call_span = syntax.definitions[0].body[1].span;
+        let program = compile_procedure(&syntax.definitions[0]).expect("procedure should compile");
+        let error = execute_with_limits(
+            &program,
+            &[],
+            ExecutionLimits {
+                max_call_depth: 3,
+                ..ExecutionLimits::default()
+            },
+        )
+        .expect_err(".() should reuse omission and reapply the default in each frame");
+        assert!(error.message.contains("maximum call depth 3"));
+        assert_eq!(error.source_span, Some(call_span));
+        assert_eq!(error.call_stack.len(), 3);
+    }
+
+    #[test]
+    fn unsupported_parameter_default_forms_have_precise_diagnostics() {
+        let reference = parse("/proc/reference(first = 2, second = first)\n\treturn second\n")
+            .expect("source should parse");
+        let error = compile_procedure(&reference.definitions[0])
+            .expect_err("cross-parameter default needs conformance confirmation");
+        assert_eq!(
+            error.message,
+            "parameter default reference \"first\" requires BYOND conformance confirmation"
+        );
+
+        let call = parse("/proc/call_default(value = helper())\n\treturn value\n")
+            .expect("source should parse");
+        let error = compile_procedure(&call.definitions[0])
+            .expect_err("call defaults should remain outside the supported subset");
+        assert_eq!(
+            error.message,
+            "procedure calls in parameter defaults are not supported"
+        );
     }
 }

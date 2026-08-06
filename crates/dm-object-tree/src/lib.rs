@@ -493,7 +493,23 @@ fn parent_assignment(
     definition: &Definition,
     declaration: PendingDeclaration,
 ) -> Option<PendingParentAssignment> {
-    if !definition.path.ends_with(&["var", "parent_type"]) {
+    let assignment = definition.header.iter().position(
+        |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
+    )?;
+    if definition
+        .header
+        .iter()
+        .position(|token| token.kind == TokenKind::Punctuation('('))
+        .is_some_and(|opening| opening < assignment)
+    {
+        return None;
+    }
+    if !matches!(
+        definition.header[..assignment]
+            .last()
+            .map(|token| &token.kind),
+        Some(TokenKind::Identifier(identifier)) if identifier == "parent_type"
+    ) {
         return None;
     }
     let owner_length = definition.path.segments().len().checked_sub(2)?;
@@ -501,9 +517,6 @@ fn parent_assignment(
         return None;
     }
     let owner = CodePath::prefix(&definition.path.segments()[..owner_length]);
-    let assignment = definition.header.iter().position(
-        |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
-    )?;
     let target = parse_constant_type_path(&definition.header[assignment + 1..]);
     Some(PendingParentAssignment {
         owner,
@@ -1354,7 +1367,7 @@ mod tests {
     #[test]
     fn diagnoses_invalid_and_nonconstant_parent_targets() {
         let syntax = parse(
-            "/proc/not_a_type()\n/unknown_parent\n\tparent_type = /missing/type\n/member_parent\n\tparent_type = /proc/not_a_type\n/dynamic_parent\n\tparent_type = parent_choice\n",
+            "/proc/not_a_type()\n/unknown_parent\n\tparent_type = /missing/type\n/member_parent\n\tparent_type = /proc/not_a_type\n/dynamic_parent\n\tparent_type = choose_parent()\n",
         )
         .expect("invalid-parent source should parse");
         let output = build(&[SyntaxUnit {

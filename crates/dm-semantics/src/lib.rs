@@ -105,6 +105,30 @@ pub struct ProcedureRegistry {
     by_path: BTreeMap<CodePath, ProcedureId>,
 }
 
+/// Executable VM module paired with semantic implementation identities.
+#[derive(Debug)]
+pub struct ExecutableProcedures {
+    module: dm_vm::Module,
+    implementations: BTreeMap<ProcedureImplementationId, dm_vm::ProcedureId>,
+}
+
+impl ExecutableProcedures {
+    /// Returns the compiled VM module.
+    #[must_use]
+    pub const fn module(&self) -> &dm_vm::Module {
+        &self.module
+    }
+
+    /// Resolves a semantic implementation to its VM-local identity.
+    #[must_use]
+    pub fn implementation(
+        &self,
+        implementation: ProcedureImplementationId,
+    ) -> Option<dm_vm::ProcedureId> {
+        self.implementations.get(&implementation).copied()
+    }
+}
+
 impl ProcedureRegistry {
     /// Builds a registry from the compiler's accepted canonical declarations.
     #[must_use]
@@ -230,6 +254,82 @@ impl ProcedureRegistry {
             .implementations
             .get(id.index())
     }
+
+    /// Compiles every registered implementation with its exact resolved
+    /// parent-call target.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`dm_vm::CompileError`] when a retained source definition is
+    /// unavailable or a procedure body is outside the executable VM subset.
+    pub fn compile_vm(
+        &self,
+        compilation: &Compilation,
+    ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
+        let mut ordered = Vec::new();
+        for procedure in &self.procedures {
+            for implementation in &procedure.implementations {
+                let definition = compilation
+                    .syntax(implementation.file_id)
+                    .and_then(|syntax| syntax.definitions.get(implementation.definition_index))
+                    .ok_or_else(|| dm_vm::CompileError {
+                        message: format!(
+                            "missing syntax definition for implementation of {}",
+                            procedure.path
+                        ),
+                    })?;
+                ordered.push((procedure, implementation, definition));
+            }
+        }
+        let indices: BTreeMap<_, _> = ordered
+            .iter()
+            .enumerate()
+            .map(|(index, (_, implementation, _))| (implementation.id, index))
+            .collect();
+        let specs: Vec<_> = ordered
+            .iter()
+            .map(|(procedure, implementation, definition)| {
+                let parent = implementation
+                    .parent_target
+                    .map(|parent| {
+                        indices
+                            .get(&parent)
+                            .copied()
+                            .ok_or_else(|| dm_vm::CompileError {
+                                message: format!(
+                                    "parent implementation for {} is missing from the VM module",
+                                    procedure.path
+                                ),
+                            })
+                    })
+                    .transpose()?;
+                Ok(dm_vm::ProcedureSpec {
+                    path: format!("{}@{}", procedure.path, implementation.ordinal),
+                    definition,
+                    parent,
+                })
+            })
+            .collect::<Result<_, dm_vm::CompileError>>()?;
+        let module = dm_vm::compile_module_specs(&specs)?;
+        let implementations = ordered
+            .iter()
+            .enumerate()
+            .map(|(index, (_, implementation, _))| {
+                Ok((
+                    implementation.id,
+                    module
+                        .procedure_id_at(index)
+                        .ok_or_else(|| dm_vm::CompileError {
+                            message: format!("compiled procedure spec {index} has no VM identity"),
+                        })?,
+                ))
+            })
+            .collect::<Result<_, dm_vm::CompileError>>()?;
+        Ok(ExecutableProcedures {
+            module,
+            implementations,
+        })
+    }
 }
 
 fn effective_target(
@@ -266,6 +366,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use dm_compiler::{Compilation, CompilerDatabase};
+    use dm_vm::{RuntimeError, Value, execute_module};
 
     use super::{Procedure, ProcedureImplementationKind, ProcedureRegistry};
 
@@ -313,6 +414,25 @@ mod tests {
             .iter()
             .find(|procedure| procedure.path.to_string() == path)
             .expect("procedure path should exist")
+    }
+
+    fn execute_effective(
+        compilation: &Compilation,
+        path: &str,
+        arguments: &[Value],
+    ) -> Result<Value, RuntimeError> {
+        let registry = ProcedureRegistry::build(compilation);
+        let procedure = procedure_by_path(&registry, path);
+        let target = procedure
+            .effective_target
+            .expect("procedure should have an effective implementation");
+        let executable = registry
+            .compile_vm(compilation)
+            .expect("procedure registry should compile to VM bytecode");
+        let entry = executable
+            .implementation(target)
+            .expect("effective implementation should have a VM identity");
+        execute_module(executable.module(), entry, arguments)
     }
 
     #[test]
@@ -410,5 +530,100 @@ mod tests {
             custom.implementations[0].parent_target,
             alternate.effective_target
         );
+    }
+
+    #[test]
+    fn executes_an_inherited_override_and_reuses_omitted_arguments() {
+        let compilation = TestProject::compile(
+            "/datum/base\n\tproc/run(value = 2)\n\t\treturn value + 1\n/datum/base/child\n\trun(value = 2)\n\t\treturn ..() + 10\n",
+        );
+
+        assert_eq!(
+            execute_effective(&compilation, "/datum/base/child/proc/run", &[]),
+            Ok(Value::number(13.0))
+        );
+        let error = execute_effective(&compilation, "/datum/base/child/proc/run", &[Value::Null])
+            .expect_err("explicit null should be reused rather than defaulted");
+        assert_eq!(error.message, "numeric operation received null");
+    }
+
+    #[test]
+    fn executes_multiple_reopenings_through_the_exact_parent_chain() {
+        let compilation = TestProject::compile(
+            "/datum/base\n\tproc/run()\n\t\treturn 1\n/datum/base\n\trun()\n\t\treturn ..() + 1\n/datum/base\n\trun()\n\t\treturn ..() + 1\n",
+        );
+
+        assert_eq!(
+            execute_effective(&compilation, "/datum/base/proc/run", &[]),
+            Ok(Value::number(3.0))
+        );
+    }
+
+    #[test]
+    fn executes_parent_target_from_explicit_parent_type_and_explicit_arguments() {
+        let compilation = TestProject::compile(
+            "/datum/alternate\n\tproc/run(value = 1)\n\t\treturn value * 2\n/custom\n\tparent_type = /datum/alternate\n\trun(value = 3)\n\t\treturn ..(value + 1)\n",
+        );
+
+        assert_eq!(
+            execute_effective(&compilation, "/custom/proc/run", &[]),
+            Ok(Value::number(8.0))
+        );
+    }
+
+    #[test]
+    fn missing_parent_target_is_a_source_mapped_runtime_error() {
+        let compilation = TestProject::compile("/proc/orphan()\n\treturn ..()\n");
+        let registry = ProcedureRegistry::build(&compilation);
+        let procedure = procedure_by_path(&registry, "/proc/orphan");
+        let implementation = procedure.implementations[0];
+        assert_eq!(implementation.parent_target, None);
+        let expected_span = compilation
+            .syntax(implementation.file_id)
+            .expect("source syntax should exist")
+            .definitions[implementation.definition_index]
+            .body[0]
+            .span;
+        let error = execute_effective(&compilation, "/proc/orphan", &[])
+            .expect_err("orphan parent call should fail at runtime");
+
+        assert_eq!(
+            error.message,
+            "parent procedure call has no resolved target"
+        );
+        assert_eq!(error.source_span, Some(expected_span));
+        assert_eq!(error.call_stack.len(), 1);
+    }
+
+    #[test]
+    fn parent_failure_preserves_both_source_mapped_frames() {
+        let compilation = TestProject::compile(
+            "/datum/base\n\tproc/run()\n\t\treturn \"text\" + 1\n/datum/base/child\n\trun()\n\t\treturn ..()\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let base = procedure_by_path(&registry, "/datum/base/proc/run");
+        let base_implementation = base.implementations[0];
+        let expected_span = compilation
+            .syntax(base_implementation.file_id)
+            .expect("source syntax should exist")
+            .definitions[base_implementation.definition_index]
+            .body[0]
+            .span;
+        let error = execute_effective(&compilation, "/datum/base/child/proc/run", &[])
+            .expect_err("parent numeric failure should propagate");
+
+        assert_eq!(error.source_span, Some(expected_span));
+        assert_eq!(error.call_stack.len(), 2);
+        assert!(
+            error.call_stack[0]
+                .procedure
+                .contains("/datum/base/child/proc/run")
+        );
+        assert!(
+            error.call_stack[1]
+                .procedure
+                .contains("/datum/base/proc/run")
+        );
+        assert_eq!(error.call_stack[1].source_span, Some(expected_span));
     }
 }

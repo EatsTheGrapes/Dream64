@@ -30,6 +30,18 @@ The interpreter is the semantic reference and debugging tier. Optimized tiers
 must pass the same fixture corpus and may deoptimize to the interpreter at
 observable boundaries.
 
+Project compilation preserves textual `#include` splice order while retaining
+each declaration's original file identity and byte span. The compiler database
+owns parsed syntax snapshots, diagnostics, the canonical type/member tree, and
+semantic procedure registries. Tree-local numeric IDs are never persisted as
+cross-build identities; durable tooling keys use canonical paths and source
+locations.
+
+The object tree starts from the DM standard roots (`/datum`, `/atom`,
+`/atom/movable`, `/area`, `/turf`, `/obj`, and `/mob`), applies source-ordered
+`parent_type` assignments, rejects invalid inheritance cycles, and only then
+derives child and inherited-member links.
+
 ## Runtime model
 
 Ordinary DM procs retain deterministic, cooperative semantics. The coordinator
@@ -69,6 +81,11 @@ optimized tiers so the interpreter remains the reference behavior.
 A configurable frame limit produces a deterministic runtime error instead of
 overflowing the host stack. Sleeping or yielding suspends a frame inside its
 fiber; it never blocks an operating-system worker thread.
+
+A separate shared instruction budget is charged before every interpreted
+bytecode operation across the complete call stack. Exhaustion is source-mapped
+and deterministic, which prevents infinite loops from hanging tooling or a
+server tick while preserving a configurable production ceiling.
 
 ## Values and memory
 

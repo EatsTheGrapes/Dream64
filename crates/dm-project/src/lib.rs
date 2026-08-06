@@ -152,6 +152,7 @@ pub struct ProjectFile {
     /// Original bytes. Source consumers may call [`Self::text`].
     pub contents: Vec<u8>,
     compiler_contents: Option<Vec<u8>>,
+    compiler_source_map: Vec<SourceMapping>,
 }
 
 impl ProjectFile {
@@ -180,6 +181,60 @@ impl ProjectFile {
     pub fn compiler_text(&self) -> Result<&str, str::Utf8Error> {
         str::from_utf8(self.compiler_contents.as_deref().unwrap_or(&self.contents))
     }
+
+    /// Maps a compiler-view byte range back to this file's original bytes.
+    ///
+    /// Bytes copied from ordinary source map one-to-one. Text produced by a
+    /// macro replacement maps to the complete identifier that invoked the
+    /// macro. A range spanning several mapping entries covers their combined
+    /// original range.
+    #[must_use]
+    pub fn original_span(&self, compiler_span: SourceSpan) -> SourceSpan {
+        if self.compiler_source_map.is_empty() {
+            return compiler_span;
+        }
+        let start = self.map_compiler_offset(compiler_span.start, false);
+        let end = self.map_compiler_offset(compiler_span.end, true);
+        SourceSpan::new(start.min(end), end.max(start))
+    }
+
+    fn map_compiler_offset(&self, offset: usize, end: bool) -> usize {
+        let probe = if end && offset != 0 {
+            offset - 1
+        } else {
+            offset
+        };
+        let mapping = self
+            .compiler_source_map
+            .iter()
+            .find(|mapping| {
+                mapping.expanded.start <= probe
+                    && (probe < mapping.expanded.end
+                        || (mapping.expanded.is_empty() && probe == mapping.expanded.start))
+            })
+            .or_else(|| self.compiler_source_map.last());
+        let Some(mapping) = mapping else {
+            return offset.min(self.contents.len());
+        };
+        if mapping.expanded.len() == mapping.original.len() {
+            let relative = offset
+                .saturating_sub(mapping.expanded.start)
+                .min(mapping.expanded.len());
+            mapping.original.start + relative
+        } else if end {
+            mapping.original.end
+        } else {
+            mapping.original.start
+        }
+        .min(self.contents.len())
+    }
+}
+
+/// One contiguous relationship between compiler-view and original bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceMapping {
+    expanded: SourceSpan,
+    original: SourceSpan,
 }
 
 /// Role of a file in a DM project.
@@ -280,6 +335,15 @@ pub enum ProjectError {
         /// Explanation of the malformed directive.
         message: String,
     },
+    /// An object-like macro recursively expanded itself or exceeded limits.
+    MacroExpansion {
+        /// File containing the macro invocation.
+        path: PathBuf,
+        /// Original byte offset of the invocation.
+        offset: usize,
+        /// Deterministic expansion failure explanation.
+        message: String,
+    },
 }
 
 impl fmt::Display for ProjectError {
@@ -315,6 +379,15 @@ impl fmt::Display for ProjectError {
                 "{}:{offset}: preprocessor error: {message}",
                 path.display()
             ),
+            Self::MacroExpansion {
+                path,
+                offset,
+                message,
+            } => write!(
+                formatter,
+                "{}:{offset}: macro expansion error: {message}",
+                path.display()
+            ),
         }
     }
 }
@@ -326,7 +399,8 @@ impl std::error::Error for ProjectError {
             Self::InvalidUtf8 { source, .. } => Some(source),
             Self::MissingInclude { .. }
             | Self::OutsideProject { .. }
-            | Self::Preprocessor { .. } => None,
+            | Self::Preprocessor { .. }
+            | Self::MacroExpansion { .. } => None,
         }
     }
 }
@@ -337,7 +411,7 @@ struct Loader {
     files: Vec<ProjectFile>,
     includes: Vec<(usize, IncludeEdge)>,
     identities: HashMap<PathBuf, FileId>,
-    macros: HashMap<String, String>,
+    macros: HashMap<String, MacroDefinition>,
     next_include_ordinal: usize,
 }
 
@@ -349,8 +423,14 @@ impl Loader {
             .expect("a canonical file path has a parent")
             .to_path_buf();
         let macros = HashMap::from([
-            ("DM_VERSION".to_owned(), TARGET_DM_VERSION.to_string()),
-            ("DM_BUILD".to_owned(), TARGET_DM_BUILD.to_string()),
+            (
+                "DM_VERSION".to_owned(),
+                MacroDefinition::object(TARGET_DM_VERSION.to_string()),
+            ),
+            (
+                "DM_BUILD".to_owned(),
+                MacroDefinition::object(TARGET_DM_BUILD.to_string()),
+            ),
         ]);
         Ok(Self {
             root_file,
@@ -404,6 +484,7 @@ impl Loader {
             kind,
             contents,
             compiler_contents: None,
+            compiler_source_map: Vec::new(),
         });
 
         if kind.can_contain_includes() {
@@ -427,19 +508,25 @@ impl Loader {
         path: &Path,
         directives: Vec<Directive>,
     ) -> Result<(), ProjectError> {
-        if directives.is_empty() {
-            return Ok(());
-        }
-
-        let mut compiler_contents = self.files[source.index()].contents.clone();
+        let original = self.files[source.index()].contents.clone();
+        let original_text = str::from_utf8(&original).expect("source UTF-8 was validated");
+        let mut compiler_source = CompilerSourceBuilder::new();
         let mut conditionals = Vec::new();
         let mut cursor = 0usize;
         for directive in directives {
             let span = directive.span;
-            if !conditional_active(&conditionals) {
-                mask_source(&mut compiler_contents, SourceSpan::new(cursor, span.start));
+            let ordinary_span = SourceSpan::new(cursor, span.start);
+            if conditional_active(&conditionals) {
+                compiler_source.append_expanded_source(
+                    original_text,
+                    ordinary_span,
+                    &self.macros,
+                    path,
+                )?;
+            } else {
+                compiler_source.append_masked(original_text, ordinary_span);
             }
-            mask_source(&mut compiler_contents, span);
+            compiler_source.append_masked(original_text, span);
             cursor = span.end;
             self.process_directive(source, path, directive, &mut conditionals)?;
         }
@@ -455,13 +542,16 @@ impl Loader {
                 ),
             ));
         }
-        if !conditional_active(&conditionals) {
-            mask_source(
-                &mut compiler_contents,
-                SourceSpan::new(cursor, self.files[source.index()].contents.len()),
-            );
+        let tail = SourceSpan::new(cursor, original.len());
+        if conditional_active(&conditionals) {
+            compiler_source.append_expanded_source(original_text, tail, &self.macros, path)?;
+        } else {
+            compiler_source.append_masked(original_text, tail);
         }
-        self.files[source.index()].compiler_contents = Some(compiler_contents);
+        if compiler_source.contents != original {
+            self.files[source.index()].compiler_contents = Some(compiler_source.contents);
+            self.files[source.index()].compiler_source_map = compiler_source.mappings;
+        }
         Ok(())
     }
 
@@ -527,8 +617,18 @@ impl Loader {
                     preprocessor_error(path, offset, "#endif without matching #if")
                 })?;
             }
-            DirectiveKind::Define { name, value } if active => {
-                self.macros.insert(name, value);
+            DirectiveKind::Define {
+                name,
+                value,
+                function_like,
+            } if active => {
+                self.macros.insert(
+                    name,
+                    MacroDefinition {
+                        replacement: value,
+                        function_like,
+                    },
+                );
             }
             DirectiveKind::Undef(name) if active => {
                 self.macros.remove(&name);
@@ -640,6 +740,7 @@ enum DirectiveKind {
     Define {
         name: String,
         value: String,
+        function_like: bool,
     },
     Undef(String),
     If(String),
@@ -649,6 +750,21 @@ enum DirectiveKind {
     Else,
     Endif,
     Malformed(String),
+}
+
+#[derive(Clone, Debug)]
+struct MacroDefinition {
+    replacement: String,
+    function_like: bool,
+}
+
+impl MacroDefinition {
+    fn object(replacement: String) -> Self {
+        Self {
+            replacement,
+            function_like: false,
+        }
+    }
 }
 
 struct ConditionalFrame {
@@ -699,12 +815,245 @@ fn conditional_active(conditionals: &[ConditionalFrame]) -> bool {
         .is_none_or(|frame: &ConditionalFrame| frame.active)
 }
 
-fn mask_source(contents: &mut [u8], span: SourceSpan) {
-    for byte in &mut contents[span.start..span.end] {
-        if !matches!(*byte, b'\r' | b'\n') {
-            *byte = b' ';
+struct CompilerSourceBuilder {
+    contents: Vec<u8>,
+    mappings: Vec<SourceMapping>,
+}
+
+impl CompilerSourceBuilder {
+    const fn new() -> Self {
+        Self {
+            contents: Vec::new(),
+            mappings: Vec::new(),
         }
     }
+
+    fn append_expanded_source(
+        &mut self,
+        source: &str,
+        span: SourceSpan,
+        macros: &HashMap<String, MacroDefinition>,
+        path: &Path,
+    ) -> Result<(), ProjectError> {
+        let text = &source[span.start..span.end];
+        let mut offset = 0usize;
+        let mut literal_start = 0usize;
+        while offset < text.len() {
+            if let Some(end) = protected_text_end(text, offset) {
+                offset = end;
+                continue;
+            }
+            let byte = text.as_bytes()[offset];
+            if is_identifier_start(byte) {
+                let identifier_end = identifier_end(text, offset);
+                let name = &text[offset..identifier_end];
+                if let Some(definition) = macros.get(name)
+                    && !definition.function_like
+                {
+                    self.append_original(
+                        source,
+                        SourceSpan::new(span.start + literal_start, span.start + offset),
+                    );
+                    let invocation =
+                        SourceSpan::new(span.start + offset, span.start + identifier_end);
+                    let replacement =
+                        expand_macro(name, macros, &mut Vec::new()).map_err(|message| {
+                            ProjectError::MacroExpansion {
+                                path: path.to_path_buf(),
+                                offset: invocation.start,
+                                message,
+                            }
+                        })?;
+                    self.append_replacement(&replacement, invocation);
+                    offset = identifier_end;
+                    literal_start = offset;
+                    continue;
+                }
+                offset = identifier_end;
+                continue;
+            }
+            offset += text[offset..]
+                .chars()
+                .next()
+                .expect("offset is inside source text")
+                .len_utf8();
+        }
+        self.append_original(
+            source,
+            SourceSpan::new(span.start + literal_start, span.end),
+        );
+        Ok(())
+    }
+
+    fn append_original(&mut self, source: &str, span: SourceSpan) {
+        if span.is_empty() {
+            return;
+        }
+        let expanded_start = self.contents.len();
+        self.contents
+            .extend_from_slice(&source.as_bytes()[span.start..span.end]);
+        self.mappings.push(SourceMapping {
+            expanded: SourceSpan::new(expanded_start, self.contents.len()),
+            original: span,
+        });
+    }
+
+    fn append_masked(&mut self, source: &str, span: SourceSpan) {
+        if span.is_empty() {
+            return;
+        }
+        let expanded_start = self.contents.len();
+        self.contents
+            .extend(source.as_bytes()[span.start..span.end].iter().map(|byte| {
+                if matches!(*byte, b'\r' | b'\n') {
+                    *byte
+                } else {
+                    b' '
+                }
+            }));
+        self.mappings.push(SourceMapping {
+            expanded: SourceSpan::new(expanded_start, self.contents.len()),
+            original: span,
+        });
+    }
+
+    fn append_replacement(&mut self, replacement: &str, invocation: SourceSpan) {
+        if replacement.is_empty() {
+            return;
+        }
+        let expanded_start = self.contents.len();
+        self.contents.extend_from_slice(replacement.as_bytes());
+        self.mappings.push(SourceMapping {
+            expanded: SourceSpan::new(expanded_start, self.contents.len()),
+            original: invocation,
+        });
+    }
+}
+
+const MAX_MACRO_EXPANSION_DEPTH: usize = 64;
+
+fn expand_macro(
+    name: &str,
+    macros: &HashMap<String, MacroDefinition>,
+    stack: &mut Vec<String>,
+) -> Result<String, String> {
+    if let Some(cycle_start) = stack.iter().position(|entry| entry == name) {
+        let mut cycle = stack[cycle_start..].to_vec();
+        cycle.push(name.to_owned());
+        return Err(format!(
+            "recursive object macro expansion: {}",
+            cycle.join(" -> ")
+        ));
+    }
+    if stack.len() >= MAX_MACRO_EXPANSION_DEPTH {
+        return Err(format!(
+            "object macro expansion exceeded {MAX_MACRO_EXPANSION_DEPTH} levels while expanding {name}"
+        ));
+    }
+    let Some(definition) = macros.get(name) else {
+        return Ok(name.to_owned());
+    };
+    if definition.function_like {
+        return Ok(name.to_owned());
+    }
+
+    stack.push(name.to_owned());
+    let result = expand_replacement(&definition.replacement, macros, stack);
+    stack.pop();
+    result
+}
+
+fn expand_replacement(
+    replacement: &str,
+    macros: &HashMap<String, MacroDefinition>,
+    stack: &mut Vec<String>,
+) -> Result<String, String> {
+    let mut output = String::with_capacity(replacement.len());
+    let mut offset = 0usize;
+    while offset < replacement.len() {
+        if let Some(end) = protected_text_end(replacement, offset) {
+            output.push_str(&replacement[offset..end]);
+            offset = end;
+            continue;
+        }
+        let byte = replacement.as_bytes()[offset];
+        if is_identifier_start(byte) {
+            let end = identifier_end(replacement, offset);
+            let name = &replacement[offset..end];
+            if macros
+                .get(name)
+                .is_some_and(|definition| !definition.function_like)
+            {
+                output.push_str(&expand_macro(name, macros, stack)?);
+            } else {
+                output.push_str(name);
+            }
+            offset = end;
+            continue;
+        }
+        let character = replacement[offset..]
+            .chars()
+            .next()
+            .expect("offset is inside macro replacement text");
+        output.push(character);
+        offset += character.len_utf8();
+    }
+    Ok(output)
+}
+
+fn protected_text_end(source: &str, offset: usize) -> Option<usize> {
+    let remaining = &source[offset..];
+    if remaining.starts_with("//") {
+        return Some(
+            remaining
+                .find('\n')
+                .map_or(source.len(), |end| offset + end),
+        );
+    }
+    if let Some(comment) = remaining.strip_prefix("/*") {
+        return Some(
+            comment
+                .find("*/")
+                .map_or(source.len(), |end| offset + 2 + end + 2),
+        );
+    }
+    if let Some(raw_string) = remaining.strip_prefix("{\"") {
+        return Some(
+            raw_string
+                .find("\"}")
+                .map_or(source.len(), |end| offset + 2 + end + 2),
+        );
+    }
+    if matches!(source.as_bytes()[offset], b'\"' | b'\'') {
+        let delimiter = source.as_bytes()[offset];
+        let mut cursor = offset + 1;
+        let mut escaped = false;
+        while cursor < source.len() {
+            let byte = source.as_bytes()[cursor];
+            cursor += 1;
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                break;
+            }
+        }
+        return Some(cursor);
+    }
+    None
+}
+
+const fn is_identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn identifier_end(source: &str, start: usize) -> usize {
+    start
+        + source.as_bytes()[start..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+            .count()
 }
 
 fn scan_directives(source: &str) -> Vec<Directive> {
@@ -716,12 +1065,23 @@ fn scan_directives(source: &str) -> Vec<Directive> {
         let physical_line = &source[offset..physical_end];
         let line = physical_line.strip_suffix('\n').unwrap_or(physical_line);
         let uncommented = remove_comments(line, &mut in_block_comment);
-        if let Some(kind) = parse_directive_line(&uncommented) {
+        if let Some(mut kind) = parse_directive_line(&uncommented) {
             let directive_end = if matches!(&kind, DirectiveKind::Define { .. }) {
                 extended_define_end(source, offset, physical_end, &uncommented)
             } else {
                 physical_end
             };
+            if let DirectiveKind::Define {
+                name,
+                value,
+                function_like,
+            } = &mut kind
+            {
+                let (complete_value, complete_function_like) =
+                    complete_define(source, offset, directive_end, name);
+                *value = complete_value;
+                *function_like = complete_function_like;
+            }
             directives.push(Directive {
                 kind,
                 span: SourceSpan::new(offset, directive_end),
@@ -732,6 +1092,56 @@ fn scan_directives(source: &str) -> Vec<Directive> {
         }
     }
     directives
+}
+
+fn complete_define(source: &str, start: usize, end: usize, name: &str) -> (String, bool) {
+    let directive = source[start..end]
+        .trim_end_matches(['\r', '\n'])
+        .trim_start();
+    let hash = directive.find('#').expect("a parsed directive contains #");
+    let after_keyword = directive[hash + 1..]
+        .trim_start()
+        .strip_prefix("define")
+        .expect("a define directive has the define keyword")
+        .trim_start();
+    let after_name = after_keyword
+        .strip_prefix(name)
+        .expect("parsed macro name is present in its directive");
+    let (replacement, function_like) = if after_name.starts_with('(') {
+        let parameters_end = after_name
+            .find(')')
+            .map_or(after_name.len(), |index| index + 1);
+        (&after_name[parameters_end..], true)
+    } else {
+        (after_name, false)
+    };
+    let replacement = replacement.trim_start();
+    if replacement.starts_with("{\"") {
+        (replacement.to_owned(), function_like)
+    } else {
+        (splice_continuations(replacement), function_like)
+    }
+}
+
+fn splice_continuations(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        if bytes[offset] == b'\\' {
+            if bytes.get(offset + 1) == Some(&b'\n') {
+                offset += 2;
+                continue;
+            }
+            if bytes.get(offset + 1) == Some(&b'\r') && bytes.get(offset + 2) == Some(&b'\n') {
+                offset += 3;
+                continue;
+            }
+        }
+        output.push(bytes[offset]);
+        offset += 1;
+    }
+    String::from_utf8(output).expect("removing ASCII continuations preserves UTF-8")
 }
 
 fn extended_define_end(
@@ -848,6 +1258,7 @@ fn parse_directive_line(line: &str) -> Option<DirectiveKind> {
             Some(DirectiveKind::Define {
                 name,
                 value: macro_value.to_owned(),
+                function_like: value[name_end..].starts_with('('),
             })
         }
         "undef" => identifier(value).map(DirectiveKind::Undef),
@@ -932,11 +1343,11 @@ fn preprocessor_error(path: &Path, offset: usize, message: impl Into<String>) ->
 struct ConditionParser<'a> {
     source: &'a str,
     offset: usize,
-    macros: &'a HashMap<String, String>,
+    macros: &'a HashMap<String, MacroDefinition>,
 }
 
 impl<'a> ConditionParser<'a> {
-    fn new(source: &'a str, macros: &'a HashMap<String, String>) -> Self {
+    fn new(source: &'a str, macros: &'a HashMap<String, MacroDefinition>) -> Self {
         Self {
             source: source.split("//").next().unwrap_or(source),
             offset: 0,
@@ -1103,17 +1514,21 @@ impl<'a> ConditionParser<'a> {
     }
 }
 
-fn resolve_macro_number(name: &str, macros: &HashMap<String, String>, depth: usize) -> i64 {
+fn resolve_macro_number(
+    name: &str,
+    macros: &HashMap<String, MacroDefinition>,
+    depth: usize,
+) -> i64 {
     if depth >= 32 {
         return 0;
     }
-    let Some(value) = macros.get(name) else {
+    let Some(definition) = macros.get(name) else {
         return match name {
             "TRUE" => 1,
             _ => 0,
         };
     };
-    let value = value.trim();
+    let value = definition.replacement.trim();
     if value.is_empty() {
         return 1;
     }
@@ -1137,10 +1552,13 @@ fn resolve_macro_number(name: &str, macros: &HashMap<String, String>, depth: usi
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use dm_core::SourceSpan;
 
     use super::{IncludeTarget, Project, ProjectError};
 
@@ -1356,6 +1774,79 @@ mod tests {
             "/datum/after_macros\n"
         );
         assert!(project.includes.is_empty());
+    }
+
+    #[test]
+    fn expands_nested_object_macros_across_includes_with_source_mapping() {
+        let scratch = ScratchDirectory::new();
+        fs::write(
+            scratch.path().join("world.dme"),
+            "#include \"defines.dm\"\n#include \"uses.dm\"\n",
+        )
+        .expect("environment should be written");
+        fs::write(
+            scratch.path().join("defines.dm"),
+            "#define ROOT /datum\n#define NESTED ROOT/example\n#define FUNCTION(value) ROOT/value\n",
+        )
+        .expect("macro definitions should be written");
+        let uses = "NESTED\n\"NESTED\"\n// NESTED\n/* NESTED */\n{\"NESTED\"}\nFUNCTION(test)\n#undef NESTED\nNESTED\n";
+        fs::write(scratch.path().join("uses.dm"), uses).expect("macro uses should be written");
+
+        let project =
+            Project::load(scratch.path().join("world.dme")).expect("object macros should expand");
+        let file = &project.files[2];
+        let expanded = file
+            .compiler_text()
+            .expect("expanded source should be UTF-8");
+
+        assert!(expanded.starts_with("/datum/example\n"));
+        assert!(expanded.contains("\"NESTED\"\n// NESTED\n/* NESTED */\n{\"NESTED\"}"));
+        assert!(expanded.contains("FUNCTION(test)"));
+        assert!(expanded.ends_with("      \nNESTED\n"));
+        let expanded_start = expanded
+            .find("/datum/example")
+            .expect("nested replacement should exist");
+        let original_start = uses.find("NESTED").expect("invocation should exist");
+        assert_eq!(
+            file.original_span(SourceSpan::new(
+                expanded_start,
+                expanded_start + "/datum/example".len(),
+            )),
+            SourceSpan::new(original_start, original_start + "NESTED".len())
+        );
+    }
+
+    #[test]
+    fn reports_deterministic_recursive_and_depth_macro_errors() {
+        let scratch = ScratchDirectory::new();
+        let recursive_source = "#define FIRST SECOND\n#define SECOND FIRST\nFIRST\n";
+        fs::write(scratch.path().join("world.dme"), recursive_source)
+            .expect("recursive macros should be written");
+        let recursion = Project::load(scratch.path().join("world.dme"))
+            .expect_err("recursive macros should fail");
+        assert!(matches!(
+            recursion,
+            ProjectError::MacroExpansion { offset, ref message, .. }
+                if offset == recursive_source.rfind("FIRST").expect("invocation should exist")
+                    && message == "recursive object macro expansion: FIRST -> SECOND -> FIRST"
+        ));
+
+        let depth_scratch = ScratchDirectory::new();
+        let mut depth_source = String::new();
+        for index in 0..=64 {
+            writeln!(depth_source, "#define LEVEL_{index} LEVEL_{}", index + 1)
+                .expect("writing to a string should succeed");
+        }
+        depth_source.push_str("LEVEL_0\n");
+        fs::write(depth_scratch.path().join("world.dme"), depth_source)
+            .expect("deep macros should be written");
+        let depth = Project::load(depth_scratch.path().join("world.dme"))
+            .expect_err("over-deep macros should fail");
+        assert!(matches!(
+            depth,
+            ProjectError::MacroExpansion { ref message, .. }
+                if message == "object macro expansion exceeded 64 levels while expanding LEVEL_64"
+        ));
     }
 
     #[test]

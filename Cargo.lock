@@ -58,6 +58,7 @@ dependencies = [
  "dm-core",
  "dm-object-tree",
  "dm-syntax",
+ "dm-vm",
 ]
 
 [[package]]

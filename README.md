@@ -21,10 +21,13 @@ both Dream Maker/Dream Daemon and this engine.
 	Monkestation source graph.
 - A reusable compiler database that retains syntax by file identity, builds a
 	project-wide object tree, and maps frontend diagnostics back to source spans.
+- A typed, loss-aware DMF skin parser validated against Monkestation's real
+	window, control, menu, and macro definitions.
 - Portable stack bytecode and a deterministic reference interpreter supporting
 	explicit call frames, forward and recursive procedure calls, permissive DM
-	argument arity, parameters, locals, assignment, arithmetic, comparisons, and
-	nested indentation-based `if`/`else` control flow.
+	argument arity, parameters, locals, assignment, arithmetic, comparisons,
+	`if`/`else`, `while`, C-style `for`, `break`, and `continue`, with deterministic
+	call-depth and instruction limits.
 - A bounded reference-compiler runner for differential fixtures.
 - A written compatibility boundary and runtime architecture.
 

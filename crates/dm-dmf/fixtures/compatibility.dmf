@@ -1,0 +1,28 @@
+// Synthetic compatibility fixture; no game skin content is copied here.
+macro "default"
+	elem "Shift"
+		name = "SHIFT"
+		command = ".configure input.mode=held"
+
+menu "main-menu"
+	elem
+		name = "&File"
+	elem "quit-action"
+		name = "&Quit\tAlt-F4"
+		category = "&File"
+		command = ".quit"
+
+window "main-window"
+	elem "main-window"
+		type = MAIN
+		size = 800x600
+		is-default = true
+		macro = "default"
+		menu = "main-menu"
+	elem "map-view"
+		type = MAP
+		anchor1 = 0,0
+		anchor2 = 100,100
+		background-color = #202020
+		icon = 'icons\\ui\\app.png'
+		on-status = ".configure \"status.text=[[*]]\""

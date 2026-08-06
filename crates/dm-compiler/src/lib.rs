@@ -77,6 +77,14 @@ impl Compilation {
         self.syntax_files.get(file_id.index())?.as_ref()
     }
 
+    /// Maps a syntax-layer compiler-view range back to original file bytes.
+    #[must_use]
+    pub fn original_span(&self, file_id: FileId, compiler_span: SourceSpan) -> Option<SourceSpan> {
+        self.project
+            .file(file_id)
+            .map(|file| file.original_span(compiler_span))
+    }
+
     /// Returns the global canonical object tree.
     #[must_use]
     pub const fn code_tree(&self) -> &CodeTree {
@@ -244,7 +252,16 @@ fn compile_project(project: Project) -> Compilation {
                 syntax_files.push(Some(syntax));
             }
             Err(error) => {
-                diagnostics.push(syntax_diagnostic(file.id, file.path.clone(), &error));
+                let compiler_span = match &error {
+                    SyntaxError::Lex(error) => error.span,
+                    SyntaxError::UnclosedDelimiter(span) => *span,
+                };
+                diagnostics.push(syntax_diagnostic(
+                    file.id,
+                    file.path.clone(),
+                    file.original_span(compiler_span),
+                    &error,
+                ));
                 syntax_files.push(None);
             }
         }
@@ -263,7 +280,10 @@ fn compile_project(project: Project) -> Compilation {
             file_id: declaration.file_id,
             definition_index: declaration.definition_index,
             node: declaration.node,
-            span: declaration.span,
+            span: project
+                .file(declaration.file_id)
+                .expect("tree declarations refer to supplied project files")
+                .original_span(declaration.span),
         })
         .collect::<Vec<_>>();
     diagnostics.extend(
@@ -314,14 +334,20 @@ fn expanded_definition_units<'syntax>(
             continue;
         };
         let definition_index = &mut next_definition[segment.file_id.index()];
+        let file = project
+            .file(segment.file_id)
+            .expect("expansion segments refer to project files");
         while *definition_index < syntax.definitions.len()
-            && syntax.definitions[*definition_index].span.start < segment.span.start
+            && file
+                .original_span(syntax.definitions[*definition_index].span)
+                .start
+                < segment.span.start
         {
             *definition_index += 1;
         }
         while *definition_index < syntax.definitions.len() {
             let definition = &syntax.definitions[*definition_index];
-            if definition.span.start >= segment.span.end {
+            if file.original_span(definition.span).start >= segment.span.end {
                 break;
             }
             units.push(DefinitionUnit {
@@ -335,11 +361,12 @@ fn expanded_definition_units<'syntax>(
     units
 }
 
-fn syntax_diagnostic(file_id: FileId, path: PathBuf, error: &SyntaxError) -> Diagnostic {
-    let span = match error {
-        SyntaxError::Lex(error) => error.span,
-        SyntaxError::UnclosedDelimiter(span) => *span,
-    };
+fn syntax_diagnostic(
+    file_id: FileId,
+    path: PathBuf,
+    span: SourceSpan,
+    error: &SyntaxError,
+) -> Diagnostic {
     Diagnostic {
         kind: DiagnosticKind::Syntax,
         severity: DiagnosticSeverity::Error,
@@ -407,7 +434,12 @@ fn declaration_location(
             .expect("tree declarations refer to supplied project files")
             .path
             .clone(),
-        span: Some(span),
+        span: Some(
+            project
+                .file(file_id)
+                .expect("tree declarations refer to supplied project files")
+                .original_span(span),
+        ),
     }
 }
 
@@ -438,6 +470,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use dm_core::SourceSpan;
     use dm_object_tree::NodeKind;
 
     use super::{CompilerDatabase, DiagnosticKind};
@@ -628,6 +661,57 @@ mod tests {
         );
         assert_eq!(compilation.stats().definitions, 4);
         assert_eq!(compilation.stats().code_declarations, 4);
+    }
+
+    #[test]
+    fn maps_expanded_declarations_and_diagnostics_to_macro_invocations() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            "#include \"defines.dm\"\n#include \"mapped.dm\"\n#include \"broken.dm\"\n",
+        );
+        fixture.write(
+            "defines.dm",
+            "#define ROOT /datum\n#define MAPPED ROOT/mapped\n#define BROKEN ☃\n",
+        );
+        fixture.write("mapped.dm", "MAPPED\n");
+        fixture.write("broken.dm", "BROKEN\n");
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("macro diagnostics should be recoverable");
+        let mapped_file = compilation
+            .project()
+            .files
+            .iter()
+            .find(|file| relative(&file.path) == "mapped.dm")
+            .expect("mapped source should be discovered");
+        let syntax = compilation
+            .syntax(mapped_file.id)
+            .expect("mapped declaration should parse");
+        assert_eq!(syntax.definitions[0].path.to_string(), "/datum/mapped");
+        assert_eq!(
+            compilation.original_span(mapped_file.id, syntax.definitions[0].span),
+            Some(SourceSpan::new(0, "MAPPED\n".len()))
+        );
+        let declaration = compilation
+            .declarations()
+            .iter()
+            .find(|declaration| declaration.file_id == mapped_file.id)
+            .expect("mapped declaration should enter the tree");
+        assert_eq!(declaration.span, SourceSpan::new(0, "MAPPED\n".len()));
+
+        let diagnostic = compilation
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.kind == DiagnosticKind::Syntax)
+            .expect("invalid replacement should produce a syntax diagnostic");
+        let location = diagnostic
+            .location
+            .as_ref()
+            .expect("macro diagnostic should retain its invocation");
+        assert_eq!(relative(&location.path), "broken.dm");
+        assert_eq!(location.span, Some(SourceSpan::new(0, "BROKEN".len())));
     }
 
     #[test]
