@@ -1,0 +1,22 @@
+[workspace]
+members = [
+	"crates/dm-conformance",
+	"crates/dm-core",
+	"crates/dm-lexer",
+	"crates/dm-project",
+	"crates/dm-syntax",
+	"crates/dm-vm",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
