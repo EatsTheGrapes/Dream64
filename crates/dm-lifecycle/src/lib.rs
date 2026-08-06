@@ -9,7 +9,11 @@ use dm_core::{FileId, SourceSpan};
 use dm_object_tree::{NodeId, NodeKind};
 use dm_runtime::RuntimeImage;
 use dm_semantics::{Procedure, ProcedureId, ProcedureImplementationId, ProcedureRegistry};
-use dm_world::{AtomCategory, InitializerResolution, WorldCoordinate, WorldPlan};
+use dm_value::{DatumId, TypePath, Value};
+use dm_vm::{ExecutionContext, ExecutionState, RuntimeError, execute_module_in_context};
+use dm_world::{
+    AtomCategory, InitializerResolution, WorldAllocation, WorldCoordinate, WorldPlan,
+};
 
 /// Lifecycle entry points resolved for every runtime type.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -445,6 +449,255 @@ pub fn build_initialization_plan(
         events,
         diagnostics,
     }
+}
+
+/// One successfully invoked lifecycle hook.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecutedLifecycleEvent {
+    /// Planned event that selected the hook.
+    pub event: InitializationEvent,
+    /// Live datum passed as `src` to the hook.
+    pub datum: DatumId,
+    /// Canonical selected procedure path.
+    pub procedure_path: String,
+    /// Result value returned by the hook.
+    pub result: Value,
+}
+
+/// Deterministic result of executing a planned initialization sequence.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InitializationExecution {
+    /// The allocated singleton `/world` datum.
+    pub world: Option<DatumId>,
+    /// Hooks executed in event order.
+    pub events: Vec<ExecutedLifecycleEvent>,
+    /// Repeated map placements sharing an already initialized datum.
+    pub duplicate_map_events: usize,
+}
+
+/// Failure while binding or executing a planned lifecycle hook.
+#[derive(Debug)]
+pub enum InitializationExecutionError {
+    /// Selected lifecycle bodies could not be lowered to the reference VM.
+    Compile(dm_vm::CompileError),
+    /// A planned map atom has no matching allocated datum.
+    MissingMapDatum { atom_index: usize, path: String },
+    /// Lifecycle metadata did not retain an executable target.
+    MissingTarget { type_index: usize, kind: LifecycleKind },
+    /// A selected semantic body was absent from the compiled VM module.
+    MissingVmTarget { procedure_path: String },
+    /// The runtime image cannot allocate the singleton `/world` datum.
+    WorldAllocation(dm_runtime::RuntimeImageError),
+    /// VM execution failed with its original source-mapped call stack.
+    Runtime {
+        /// Event being executed.
+        event: InitializationEvent,
+        /// Source-selected lifecycle target.
+        target: LifecycleTarget,
+        /// Original VM failure.
+        error: RuntimeError,
+    },
+}
+
+impl std::fmt::Display for InitializationExecutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Compile(error) => write!(formatter, "lifecycle compilation failed: {error}"),
+            Self::MissingMapDatum { atom_index, path } => write!(
+                formatter,
+                "map lifecycle atom {atom_index} ({path}) has no allocated datum"
+            ),
+            Self::MissingTarget { type_index, kind } => {
+                write!(formatter, "lifecycle target {kind:?} is missing for type {type_index}")
+            }
+            Self::MissingVmTarget { procedure_path } => {
+                write!(formatter, "lifecycle VM target is missing for {procedure_path}")
+            }
+            Self::WorldAllocation(error) => write!(formatter, "world allocation failed: {error}"),
+            Self::Runtime { target, error, .. } => {
+                write!(formatter, "lifecycle {} failed: {error}", target.procedure_path)
+            }
+        }
+    }
+}
+
+impl std::error::Error for InitializationExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Compile(error) => Some(error),
+            Self::WorldAllocation(error) => Some(error),
+            Self::Runtime { error, .. } => Some(error),
+            Self::MissingMapDatum { .. }
+            | Self::MissingTarget { .. }
+            | Self::MissingVmTarget { .. } => None,
+        }
+    }
+}
+
+/// Executes `New`, `Initialize`, and `LateInitialize` for allocated map atoms.
+///
+/// The caller first builds an [`InitializationPlan`] and materializes the same
+/// [`WorldPlan`] with [`dm_world::allocate_world`]. Hooks use each live datum as
+/// `src`, execute in plan order, and share one mutable VM heap. Repeated map
+/// placements referring to one shared area datum run each hook once.
+///
+/// # Errors
+///
+/// Returns a source-aware error when a planned target cannot be compiled,
+/// bound to an allocation, or executed.
+pub fn execute_initialization_plan(
+    compilation: &Compilation,
+    procedures: &ProcedureRegistry,
+    index: &LifecycleIndex,
+    plan: &InitializationPlan,
+    allocation: &WorldAllocation,
+    runtime: &mut RuntimeImage,
+) -> Result<InitializationExecution, InitializationExecutionError> {
+    let bindings = map_datum_bindings(plan, allocation, runtime);
+    let targets = plan
+        .events
+        .iter()
+        .filter_map(|event| event_target(*event, index).map(|target| target.implementation))
+        .collect::<BTreeSet<_>>();
+    let executable = procedures
+        .compile_vm_implementations(compilation, targets)
+        .map_err(InitializationExecutionError::Compile)?;
+    let world = if plan
+        .events
+        .iter()
+        .any(|event| matches!(event, InitializationEvent::Lifecycle { subject: EventSubject::World, .. }))
+    {
+        Some(
+            runtime
+                .allocate_datum(&TypePath::parse("/world").expect("/world is a valid type path"))
+                .map_err(InitializationExecutionError::WorldAllocation)?,
+        )
+    } else {
+        None
+    };
+
+    let mut state = ExecutionState::from_heap(std::mem::take(runtime.heap_mut()));
+    let execution = (|| {
+        let mut result = InitializationExecution {
+            world,
+            ..InitializationExecution::default()
+        };
+        let mut seen = BTreeSet::new();
+        for event in &plan.events {
+            let InitializationEvent::Lifecycle { subject, .. } = *event else {
+                continue;
+            };
+            let datum = match subject {
+                EventSubject::World => world.expect("world event must allocate /world"),
+                EventSubject::MapAtom(atom_index) => bindings
+                    .get(atom_index)
+                    .and_then(|datum| *datum)
+                    .ok_or_else(|| InitializationExecutionError::MissingMapDatum {
+                        atom_index,
+                        path: plan.map_atoms[atom_index].type_path.clone(),
+                    })?,
+                EventSubject::Globals => continue,
+            };
+            if matches!(subject, EventSubject::MapAtom(_)) && !seen.insert((datum, event_kind(*event))) {
+                result.duplicate_map_events += 1;
+                continue;
+            }
+            let target = event_target(*event, index).ok_or_else(|| {
+                InitializationExecutionError::MissingTarget {
+                    type_index: event_type_index(*event),
+                    kind: event_kind(*event),
+                }
+            })?;
+            let entry = executable.implementation(target.implementation).ok_or_else(|| {
+                InitializationExecutionError::MissingVmTarget {
+                    procedure_path: target.procedure_path.clone(),
+                }
+            })?;
+            let value = execute_module_in_context(
+                executable.module(),
+                entry,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(datum), Value::Null),
+            )
+            .map_err(|error| InitializationExecutionError::Runtime {
+                event: *event,
+                target: target.clone(),
+                error,
+            })?;
+            result.events.push(ExecutedLifecycleEvent {
+                event: *event,
+                datum,
+                procedure_path: target.procedure_path.clone(),
+                result: value,
+            });
+        }
+        Ok(result)
+    })();
+    *runtime.heap_mut() = state.into_heap();
+    execution
+}
+
+fn event_kind(event: InitializationEvent) -> LifecycleKind {
+    match event {
+        InitializationEvent::Lifecycle { kind, .. } => kind,
+        InitializationEvent::Globals => unreachable!("global initialization has no lifecycle kind"),
+    }
+}
+
+fn event_type_index(event: InitializationEvent) -> usize {
+    match event {
+        InitializationEvent::Lifecycle { type_index, .. } => type_index,
+        InitializationEvent::Globals => unreachable!("global initialization has no lifecycle type"),
+    }
+}
+
+fn event_target(event: InitializationEvent, index: &LifecycleIndex) -> Option<&LifecycleTarget> {
+    let InitializationEvent::Lifecycle { kind, type_index, .. } = event else {
+        return None;
+    };
+    match index.types.get(type_index)?.targets.get(kind) {
+        LifecycleResolution::Resolved(target) => Some(target),
+        LifecycleResolution::Absent | LifecycleResolution::Unsupported(_) => None,
+    }
+}
+
+fn map_datum_bindings(
+    plan: &InitializationPlan,
+    allocation: &WorldAllocation,
+    runtime: &RuntimeImage,
+) -> Vec<Option<DatumId>> {
+    let mut by_coordinate: BTreeMap<_, Vec<DatumId>> = allocation
+        .snapshots()
+        .iter()
+        .map(|snapshot| (snapshot.coordinate, snapshot.source_order.clone()))
+        .collect();
+    let mut positions = BTreeMap::<WorldCoordinate, usize>::new();
+    plan.map_atoms
+        .iter()
+        .map(|atom| {
+            if atom.category == AtomCategory::OtherType {
+                return None;
+            }
+            let position = positions.entry(atom.placement.coordinate).or_default();
+            let datum = by_coordinate
+                .get(&atom.placement.coordinate)
+                .and_then(|datums| datums.get(*position))
+                .copied();
+            let matches_type = datum.is_some_and(|datum| {
+                runtime
+                    .heap()
+                    .datum(datum)
+                    .is_ok_and(|record| record.type_path().as_str() == atom.type_path)
+            });
+            if matches_type {
+                *position += 1;
+                datum
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn global_initialization(runtime: &RuntimeImage) -> GlobalInitialization {

@@ -10,7 +10,7 @@
 
 #![cfg_attr(not(test), deny(missing_docs))]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use dm_compiler::Compilation;
 use dm_core::{FileId, SourceSpan};
@@ -266,9 +266,61 @@ impl ProcedureRegistry {
         &self,
         compilation: &Compilation,
     ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
+        self.compile_vm_selected(
+            compilation,
+            self.procedures
+                .iter()
+                .flat_map(|procedure| {
+                    procedure
+                        .implementations
+                        .iter()
+                        .map(|implementation| implementation.id)
+                }),
+        )
+    }
+
+    /// Compiles selected implementations and their exact `..()` ancestors.
+    ///
+    /// This lets bounded runtime phases compile only their declared entry
+    /// points without unrelated unsupported procedures preventing execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`dm_vm::CompileError`] when a selected body, or one of its
+    /// parent-call targets, is unavailable or outside the executable subset.
+    pub fn compile_vm_implementations(
+        &self,
+        compilation: &Compilation,
+        implementations: impl IntoIterator<Item = ProcedureImplementationId>,
+    ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
+        let mut selected: BTreeSet<_> = implementations.into_iter().collect();
+        let mut pending: Vec<_> = selected.iter().copied().collect();
+        while let Some(implementation) = pending.pop() {
+            let Some(parent) = self
+                .implementation(implementation)
+                .and_then(|body| body.parent_target)
+            else {
+                continue;
+            };
+            if selected.insert(parent) {
+                pending.push(parent);
+            }
+        }
+        self.compile_vm_selected(compilation, selected)
+    }
+
+    fn compile_vm_selected(
+        &self,
+        compilation: &Compilation,
+        selected: impl IntoIterator<Item = ProcedureImplementationId>,
+    ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
+        let selected: BTreeSet<_> = selected.into_iter().collect();
         let mut ordered = Vec::new();
         for procedure in &self.procedures {
             for implementation in &procedure.implementations {
+                if !selected.contains(&implementation.id) {
+                    continue;
+                }
                 let definition = compilation
                     .syntax(implementation.file_id)
                     .and_then(|syntax| syntax.definitions.get(implementation.definition_index))

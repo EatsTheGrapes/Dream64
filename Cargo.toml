@@ -6,6 +6,7 @@ members = [
 	"crates/dm-dmf",
 	"crates/dm-globals",
 	"crates/dm-lexer",
+	"crates/dm-lifecycle",
 	"crates/dm-lowering",
 	"crates/dm-map",
 	"crates/dm-object-tree",

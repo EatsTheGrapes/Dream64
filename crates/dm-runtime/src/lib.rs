@@ -456,22 +456,24 @@ impl RuntimeImage {
         entry: &VariableEntry,
         step: &InitializationStep,
     ) -> Result<Value, DynamicInitializerFailure> {
-        let initializer = entry.initializer.as_ref().ok_or_else(|| {
-            DynamicInitializerFailure {
+        let initializer = entry
+            .initializer
+            .as_ref()
+            .ok_or_else(|| DynamicInitializerFailure {
                 phase: InitializerFailurePhase::Lowering,
                 message: format!("initialization step for {:?} has no syntax", step.path),
                 expanded_span: entry.span,
-            }
-        })?;
+            })?;
         let initializer_span = initializer.expanded_span;
         let bindings = self.initializer_bindings(binding_index, entry)?;
-        let program = compile_initializer(&initializer.tokens, &bindings, None).map_err(|error| {
-            DynamicInitializerFailure {
-                phase: InitializerFailurePhase::Lowering,
-                message: error.message,
-                expanded_span: initializer_span,
-            }
-        })?;
+        let program =
+            compile_initializer(&initializer.tokens, &bindings, None).map_err(|error| {
+                DynamicInitializerFailure {
+                    phase: InitializerFailurePhase::Lowering,
+                    message: error.message,
+                    expanded_span: initializer_span,
+                }
+            })?;
 
         let src = if step.storage == StorageClass::Instance {
             let owner = entry

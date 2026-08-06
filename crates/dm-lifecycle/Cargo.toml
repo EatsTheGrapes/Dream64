@@ -1,5 +1,3 @@
-[workspace]
-
 [package]
 name = "dm-lifecycle"
 version = "0.1.0"
@@ -15,6 +13,8 @@ dm-map = { path = "../dm-map" }
 dm-object-tree = { path = "../dm-object-tree" }
 dm-runtime = { path = "../dm-runtime" }
 dm-semantics = { path = "../dm-semantics" }
+dm-value = { path = "../dm-value" }
+dm-vm = { path = "../dm-vm" }
 dm-world = { path = "../dm-world" }
 
 [lints.rust]
