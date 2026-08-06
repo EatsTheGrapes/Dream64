@@ -10,8 +10,10 @@ publish = false
 dm-compiler = { path = "../dm-compiler" }
 dm-core = { path = "../dm-core" }
 dm-globals = { path = "../dm-globals" }
+dm-lexer = { path = "../dm-lexer" }
 dm-object-tree = { path = "../dm-object-tree" }
 dm-value = { path = "../dm-value" }
+dm-vm = { path = "../dm-vm" }
 
 [lints]
 workspace = true

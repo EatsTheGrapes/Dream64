@@ -13,26 +13,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "dm-conformance"
-version = "0.1.0"
-dependencies = [
- "dm-compiler",
- "dm-lexer",
- "dm-project",
- "dm-syntax",
- "dm-vm",
-]
-
-[[package]]
 name = "dm-core"
 version = "0.1.0"
-
-[[package]]
-name = "dm-dmf"
-version = "0.1.0"
-dependencies = [
- "dm-core",
-]
 
 [[package]]
 name = "dm-globals"
@@ -53,13 +35,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "dm-lowering"
+name = "dm-lifecycle"
 version = "0.1.0"
 dependencies = [
  "dm-compiler",
  "dm-core",
+ "dm-map",
+ "dm-object-tree",
+ "dm-runtime",
  "dm-semantics",
- "dm-vm",
+ "dm-world",
 ]
 
 [[package]]

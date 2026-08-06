@@ -131,6 +131,15 @@ pub enum ListEntryKind {
     Associative,
 }
 
+/// Runtime storage selected for one bare identifier in an initializer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InitializerBinding {
+    /// Read a persistent runtime global by its DM identifier.
+    Global(FieldName),
+    /// Read a field from the initializer's `src` datum.
+    SrcField(FieldName),
+}
+
 /// Stable procedure identity within one compiled module.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ProcedureId(u32);
@@ -166,6 +175,27 @@ pub struct Module {
     procedures: Vec<Program>,
     paths: Vec<String>,
     names: HashMap<String, ProcedureId>,
+}
+
+/// An initializer expression linked as an entry point in a VM module.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitializerProgram {
+    module: Module,
+    entry: ProcedureId,
+}
+
+impl InitializerProgram {
+    /// Returns the linked module containing the initializer entry point.
+    #[must_use]
+    pub const fn module(&self) -> &Module {
+        &self.module
+    }
+
+    /// Returns the initializer's module-local entry point.
+    #[must_use]
+    pub const fn entry(&self) -> ProcedureId {
+        self.entry
+    }
 }
 
 impl Module {
@@ -274,6 +304,62 @@ impl std::error::Error for RuntimeError {}
 /// unknown locals, or non-procedure definitions.
 pub fn compile_procedure(definition: &Definition) -> Result<Program, CompileError> {
     compile_procedure_with_resolver(definition, &HashMap::new())
+}
+
+/// Lowers one variable initializer expression to existing VM bytecode.
+///
+/// Bare names are resolved only through `bindings`; there are no implicit or
+/// fabricated built-ins. When `procedures` is supplied, unqualified calls may
+/// resolve to global `/proc/name` entries already present in that module.
+/// Initializer tokens retain their expanded-source span on every instruction.
+///
+/// # Errors
+///
+/// Returns [`CompileError`] for malformed syntax, unresolved identifiers or
+/// calls, and expression forms that have no initializer execution context.
+pub fn compile_initializer(
+    tokens: &[SpannedToken],
+    bindings: &BTreeMap<String, InitializerBinding>,
+    procedures: Option<&Module>,
+) -> Result<InitializerProgram, CompileError> {
+    let mut expression = ExpressionParser::new(tokens).parse()?;
+    bind_initializer_expression(&mut expression, bindings)?;
+
+    let mut module = procedures.cloned().unwrap_or_else(|| Module {
+        procedures: Vec::new(),
+        paths: Vec::new(),
+        names: HashMap::new(),
+    });
+    let mut call_names = HashMap::new();
+    for (path, procedure) in &module.names {
+        if let Some(name) = path.strip_prefix("/proc/")
+            && !name.contains('/')
+        {
+            call_names.insert(name.to_owned(), *procedure);
+        }
+    }
+    let mut instructions = Vec::new();
+    emit_expression(
+        &expression,
+        &LocalTable::default(),
+        &mut instructions,
+        &call_names,
+    )?;
+    instructions.push(Instruction::Return);
+    let source_span = match (tokens.first(), tokens.last()) {
+        (Some(first), Some(last)) => SourceSpan::new(first.span.start, last.span.end),
+        _ => return Err(compile_error("expected an initializer expression")),
+    };
+    let program = Program {
+        parameter_count: 0,
+        local_count: 0,
+        source_spans: vec![source_span; instructions.len()],
+        instructions,
+    };
+    let entry = ProcedureId::from_index(module.procedures.len())?;
+    module.procedures.push(program);
+    module.paths.push("<initializer>".to_owned());
+    Ok(InitializerProgram { module, entry })
 }
 
 /// Compiles a deterministic module from procedure definitions in source order.
@@ -2009,6 +2095,71 @@ fn emit_expression(
     Ok(())
 }
 
+fn bind_initializer_expression(
+    expression: &mut Expression,
+    bindings: &BTreeMap<String, InitializerBinding>,
+) -> Result<(), CompileError> {
+    match expression {
+        Expression::Local(name) => {
+            let binding = bindings
+                .get(name)
+                .ok_or_else(|| compile_error(format!("unresolved initializer name {name:?}")))?;
+            *expression = match binding {
+                InitializerBinding::Global(field) => Expression::GlobalField(field.clone()),
+                InitializerBinding::SrcField(field) => Expression::Field {
+                    receiver: Box::new(Expression::Src),
+                    name: field.clone(),
+                },
+            };
+        }
+        Expression::Field { receiver, .. } => {
+            bind_initializer_expression(receiver, bindings)?;
+        }
+        Expression::Call { arguments, .. } => {
+            for argument in arguments {
+                bind_initializer_expression(argument, bindings)?;
+            }
+        }
+        Expression::List(entries) => {
+            for entry in entries {
+                match entry {
+                    ListExpressionEntry::Positional(value) => {
+                        bind_initializer_expression(value, bindings)?;
+                    }
+                    ListExpressionEntry::Associative { key, value } => {
+                        bind_initializer_expression(key, bindings)?;
+                        bind_initializer_expression(value, bindings)?;
+                    }
+                }
+            }
+        }
+        Expression::Index { list, index } => {
+            bind_initializer_expression(list, bindings)?;
+            bind_initializer_expression(index, bindings)?;
+        }
+        Expression::Unary { operand, .. } => {
+            bind_initializer_expression(operand, bindings)?;
+        }
+        Expression::Binary { left, right, .. } => {
+            bind_initializer_expression(left, bindings)?;
+            bind_initializer_expression(right, bindings)?;
+        }
+        Expression::CurrentCall { .. } | Expression::ParentCall { .. } | Expression::Result => {
+            return Err(compile_error(
+                "current-procedure state is unavailable in a variable initializer",
+            ));
+        }
+        Expression::Null
+        | Expression::Number(_)
+        | Expression::Text(_)
+        | Expression::Src
+        | Expression::Usr
+        | Expression::GlobalNamespace
+        | Expression::GlobalField(_) => {}
+    }
+    Ok(())
+}
+
 fn compile_error(message: impl Into<String>) -> CompileError {
     CompileError {
         message: message.into(),
@@ -2048,6 +2199,21 @@ impl ExecutionState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates execution state around an existing runtime heap.
+    #[must_use]
+    pub fn from_heap(heap: ValueHeap) -> Self {
+        Self {
+            heap,
+            globals: BTreeMap::new(),
+        }
+    }
+
+    /// Returns ownership of the runtime heap after execution.
+    #[must_use]
+    pub fn into_heap(self) -> ValueHeap {
+        self.heap
     }
 
     /// Returns the shared value heap.
@@ -3015,15 +3181,19 @@ fn pop_number(stack: &mut Vec<Value>) -> Result<f32, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use dm_core::{DmNumberBits, SourceSpan};
+    use dm_lexer::{SpannedToken, TokenKind, lex};
     use dm_syntax::parse;
     use dm_value::{FieldName, TypePath};
 
     use super::{
-        ExecutionContext, ExecutionLimits, ExecutionState, Instruction, ProcedureSpec, Program,
-        Value, compile_module, compile_module_specs, compile_procedure, execute,
-        execute_in_context, execute_in_state, execute_module, execute_module_in_context,
-        execute_module_with_limits, execute_with_limits, execute_with_limits_in_state,
+        ExecutionContext, ExecutionLimits, ExecutionState, InitializerBinding, Instruction,
+        ProcedureSpec, Program, Value, compile_initializer, compile_module, compile_module_specs,
+        compile_procedure, execute, execute_in_context, execute_in_state, execute_module,
+        execute_module_in_context, execute_module_with_limits, execute_with_limits,
+        execute_with_limits_in_state,
     };
 
     fn execute_source(source: &str, argument: f32) -> Value {
@@ -3046,6 +3216,82 @@ mod tests {
 
     fn field(name: &str) -> FieldName {
         FieldName::parse(name).unwrap()
+    }
+
+    fn expression_tokens(source: &str) -> Vec<SpannedToken> {
+        lex(source)
+            .expect("expression should lex")
+            .into_iter()
+            .filter(|token| {
+                !matches!(
+                    token.kind,
+                    TokenKind::LineStart { .. } | TokenKind::Newline | TokenKind::LineContinuation
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn initializer_lowering_uses_explicit_bindings_and_source_spans() {
+        let tokens = expression_tokens("base + src.increment + global.offset");
+        let bindings =
+            BTreeMap::from([("base".to_owned(), InitializerBinding::Global(field("base")))]);
+        let initializer = compile_initializer(&tokens, &bindings, None)
+            .expect("bound initializer should compile");
+        let program = initializer
+            .module()
+            .procedure(initializer.entry())
+            .expect("initializer entry should exist");
+
+        assert_eq!(program.instructions.len(), program.source_spans.len());
+        assert!(program.source_spans.iter().all(|span| !span.is_empty()));
+
+        let mut state = ExecutionState::new();
+        state.set_global(field("base"), Value::number(2.0));
+        state.set_global(field("offset"), Value::number(3.0));
+        let src = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(src, field("increment"), Value::number(4.0))
+            .unwrap();
+        let context = ExecutionContext::new(Value::Datum(src), Value::Null);
+
+        assert_eq!(
+            execute_module_in_context(
+                initializer.module(),
+                initializer.entry(),
+                &[],
+                &mut state,
+                &context,
+            ),
+            Ok(Value::number(9.0))
+        );
+    }
+
+    #[test]
+    fn initializer_calls_only_real_linked_global_procedures() {
+        let syntax =
+            parse("/proc/double(value)\n\treturn value * 2\n").expect("procedure should parse");
+        let procedures = compile_module(&syntax.definitions).expect("procedure should compile");
+        let tokens = expression_tokens("double(4)");
+        let initializer = compile_initializer(&tokens, &BTreeMap::new(), Some(&procedures))
+            .expect("linked call should compile");
+
+        assert_eq!(
+            execute_module(initializer.module(), initializer.entry(), &[]),
+            Ok(Value::number(8.0))
+        );
+        assert!(
+            compile_initializer(
+                &expression_tokens("invented_builtin()"),
+                &BTreeMap::new(),
+                None,
+            )
+            .is_err(),
+            "unregistered names must not become fake built-ins"
+        );
     }
 
     #[test]

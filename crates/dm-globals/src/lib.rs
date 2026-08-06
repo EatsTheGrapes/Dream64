@@ -359,6 +359,9 @@ fn classify_storage(definition: &Definition, has_no_owner: bool) -> StorageClass
     let identifiers: BTreeSet<_> = definition
         .header
         .iter()
+        .take_while(
+            |token| !matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
+        )
         .filter_map(|token| match &token.kind {
             TokenKind::Identifier(name) => Some(name.as_str()),
             _ => None,
@@ -675,5 +678,22 @@ mod tests {
             plans.type_defaults[0].steps[1].assignment,
             AssignmentKind::Override
         );
+    }
+
+    #[test]
+    fn storage_modifiers_do_not_scan_initializer_expressions() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"vars.dm\"\n");
+        fixture.write(
+            "vars.dm",
+            "/datum/example\n\tvar/value = global.offset\n\tvar/static/shared = 2\n",
+        );
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.0.join("world.dme"))
+            .expect("fixture should compile");
+        let registry = VariableRegistry::build(&compilation);
+
+        assert_eq!(registry.entries()[0].storage, StorageClass::Instance);
+        assert_eq!(registry.entries()[1].storage, StorageClass::Static);
     }
 }

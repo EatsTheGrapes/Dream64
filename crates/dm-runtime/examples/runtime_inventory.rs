@@ -31,6 +31,10 @@ fn main() -> ExitCode {
         "constants materialized:     {}",
         stats.constants_materialized
     );
+    println!(
+        "dynamic initializers:       {}",
+        stats.dynamic_initializers_materialized
+    );
     println!("global/static slots:        {}", stats.runtime_variables);
     println!("runtime types:              {}", stats.runtime_types);
     println!("direct default layers:      {}", stats.default_layers);

@@ -13,6 +13,13 @@ use dm_core::SourceSpan;
 use dm_map::{Map, MapVariableAssignment};
 use dm_object_tree::{CodeTree, NodeId, NodeKind};
 
+mod allocation;
+
+pub use allocation::{
+    CoordinateDatumSnapshot, WorldAllocation, WorldAllocationError, WorldAllocationStats,
+    WorldAllocationWorkItem, WorldAllocationWorkKind, allocate_world,
+};
+
 /// One stable integer world coordinate.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WorldCoordinate {
