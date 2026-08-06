@@ -188,7 +188,7 @@ impl std::error::Error for SyntaxError {}
 /// line.
 pub fn parse(source: &str) -> Result<SyntaxFile, SyntaxError> {
     let tokens = lex(source).map_err(SyntaxError::Lex)?;
-    let lines = build_logical_lines(tokens)?;
+    let lines = expand_braced_lines(source, build_logical_lines(tokens)?);
     Ok(Parser::new(lines).run())
 }
 
@@ -560,6 +560,220 @@ fn push_parameter(parameters: &mut Vec<ParameterSyntax>, tokens: &[SpannedToken]
         span: SourceSpan::new(first.span.start, last.span.end),
         tokens: tokens.to_vec(),
     });
+}
+
+fn expand_braced_lines(source: &str, lines: Vec<SourceLine>) -> Vec<SourceLine> {
+    let mut expanded = Vec::new();
+    for line in lines {
+        let checkpoint = expanded.len();
+        if !expand_braced_definition_sequence(source, &line.tokens, line.indentation, &mut expanded)
+        {
+            expanded.truncate(checkpoint);
+            expanded.push(line);
+        }
+    }
+    expanded
+}
+
+fn expand_braced_definition_sequence(
+    source: &str,
+    tokens: &[SpannedToken],
+    indentation: Indentation,
+    output: &mut Vec<SourceLine>,
+) -> bool {
+    let checkpoint = output.len();
+    let mut cursor = 0usize;
+    let mut found_brace = false;
+    while cursor < tokens.len() {
+        while tokens
+            .get(cursor)
+            .is_some_and(|token| token.kind == TokenKind::Punctuation(';'))
+        {
+            cursor += 1;
+        }
+        if cursor == tokens.len() {
+            break;
+        }
+        match sequence_boundary(tokens, cursor) {
+            Some(SequenceBoundary::Semicolon(end)) => {
+                if !push_definition_line(&tokens[cursor..end], indentation, output) {
+                    output.truncate(checkpoint);
+                    return false;
+                }
+                cursor = end + 1;
+            }
+            Some(SequenceBoundary::Brace(open)) => {
+                let header = &tokens[cursor..open];
+                let Some(header_line) = line_from_tokens(header, indentation) else {
+                    output.truncate(checkpoint);
+                    return false;
+                };
+                let Some(candidate) = classify_line(&header_line) else {
+                    output.truncate(checkpoint);
+                    return false;
+                };
+                if candidate.kind != DefinitionKind::Type && !candidate.kind.owns_procedure_body() {
+                    output.truncate(checkpoint);
+                    return false;
+                }
+                let Some(close) = matching_brace(tokens, open) else {
+                    output.truncate(checkpoint);
+                    return false;
+                };
+                output.push(header_line);
+                expand_braced_body(
+                    source,
+                    &tokens[open + 1..close],
+                    deeper_indentation(indentation),
+                    candidate.kind,
+                    output,
+                );
+                cursor = close + 1;
+                found_brace = true;
+            }
+            None => {
+                if !push_definition_line(&tokens[cursor..], indentation, output) {
+                    output.truncate(checkpoint);
+                    return false;
+                }
+                cursor = tokens.len();
+            }
+        }
+    }
+    if !found_brace {
+        output.truncate(checkpoint);
+    }
+    found_brace
+}
+
+#[derive(Clone, Copy)]
+enum SequenceBoundary {
+    Semicolon(usize),
+    Brace(usize),
+}
+
+fn sequence_boundary(tokens: &[SpannedToken], start: usize) -> Option<SequenceBoundary> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        match token.kind {
+            TokenKind::Punctuation('(' | '[') => depth += 1,
+            TokenKind::Punctuation(')' | ']') => depth = depth.saturating_sub(1),
+            TokenKind::Punctuation(';') if depth == 0 => {
+                return Some(SequenceBoundary::Semicolon(index));
+            }
+            TokenKind::Punctuation('{') if depth == 0 => {
+                return Some(SequenceBoundary::Brace(index));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn push_definition_line(
+    tokens: &[SpannedToken],
+    indentation: Indentation,
+    output: &mut Vec<SourceLine>,
+) -> bool {
+    let Some(line) = line_from_tokens(tokens, indentation) else {
+        return true;
+    };
+    if classify_line(&line).is_none() {
+        return false;
+    }
+    output.push(line);
+    true
+}
+
+fn expand_braced_body(
+    source: &str,
+    tokens: &[SpannedToken],
+    indentation: Indentation,
+    owner_kind: DefinitionKind,
+    output: &mut Vec<SourceLine>,
+) {
+    for segment in split_braced_body(source, tokens) {
+        if owner_kind == DefinitionKind::Type
+            && expand_braced_definition_sequence(source, segment, indentation, output)
+        {
+            continue;
+        }
+        if let Some(line) = line_from_tokens(segment, indentation) {
+            output.push(line);
+        }
+    }
+}
+
+fn split_braced_body<'tokens>(
+    source: &str,
+    tokens: &'tokens [SpannedToken],
+) -> Vec<&'tokens [SpannedToken]> {
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    for index in 0..tokens.len() {
+        if index > start
+            && depth == 0
+            && source[tokens[index - 1].span.end..tokens[index].span.start].contains(['\r', '\n'])
+        {
+            push_token_segment(&mut segments, &tokens[start..index]);
+            start = index;
+        }
+        match tokens[index].kind {
+            TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+            TokenKind::Punctuation(')' | ']' | '}') => depth = depth.saturating_sub(1),
+            TokenKind::Punctuation(';') if depth == 0 => {
+                push_token_segment(&mut segments, &tokens[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    push_token_segment(&mut segments, &tokens[start..]);
+    segments
+}
+
+fn push_token_segment<'tokens>(
+    segments: &mut Vec<&'tokens [SpannedToken]>,
+    segment: &'tokens [SpannedToken],
+) {
+    if !segment.is_empty() {
+        segments.push(segment);
+    }
+}
+
+fn matching_brace(tokens: &[SpannedToken], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(open) {
+        match token.kind {
+            TokenKind::Punctuation('{') => depth += 1,
+            TokenKind::Punctuation('}') => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn line_from_tokens(tokens: &[SpannedToken], indentation: Indentation) -> Option<SourceLine> {
+    let first = tokens.first()?;
+    let last = tokens.last()?;
+    Some(SourceLine {
+        indentation,
+        span: SourceSpan::new(first.span.start, last.span.end),
+        tokens: tokens.to_vec(),
+    })
+}
+
+const fn deeper_indentation(indentation: Indentation) -> Indentation {
+    Indentation {
+        tabs: indentation.tabs.saturating_add(1),
+        spaces: indentation.spaces,
+    }
 }
 
 fn build_logical_lines(tokens: Vec<SpannedToken>) -> Result<Vec<SourceLine>, SyntaxError> {

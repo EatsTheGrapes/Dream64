@@ -10,6 +10,7 @@ members = [
 	"crates/dm-map",
 	"crates/dm-object-tree",
 	"crates/dm-project",
+	"crates/dm-runtime",
 	"crates/dm-semantics",
 	"crates/dm-syntax",
 	"crates/dm-value",

@@ -53,6 +53,43 @@ impl fmt::Display for TypePath {
     }
 }
 
+/// A canonical case-sensitive DM field identifier.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FieldName(Arc<str>);
+
+impl FieldName {
+    /// Validates and stores one DM identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValueError::InvalidFieldName`] when `name` is empty, starts
+    /// with a non-identifier character, or contains non-identifier bytes.
+    pub fn parse(name: &str) -> Result<Self, ValueError> {
+        let mut bytes = name.bytes();
+        let Some(first) = bytes.next() else {
+            return Err(ValueError::InvalidFieldName(name.to_owned()));
+        };
+        if !(first.is_ascii_alphabetic() || first == b'_')
+            || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(ValueError::InvalidFieldName(name.to_owned()));
+        }
+        Ok(Self(Arc::from(name)))
+    }
+
+    /// Returns the canonical identifier spelling.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for FieldName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 macro_rules! handle_type {
     ($name:ident, $description:literal) => {
         #[doc = $description]
@@ -161,11 +198,126 @@ impl fmt::Display for Value {
     }
 }
 
+/// One deterministic layer of type-level field defaults.
+///
+/// A frontend may resolve inheritance into an ancestor-to-descendant sequence
+/// of these path-keyed layers without exposing compiler-specific node IDs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DatumDefaults {
+    type_path: TypePath,
+    fields: Vec<(FieldName, Value)>,
+}
+
+impl DatumDefaults {
+    /// Creates an empty default layer declared by `type_path`.
+    #[must_use]
+    pub const fn new(type_path: TypePath) -> Self {
+        Self {
+            type_path,
+            fields: Vec::new(),
+        }
+    }
+
+    /// Returns the type that declared this layer.
+    #[must_use]
+    pub const fn type_path(&self) -> &TypePath {
+        &self.type_path
+    }
+
+    /// Inserts or updates a default while retaining first-declaration order.
+    pub fn set(&mut self, name: FieldName, value: Value) -> Option<Value> {
+        set_named_field(&mut self.fields, name, value)
+    }
+
+    /// Iterates defaults in deterministic declaration order.
+    #[must_use]
+    pub fn fields(&self) -> impl ExactSizeIterator<Item = (&FieldName, &Value)> {
+        self.fields.iter().map(|(name, value)| (name, value))
+    }
+}
+
 /// One datum record retained by the heap.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Datum {
-    /// Runtime type of this datum.
-    pub type_path: TypePath,
+    type_path: TypePath,
+    fields: Vec<(FieldName, Value)>,
+}
+
+impl Datum {
+    /// Returns the datum's canonical runtime type identity.
+    #[must_use]
+    pub const fn type_path(&self) -> &TypePath {
+        &self.type_path
+    }
+
+    /// Returns the number of materialized named fields.
+    #[must_use]
+    pub fn field_len(&self) -> usize {
+        self.fields.len()
+    }
+
+    /// Returns whether no named fields are materialized.
+    #[must_use]
+    pub fn fields_are_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+
+    /// Reads a named field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValueError::MissingField`] when `name` is not materialized.
+    pub fn field(&self, name: &FieldName) -> Result<&Value, ValueError> {
+        self.fields
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, value)| value)
+            .ok_or_else(|| ValueError::MissingField(name.clone()))
+    }
+
+    /// Inserts or updates a field while retaining first-insertion order.
+    pub fn set_field(&mut self, name: FieldName, value: Value) -> Option<Value> {
+        set_named_field(&mut self.fields, name, value)
+    }
+
+    /// Deletes a materialized field and returns its value when present.
+    pub fn delete_field(&mut self, name: &FieldName) -> Option<Value> {
+        let index = self
+            .fields
+            .iter()
+            .position(|(candidate, _)| candidate == name)?;
+        Some(self.fields.remove(index).1)
+    }
+
+    /// Applies one resolved type-default layer.
+    ///
+    /// Existing fields are updated in place and new fields append in layer
+    /// order. Applying ancestor layers before descendants therefore preserves
+    /// stable declaration order while allowing child overrides. Values are
+    /// cloned shallowly, retaining heap-handle alias identity.
+    pub fn apply_defaults(&mut self, defaults: &DatumDefaults) {
+        for (name, value) in &defaults.fields {
+            self.set_field(name.clone(), value.clone());
+        }
+    }
+
+    /// Iterates materialized fields in stable first-declaration order.
+    #[must_use]
+    pub fn fields(&self) -> impl ExactSizeIterator<Item = (&FieldName, &Value)> {
+        self.fields.iter().map(|(name, value)| (name, value))
+    }
+}
+
+fn set_named_field(
+    fields: &mut Vec<(FieldName, Value)>,
+    name: FieldName,
+    value: Value,
+) -> Option<Value> {
+    if let Some((_, current)) = fields.iter_mut().find(|(candidate, _)| candidate == &name) {
+        return Some(std::mem::replace(current, value));
+    }
+    fields.push((name, value));
+    None
 }
 
 /// Ordered mutable list data.
@@ -354,6 +506,10 @@ impl DmList {
 pub enum ValueError {
     /// A type path was not a valid canonical absolute path.
     InvalidTypePath(String),
+    /// A field name was not a canonical DM identifier.
+    InvalidFieldName(String),
+    /// A requested datum field is not materialized.
+    MissingField(FieldName),
     /// Positional index zero was used where DM indices begin at one.
     IndexZero,
     /// Positional index was beyond the current list length.
@@ -384,6 +540,8 @@ impl fmt::Display for ValueError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidTypePath(path) => write!(formatter, "invalid absolute type path {path:?}"),
+            Self::InvalidFieldName(name) => write!(formatter, "invalid DM field name {name:?}"),
+            Self::MissingField(name) => write!(formatter, "datum field {name:?} is absent"),
             Self::IndexZero => {
                 formatter.write_str("DM list position 0 is invalid; indices begin at 1")
             }
@@ -476,6 +634,13 @@ impl<T> Arena<T> {
         }
         Some(value)
     }
+
+    fn iter(&self) -> impl Iterator<Item = (u32, u32, &T)> {
+        self.slots.iter().enumerate().filter_map(|(index, slot)| {
+            let index = u32::try_from(index).ok()?;
+            Some((index, slot.generation, slot.value.as_ref()?))
+        })
+    }
 }
 
 /// Owner of all mutable datum and list identities.
@@ -546,7 +711,32 @@ impl ValueHeap {
 
     /// Allocates a datum with its runtime type.
     pub fn allocate_datum(&mut self, type_path: TypePath) -> DatumId {
-        let (index, generation) = self.datums.insert(Datum { type_path });
+        let (index, generation) = self.datums.insert(Datum {
+            type_path,
+            fields: Vec::new(),
+        });
+        DatumId { index, generation }
+    }
+
+    /// Allocates a datum after applying resolved default layers in order.
+    ///
+    /// The caller owns inheritance resolution and should pass layers from the
+    /// oldest ancestor through the concrete type. Layer paths are retained for
+    /// diagnostics by their owners but are intentionally not coupled to a
+    /// compiler object-tree identity. Default values are cloned shallowly.
+    pub fn allocate_datum_with_defaults(
+        &mut self,
+        type_path: TypePath,
+        defaults: &[DatumDefaults],
+    ) -> DatumId {
+        let mut datum = Datum {
+            type_path,
+            fields: Vec::new(),
+        };
+        for layer in defaults {
+            datum.apply_defaults(layer);
+        }
+        let (index, generation) = self.datums.insert(datum);
         DatumId { index, generation }
     }
 
@@ -559,6 +749,65 @@ impl ValueHeap {
         self.datums
             .get(id.index, id.generation)
             .ok_or(ValueError::StaleDatum(id))
+    }
+
+    /// Returns a live mutable datum.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValueError::StaleDatum`] for stale or unknown identities.
+    pub fn datum_mut(&mut self, id: DatumId) -> Result<&mut Datum, ValueError> {
+        self.datums
+            .get_mut(id.index, id.generation)
+            .ok_or(ValueError::StaleDatum(id))
+    }
+
+    /// Reads a field from a live datum.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValueError::StaleDatum`] for a stale identity or
+    /// [`ValueError::MissingField`] for an absent field.
+    pub fn datum_field(&self, id: DatumId, name: &FieldName) -> Result<&Value, ValueError> {
+        self.datum(id)?.field(name)
+    }
+
+    /// Inserts or updates a field on a live datum.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValueError::StaleDatum`] for a stale identity.
+    pub fn set_datum_field(
+        &mut self,
+        id: DatumId,
+        name: FieldName,
+        value: Value,
+    ) -> Result<Option<Value>, ValueError> {
+        Ok(self.datum_mut(id)?.set_field(name, value))
+    }
+
+    /// Deletes a field from a live datum.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValueError::StaleDatum`] for a stale identity. A live datum
+    /// with no such field returns `Ok(None)`.
+    pub fn delete_datum_field(
+        &mut self,
+        id: DatumId,
+        name: &FieldName,
+    ) -> Result<Option<Value>, ValueError> {
+        Ok(self.datum_mut(id)?.delete_field(name))
+    }
+
+    /// Iterates live datums in stable arena-slot order for snapshots.
+    ///
+    /// Deletions leave holes and slot reuse receives a new generation, so a
+    /// snapshot consumer must retain the complete [`DatumId`].
+    pub fn datums(&self) -> impl Iterator<Item = (DatumId, &Datum)> {
+        self.datums
+            .iter()
+            .map(|(index, generation, datum)| (DatumId { index, generation }, datum))
     }
 
     /// Deallocates a datum and invalidates every alias to its identity.
@@ -601,6 +850,10 @@ mod tests {
         Value::text(value)
     }
 
+    fn field(value: &str) -> FieldName {
+        FieldName::parse(value).unwrap()
+    }
+
     #[test]
     fn type_paths_are_canonical_and_validated() {
         let path = TypePath::parse("/obj/item/tool").unwrap();
@@ -613,6 +866,147 @@ mod tests {
                 Err(ValueError::InvalidTypePath(invalid.to_owned()))
             );
         }
+    }
+
+    #[test]
+    fn field_names_are_canonical_identifiers() {
+        for valid in ["name", "icon_state", "_private", "field2"] {
+            let name = FieldName::parse(valid).unwrap();
+            assert_eq!(name.as_str(), valid);
+            assert_eq!(name.to_string(), valid);
+        }
+        for invalid in ["", "2field", "field-name", "field/name", "naïve"] {
+            assert_eq!(
+                FieldName::parse(invalid),
+                Err(ValueError::InvalidFieldName(invalid.to_owned()))
+            );
+        }
+    }
+
+    #[test]
+    fn datum_fields_support_ordered_get_set_and_delete() {
+        let mut heap = ValueHeap::new();
+        let datum = heap.allocate_datum(TypePath::parse("/datum/example").unwrap());
+        let name = field("name");
+        let count = field("count");
+
+        assert!(
+            heap.set_datum_field(datum, name.clone(), text("first"))
+                .unwrap()
+                .is_none()
+        );
+        heap.set_datum_field(datum, count.clone(), Value::number(2.0))
+            .unwrap();
+        let old = heap
+            .set_datum_field(datum, name.clone(), text("updated"))
+            .unwrap()
+            .unwrap();
+        assert!(old.semantic_eq(&text("first")));
+        assert!(
+            heap.datum_field(datum, &name)
+                .unwrap()
+                .semantic_eq(&text("updated"))
+        );
+        let names: Vec<&str> = heap
+            .datum(datum)
+            .unwrap()
+            .fields()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(names, ["name", "count"]);
+
+        assert!(
+            heap.delete_datum_field(datum, &name)
+                .unwrap()
+                .unwrap()
+                .semantic_eq(&text("updated"))
+        );
+        assert_eq!(
+            heap.datum_field(datum, &name),
+            Err(ValueError::MissingField(name))
+        );
+        assert_eq!(heap.datum(datum).unwrap().field_len(), 1);
+    }
+
+    #[test]
+    fn resolved_default_layers_apply_parent_first_with_stable_order() {
+        let mut parent = DatumDefaults::new(TypePath::parse("/datum").unwrap());
+        parent.set(field("name"), text("parent"));
+        parent.set(field("health"), Value::number(10.0));
+        let mut child = DatumDefaults::new(TypePath::parse("/datum/child").unwrap());
+        child.set(field("name"), text("child"));
+        child.set(field("speed"), Value::number(2.0));
+
+        let mut heap = ValueHeap::new();
+        let runtime_type = TypePath::parse("/datum/child/grandchild").unwrap();
+        let datum = heap
+            .allocate_datum_with_defaults(runtime_type.clone(), &[parent.clone(), child.clone()]);
+        let record = heap.datum(datum).unwrap();
+        assert_eq!(record.type_path(), &runtime_type);
+        assert_eq!(parent.type_path().as_str(), "/datum");
+        assert_eq!(child.type_path().as_str(), "/datum/child");
+        assert!(
+            record
+                .field(&field("name"))
+                .unwrap()
+                .semantic_eq(&text("child"))
+        );
+        let names: Vec<&str> = record.fields().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["name", "health", "speed"]);
+    }
+
+    #[test]
+    fn datum_aliases_share_fields_and_stale_aliases_never_resolve() {
+        let mut heap = ValueHeap::new();
+        let datum = heap.allocate_datum(TypePath::parse("/datum/example").unwrap());
+        let alias = datum;
+        heap.set_datum_field(alias, field("value"), Value::number(8.0))
+            .unwrap();
+        assert!(
+            heap.datum_field(datum, &field("value"))
+                .unwrap()
+                .semantic_eq(&Value::number(8.0))
+        );
+
+        heap.destroy_datum(datum).unwrap();
+        let replacement = heap.allocate_datum(TypePath::parse("/datum/replacement").unwrap());
+        assert_eq!(alias.index(), replacement.index());
+        assert_ne!(alias.generation(), replacement.generation());
+        assert_eq!(
+            heap.set_datum_field(alias, field("value"), Value::Null),
+            Err(ValueError::StaleDatum(alias))
+        );
+    }
+
+    #[test]
+    fn default_values_clone_handles_and_heap_iteration_is_snapshot_stable() {
+        let mut heap = ValueHeap::new();
+        let shared_list = heap.allocate_list();
+        let mut defaults = DatumDefaults::new(TypePath::parse("/datum").unwrap());
+        defaults.set(field("contents"), Value::List(shared_list));
+        let first = heap.allocate_datum_with_defaults(
+            TypePath::parse("/datum/first").unwrap(),
+            std::slice::from_ref(&defaults),
+        );
+        let second = heap.allocate_datum_with_defaults(
+            TypePath::parse("/datum/second").unwrap(),
+            std::slice::from_ref(&defaults),
+        );
+        assert!(
+            heap.datum_field(first, &field("contents"))
+                .unwrap()
+                .semantic_eq(heap.datum_field(second, &field("contents")).unwrap())
+        );
+
+        heap.destroy_datum(first).unwrap();
+        let replacement = heap.allocate_datum(TypePath::parse("/datum/replacement").unwrap());
+        let snapshot: Vec<(DatumId, &str)> = heap
+            .datums()
+            .map(|(id, datum)| (id, datum.type_path().as_str()))
+            .collect();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0], (replacement, "/datum/replacement"));
+        assert_eq!(snapshot[1], (second, "/datum/second"));
     }
 
     #[test]
@@ -743,7 +1137,7 @@ mod tests {
 
         let path = TypePath::parse("/datum/test").unwrap();
         let old_datum = heap.allocate_datum(path.clone());
-        assert_eq!(heap.datum(old_datum).unwrap().type_path, path);
+        assert_eq!(heap.datum(old_datum).unwrap().type_path(), &path);
         heap.destroy_datum(old_datum).unwrap();
         let new_datum = heap.allocate_datum(TypePath::parse("/datum/new").unwrap());
         assert_eq!(old_datum.index(), new_datum.index());

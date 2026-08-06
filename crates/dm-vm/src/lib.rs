@@ -2,14 +2,14 @@
 
 #![cfg_attr(not(test), deny(missing_docs))]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use dm_core::{DmNumberBits, SourceSpan};
 use dm_lexer::{SpannedToken, TokenKind};
 use dm_syntax::{Definition, DefinitionKind, SourceLine};
 pub use dm_value::Value;
-use dm_value::{ListId, ValueError, ValueHeap};
+use dm_value::{DatumId, FieldName, ListId, ValueError, ValueHeap};
 
 /// One instruction in the portable reference bytecode.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +36,20 @@ pub enum Instruction {
     LoadLocal(u16),
     /// Pops into a local slot.
     StoreLocal(u16),
+    /// Pushes the current frame's `src` value.
+    LoadSrc,
+    /// Pushes the current frame's `usr` value.
+    LoadUsr,
+    /// Pops a datum receiver and pushes one named field.
+    LoadField(FieldName),
+    /// Pops a value and datum receiver, then writes one named field.
+    StoreField(FieldName),
+    /// Pushes one persistent runtime global.
+    LoadGlobal(FieldName),
+    /// Pops and stores one persistent runtime global.
+    StoreGlobal(FieldName),
+    /// Clones the top stack value.
+    Duplicate,
     /// Pushes the current procedure's special `.` return value.
     LoadResult,
     /// Pops into the current procedure's special `.` return value.
@@ -521,6 +535,13 @@ fn validate_parameter_default(expression: &Expression) -> Result<(), CompileErro
         Expression::Local(name) => Err(compile_error(format!(
             "parameter default reference {name:?} requires BYOND conformance confirmation"
         ))),
+        Expression::Src
+        | Expression::Usr
+        | Expression::GlobalNamespace
+        | Expression::Field { .. }
+        | Expression::GlobalField(_) => Err(compile_error(
+            "runtime object access is not supported in parameter defaults",
+        )),
         Expression::Result => Err(compile_error(
             "special return value '.' is not supported in parameter defaults",
         )),
@@ -703,13 +724,18 @@ fn compile_block(
     Ok((line_index, falls_through))
 }
 
-fn top_level_assignment(tokens: &[SpannedToken]) -> Option<usize> {
+fn top_level_assignment(tokens: &[SpannedToken]) -> Option<(usize, &str)> {
     let mut depth = 0_usize;
     for (index, token) in tokens.iter().enumerate() {
         match &token.kind {
             TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
             TokenKind::Punctuation(')' | ']' | '}') => depth = depth.saturating_sub(1),
-            TokenKind::Operator(operator) if operator == "=" && depth == 0 => return Some(index),
+            TokenKind::Operator(operator)
+                if matches!(operator.as_str(), "=" | "+=" | "-=" | "*=" | "/=" | "%=")
+                    && depth == 0 =>
+            {
+                return Some((index, operator));
+            }
             _ => {}
         }
     }
@@ -722,7 +748,7 @@ fn compile_assignment_statement(
     instructions: &mut Vec<Instruction>,
     procedures: &HashMap<String, ProcedureId>,
 ) -> Result<(), CompileError> {
-    let assignment = top_level_assignment(tokens)
+    let (assignment, operator) = top_level_assignment(tokens)
         .ok_or_else(|| compile_error("assignment statement requires '='"))?;
     if assignment == 0 || assignment + 1 == tokens.len() {
         return Err(compile_error("assignment requires a target and value"));
@@ -733,18 +759,66 @@ fn compile_assignment_statement(
             let slot = locals
                 .get(&name)
                 .ok_or_else(|| compile_error(format!("unknown local {name:?}")))?;
+            if operator != "=" {
+                instructions.push(Instruction::LoadLocal(slot));
+            }
             compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
+            if operator != "=" {
+                instructions.push(compound_instruction(operator)?);
+            }
             instructions.push(Instruction::StoreLocal(slot));
         }
         Expression::Index { list, index } => {
+            if operator != "=" {
+                return Err(compile_error(
+                    "compound list-index assignment is not implemented",
+                ));
+            }
             emit_expression(&list, locals, instructions, procedures)?;
             emit_expression(&index, locals, instructions, procedures)?;
             compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
             instructions.push(Instruction::SetListIndex);
         }
+        Expression::Field { receiver, name } => {
+            emit_expression(&receiver, locals, instructions, procedures)?;
+            if operator != "=" {
+                instructions.push(Instruction::Duplicate);
+                instructions.push(Instruction::LoadField(name.clone()));
+            }
+            compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
+            if operator != "=" {
+                instructions.push(compound_instruction(operator)?);
+            }
+            instructions.push(Instruction::StoreField(name));
+        }
+        Expression::GlobalField(name) => {
+            if operator != "=" {
+                instructions.push(Instruction::LoadGlobal(name.clone()));
+            }
+            compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
+            if operator != "=" {
+                instructions.push(compound_instruction(operator)?);
+            }
+            instructions.push(Instruction::StoreGlobal(name));
+        }
         _ => return Err(compile_error("assignment target is not writable")),
     }
     Ok(())
+}
+
+fn compound_instruction(operator: &str) -> Result<Instruction, CompileError> {
+    Ok(match operator {
+        "+=" => Instruction::Add,
+        "-=" => Instruction::Subtract,
+        "*=" => Instruction::Multiply,
+        "/=" => Instruction::Divide,
+        "%=" => Instruction::Remainder,
+        _ => {
+            return Err(compile_error(format!(
+                "unsupported compound operator {operator:?}"
+            )));
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1457,6 +1531,14 @@ enum Expression {
     Number(DmNumberBits),
     Text(String),
     Local(String),
+    Src,
+    Usr,
+    GlobalNamespace,
+    Field {
+        receiver: Box<Self>,
+        name: FieldName,
+    },
+    GlobalField(FieldName),
     Result,
     Call {
         procedure: String,
@@ -1542,23 +1624,47 @@ impl<'a> ExpressionParser<'a> {
             });
         }
         let mut expression = self.parse_primary()?;
-        while matches!(
-            self.tokens.get(self.index).map(|token| &token.kind),
-            Some(TokenKind::Punctuation('['))
-        ) {
-            self.index += 1;
-            let index = self.parse_binary(1)?;
-            if !matches!(
+        loop {
+            if matches!(
                 self.tokens.get(self.index).map(|token| &token.kind),
-                Some(TokenKind::Punctuation(']'))
+                Some(TokenKind::Punctuation('['))
             ) {
-                return Err(compile_error("expected ']' after list index"));
+                self.index += 1;
+                let index = self.parse_binary(1)?;
+                if !matches!(
+                    self.tokens.get(self.index).map(|token| &token.kind),
+                    Some(TokenKind::Punctuation(']'))
+                ) {
+                    return Err(compile_error("expected ']' after list index"));
+                }
+                self.index += 1;
+                expression = Expression::Index {
+                    list: Box::new(expression),
+                    index: Box::new(index),
+                };
+                continue;
             }
-            self.index += 1;
-            expression = Expression::Index {
-                list: Box::new(expression),
-                index: Box::new(index),
-            };
+            if matches!(self.current_operator(), Some(".")) {
+                self.index += 1;
+                let Some(TokenKind::Identifier(name)) =
+                    self.tokens.get(self.index).map(|token| &token.kind)
+                else {
+                    return Err(compile_error("expected a field name after '.'"));
+                };
+                let name =
+                    FieldName::parse(name).map_err(|error| compile_error(error.to_string()))?;
+                self.index += 1;
+                expression = if matches!(expression, Expression::GlobalNamespace) {
+                    Expression::GlobalField(name)
+                } else {
+                    Expression::Field {
+                        receiver: Box::new(expression),
+                        name,
+                    }
+                };
+                continue;
+            }
+            break;
         }
         Ok(expression)
     }
@@ -1613,6 +1719,11 @@ impl<'a> ExpressionParser<'a> {
             }
             TokenKind::Identifier(identifier) if identifier == "FALSE" => {
                 Ok(Expression::Number(DmNumberBits::from_f32(0.0)))
+            }
+            TokenKind::Identifier(identifier) if identifier == "src" => Ok(Expression::Src),
+            TokenKind::Identifier(identifier) if identifier == "usr" => Ok(Expression::Usr),
+            TokenKind::Identifier(identifier) if identifier == "global" => {
+                Ok(Expression::GlobalNamespace)
             }
             TokenKind::Identifier(identifier)
                 if matches!(
@@ -1771,6 +1882,18 @@ fn emit_expression(
                 .ok_or_else(|| compile_error(format!("unknown local {name:?}")))?;
             instructions.push(Instruction::LoadLocal(slot));
         }
+        Expression::Src => instructions.push(Instruction::LoadSrc),
+        Expression::Usr => instructions.push(Instruction::LoadUsr),
+        Expression::GlobalNamespace => {
+            return Err(compile_error("global namespace requires a field name"));
+        }
+        Expression::Field { receiver, name } => {
+            emit_expression(receiver, locals, instructions, procedures)?;
+            instructions.push(Instruction::LoadField(name.clone()));
+        }
+        Expression::GlobalField(name) => {
+            instructions.push(Instruction::LoadGlobal(name.clone()));
+        }
         Expression::Result => instructions.push(Instruction::LoadResult),
         Expression::Call {
             procedure,
@@ -1917,6 +2040,7 @@ impl Default for ExecutionLimits {
 #[derive(Default)]
 pub struct ExecutionState {
     heap: ValueHeap,
+    globals: BTreeMap<FieldName, Value>,
 }
 
 impl ExecutionState {
@@ -1937,6 +2061,63 @@ impl ExecutionState {
     pub const fn heap_mut(&mut self) -> &mut ValueHeap {
         &mut self.heap
     }
+
+    /// Reads a persistent runtime global.
+    #[must_use]
+    pub fn global(&self, name: &FieldName) -> Option<&Value> {
+        self.globals.get(name)
+    }
+
+    /// Inserts or replaces a persistent runtime global.
+    pub fn set_global(&mut self, name: FieldName, value: Value) -> Option<Value> {
+        self.globals.insert(name, value)
+    }
+
+    /// Deletes a persistent runtime global.
+    pub fn delete_global(&mut self, name: &FieldName) -> Option<Value> {
+        self.globals.remove(name)
+    }
+
+    /// Iterates globals in canonical field-name order for snapshots.
+    pub fn globals(&self) -> impl Iterator<Item = (&FieldName, &Value)> {
+        self.globals.iter()
+    }
+}
+
+/// Entry-frame object context retained across a procedure call chain.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecutionContext {
+    src: Value,
+    usr: Value,
+}
+
+impl ExecutionContext {
+    /// Creates a context with explicit `src` and `usr` values.
+    #[must_use]
+    pub const fn new(src: Value, usr: Value) -> Self {
+        Self { src, usr }
+    }
+
+    /// Returns the current source object.
+    #[must_use]
+    pub const fn src(&self) -> &Value {
+        &self.src
+    }
+
+    /// Returns the current user object.
+    #[must_use]
+    pub const fn usr(&self) -> &Value {
+        &self.usr
+    }
+}
+
+impl Default for ExecutionContext {
+    fn default() -> Self {
+        Self {
+            src: Value::Null,
+            usr: Value::Null,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1946,6 +2127,8 @@ struct CallFrame {
     locals: Vec<Value>,
     stack: Vec<Value>,
     result: Value,
+    src: Value,
+    usr: Value,
     // Retain all supplied values for the future DM `args` list, including
     // extras beyond the declared parameter slots.
     arguments: Vec<Value>,
@@ -1975,6 +2158,33 @@ pub fn execute_in_state(
     state: &mut ExecutionState,
 ) -> Result<Value, RuntimeError> {
     execute_with_limits_in_state(program, arguments, ExecutionLimits::default(), state)
+}
+
+/// Executes one standalone program with persistent state and object context.
+///
+/// # Errors
+///
+/// Returns [`RuntimeError`] for invalid bytecode or value operations.
+pub fn execute_in_context(
+    program: &Program,
+    arguments: &[Value],
+    state: &mut ExecutionState,
+    context: &ExecutionContext,
+) -> Result<Value, RuntimeError> {
+    let entry = ProcedureId(0);
+    let module = Module {
+        procedures: vec![program.clone()],
+        paths: vec!["<standalone>".to_owned()],
+        names: HashMap::new(),
+    };
+    execute_module_with_limits_in_context(
+        &module,
+        entry,
+        arguments,
+        ExecutionLimits::default(),
+        state,
+        context,
+    )
 }
 
 /// Executes one standalone program with explicit deterministic safety limits.
@@ -2045,6 +2255,28 @@ pub fn execute_module_in_state(
     execute_module_with_limits_in_state(module, entry, arguments, ExecutionLimits::default(), state)
 }
 
+/// Executes a module procedure with persistent state and object context.
+///
+/// # Errors
+///
+/// Returns [`RuntimeError`] for invalid bytecode or value operations.
+pub fn execute_module_in_context(
+    module: &Module,
+    entry: ProcedureId,
+    arguments: &[Value],
+    state: &mut ExecutionState,
+    context: &ExecutionContext,
+) -> Result<Value, RuntimeError> {
+    execute_module_with_limits_in_context(
+        module,
+        entry,
+        arguments,
+        ExecutionLimits::default(),
+        state,
+        context,
+    )
+}
+
 /// Executes a module procedure with explicit deterministic safety limits.
 ///
 /// # Errors
@@ -2073,6 +2305,33 @@ pub fn execute_module_with_limits_in_state(
     limits: ExecutionLimits,
     state: &mut ExecutionState,
 ) -> Result<Value, RuntimeError> {
+    execute_module_with_limits_in_context(
+        module,
+        entry,
+        arguments,
+        limits,
+        state,
+        &ExecutionContext::default(),
+    )
+}
+
+/// Executes a module procedure with persistent state, context, and limits.
+///
+/// Current, parent, and resolved procedure calls inherit both `src` and `usr`
+/// unchanged from their caller frame.
+///
+/// # Errors
+///
+/// Returns [`RuntimeError`] for invalid bytecode, value operations, stale
+/// handles, missing fields/globals, or safety-limit exhaustion.
+pub fn execute_module_with_limits_in_context(
+    module: &Module,
+    entry: ProcedureId,
+    arguments: &[Value],
+    limits: ExecutionLimits,
+    state: &mut ExecutionState,
+    context: &ExecutionContext,
+) -> Result<Value, RuntimeError> {
     let Some(program) = module.procedure(entry) else {
         return Err(RuntimeError {
             message: format!("invalid entry procedure {}", entry.index()),
@@ -2090,7 +2349,7 @@ pub fn execute_module_with_limits_in_state(
         });
     }
 
-    let frames = vec![make_frame(entry, program, arguments)];
+    let frames = vec![make_frame(entry, program, arguments, context)];
     run_frames(module, frames, limits, state)
 }
 
@@ -2267,6 +2526,71 @@ fn run_frames(
                     )
                 })?;
                 frames[frame_index].stack.push(Value::number(length));
+            }
+            Instruction::LoadSrc => {
+                let src = frames[frame_index].src.clone();
+                frames[frame_index].stack.push(src);
+            }
+            Instruction::LoadUsr => {
+                let usr = frames[frame_index].usr.clone();
+                frames[frame_index].stack.push(usr);
+            }
+            Instruction::LoadField(name) => {
+                let receiver = match pop(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let datum = match datum_receiver(&receiver, "field read") {
+                    Ok(datum) => datum,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let value = match state.heap.datum_field(datum, &name) {
+                    Ok(value) => value.clone(),
+                    Err(error) => {
+                        return Err(execution_error(module, &frames, error.to_string()));
+                    }
+                };
+                frames[frame_index].stack.push(value);
+            }
+            Instruction::StoreField(name) => {
+                let value = match pop(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let receiver = match pop(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let datum = match datum_receiver(&receiver, "field write") {
+                    Ok(datum) => datum,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                if let Err(error) = state.heap.set_datum_field(datum, name, value) {
+                    return Err(execution_error(module, &frames, error.to_string()));
+                }
+            }
+            Instruction::LoadGlobal(name) => {
+                let Some(value) = state.global(&name).cloned() else {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        format!("runtime global {name:?} is absent"),
+                    ));
+                };
+                frames[frame_index].stack.push(value);
+            }
+            Instruction::StoreGlobal(name) => {
+                let value = match pop(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                state.set_global(name, value);
+            }
+            Instruction::Duplicate => {
+                let Some(value) = frames[frame_index].stack.last().cloned() else {
+                    return Err(execution_error(module, &frames, "bytecode stack underflow"));
+                };
+                frames[frame_index].stack.push(value);
             }
             Instruction::LoadLocal(slot) => {
                 let Some(value) = frames[frame_index].locals.get(usize::from(slot)).cloned() else {
@@ -2445,7 +2769,8 @@ fn run_frames(
                         format!("invalid call target {}", target.index()),
                     ));
                 };
-                frames.push(make_frame(target, target_program, &arguments));
+                let context = frame_context(&frames[frame_index]);
+                frames.push(make_frame(target, target_program, &arguments, &context));
                 continue;
             }
             Instruction::CallCurrent { argument_count } => {
@@ -2466,7 +2791,8 @@ fn run_frames(
                 } else {
                     frames[frame_index].arguments.clone()
                 };
-                frames.push(make_frame(procedure, program, &arguments));
+                let context = frame_context(&frames[frame_index]);
+                frames.push(make_frame(procedure, program, &arguments, &context));
                 continue;
             }
             Instruction::CallParent {
@@ -2504,7 +2830,8 @@ fn run_frames(
                         format!("invalid parent call target {}", target.index()),
                     ));
                 };
-                frames.push(make_frame(target, target_program, &arguments));
+                let context = frame_context(&frames[frame_index]);
+                frames.push(make_frame(target, target_program, &arguments, &context));
                 continue;
             }
             Instruction::Return => {
@@ -2525,7 +2852,12 @@ fn run_frames(
     }
 }
 
-fn make_frame(procedure: ProcedureId, program: &Program, arguments: &[Value]) -> CallFrame {
+fn make_frame(
+    procedure: ProcedureId,
+    program: &Program,
+    arguments: &[Value],
+    context: &ExecutionContext,
+) -> CallFrame {
     let mut locals = vec![Value::Null; program.local_count];
     let bound_count = arguments
         .len()
@@ -2538,8 +2870,14 @@ fn make_frame(procedure: ProcedureId, program: &Program, arguments: &[Value]) ->
         locals,
         stack: Vec::new(),
         result: Value::Null,
+        src: context.src.clone(),
+        usr: context.usr.clone(),
         arguments: arguments.to_vec(),
     }
+}
+
+fn frame_context(frame: &CallFrame) -> ExecutionContext {
+    ExecutionContext::new(frame.src.clone(), frame.usr.clone())
 }
 
 fn execution_error(
@@ -2609,6 +2947,14 @@ fn runtime_truthy(heap: &ValueHeap, value: &Value) -> Result<bool, String> {
     heap.truthy(value).map_err(|error| error.to_string())
 }
 
+fn datum_receiver(value: &Value, operation: &str) -> Result<DatumId, String> {
+    match value {
+        Value::Datum(datum) => Ok(*datum),
+        Value::Null => Err(format!("{operation} received null")),
+        _ => Err(format!("{operation} requires a datum, received {value}")),
+    }
+}
+
 fn read_list_value<'heap>(
     heap: &'heap ValueHeap,
     list: ListId,
@@ -2671,12 +3017,13 @@ fn pop_number(stack: &mut Vec<Value>) -> Result<f32, String> {
 mod tests {
     use dm_core::{DmNumberBits, SourceSpan};
     use dm_syntax::parse;
+    use dm_value::{FieldName, TypePath};
 
     use super::{
-        ExecutionLimits, ExecutionState, Instruction, ProcedureSpec, Program, Value,
-        compile_module, compile_module_specs, compile_procedure, execute, execute_in_state,
-        execute_module, execute_module_with_limits, execute_with_limits,
-        execute_with_limits_in_state,
+        ExecutionContext, ExecutionLimits, ExecutionState, Instruction, ProcedureSpec, Program,
+        Value, compile_module, compile_module_specs, compile_procedure, execute,
+        execute_in_context, execute_in_state, execute_module, execute_module_in_context,
+        execute_module_with_limits, execute_with_limits, execute_with_limits_in_state,
     };
 
     fn execute_source(source: &str, argument: f32) -> Value {
@@ -2695,6 +3042,184 @@ mod tests {
                 .map(|index| SourceSpan::new(index * 10, index * 10 + 1))
                 .collect(),
         }
+    }
+
+    fn field(name: &str) -> FieldName {
+        FieldName::parse(name).unwrap()
+    }
+
+    #[test]
+    fn explicit_src_and_usr_fields_support_compound_assignment() {
+        let source = "/proc/update()\n\tsrc.count += usr.increment\n\treturn src.count\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("fields should compile");
+        let mut state = ExecutionState::new();
+        let src = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/source").unwrap());
+        let usr = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/mob/user").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(src, field("count"), Value::number(3.0))
+            .unwrap();
+        state
+            .heap_mut()
+            .set_datum_field(usr, field("increment"), Value::number(2.0))
+            .unwrap();
+        let context = ExecutionContext::new(Value::Datum(src), Value::Datum(usr));
+
+        assert_eq!(
+            execute_in_context(&program, &[], &mut state, &context),
+            Ok(Value::number(5.0))
+        );
+        assert!(
+            state
+                .heap()
+                .datum_field(src, &field("count"))
+                .unwrap()
+                .semantic_eq(&Value::number(5.0))
+        );
+    }
+
+    #[test]
+    fn src_and_usr_aliases_observe_the_same_datum_write() {
+        let source = "/proc/alias()\n\tsrc.value = 7\n\treturn usr.value\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("fields should compile");
+        let mut state = ExecutionState::new();
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/shared").unwrap());
+        let context = ExecutionContext::new(Value::Datum(datum), Value::Datum(datum));
+
+        assert_eq!(
+            execute_in_context(&program, &[], &mut state, &context),
+            Ok(Value::number(7.0))
+        );
+    }
+
+    #[test]
+    fn globals_persist_across_executions_and_compound_updates() {
+        let set_source =
+            parse("/proc/set_global()\n\tglobal.counter = 4\n\treturn global.counter\n").unwrap();
+        let increment_source =
+            parse("/proc/increment_global()\n\tglobal.counter += 1\n\treturn global.counter\n")
+                .unwrap();
+        let setter = compile_procedure(&set_source.definitions[0]).unwrap();
+        let incrementer = compile_procedure(&increment_source.definitions[0]).unwrap();
+        let mut state = ExecutionState::new();
+
+        assert_eq!(
+            execute_in_state(&setter, &[], &mut state),
+            Ok(Value::number(4.0))
+        );
+        assert_eq!(
+            execute_in_state(&incrementer, &[], &mut state),
+            Ok(Value::number(5.0))
+        );
+        assert!(
+            state
+                .global(&field("counter"))
+                .unwrap()
+                .semantic_eq(&Value::number(5.0))
+        );
+        assert_eq!(state.globals().count(), 1);
+    }
+
+    #[test]
+    fn named_and_parent_calls_preserve_object_context() {
+        let source =
+            parse("/proc/main()\n\treturn helper()\n/proc/helper()\n\treturn usr.value\n").unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+        let entry = module.procedure_id("/proc/main").unwrap();
+        let mut state = ExecutionState::new();
+        let usr = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/mob/user").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(usr, field("value"), Value::number(6.0))
+            .unwrap();
+        let context = ExecutionContext::new(Value::Null, Value::Datum(usr));
+        assert_eq!(
+            execute_module_in_context(&module, entry, &[], &mut state, &context),
+            Ok(Value::number(6.0))
+        );
+
+        let parent_source =
+            parse("/proc/base()\n\treturn src.value\n/proc/child()\n\treturn ..()\n").unwrap();
+        let parent_module = compile_module_specs(&[
+            ProcedureSpec {
+                path: "/proc/base@0".to_owned(),
+                definition: &parent_source.definitions[0],
+                parent: None,
+            },
+            ProcedureSpec {
+                path: "/proc/child@1".to_owned(),
+                definition: &parent_source.definitions[1],
+                parent: Some(0),
+            },
+        ])
+        .unwrap();
+        let child = parent_module.procedure_id_at(1).unwrap();
+        let src = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/source").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(src, field("value"), Value::number(8.0))
+            .unwrap();
+        let context = ExecutionContext::new(Value::Datum(src), Value::Null);
+        assert_eq!(
+            execute_module_in_context(&parent_module, child, &[], &mut state, &context),
+            Ok(Value::number(8.0))
+        );
+
+        let current_source = parse(
+            "/proc/recurse(depth)\n\tif(depth <= 0)\n\t\treturn src.value\n\treturn .(depth - 1)\n",
+        )
+        .unwrap();
+        let current_program = compile_procedure(&current_source.definitions[0]).unwrap();
+        assert_eq!(
+            execute_in_context(
+                &current_program,
+                &[Value::number(2.0)],
+                &mut state,
+                &context,
+            ),
+            Ok(Value::number(8.0))
+        );
+    }
+
+    #[test]
+    fn field_errors_retain_source_mapping_for_null_missing_and_stale_receivers() {
+        let syntax = parse("/proc/read()\n\treturn src.missing\n").unwrap();
+        let span = syntax.definitions[0].body[0].span;
+        let program = compile_procedure(&syntax.definitions[0]).unwrap();
+        let mut state = ExecutionState::new();
+        let null_error =
+            execute_in_context(&program, &[], &mut state, &ExecutionContext::default())
+                .unwrap_err();
+        assert_eq!(null_error.message, "field read received null");
+        assert_eq!(null_error.source_span, Some(span));
+
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/source").unwrap());
+        let context = ExecutionContext::new(Value::Datum(datum), Value::Null);
+        let missing_error = execute_in_context(&program, &[], &mut state, &context).unwrap_err();
+        assert_eq!(
+            missing_error.message,
+            "datum field FieldName(\"missing\") is absent"
+        );
+        assert_eq!(missing_error.source_span, Some(span));
+
+        state.heap_mut().destroy_datum(datum).unwrap();
+        let stale_error = execute_in_context(&program, &[], &mut state, &context).unwrap_err();
+        assert_eq!(stale_error.message, format!("stale datum handle {datum:?}"));
+        assert_eq!(stale_error.source_span, Some(span));
     }
 
     #[test]

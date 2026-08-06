@@ -45,5 +45,24 @@ fn main() -> ExitCode {
     for (blocker, count) in blockers {
         println!("runtime_{blocker:?}={count}");
     }
+    for (shape, count) in registry.constant_value_counts() {
+        println!("constant_{shape:?}={count}");
+    }
+    let mut unsupported: Vec<_> = registry.unsupported_constant_counts().into_iter().collect();
+    unsupported.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    for (category, count) in unsupported {
+        println!("unsupported_{category:?}={count}");
+    }
+    let plans = registry.initialization_plans();
+    println!("plan_global_steps={}", plans.global_steps.len());
+    println!("plan_type_count={}", plans.type_defaults.len());
+    println!(
+        "plan_type_steps={}",
+        plans
+            .type_defaults
+            .iter()
+            .map(|plan| plan.steps.len())
+            .sum::<usize>()
+    );
     ExitCode::SUCCESS
 }

@@ -10,6 +10,13 @@ use dm_lexer::{SpannedToken, TokenKind};
 use dm_object_tree::NodeId;
 use dm_syntax::{Definition, DefinitionKind};
 
+mod constant;
+
+pub use constant::{
+    ConstantEvaluation, ConstantListEntry, ConstantValue, ConstantValueShape, UnsupportedCategory,
+    UnsupportedConstant, evaluate_constant,
+};
+
 /// Storage lifetime assigned to a variable node.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum StorageClass {
@@ -33,9 +40,7 @@ pub enum AssignmentKind {
 /// Conservative initialization classification.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum InitializerClass {
-    /// No initializer syntax was present.
-    None,
-    /// A single literal, `null`, or absolute type path can be retained directly.
+    /// The typed evaluator proved that no runtime state is read.
     ConstantSafe,
     /// Evaluation must occur in the runtime initializer phase.
     RequiresRuntime(RuntimeBlocker),
@@ -48,8 +53,6 @@ pub enum RuntimeBlocker {
     NewExpression,
     /// A procedure or built-in call is present.
     Call,
-    /// `list(...)` constructs mutable runtime state.
-    ListConstruction,
     /// An identifier may read another variable or constant.
     IdentifierReference,
     /// Multiple operators or values require expression evaluation.
@@ -78,6 +81,8 @@ pub struct InitializerSyntax {
     pub original_span: SourceSpan,
     /// Conservative execution classification.
     pub class: InitializerClass,
+    /// Typed constant value or the precise reason evaluation stopped.
+    pub evaluation: ConstantEvaluation,
     /// Identifier dependencies in stable first-use order.
     pub dependencies: Vec<InitializerDependency>,
 }
@@ -120,6 +125,43 @@ pub struct VariableEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VariableRegistry {
     entries: Vec<VariableEntry>,
+}
+
+/// One explicit initializer assignment in an execution plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitializationStep {
+    /// Index of the corresponding entry in [`VariableRegistry::entries`].
+    pub entry_index: usize,
+    /// Expanded declaration ordinal used to preserve override order.
+    pub ordinal: usize,
+    /// Object-tree identity of the variable node.
+    pub node: NodeId,
+    /// Canonical variable path.
+    pub path: String,
+    /// Declaration versus later override assignment.
+    pub assignment: AssignmentKind,
+    /// Storage lifetime receiving the value.
+    pub storage: StorageClass,
+    /// Constant value or an explicit runtime-evaluation requirement.
+    pub evaluation: ConstantEvaluation,
+}
+
+/// Ordered instance-default assignments belonging to one object type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypeDefaultPlan {
+    /// Type receiving the default assignments.
+    pub owner: VariableOwner,
+    /// Assignments in expanded declaration and override order.
+    pub steps: Vec<InitializationStep>,
+}
+
+/// Deterministic explicit-initializer plans derived from the registry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitializationPlans {
+    /// Global and type-static assignments in expanded source order.
+    pub global_steps: Vec<InitializationStep>,
+    /// Instance-default plans in owner first-encounter order.
+    pub type_defaults: Vec<TypeDefaultPlan>,
 }
 
 impl VariableRegistry {
@@ -207,6 +249,87 @@ impl VariableRegistry {
         }
         counts
     }
+
+    /// Returns deterministic top-level shapes for proven constant values.
+    #[must_use]
+    pub fn constant_value_counts(&self) -> BTreeMap<ConstantValueShape, usize> {
+        let mut counts = BTreeMap::new();
+        for evaluation in self.entries.iter().filter_map(|entry| {
+            entry
+                .initializer
+                .as_ref()
+                .map(|initializer| &initializer.evaluation)
+        }) {
+            if let ConstantEvaluation::Value(value) = evaluation {
+                *counts.entry(value.shape()).or_default() += 1;
+            }
+        }
+        counts
+    }
+
+    /// Returns deterministic counts for exact constant-evaluation blockers.
+    #[must_use]
+    pub fn unsupported_constant_counts(&self) -> BTreeMap<UnsupportedCategory, usize> {
+        let mut counts = BTreeMap::new();
+        for evaluation in self.entries.iter().filter_map(|entry| {
+            entry
+                .initializer
+                .as_ref()
+                .map(|initializer| &initializer.evaluation)
+        }) {
+            if let ConstantEvaluation::Unsupported(unsupported) = evaluation {
+                *counts.entry(unsupported.category).or_default() += 1;
+            }
+        }
+        counts
+    }
+
+    /// Builds ordered plans for every explicit initializer.
+    ///
+    /// Global and static values execute once in project order. Instance values
+    /// become per-owner default assignments, with reopenings and overrides
+    /// appended to the same owner plan in exact source order.
+    #[must_use]
+    pub fn initialization_plans(&self) -> InitializationPlans {
+        let mut global_steps = Vec::new();
+        let mut type_defaults = Vec::<TypeDefaultPlan>::new();
+        let mut owner_plans = HashMap::<NodeId, usize>::new();
+        for (entry_index, entry) in self.entries.iter().enumerate() {
+            let Some(initializer) = &entry.initializer else {
+                continue;
+            };
+            let step = InitializationStep {
+                entry_index,
+                ordinal: entry.ordinal,
+                node: entry.node,
+                path: entry.path.clone(),
+                assignment: entry.assignment,
+                storage: entry.storage,
+                evaluation: initializer.evaluation.clone(),
+            };
+            if entry.storage != StorageClass::Instance {
+                global_steps.push(step);
+                continue;
+            }
+            let Some(owner) = &entry.owner else {
+                global_steps.push(step);
+                continue;
+            };
+            let plan_index = *owner_plans.entry(owner.node).or_insert_with(|| {
+                let index = type_defaults.len();
+                type_defaults.push(TypeDefaultPlan {
+                    owner: owner.clone(),
+                    steps: Vec::new(),
+                });
+                index
+            });
+            type_defaults[plan_index].steps.push(step);
+        }
+        InitializationPlans {
+            global_steps,
+            type_defaults,
+        }
+    }
 }
 
 fn declared_storage(compilation: &Compilation) -> HashMap<NodeId, StorageClass> {
@@ -266,73 +389,38 @@ fn initializer(
         .get(expanded_span.start..expanded_span.end)?
         .to_owned();
     let tokens = definition.header[equals + 1..].to_vec();
-    let class = classify_initializer(&tokens);
+    let evaluation = evaluate_constant(&tokens);
+    let class = classify_evaluation(&evaluation);
     Some(InitializerSyntax {
         text,
         tokens: tokens.clone(),
         expanded_span,
         original_span: file.original_span(expanded_span),
         class,
+        evaluation,
         dependencies: initializer_dependencies(&tokens),
     })
 }
 
-fn classify_initializer(tokens: &[SpannedToken]) -> InitializerClass {
-    if tokens.is_empty() {
-        return InitializerClass::RequiresRuntime(RuntimeBlocker::Other);
+const fn classify_evaluation(evaluation: &ConstantEvaluation) -> InitializerClass {
+    match evaluation {
+        ConstantEvaluation::Value(_) => InitializerClass::ConstantSafe,
+        ConstantEvaluation::Unsupported(unsupported) => {
+            InitializerClass::RequiresRuntime(match unsupported.category {
+                UnsupportedCategory::Identifier => RuntimeBlocker::IdentifierReference,
+                UnsupportedCategory::Call => RuntimeBlocker::Call,
+                UnsupportedCategory::NewExpression => RuntimeBlocker::NewExpression,
+                UnsupportedCategory::UnsupportedOperator
+                | UnsupportedCategory::TypeMismatch
+                | UnsupportedCategory::DynamicExpression => RuntimeBlocker::CompositeExpression,
+                UnsupportedCategory::EmptyExpression
+                | UnsupportedCategory::DynamicText
+                | UnsupportedCategory::ResourceLiteral
+                | UnsupportedCategory::InvalidSyntax
+                | UnsupportedCategory::InvalidNumber => RuntimeBlocker::Other,
+            })
+        }
     }
-    if tokens.len() == 1 {
-        return match &tokens[0].kind {
-            TokenKind::Number(_)
-            | TokenKind::String(_)
-            | TokenKind::RawString(_)
-            | TokenKind::TextBlock(_)
-            | TokenKind::Resource(_) => InitializerClass::ConstantSafe,
-            TokenKind::Identifier(name) if name == "null" => InitializerClass::ConstantSafe,
-            TokenKind::Identifier(_) => {
-                InitializerClass::RequiresRuntime(RuntimeBlocker::IdentifierReference)
-            }
-            _ => InitializerClass::RequiresRuntime(RuntimeBlocker::Other),
-        };
-    }
-    if is_absolute_path(tokens) {
-        return InitializerClass::ConstantSafe;
-    }
-    if tokens
-        .iter()
-        .any(|token| matches!(&token.kind, TokenKind::Identifier(name) if name == "new"))
-    {
-        return InitializerClass::RequiresRuntime(RuntimeBlocker::NewExpression);
-    }
-    if tokens.windows(2).any(|pair| {
-        matches!(&pair[0].kind, TokenKind::Identifier(name) if name == "list")
-            && pair[1].kind == TokenKind::Punctuation('(')
-    }) {
-        return InitializerClass::RequiresRuntime(RuntimeBlocker::ListConstruction);
-    }
-    if tokens.windows(2).any(|pair| {
-        matches!(pair[0].kind, TokenKind::Identifier(_))
-            && pair[1].kind == TokenKind::Punctuation('(')
-    }) {
-        return InitializerClass::RequiresRuntime(RuntimeBlocker::Call);
-    }
-    if tokens
-        .iter()
-        .any(|token| matches!(token.kind, TokenKind::Identifier(_)))
-    {
-        return InitializerClass::RequiresRuntime(RuntimeBlocker::IdentifierReference);
-    }
-    InitializerClass::RequiresRuntime(RuntimeBlocker::CompositeExpression)
-}
-
-fn is_absolute_path(tokens: &[SpannedToken]) -> bool {
-    matches!(
-        tokens.first().map(|token| &token.kind),
-        Some(TokenKind::Operator(operator)) if operator == "/"
-    ) && tokens.iter().all(|token| {
-        matches!(token.kind, TokenKind::Identifier(_))
-            || matches!(&token.kind, TokenKind::Operator(operator) if operator == "/")
-    })
 }
 
 fn initializer_dependencies(tokens: &[SpannedToken]) -> Vec<InitializerDependency> {
@@ -358,8 +446,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use dm_compiler::CompilerDatabase;
+    use dm_lexer::{TokenKind, lex};
 
-    use super::{AssignmentKind, InitializerClass, RuntimeBlocker, StorageClass, VariableRegistry};
+    use super::{
+        AssignmentKind, ConstantEvaluation, ConstantListEntry, ConstantValue, InitializerClass,
+        RuntimeBlocker, StorageClass, UnsupportedCategory, VariableRegistry, evaluate_constant,
+    };
 
     static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
 
@@ -385,6 +477,22 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).expect("fixture directory should be removed");
         }
+    }
+
+    fn evaluate(source: &str) -> ConstantEvaluation {
+        let tokens: Vec<_> = lex(source)
+            .expect("expression should lex")
+            .into_iter()
+            .filter(|token| !matches!(token.kind, TokenKind::LineStart { .. } | TokenKind::Newline))
+            .collect();
+        evaluate_constant(&tokens)
+    }
+
+    fn evaluate_number(source: &str) -> u32 {
+        let ConstantEvaluation::Value(ConstantValue::Number(number)) = evaluate(source) else {
+            panic!("{source:?} should evaluate to a number");
+        };
+        number.bits()
     }
 
     #[test]
@@ -462,6 +570,110 @@ mod tests {
         assert_eq!(
             initializer.class,
             InitializerClass::RequiresRuntime(RuntimeBlocker::IdentifierReference)
+        );
+    }
+
+    #[test]
+    fn evaluates_binary32_truth_paths_and_ordered_lists() {
+        let evaluation =
+            evaluate(r#"list(-(1 + 2 * 3), "text", /datum/example, "answer" = !null && TRUE)"#);
+        let ConstantEvaluation::Value(ConstantValue::List(entries)) = evaluation else {
+            panic!("initializer should evaluate to a constant list");
+        };
+
+        assert_eq!(entries.len(), 4);
+        let ConstantListEntry::Positional(ConstantValue::Number(number)) = &entries[0] else {
+            panic!("first entry should be numeric");
+        };
+        assert_eq!(number.bits(), (-7.0_f32).to_bits());
+        assert_eq!(
+            entries[1],
+            ConstantListEntry::Positional(ConstantValue::Text("text".to_owned()))
+        );
+        assert_eq!(
+            entries[2],
+            ConstantListEntry::Positional(ConstantValue::TypePath("/datum/example".to_owned()))
+        );
+        let ConstantListEntry::Associative { key, value } = &entries[3] else {
+            panic!("last entry should be associative");
+        };
+        assert_eq!(key, &ConstantValue::Text("answer".to_owned()));
+        let ConstantValue::Number(value) = value else {
+            panic!("truth expression should produce a number");
+        };
+        assert_eq!(value.bits(), 1.0_f32.to_bits());
+    }
+
+    #[test]
+    fn applies_binary32_rounding_and_dm_truth_rules() {
+        assert_eq!(evaluate_number("16777216 + 1"), 16_777_216.0_f32.to_bits());
+        assert_eq!(evaluate_number("!null"), 1.0_f32.to_bits());
+        assert_eq!(evaluate_number("!\"\""), 1.0_f32.to_bits());
+        assert_eq!(evaluate_number("!/datum/example"), 0.0_f32.to_bits());
+        assert_eq!(evaluate_number("!list()"), 0.0_f32.to_bits());
+    }
+
+    #[test]
+    fn reports_precise_unsupported_categories_and_spans() {
+        let cases = [
+            ("dependency", UnsupportedCategory::Identifier),
+            ("build_value()", UnsupportedCategory::Call),
+            ("new /datum/example", UnsupportedCategory::NewExpression),
+            (r#""value [world.time]""#, UnsupportedCategory::DynamicText),
+            ("1 ** 2", UnsupportedCategory::UnsupportedOperator),
+        ];
+
+        for (source, expected) in cases {
+            let ConstantEvaluation::Unsupported(unsupported) = evaluate(source) else {
+                panic!("{source:?} should require runtime evaluation");
+            };
+            assert_eq!(unsupported.category, expected, "source: {source}");
+            assert!(!unsupported.span.is_empty(), "source: {source}");
+            assert!(unsupported.span.end <= source.len(), "source: {source}");
+        }
+    }
+
+    #[test]
+    fn builds_source_ordered_global_and_type_default_plans() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "world.dme",
+            "#include \"first.dm\"\n#include \"second.dm\"\n",
+        );
+        fixture.write(
+            "first.dm",
+            "var/global/root = 1\n/datum/example\n\tvar/instance = 2\n\tvar/static/shared = 3\n",
+        );
+        fixture.write(
+            "second.dm",
+            "root = 4\n/datum/example\n\tinstance = 5\n\tshared = 6\n",
+        );
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.0.join("world.dme"))
+            .expect("fixture should compile");
+        let registry = VariableRegistry::build(&compilation);
+        let plans = registry.initialization_plans();
+
+        assert_eq!(plans.global_steps.len(), 4);
+        assert_eq!(plans.type_defaults.len(), 1);
+        assert_eq!(plans.type_defaults[0].owner.path, "/datum/example");
+        assert_eq!(plans.type_defaults[0].steps.len(), 2);
+        assert!(
+            plans
+                .global_steps
+                .windows(2)
+                .all(|steps| steps[0].ordinal < steps[1].ordinal)
+        );
+        assert!(
+            plans.type_defaults[0]
+                .steps
+                .windows(2)
+                .all(|steps| steps[0].ordinal < steps[1].ordinal)
+        );
+        assert_eq!(plans.global_steps[2].assignment, AssignmentKind::Override);
+        assert_eq!(
+            plans.type_defaults[0].steps[1].assignment,
+            AssignmentKind::Override
         );
     }
 }

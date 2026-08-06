@@ -86,6 +86,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dm-runtime"
+version = "0.1.0"
+dependencies = [
+ "dm-compiler",
+ "dm-core",
+ "dm-globals",
+ "dm-object-tree",
+ "dm-value",
+]
+
+[[package]]
 name = "dm-semantics"
 version = "0.1.0"
 dependencies = [
