@@ -3,9 +3,20 @@
 version = 4
 
 [[package]]
+name = "dm-compiler"
+version = "0.1.0"
+dependencies = [
+ "dm-core",
+ "dm-object-tree",
+ "dm-project",
+ "dm-syntax",
+]
+
+[[package]]
 name = "dm-conformance"
 version = "0.1.0"
 dependencies = [
+ "dm-compiler",
  "dm-lexer",
  "dm-project",
  "dm-syntax",
@@ -24,10 +35,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "dm-object-tree"
+version = "0.1.0"
+dependencies = [
+ "dm-core",
+ "dm-lexer",
+ "dm-syntax",
+]
+
+[[package]]
 name = "dm-project"
 version = "0.1.0"
 dependencies = [
  "dm-core",
+]
+
+[[package]]
+name = "dm-semantics"
+version = "0.1.0"
+dependencies = [
+ "dm-compiler",
+ "dm-core",
+ "dm-object-tree",
+ "dm-syntax",
 ]
 
 [[package]]

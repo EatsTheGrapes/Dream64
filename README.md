@@ -19,8 +19,12 @@ both Dream Maker/Dream Daemon and this engine.
 - A declaration parser that indexes paths, types, vars, procs, verbs,
 	parameters, overrides, and opaque procedure bodies across the full active
 	Monkestation source graph.
-- Portable stack bytecode and a deterministic reference interpreter for the
-	first executable DM subset.
+- A reusable compiler database that retains syntax by file identity, builds a
+	project-wide object tree, and maps frontend diagnostics back to source spans.
+- Portable stack bytecode and a deterministic reference interpreter supporting
+	explicit call frames, forward and recursive procedure calls, permissive DM
+	argument arity, parameters, locals, assignment, arithmetic, comparisons, and
+	nested indentation-based `if`/`else` control flow.
 - A bounded reference-compiler runner for differential fixtures.
 - A written compatibility boundary and runtime architecture.
 
@@ -62,9 +66,21 @@ Load that graph and run declaration parsing across every DM source file:
 cargo run -p dm-conformance -- check path\to\world.dme
 ```
 
+Build the combined frontend snapshot and object tree:
+
+```powershell
+cargo run -p dm-conformance -- frontend path\to\world.dme
+```
+
 Compile and execute a supported procedure through the reference interpreter:
 
 ```powershell
 cargo run -p dm-conformance -- execute `
 	fixtures\runtime\arithmetic.dm /proc/arithmetic_probe 4
+```
+
+Measure current bytecode-lowering coverage across a complete project:
+
+```powershell
+cargo run -p dm-conformance -- compile-check path\to\world.dme
 ```

@@ -47,6 +47,95 @@ impl Project {
     pub fn file(&self, id: FileId) -> Option<&ProjectFile> {
         self.files.get(id.index())
     }
+
+    /// Returns the project source stream after quoted includes are spliced in.
+    ///
+    /// Segments appear in the same deterministic depth-first order as textual
+    /// `#include` expansion. Include directive lines are excluded. A physical
+    /// file contributes segments only at its first include, matching the
+    /// loader's include-once behavior; later includes of the same file expand
+    /// to no source.
+    #[must_use]
+    pub fn expansion_segments(&self) -> Vec<ExpansionSegment> {
+        if self.files.is_empty() {
+            return Vec::new();
+        }
+
+        let mut includes_by_file = vec![Vec::new(); self.files.len()];
+        for include in &self.includes {
+            includes_by_file[include.source.index()].push(include);
+        }
+        for includes in &mut includes_by_file {
+            includes.sort_by_key(|include| (include.span.start, include.span.end));
+        }
+
+        let mut segments = Vec::new();
+        let mut expanded = vec![false; self.files.len()];
+        expanded[0] = true;
+        let mut stack = vec![ExpansionFrame::new(self.files[0].id)];
+        while !stack.is_empty() {
+            let frame_index = stack.len() - 1;
+            let file_id = stack[frame_index].file_id;
+            let includes = &includes_by_file[file_id.index()];
+            if stack[frame_index].next_include < includes.len() {
+                let include = includes[stack[frame_index].next_include];
+                stack[frame_index].next_include += 1;
+                let cursor = stack[frame_index].cursor;
+                if cursor < include.span.start {
+                    segments.push(ExpansionSegment {
+                        file_id,
+                        span: SourceSpan::new(cursor, include.span.start),
+                    });
+                }
+                stack[frame_index].cursor = cursor.max(include.span.end);
+
+                if let IncludeTarget::File(target) = include.target
+                    && !expanded[target.index()]
+                {
+                    expanded[target.index()] = true;
+                    stack.push(ExpansionFrame::new(target));
+                }
+                continue;
+            }
+
+            let cursor = stack[frame_index].cursor;
+            let file_end = self.files[file_id.index()].contents.len();
+            if cursor < file_end {
+                segments.push(ExpansionSegment {
+                    file_id,
+                    span: SourceSpan::new(cursor, file_end),
+                });
+            }
+            stack.pop();
+        }
+        segments
+    }
+}
+
+/// A contiguous part of one file in the fully expanded project source stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExpansionSegment {
+    /// Physical project file supplying the bytes.
+    pub file_id: FileId,
+    /// Byte range retained from that physical file.
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExpansionFrame {
+    file_id: FileId,
+    next_include: usize,
+    cursor: usize,
+}
+
+impl ExpansionFrame {
+    const fn new(file_id: FileId) -> Self {
+        Self {
+            file_id,
+            next_include: 0,
+            cursor: 0,
+        }
+    }
 }
 
 /// A file known to the project loader.
@@ -62,6 +151,7 @@ pub struct ProjectFile {
     pub kind: FileKind,
     /// Original bytes. Source consumers may call [`Self::text`].
     pub contents: Vec<u8>,
+    compiler_contents: Option<Vec<u8>>,
 }
 
 impl ProjectFile {
@@ -72,6 +162,23 @@ impl ProjectFile {
     /// Returns [`str::Utf8Error`] if this file is not UTF-8 text.
     pub fn text(&self) -> Result<&str, str::Utf8Error> {
         str::from_utf8(&self.contents)
+    }
+
+    /// Returns source suitable for syntax parsing after conditional masking.
+    ///
+    /// Preprocessor directive lines and source in inactive conditional branches
+    /// are replaced with same-length ASCII whitespace. Line endings and all
+    /// active ordinary source bytes are preserved, so offsets in the returned
+    /// text refer directly to [`Self::contents`]. Files without directives
+    /// borrow the original byte buffer without making a copy.
+    ///
+    /// This stage intentionally does not perform general macro replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`str::Utf8Error`] if this file is not UTF-8 text.
+    pub fn compiler_text(&self) -> Result<&str, str::Utf8Error> {
+        str::from_utf8(self.compiler_contents.as_deref().unwrap_or(&self.contents))
     }
 }
 
@@ -296,6 +403,7 @@ impl Loader {
             relative_path,
             kind,
             contents,
+            compiler_contents: None,
         });
 
         if kind.can_contain_includes() {
@@ -319,92 +427,154 @@ impl Loader {
         path: &Path,
         directives: Vec<Directive>,
     ) -> Result<(), ProjectError> {
-        let mut conditionals = Vec::new();
-        for directive in directives {
-            let active = conditionals
-                .last()
-                .is_none_or(|frame: &ConditionalFrame| frame.active);
-            match directive.kind {
-                DirectiveKind::If(expression) => {
-                    let condition = self.evaluate(path, directive.span.start, &expression)?;
-                    conditionals.push(ConditionalFrame::new(active, condition));
-                }
-                DirectiveKind::Ifdef(name) => {
-                    conditionals.push(ConditionalFrame::new(
-                        active,
-                        self.macros.contains_key(&name),
-                    ));
-                }
-                DirectiveKind::Ifndef(name) => {
-                    conditionals.push(ConditionalFrame::new(
-                        active,
-                        !self.macros.contains_key(&name),
-                    ));
-                }
-                DirectiveKind::Elif(expression) => {
-                    let condition = self.evaluate(path, directive.span.start, &expression)?;
-                    let frame = conditionals.last_mut().ok_or_else(|| {
-                        preprocessor_error(path, directive.span.start, "#elif without matching #if")
-                    })?;
-                    frame.activate_alternative(condition);
-                }
-                DirectiveKind::Else => {
-                    let frame = conditionals.last_mut().ok_or_else(|| {
-                        preprocessor_error(path, directive.span.start, "#else without matching #if")
-                    })?;
-                    frame.activate_alternative(true);
-                }
-                DirectiveKind::Endif => {
-                    conditionals.pop().ok_or_else(|| {
-                        preprocessor_error(
-                            path,
-                            directive.span.start,
-                            "#endif without matching #if",
-                        )
-                    })?;
-                }
-                DirectiveKind::Define { name, value } if active => {
-                    self.macros.insert(name, value);
-                }
-                DirectiveKind::Undef(name) if active => {
-                    self.macros.remove(&name);
-                }
-                DirectiveKind::Include {
-                    spelling,
-                    delimiter,
-                } if active => {
-                    let ordinal = self.next_include_ordinal;
-                    self.next_include_ordinal += 1;
-                    let target = match delimiter {
-                        IncludeDelimiter::System => IncludeTarget::System(spelling.clone()),
-                        IncludeDelimiter::Quoted => {
-                            let target_path = self.resolve_quoted(path, &spelling)?;
-                            let target_id = self.load_file(&target_path)?;
-                            IncludeTarget::File(target_id)
-                        }
-                    };
-                    self.includes.push((
-                        ordinal,
-                        IncludeEdge {
-                            source,
-                            target,
-                            spelling,
-                            span: directive.span,
-                        },
-                    ));
-                }
-                DirectiveKind::Define { .. }
-                | DirectiveKind::Undef(_)
-                | DirectiveKind::Include { .. } => {}
-            }
+        if directives.is_empty() {
+            return Ok(());
         }
-        if !conditionals.is_empty() {
+
+        let mut compiler_contents = self.files[source.index()].contents.clone();
+        let mut conditionals = Vec::new();
+        let mut cursor = 0usize;
+        for directive in directives {
+            let span = directive.span;
+            if !conditional_active(&conditionals) {
+                mask_source(&mut compiler_contents, SourceSpan::new(cursor, span.start));
+            }
+            mask_source(&mut compiler_contents, span);
+            cursor = span.end;
+            self.process_directive(source, path, directive, &mut conditionals)?;
+        }
+        if let Some(frame) = conditionals.last() {
             return Err(preprocessor_error(
                 path,
                 self.files[source.index()].contents.len(),
-                "unterminated conditional directive",
+                format!(
+                    "unterminated conditional opened at byte {} ({} conditional directive{} still open)",
+                    frame.opening_offset,
+                    conditionals.len(),
+                    if conditionals.len() == 1 { "" } else { "s" },
+                ),
             ));
         }
+        if !conditional_active(&conditionals) {
+            mask_source(
+                &mut compiler_contents,
+                SourceSpan::new(cursor, self.files[source.index()].contents.len()),
+            );
+        }
+        self.files[source.index()].compiler_contents = Some(compiler_contents);
+        Ok(())
+    }
+
+    fn process_directive(
+        &mut self,
+        source: FileId,
+        path: &Path,
+        directive: Directive,
+        conditionals: &mut Vec<ConditionalFrame>,
+    ) -> Result<(), ProjectError> {
+        let active = conditional_active(conditionals);
+        let offset = directive.span.start;
+        match directive.kind {
+            DirectiveKind::If(expression) => {
+                let condition = self.evaluate(path, offset, &expression)?;
+                conditionals.push(ConditionalFrame::new(active, condition, offset));
+            }
+            DirectiveKind::Ifdef(name) => conditionals.push(ConditionalFrame::new(
+                active,
+                self.macros.contains_key(&name),
+                offset,
+            )),
+            DirectiveKind::Ifndef(name) => conditionals.push(ConditionalFrame::new(
+                active,
+                !self.macros.contains_key(&name),
+                offset,
+            )),
+            DirectiveKind::Elif(expression) => {
+                let frame = conditionals.last_mut().ok_or_else(|| {
+                    preprocessor_error(path, offset, "#elif without matching #if")
+                })?;
+                if frame.branch_state == ConditionalBranchState::Else {
+                    return Err(preprocessor_error(
+                        path,
+                        offset,
+                        format!(
+                            "#elif after #else for conditional opened at byte {}",
+                            frame.opening_offset
+                        ),
+                    ));
+                }
+                let condition = self.evaluate(path, offset, &expression)?;
+                frame.activate_alternative(condition);
+            }
+            DirectiveKind::Else => {
+                let frame = conditionals.last_mut().ok_or_else(|| {
+                    preprocessor_error(path, offset, "#else without matching #if")
+                })?;
+                if frame.branch_state == ConditionalBranchState::Else {
+                    return Err(preprocessor_error(
+                        path,
+                        offset,
+                        format!(
+                            "duplicate #else for conditional opened at byte {}",
+                            frame.opening_offset
+                        ),
+                    ));
+                }
+                frame.activate_else();
+            }
+            DirectiveKind::Endif => {
+                conditionals.pop().ok_or_else(|| {
+                    preprocessor_error(path, offset, "#endif without matching #if")
+                })?;
+            }
+            DirectiveKind::Define { name, value } if active => {
+                self.macros.insert(name, value);
+            }
+            DirectiveKind::Undef(name) if active => {
+                self.macros.remove(&name);
+            }
+            DirectiveKind::Include {
+                spelling,
+                delimiter,
+            } if active => {
+                self.process_include(source, path, spelling, delimiter, directive.span)?;
+            }
+            DirectiveKind::Define { .. }
+            | DirectiveKind::Undef(_)
+            | DirectiveKind::Include { .. } => {}
+            DirectiveKind::Malformed(message) => {
+                return Err(preprocessor_error(path, offset, message));
+            }
+        }
+        Ok(())
+    }
+
+    fn process_include(
+        &mut self,
+        source: FileId,
+        path: &Path,
+        spelling: String,
+        delimiter: IncludeDelimiter,
+        span: SourceSpan,
+    ) -> Result<(), ProjectError> {
+        let ordinal = self.next_include_ordinal;
+        self.next_include_ordinal += 1;
+        let target = match delimiter {
+            IncludeDelimiter::System => IncludeTarget::System(spelling.clone()),
+            IncludeDelimiter::Quoted => {
+                let target_path = self.resolve_quoted(path, &spelling)?;
+                IncludeTarget::File(self.load_file(&target_path)?)
+            }
+        };
+        self.includes.push((
+            ordinal,
+            IncludeEdge {
+                source,
+                target,
+                spelling,
+                span,
+            },
+        ));
         Ok(())
     }
 
@@ -478,44 +648,179 @@ enum DirectiveKind {
     Elif(String),
     Else,
     Endif,
+    Malformed(String),
 }
 
 struct ConditionalFrame {
     parent_active: bool,
-    branch_taken: bool,
     active: bool,
+    branch_state: ConditionalBranchState,
+    opening_offset: usize,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ConditionalBranchState {
+    NoneTaken,
+    Taken,
+    Else,
 }
 
 impl ConditionalFrame {
-    fn new(parent_active: bool, condition: bool) -> Self {
+    fn new(parent_active: bool, condition: bool, opening_offset: usize) -> Self {
         Self {
             parent_active,
-            branch_taken: condition,
             active: parent_active && condition,
+            branch_state: if condition {
+                ConditionalBranchState::Taken
+            } else {
+                ConditionalBranchState::NoneTaken
+            },
+            opening_offset,
         }
     }
 
     fn activate_alternative(&mut self, condition: bool) {
-        let selected = !self.branch_taken && condition;
+        let selected = self.branch_state == ConditionalBranchState::NoneTaken && condition;
         self.active = self.parent_active && selected;
-        self.branch_taken |= condition;
+        if selected {
+            self.branch_state = ConditionalBranchState::Taken;
+        }
+    }
+
+    fn activate_else(&mut self) {
+        self.active = self.parent_active && self.branch_state == ConditionalBranchState::NoneTaken;
+        self.branch_state = ConditionalBranchState::Else;
+    }
+}
+
+fn conditional_active(conditionals: &[ConditionalFrame]) -> bool {
+    conditionals
+        .last()
+        .is_none_or(|frame: &ConditionalFrame| frame.active)
+}
+
+fn mask_source(contents: &mut [u8], span: SourceSpan) {
+    for byte in &mut contents[span.start..span.end] {
+        if !matches!(*byte, b'\r' | b'\n') {
+            *byte = b' ';
+        }
     }
 }
 
 fn scan_directives(source: &str) -> Vec<Directive> {
     let mut directives = Vec::new();
     let mut offset = 0;
-    for physical_line in source.split_inclusive('\n') {
+    let mut in_block_comment = false;
+    while offset < source.len() {
+        let physical_end = physical_line_end(source, offset);
+        let physical_line = &source[offset..physical_end];
         let line = physical_line.strip_suffix('\n').unwrap_or(physical_line);
-        if let Some(kind) = parse_directive_line(line) {
+        let uncommented = remove_comments(line, &mut in_block_comment);
+        if let Some(kind) = parse_directive_line(&uncommented) {
+            let directive_end = if matches!(&kind, DirectiveKind::Define { .. }) {
+                extended_define_end(source, offset, physical_end, &uncommented)
+            } else {
+                physical_end
+            };
             directives.push(Directive {
                 kind,
-                span: SourceSpan::new(offset, offset + physical_line.len()),
+                span: SourceSpan::new(offset, directive_end),
             });
+            offset = directive_end;
+        } else {
+            offset = physical_end;
         }
-        offset += physical_line.len();
     }
     directives
+}
+
+fn extended_define_end(
+    source: &str,
+    line_start: usize,
+    initial_end: usize,
+    uncommented: &str,
+) -> usize {
+    if let Some(raw_start) = uncommented.find("{\"") {
+        let original_raw_start = line_start + raw_start;
+        if let Some(relative_end) = source[original_raw_start + 2..].find("\"}") {
+            let raw_end = original_raw_start + 2 + relative_end + 2;
+            return physical_line_end(source, raw_end);
+        }
+        return source.len();
+    }
+
+    let mut end = initial_end;
+    let mut current_start = line_start;
+    while source[current_start..end]
+        .trim_end_matches(['\r', '\n'])
+        .trim_end()
+        .ends_with('\\')
+        && end < source.len()
+    {
+        current_start = end;
+        end = physical_line_end(source, current_start);
+    }
+    end
+}
+
+fn physical_line_end(source: &str, start: usize) -> usize {
+    source[start..]
+        .find('\n')
+        .map_or(source.len(), |relative| start + relative + 1)
+}
+
+fn remove_comments(line: &str, in_block_comment: &mut bool) -> String {
+    let bytes = line.as_bytes();
+    let mut uncommented = Vec::with_capacity(bytes.len());
+    let mut offset = 0;
+    let mut quote = None;
+    let mut escaped = false;
+
+    while offset < bytes.len() {
+        if *in_block_comment {
+            if bytes[offset..].starts_with(b"*/") {
+                *in_block_comment = false;
+                offset += 2;
+                uncommented.push(b' ');
+            } else {
+                offset += 1;
+            }
+            continue;
+        }
+
+        if let Some(delimiter) = quote {
+            let byte = bytes[offset];
+            uncommented.push(byte);
+            offset += 1;
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+
+        if bytes[offset..].starts_with(b"//") {
+            break;
+        }
+        if bytes[offset..].starts_with(b"/*") {
+            *in_block_comment = true;
+            offset += 2;
+            uncommented.push(b' ');
+            continue;
+        }
+
+        let byte = bytes[offset];
+        if matches!(byte, b'\"' | b'\'') {
+            quote = Some(byte);
+        }
+        uncommented.push(byte);
+        offset += 1;
+    }
+
+    String::from_utf8(uncommented).expect("removing ASCII comment bytes preserves UTF-8")
 }
 
 fn parse_directive_line(line: &str) -> Option<DirectiveKind> {
@@ -546,14 +851,52 @@ fn parse_directive_line(line: &str) -> Option<DirectiveKind> {
             })
         }
         "undef" => identifier(value).map(DirectiveKind::Undef),
-        "if" => Some(DirectiveKind::If(value.to_owned())),
-        "ifdef" => identifier(value).map(DirectiveKind::Ifdef),
-        "ifndef" => identifier(value).map(DirectiveKind::Ifndef),
-        "elif" => Some(DirectiveKind::Elif(value.to_owned())),
-        "else" => Some(DirectiveKind::Else),
-        "endif" => Some(DirectiveKind::Endif),
+        "if" => Some(if value.is_empty() {
+            DirectiveKind::Malformed("#if requires a conditional expression".to_owned())
+        } else {
+            DirectiveKind::If(value.to_owned())
+        }),
+        "ifdef" => Some(parse_conditional_identifier(
+            "#ifdef",
+            value,
+            DirectiveKind::Ifdef,
+        )),
+        "ifndef" => Some(parse_conditional_identifier(
+            "#ifndef",
+            value,
+            DirectiveKind::Ifndef,
+        )),
+        "elif" => Some(if value.is_empty() {
+            DirectiveKind::Malformed("#elif requires a conditional expression".to_owned())
+        } else {
+            DirectiveKind::Elif(value.to_owned())
+        }),
+        "else" => Some(if value.is_empty() {
+            DirectiveKind::Else
+        } else {
+            DirectiveKind::Malformed("#else does not accept arguments".to_owned())
+        }),
+        "endif" => Some(if value.is_empty() {
+            DirectiveKind::Endif
+        } else {
+            DirectiveKind::Malformed("#endif does not accept arguments".to_owned())
+        }),
         _ => None,
     }
+}
+
+fn parse_conditional_identifier(
+    directive: &str,
+    value: &str,
+    constructor: impl FnOnce(String) -> DirectiveKind,
+) -> DirectiveKind {
+    let Some(name) = identifier(value) else {
+        return DirectiveKind::Malformed(format!("{directive} requires a macro name"));
+    };
+    if !value[name.len()..].trim().is_empty() {
+        return DirectiveKind::Malformed(format!("{directive} accepts exactly one macro name"));
+    }
+    constructor(name)
 }
 
 fn parse_include(value: &str) -> Option<DirectiveKind> {
@@ -826,6 +1169,18 @@ mod tests {
         }
     }
 
+    fn preprocessor_error_for(source: &str) -> (usize, String) {
+        let scratch = ScratchDirectory::new();
+        let environment = scratch.path().join("world.dme");
+        fs::write(&environment, source).expect("environment should be written");
+        match Project::load(environment).expect_err("project should reject malformed directives") {
+            ProjectError::Preprocessor {
+                offset, message, ..
+            } => (offset, message),
+            error => panic!("expected a preprocessor error, got {error}"),
+        }
+    }
+
     #[test]
     fn loads_quoted_includes_once_in_first_discovery_order() {
         let scratch = ScratchDirectory::new();
@@ -901,6 +1256,109 @@ mod tests {
     }
 
     #[test]
+    fn masks_directives_and_nested_inactive_branches_without_shifting_bytes() {
+        let scratch = ScratchDirectory::new();
+        fs::write(
+            scratch.path().join("world.dme"),
+            "#include \"conditions.dm\"\n",
+        )
+        .expect("environment should be written");
+        let source = "/datum/before\n#if 0\n/datum/hidden\n#if 1\n/datum/nested_hidden\n#endif\n#else\n/* active comment */\n/datum/selected\n#if 1\n/datum/nested_selected\n#else\n/datum/other_hidden\n#endif\n#endif\n/datum/after\n";
+        fs::write(scratch.path().join("conditions.dm"), source)
+            .expect("conditional source should be written");
+
+        let project = Project::load(scratch.path().join("world.dme"))
+            .expect("conditional source should load");
+        let file = &project.files[1];
+        let compiler_source = file
+            .compiler_text()
+            .expect("compiler source should remain UTF-8");
+
+        assert_eq!(compiler_source.len(), source.len());
+        for (offset, byte) in source.bytes().enumerate() {
+            if byte == b'\n' {
+                assert_eq!(compiler_source.as_bytes()[offset], b'\n');
+            }
+        }
+        for hidden in [
+            "/datum/hidden",
+            "/datum/nested_hidden",
+            "/datum/other_hidden",
+        ] {
+            let start = source.find(hidden).expect("hidden source should exist");
+            assert!(
+                compiler_source.as_bytes()[start..start + hidden.len()]
+                    .iter()
+                    .all(|byte| *byte == b' ')
+            );
+        }
+        for active in [
+            "/datum/before",
+            "/* active comment */",
+            "/datum/selected",
+            "/datum/nested_selected",
+            "/datum/after",
+        ] {
+            let start = source.find(active).expect("active source should exist");
+            assert_eq!(&compiler_source[start..start + active.len()], active);
+        }
+        assert!(!compiler_source.contains("#if"));
+        assert!(!compiler_source.contains("#else"));
+        assert!(!compiler_source.contains("#endif"));
+    }
+
+    #[test]
+    fn borrows_byte_identical_source_when_no_directives_need_masking() {
+        let scratch = ScratchDirectory::new();
+        fs::write(scratch.path().join("world.dme"), "#include \"plain.dm\"\n")
+            .expect("environment should be written");
+        fs::write(
+            scratch.path().join("plain.dm"),
+            "/datum/plain\n\tvar/value = 1\n",
+        )
+        .expect("plain source should be written");
+
+        let project =
+            Project::load(scratch.path().join("world.dme")).expect("plain source should load");
+        let file = &project.files[1];
+        let original = file.text().expect("plain source should be UTF-8");
+        let compiler_source = file
+            .compiler_text()
+            .expect("compiler source should be UTF-8");
+
+        assert_eq!(compiler_source, original);
+        assert_eq!(compiler_source.as_ptr(), original.as_ptr());
+    }
+
+    #[test]
+    fn masks_complete_multiline_define_values() {
+        let scratch = ScratchDirectory::new();
+        let source = "#define DOCUMENT {\"\n#include \"not_a_real_include.dm\"\n#if 0\nraw text\n#endif\n\"}\n#define CONTINUED \"first\\\nsecond\\\nthird\"\n/datum/after_macros\n";
+        fs::write(scratch.path().join("world.dme"), source).expect("environment should be written");
+
+        let project = Project::load(scratch.path().join("world.dme"))
+            .expect("directives inside macro values should not be evaluated");
+        let compiler_source = project.files[0]
+            .compiler_text()
+            .expect("masked macro source should be UTF-8");
+        let declaration_start = source
+            .find("/datum/after_macros")
+            .expect("ordinary declaration should exist");
+
+        assert_eq!(compiler_source.len(), source.len());
+        assert!(
+            compiler_source.as_bytes()[..declaration_start]
+                .iter()
+                .all(|byte| matches!(*byte, b' ' | b'\r' | b'\n'))
+        );
+        assert_eq!(
+            &compiler_source[declaration_start..],
+            "/datum/after_macros\n"
+        );
+        assert!(project.includes.is_empty());
+    }
+
+    #[test]
     fn shares_defines_across_recursive_includes() {
         let scratch = ScratchDirectory::new();
         fs::write(
@@ -945,6 +1403,72 @@ mod tests {
 
         assert_eq!(project.files.len(), 2);
         assert_eq!(project.includes.len(), 1);
+    }
+
+    #[test]
+    fn ignores_directives_in_block_comments_and_accepts_comments_as_whitespace() {
+        let scratch = ScratchDirectory::new();
+        fs::write(
+            scratch.path().join("world.dme"),
+            "/*\n#include \"missing.dm\"\n#if 0\n*/\n/* leading */ #define FEATURE 1 /* trailing\ncontinued */\n#if FEATURE /* condition */\n#include /* separator */ \"active.dm\"\n#endif\n",
+        )
+        .expect("environment should be written");
+        fs::write(scratch.path().join("active.dm"), "/datum/active\n")
+            .expect("active source should be written");
+
+        let project = Project::load(scratch.path().join("world.dme"))
+            .expect("commented directives should not affect preprocessing");
+
+        assert_eq!(project.files.len(), 2);
+        assert_eq!(project.includes.len(), 1);
+        assert_eq!(project.includes[0].spelling, "active.dm");
+    }
+
+    #[test]
+    fn rejects_duplicate_else_and_elif_after_else() {
+        let (_, duplicate_message) = preprocessor_error_for("#if 0\n#else\n#else\n#endif\n");
+        assert_eq!(
+            duplicate_message,
+            "duplicate #else for conditional opened at byte 0"
+        );
+
+        let (_, elif_message) = preprocessor_error_for("#if 0\n#else\n#elif 1\n#endif\n");
+        assert_eq!(
+            elif_message,
+            "#elif after #else for conditional opened at byte 0"
+        );
+    }
+
+    #[test]
+    fn validates_conditional_directive_arguments() {
+        let (_, empty_elif) = preprocessor_error_for("#if 0\n#elif\n#endif\n");
+        assert_eq!(empty_elif, "#elif requires a conditional expression");
+
+        let (_, else_arguments) = preprocessor_error_for("#if 0\n#else extra\n#endif\n");
+        assert_eq!(else_arguments, "#else does not accept arguments");
+
+        let (_, multiple_names) = preprocessor_error_for("#ifdef FIRST SECOND\n#endif\n");
+        assert_eq!(multiple_names, "#ifdef accepts exactly one macro name");
+    }
+
+    #[test]
+    fn reports_unmatched_elif_before_parsing_its_expression() {
+        let (offset, message) = preprocessor_error_for("#elif )\n");
+
+        assert_eq!(offset, 0);
+        assert_eq!(message, "#elif without matching #if");
+    }
+
+    #[test]
+    fn reports_the_innermost_unterminated_conditional_and_stack_depth() {
+        let source = "#if 1\n#if 1\n";
+        let (offset, message) = preprocessor_error_for(source);
+
+        assert_eq!(offset, source.len());
+        assert_eq!(
+            message,
+            "unterminated conditional opened at byte 6 (2 conditional directives still open)"
+        );
     }
 
     #[test]

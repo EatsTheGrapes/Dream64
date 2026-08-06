@@ -195,7 +195,24 @@ pub fn parse(source: &str) -> Result<SyntaxFile, SyntaxError> {
 struct Parser {
     lines: Vec<SourceLine>,
     definitions: Vec<Definition>,
-    stack: Vec<usize>,
+    stack: Vec<Context>,
+}
+
+enum Context {
+    Definition(usize),
+    Namespace {
+        indentation: Indentation,
+        segments: Vec<String>,
+        owner: Option<usize>,
+        kind: NamespaceKind,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum NamespaceKind {
+    Variable,
+    Procedure,
+    Verb,
 }
 
 impl Parser {
@@ -208,11 +225,10 @@ impl Parser {
     }
 
     fn run(mut self) -> SyntaxFile {
-        for line in std::mem::take(&mut self.lines) {
+        let mut lines = std::mem::take(&mut self.lines).into_iter().peekable();
+        while let Some(line) = lines.next() {
             self.pop_finished_definitions(line.indentation);
-            let indentation_parent = self.stack.last().copied();
-            if let Some(parent) = indentation_parent
-                && self.definitions[parent].kind.owns_procedure_body()
+            if let Some(parent) = self.procedure_body_owner()
                 && line
                     .indentation
                     .is_deeper_than(self.definitions[parent].indentation)
@@ -221,17 +237,42 @@ impl Parser {
                 continue;
             }
 
-            let Some(candidate) = classify_line(&line) else {
+            if let Some((segments, kind)) = self.classify_namespace(&line, lines.peek()) {
+                let (base_path, owner) = self.indentation_base();
+                let was_absolute = starts_with_slash(&line.tokens);
+                let mut path = if was_absolute {
+                    Vec::new()
+                } else {
+                    base_path.unwrap_or_default().to_vec()
+                };
+                path.extend(segments);
+                self.stack.push(Context::Namespace {
+                    indentation: line.indentation,
+                    segments: path,
+                    owner: if was_absolute { None } else { owner },
+                    kind,
+                });
+                continue;
+            }
+
+            let Some(mut candidate) = classify_line(&line) else {
                 continue;
             };
-            let parent = if candidate.was_absolute {
-                None
-            } else {
-                indentation_parent
-                    .filter(|index| self.definitions[*index].kind == DefinitionKind::Type)
-            };
-            let base_path = parent.map(|index| self.definitions[index].path.segments());
-            let path = canonicalize_path(base_path, &candidate);
+            let namespace_kind = self.namespace_kind();
+            if let Some(kind) = namespace_kind {
+                candidate.kind = kind.definition_kind();
+            }
+            let (base_path, owner) = self.indentation_base();
+            let parent = if candidate.was_absolute { None } else { owner };
+            let path = canonicalize_path(
+                if candidate.was_absolute {
+                    None
+                } else {
+                    base_path
+                },
+                &candidate,
+            );
+            let parameters = parse_parameters(&line.tokens);
             let index = self.definitions.len();
             self.definitions.push(Definition {
                 path,
@@ -239,11 +280,11 @@ impl Parser {
                 parent,
                 indentation: line.indentation,
                 span: line.span,
-                parameters: parse_parameters(&line.tokens),
+                parameters,
                 header: line.tokens,
                 body: Vec::new(),
             });
-            self.stack.push(index);
+            self.stack.push(Context::Definition(index));
         }
 
         SyntaxFile {
@@ -252,11 +293,73 @@ impl Parser {
     }
 
     fn pop_finished_definitions(&mut self, indentation: Indentation) {
-        while let Some(index) = self.stack.last().copied() {
-            if indentation.is_deeper_than(self.definitions[index].indentation) {
+        while let Some(context) = self.stack.last() {
+            let context_indentation = match context {
+                Context::Definition(index) => self.definitions[*index].indentation,
+                Context::Namespace { indentation, .. } => *indentation,
+            };
+            if indentation.is_deeper_than(context_indentation) {
                 break;
             }
             self.stack.pop();
+        }
+    }
+
+    fn procedure_body_owner(&self) -> Option<usize> {
+        match self.stack.last() {
+            Some(Context::Definition(index))
+                if self.definitions[*index].kind.owns_procedure_body() =>
+            {
+                Some(*index)
+            }
+            _ => None,
+        }
+    }
+
+    fn indentation_base(&self) -> (Option<&[String]>, Option<usize>) {
+        match self.stack.last() {
+            Some(Context::Definition(index))
+                if self.definitions[*index].kind == DefinitionKind::Type =>
+            {
+                (Some(self.definitions[*index].path.segments()), Some(*index))
+            }
+            Some(Context::Namespace {
+                segments, owner, ..
+            }) => (Some(segments), *owner),
+            _ => (None, None),
+        }
+    }
+
+    fn namespace_kind(&self) -> Option<NamespaceKind> {
+        match self.stack.last() {
+            Some(Context::Namespace { kind, .. }) => Some(*kind),
+            _ => None,
+        }
+    }
+
+    fn classify_namespace(
+        &self,
+        line: &SourceLine,
+        next_line: Option<&SourceLine>,
+    ) -> Option<(Vec<String>, NamespaceKind)> {
+        if !next_line.is_some_and(|next| next.indentation.is_deeper_than(line.indentation))
+            || line.tokens.is_empty()
+            || !is_path_spelling(&line.tokens)
+        {
+            return None;
+        }
+        let segments = path_segments(&line.tokens);
+        let kind = namespace_kind_from_segments(&segments).or_else(|| self.namespace_kind())?;
+        Some((segments, kind))
+    }
+}
+
+impl NamespaceKind {
+    const fn definition_kind(self) -> DefinitionKind {
+        match self {
+            Self::Variable => DefinitionKind::Variable,
+            Self::Procedure => DefinitionKind::Procedure,
+            Self::Verb => DefinitionKind::Verb,
         }
     }
 }
@@ -282,17 +385,8 @@ fn classify_line(line: &SourceLine) -> Option<Candidate> {
         })
         .unwrap_or(line.tokens.len());
     let path_tokens = &line.tokens[..header_end];
-    let was_absolute = matches!(
-        path_tokens.first().map(|token| &token.kind),
-        Some(TokenKind::Operator(operator)) if operator == "/"
-    );
-    let segments: Vec<_> = path_tokens
-        .iter()
-        .filter_map(|token| match &token.kind {
-            TokenKind::Identifier(identifier) => Some(identifier.clone()),
-            _ => None,
-        })
-        .collect();
+    let was_absolute = starts_with_slash(path_tokens);
+    let segments = path_segments(path_tokens);
     if segments.is_empty() || !is_path_spelling(path_tokens) {
         return None;
     }
@@ -324,6 +418,35 @@ fn classify_line(line: &SourceLine) -> Option<Candidate> {
         kind,
         was_absolute,
     })
+}
+
+fn starts_with_slash(tokens: &[SpannedToken]) -> bool {
+    matches!(
+        tokens.first().map(|token| &token.kind),
+        Some(TokenKind::Operator(operator)) if operator == "/"
+    )
+}
+
+fn path_segments(tokens: &[SpannedToken]) -> Vec<String> {
+    tokens
+        .iter()
+        .filter_map(|token| match &token.kind {
+            TokenKind::Identifier(identifier) => Some(identifier.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn namespace_kind_from_segments(segments: &[String]) -> Option<NamespaceKind> {
+    if segments.iter().any(|segment| segment == "verb") {
+        Some(NamespaceKind::Verb)
+    } else if segments.iter().any(|segment| segment == "proc") {
+        Some(NamespaceKind::Procedure)
+    } else if segments.iter().any(|segment| segment == "var") {
+        Some(NamespaceKind::Variable)
+    } else {
+        None
+    }
 }
 
 fn is_preprocessor_line(tokens: &[SpannedToken]) -> bool {
@@ -619,5 +742,89 @@ mod tests {
 
         assert_eq!(syntax.definitions.len(), 1);
         assert_eq!(syntax.definitions[0].body.len(), 3);
+    }
+
+    #[test]
+    fn treats_grouped_variables_as_declarations_owned_by_the_type() {
+        let indexed =
+            paths("/datum/example\n\tvar\n\t\tfirst\n\t\tsecond = 2\n\t\tlist\n\t\t\tnames\n");
+
+        assert_eq!(
+            indexed,
+            vec![
+                ("/datum/example".to_owned(), DefinitionKind::Type, None),
+                (
+                    "/datum/example/var/first".to_owned(),
+                    DefinitionKind::Variable,
+                    Some(0),
+                ),
+                (
+                    "/datum/example/var/second".to_owned(),
+                    DefinitionKind::Variable,
+                    Some(0),
+                ),
+                (
+                    "/datum/example/var/names".to_owned(),
+                    DefinitionKind::Variable,
+                    Some(0),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn supports_typed_grouped_variable_paths() {
+        let indexed = paths("/datum/example\n\tvar/list\n\t\tentries\n");
+
+        assert_eq!(
+            indexed,
+            vec![
+                ("/datum/example".to_owned(), DefinitionKind::Type, None),
+                (
+                    "/datum/example/var/entries".to_owned(),
+                    DefinitionKind::Variable,
+                    Some(0),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn treats_grouped_procedures_as_executable_declarations() {
+        let source = "/datum/example\n\tproc\n\t\tcalculate(value)\n\t\t\treturn value\n";
+        let syntax = parse(source).expect("grouped procedure should parse");
+
+        assert_eq!(
+            paths(source),
+            vec![
+                ("/datum/example".to_owned(), DefinitionKind::Type, None),
+                (
+                    "/datum/example/proc/calculate".to_owned(),
+                    DefinitionKind::Procedure,
+                    Some(0),
+                ),
+            ]
+        );
+        assert_eq!(syntax.definitions[1].parameters.len(), 1);
+        assert_eq!(syntax.definitions[1].body.len(), 1);
+    }
+
+    #[test]
+    fn treats_grouped_verbs_as_executable_declarations() {
+        let source = "/mob/example\n\tverb\n\t\tinspect_target(target)\n\t\t\treturn target\n";
+        let syntax = parse(source).expect("grouped verb should parse");
+
+        assert_eq!(
+            paths(source),
+            vec![
+                ("/mob/example".to_owned(), DefinitionKind::Type, None),
+                (
+                    "/mob/example/verb/inspect_target".to_owned(),
+                    DefinitionKind::Verb,
+                    Some(0),
+                ),
+            ]
+        );
+        assert_eq!(syntax.definitions[1].body.len(), 1);
     }
 }

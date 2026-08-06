@@ -1,5 +1,6 @@
 //! Command-line entry point for reference compiler and lexer probes.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -30,13 +31,123 @@ fn run(arguments: &[OsString]) -> Result<(), String> {
     };
     match command {
         "check" => run_project_syntax_check(&arguments[1..]),
+        "compile-check" => run_project_compile_check(&arguments[1..]),
         "execute" => run_procedure(&arguments[1..]),
+        "frontend" => run_frontend(&arguments[1..]),
         "lex" => run_lexer(&arguments[1..]),
         "probe" => run_compiler_probe(&arguments[1..]),
         "project" => run_project(&arguments[1..]),
         "syntax" => run_syntax(&arguments[1..]),
         _ => Err(usage()),
     }
+}
+
+fn run_frontend(arguments: &[OsString]) -> Result<(), String> {
+    let [project_path] = arguments else {
+        return Err("usage: dm-conformance frontend <world.dme>".to_owned());
+    };
+    let project_path = PathBuf::from(project_path);
+    let started = Instant::now();
+    let compilation = dm_compiler::CompilerDatabase::new()
+        .compile(&project_path)
+        .map_err(|error| format!("failed to compile {}: {error}", project_path.display()))?;
+    let stats = compilation.stats();
+    println!("project_files={}", stats.project_files);
+    println!("parsed_files={}", stats.parsed_files);
+    println!("project_bytes={}", stats.project_bytes);
+    println!("definitions={}", stats.definitions);
+    println!("code_nodes={}", stats.code_nodes);
+    println!("code_declarations={}", stats.code_declarations);
+    println!("diagnostic_notes={}", stats.notes);
+    println!("diagnostic_warnings={}", stats.warnings);
+    println!("diagnostic_errors={}", stats.errors);
+    for diagnostic in compilation.diagnostics().iter().take(20) {
+        let location = diagnostic.location.as_ref().map_or_else(
+            || "<project>".to_owned(),
+            |location| {
+                location.span.map_or_else(
+                    || location.path.display().to_string(),
+                    |span| format!("{}:{}..{}", location.path.display(), span.start, span.end),
+                )
+            },
+        );
+        println!(
+            "diagnostic={:?} {:?} {}: {}",
+            diagnostic.severity, diagnostic.kind, location, diagnostic.message
+        );
+    }
+    println!("elapsed_ms={}", started.elapsed().as_millis());
+    Ok(())
+}
+
+fn run_project_compile_check(arguments: &[OsString]) -> Result<(), String> {
+    let [project_path] = arguments else {
+        return Err("usage: dm-conformance compile-check <world.dme>".to_owned());
+    };
+    let project_path = PathBuf::from(project_path);
+    let started = Instant::now();
+    let project = dm_project::Project::load(&project_path)
+        .map_err(|error| format!("failed to load {}: {error}", project_path.display()))?;
+    let mut total = 0_usize;
+    let mut compiled = 0_usize;
+    let mut error_categories = BTreeMap::new();
+    for file in &project.files {
+        if !matches!(
+            file.kind,
+            dm_project::FileKind::Environment | dm_project::FileKind::Source
+        ) {
+            continue;
+        }
+        let source = file
+            .text()
+            .map_err(|error| format!("{} is not UTF-8: {error}", file.path.display()))?;
+        let syntax = dm_syntax::parse(source)
+            .map_err(|error| format!("failed to parse {}: {error}", file.path.display()))?;
+        for definition in syntax.definitions.iter().filter(|definition| {
+            matches!(
+                definition.kind,
+                dm_syntax::DefinitionKind::Procedure
+                    | dm_syntax::DefinitionKind::ProcedureOverride
+                    | dm_syntax::DefinitionKind::Verb
+            )
+        }) {
+            total += 1;
+            match dm_vm::compile_procedure(definition) {
+                Ok(_) => compiled += 1,
+                Err(error) => {
+                    *error_categories
+                        .entry(compile_error_category(&error.message))
+                        .or_insert(0_usize) += 1;
+                }
+            }
+        }
+    }
+    let mut ranked_errors: Vec<_> = error_categories.into_iter().collect();
+    ranked_errors.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    println!("procedures_total={total}");
+    println!("procedures_compiled={compiled}");
+    println!("procedures_unsupported={}", total - compiled);
+    for (rank, (category, count)) in ranked_errors.into_iter().take(20).enumerate() {
+        println!("unsupported_{}={} {:?}", rank + 1, count, category);
+    }
+    println!("elapsed_ms={}", started.elapsed().as_millis());
+    Ok(())
+}
+
+fn compile_error_category(message: &str) -> String {
+    for prefix in [
+        "unknown local",
+        "unexpected token",
+        "unsupported binary operator",
+        "unsupported unary operator",
+        "expected an expression",
+        "unexpected indentation",
+    ] {
+        if message.starts_with(prefix) {
+            return prefix.to_owned();
+        }
+    }
+    message.to_owned()
 }
 
 fn run_procedure(arguments: &[OsString]) -> Result<(), String> {
@@ -54,13 +165,26 @@ fn run_procedure(arguments: &[OsString]) -> Result<(), String> {
         .map_err(|error| format!("failed to read {}: {error}", source_path.display()))?;
     let syntax = dm_syntax::parse(&source)
         .map_err(|error| format!("failed to parse {}: {error}", source_path.display()))?;
-    let definition = syntax
+    let definitions: Vec<_> = syntax
         .definitions
-        .iter()
-        .find(|definition| definition.path.to_string() == procedure_path)
+        .into_iter()
+        .filter(|definition| {
+            matches!(
+                definition.kind,
+                dm_syntax::DefinitionKind::Procedure
+                    | dm_syntax::DefinitionKind::ProcedureOverride
+                    | dm_syntax::DefinitionKind::Verb
+            )
+        })
+        .collect();
+    let module = dm_vm::compile_module(&definitions)
+        .map_err(|error| format!("failed to compile {}: {error}", source_path.display()))?;
+    let entry = module
+        .procedure_id(procedure_path)
         .ok_or_else(|| format!("procedure {procedure_path} was not found"))?;
-    let program = dm_vm::compile_procedure(definition)
-        .map_err(|error| format!("failed to compile {procedure_path}: {error}"))?;
+    let program = module
+        .procedure(entry)
+        .expect("a module resolves only valid procedure identities");
     let values: Result<Vec<_>, _> = raw_arguments
         .iter()
         .map(|argument| {
@@ -73,7 +197,7 @@ fn run_procedure(arguments: &[OsString]) -> Result<(), String> {
                 .map_err(|error| format!("invalid numeric argument {spelling:?}: {error}"))
         })
         .collect();
-    let result = dm_vm::execute(&program, &values?)
+    let result = dm_vm::execute_module(&module, entry, &values?)
         .map_err(|error| format!("runtime error in {procedure_path}: {error}"))?;
 
     println!("procedure={procedure_path}");
@@ -409,7 +533,8 @@ fn print_stream(name: &str, bytes: &[u8]) {
 }
 
 fn usage() -> String {
-    "usage: dm-conformance <check|execute|lex|probe|project|syntax> ...".to_owned()
+    "usage: dm-conformance <check|compile-check|execute|frontend|lex|probe|project|syntax> ..."
+        .to_owned()
 }
 
 fn probe_usage() -> String {

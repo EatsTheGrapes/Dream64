@@ -50,6 +50,26 @@ racy:
 Parallel jobs cannot mutate live datums directly. An opt-in future API may
 accept pure data and return values, with determinism verified in tests.
 
+## Procedure frames
+
+Each running procedure has an explicit frame containing its stable procedure
+identity, instruction pointer, local slots, operand-stack base, complete passed
+argument vector, `src`, `usr`, return value, and caller link. Keeping these
+fields explicit supports deterministic scheduling, debugger inspection,
+replay, and useful runtime stack traces without relying on the native machine
+stack.
+
+Compatibility binding preserves the distinction between declared parameters
+and passed arguments. Missing parameters receive their declared default or
+`null`; extra positional arguments remain available through `args`. Calls to
+the current proc and parent proc may reuse the current argument vector. Named
+arguments, `arglist()`, override chains, and `..()` are resolved before the
+optimized tiers so the interpreter remains the reference behavior.
+
+A configurable frame limit produces a deterministic runtime error instead of
+overflowing the host stack. Sleeping or yielding suspends a frame inside its
+fiber; it never blocks an operating-system worker thread.
+
 ## Values and memory
 
 The host process is 64-bit. Object handles and internal indices are not limited

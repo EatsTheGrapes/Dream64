@@ -1,16 +1,15 @@
 [package]
-name = "dm-conformance"
+name = "dm-object-tree"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish = false
 
 [dependencies]
-dm-compiler = { path = "../dm-compiler" }
+dm-core = { path = "../dm-core" }
 dm-lexer = { path = "../dm-lexer" }
-dm-project = { path = "../dm-project" }
 dm-syntax = { path = "../dm-syntax" }
-dm-vm = { path = "../dm-vm" }
 
 [lints]
 workspace = true
