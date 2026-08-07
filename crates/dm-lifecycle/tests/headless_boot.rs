@@ -165,7 +165,11 @@ fn headless_boot_keeps_runtime_errors_source_mapped() {
         panic!("expected a source-aware runtime failure");
     };
     assert_eq!(target.procedure_path, "/obj/broken/proc/New");
-    assert!(error.message.contains("numeric operation received"));
+    assert!(
+        error
+            .message
+            .contains("addition requires compatible DM values")
+    );
     assert!(error.source_span.is_some());
     assert_eq!(error.call_stack.len(), 1);
     assert!(
