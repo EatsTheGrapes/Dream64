@@ -2,9 +2,14 @@
 
 #![cfg_attr(not(test), deny(missing_docs))]
 
+mod builtins;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
+
+use builtins::{execute_standard_builtin, is_subtype, standard_builtin_arity};
 
 use dm_core::{DmNumberBits, SourceSpan};
 use dm_lexer::{SpannedToken, TokenKind};
@@ -73,6 +78,15 @@ pub enum Instruction {
         /// Whether positions count Unicode scalar values rather than bytes.
         character_indices: bool,
     },
+    /// Executes a documented BYOND global procedure handled by the native runtime.
+    StandardBuiltin {
+        /// Canonical global procedure name.
+        name: String,
+        /// Number of already-evaluated arguments.
+        argument_count: u16,
+    },
+    /// Reads a field's compile-time initial value from a datum or type path.
+    InitialField(FieldName),
     /// Enumerates every materialized turf in an inclusive 3D rectangular block.
     Block {
         /// Number of supplied arguments: two turfs, or three through six coordinates.
@@ -205,6 +219,8 @@ pub enum Instruction {
     Subtract,
     /// Numeric multiplication.
     Multiply,
+    /// Numeric exponentiation (`**`).
+    Power,
     /// Numeric division.
     Divide,
     /// Numeric remainder.
@@ -3079,6 +3095,11 @@ enum Expression {
         arguments: Vec<Self>,
         character_indices: bool,
     },
+    StandardBuiltin {
+        name: String,
+        arguments: Vec<Self>,
+    },
+    Initial(Box<Self>),
     Block {
         arguments: Vec<Self>,
     },
@@ -3183,6 +3204,18 @@ enum ListExpressionEntry {
 /// source. Keep this deliberately finite: an unrecognised identifier must
 /// continue through ordinary local/field resolution and retain its useful
 /// diagnostic instead of silently becoming a number.
+fn dm_builtin_text_constant(identifier: &str) -> Option<&'static str> {
+    match identifier {
+        "UNIX" => Some("UNIX"),
+        "MS_WINDOWS" => Some("MS Windows"),
+        "MALE" => Some("male"),
+        "FEMALE" => Some("female"),
+        "NEUTER" => Some("neuter"),
+        "PLURAL" => Some("plural"),
+        _ => None,
+    }
+}
+
 fn dm_builtin_numeric_constant(identifier: &str) -> Option<f32> {
     match identifier {
         "FALSE" | "BLEND_DEFAULT" => Some(0.0),
@@ -3332,7 +3365,12 @@ impl<'a> ExpressionParser<'a> {
             }
             let operator = operator.to_owned();
             self.index += 1;
-            let right = self.parse_binary(precedence + 1)?;
+            let right_precedence = if operator == "**" {
+                precedence
+            } else {
+                precedence + 1
+            };
+            let right = self.parse_binary(right_precedence)?;
             left = if operator == "in" {
                 match left {
                     Expression::Locate { arguments } => Expression::LocateIn {
@@ -3514,6 +3552,11 @@ impl<'a> ExpressionParser<'a> {
             {
                 Ok(Expression::Number(DmNumberBits::from_f32(value)))
             }
+            TokenKind::Identifier(identifier)
+                if let Some(value) = dm_builtin_text_constant(identifier) =>
+            {
+                Ok(Expression::Text(value.to_owned()))
+            }
             TokenKind::Identifier(identifier) if identifier == "src" => Ok(Expression::Src),
             TokenKind::Identifier(identifier) if identifier == "usr" => Ok(Expression::Usr),
             // `GLOB` is the conventional SS13 alias for DM's built-in
@@ -3626,10 +3669,14 @@ impl<'a> ExpressionParser<'a> {
                 } else if let Some(kind) = type_predicate_kind(identifier) {
                     let arguments = self.parse_call_arguments()?;
                     let valid_count = match kind {
-                        TypePredicateKind::IsType => (1..=2).contains(&arguments.len()),
-                        // BYOND `isloc` is variadic and succeeds only when
-                        // every supplied value is a location.
-                        TypePredicateKind::IsLoc => !arguments.is_empty(),
+                        TypePredicateKind::IsType | TypePredicateKind::IsPath => {
+                            (1..=2).contains(&arguments.len())
+                        }
+                        // BYOND's location classifiers accept multiple values
+                        // and succeed only when every supplied value matches.
+                        TypePredicateKind::IsLoc
+                        | TypePredicateKind::IsMovable
+                        | TypePredicateKind::IsTurf => !arguments.is_empty(),
                         _ => arguments.len() == 1,
                     };
                     if !valid_count {
@@ -3639,6 +3686,17 @@ impl<'a> ExpressionParser<'a> {
                         )));
                     }
                     Ok(Expression::TypePredicate { kind, arguments })
+                } else if identifier == "initial" {
+                    let mut arguments = self.parse_call_arguments()?;
+                    if arguments.len() != 1 {
+                        return Err(compile_error(format!(
+                            "initial requires exactly one variable reference, received {} arguments",
+                            arguments.len()
+                        )));
+                    }
+                    Ok(Expression::Initial(Box::new(
+                        arguments.pop().expect("validated initial argument"),
+                    )))
                 } else if identifier == "regex" {
                     let arguments = self.parse_call_arguments()?;
                     if !(1..=2).contains(&arguments.len()) {
@@ -3791,6 +3849,18 @@ impl<'a> ExpressionParser<'a> {
                     })
                 } else if identifier == "nameof" {
                     self.parse_nameof_expression()
+                } else if let Some((minimum, maximum)) = standard_builtin_arity(identifier) {
+                    let arguments = self.parse_call_arguments()?;
+                    if arguments.len() < minimum || arguments.len() > maximum {
+                        return Err(compile_error(format!(
+                            "{identifier} received {} arguments; expected {minimum} through {maximum}",
+                            arguments.len()
+                        )));
+                    }
+                    Ok(Expression::StandardBuiltin {
+                        name: identifier.clone(),
+                        arguments,
+                    })
                 } else {
                     let arguments = self.parse_call_arguments()?;
                     Ok(Expression::Call {
@@ -4073,6 +4143,7 @@ const fn binary_precedence(operator: &str) -> Option<u8> {
         b"<<" | b">>" | b"<" | b"<=" | b">" | b">=" | b"in" => Some(7),
         b"+" | b"-" => Some(8),
         b"*" | b"/" | b"%" => Some(9),
+        b"**" => Some(10),
         _ => None,
     }
 }
@@ -4319,6 +4390,31 @@ fn emit_expression(
                 "arglist may only appear in a call or constructor argument list",
             ));
         }
+        Expression::StandardBuiltin { name, arguments } => {
+            let argument_count = u16::try_from(arguments.len())
+                .map_err(|_| compile_error("native builtin has more than 65535 arguments"))?;
+            for argument in arguments {
+                emit_expression(argument, locals, instructions, procedures)?;
+            }
+            instructions.push(Instruction::StandardBuiltin {
+                name: name.clone(),
+                argument_count,
+            });
+        }
+        Expression::Initial(reference) => match reference.as_ref() {
+            Expression::Field { receiver, name } => {
+                emit_expression(receiver, locals, instructions, procedures)?;
+                instructions.push(Instruction::InitialField(name.clone()));
+            }
+            Expression::Local(name) => {
+                let field = locals.src_field(name).ok_or_else(|| {
+                    compile_error(format!("initial target {name:?} is not an instance field"))
+                })?;
+                instructions.push(Instruction::LoadSrc);
+                instructions.push(Instruction::InitialField(field.clone()));
+            }
+            _ => return Err(compile_error("initial requires a field reference")),
+        },
         Expression::Call {
             procedure,
             arguments,
@@ -4439,6 +4535,7 @@ fn emit_expression(
                 "+" => Instruction::Add,
                 "-" => Instruction::Subtract,
                 "*" => Instruction::Multiply,
+                "**" => Instruction::Power,
                 "/" => Instruction::Divide,
                 "%" => Instruction::Remainder,
                 "&" => Instruction::BitAnd,
@@ -4601,6 +4698,7 @@ fn bind_initializer_expression(
             bind_initializer_expression(receiver, bindings)?;
         }
         Expression::Call { arguments, .. }
+        | Expression::StandardBuiltin { arguments, .. }
         | Expression::Regex { arguments }
         | Expression::MutableAppearance { arguments }
         | Expression::ReplaceText { arguments, .. }
@@ -4617,7 +4715,8 @@ fn bind_initializer_expression(
         }
         Expression::Length { value }
         | Expression::Ref { value }
-        | Expression::TypesOf { value } => {
+        | Expression::TypesOf { value }
+        | Expression::Initial(value) => {
             bind_initializer_expression(value, bindings)?;
         }
         Expression::ArgList(value) => bind_initializer_expression(value, bindings)?,
@@ -4752,6 +4851,9 @@ pub struct ExecutionState {
     heap: ValueHeap,
     globals: BTreeMap<FieldName, Value>,
     type_paths: Arc<std::collections::BTreeSet<TypePath>>,
+    type_parents: Arc<BTreeMap<TypePath, Option<TypePath>>>,
+    initial_values: Arc<BTreeMap<TypePath, BTreeMap<FieldName, Value>>>,
+    project_root: Option<Arc<PathBuf>>,
     random_state: u64,
 }
 
@@ -4769,6 +4871,9 @@ impl ExecutionState {
             heap,
             globals: BTreeMap::new(),
             type_paths: Arc::new(std::collections::BTreeSet::new()),
+            type_parents: Arc::new(BTreeMap::new()),
+            initial_values: Arc::new(BTreeMap::new()),
+            project_root: None,
             random_state: 0,
         }
     }
@@ -4824,6 +4929,41 @@ impl ExecutionState {
     /// Iterates the canonical type catalog in lexical path order.
     pub fn type_paths(&self) -> impl Iterator<Item = &TypePath> {
         self.type_paths.iter()
+    }
+
+    /// Replaces the runtime type-parent catalog used by subtype and parent_type lookups.
+    pub fn set_type_parents(&mut self, parents: BTreeMap<TypePath, Option<TypePath>>) {
+        self.type_parents = Arc::new(parents);
+    }
+
+    /// Replaces effective compile-time initial field values for every runtime type.
+    pub fn set_initial_values(&mut self, values: BTreeMap<TypePath, BTreeMap<FieldName, Value>>) {
+        self.initial_values = Arc::new(values);
+    }
+
+    /// Sets the project root used by BYOND filesystem procedures such as fexists().
+    pub fn set_project_root(&mut self, root: PathBuf) {
+        self.project_root = Some(Arc::new(root));
+    }
+
+    /// Returns a type's runtime parent when the catalog contains that type.
+    #[must_use]
+    pub fn type_parent(&self, path: &TypePath) -> Option<&TypePath> {
+        self.type_parents.get(path).and_then(Option::as_ref)
+    }
+
+    /// Returns one effective compile-time initial value when available.
+    #[must_use]
+    pub fn initial_value(&self, path: &TypePath, field: &FieldName) -> Option<&Value> {
+        self.initial_values
+            .get(path)
+            .and_then(|fields| fields.get(field))
+    }
+
+    /// Returns the project root used for relative filesystem paths.
+    #[must_use]
+    pub fn project_root(&self) -> Option<&std::path::Path> {
+        self.project_root.as_deref().map(PathBuf::as_path)
     }
 
     /// Iterates globals in canonical field-name order for snapshots.
@@ -5329,6 +5469,22 @@ fn run_frames(
                     .map_err(|message| execution_error(module, &frames, message))?;
                 frames[frame_index].stack.push(Value::text(value));
             }
+            Instruction::StandardBuiltin {
+                name,
+                argument_count,
+            } => {
+                let count = usize::from(argument_count);
+                if count > frames[frame_index].stack.len() {
+                    return Err(execution_error(module, &frames, "bytecode stack underflow"));
+                }
+                let arguments = {
+                    let stack = &mut frames[frame_index].stack;
+                    stack.split_off(stack.len() - count)
+                };
+                let value = execute_standard_builtin(&name, &arguments, state)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].stack.push(value);
+            }
             Instruction::Length => {
                 let value = match pop(&mut frames[frame_index].stack) {
                     Ok(value) => value,
@@ -5477,8 +5633,12 @@ fn run_frames(
             } => {
                 let count = usize::from(argument_count);
                 let valid_count = match kind {
-                    TypePredicateKind::IsType => (1..=2).contains(&count),
-                    TypePredicateKind::IsLoc => count >= 1,
+                    TypePredicateKind::IsType | TypePredicateKind::IsPath => {
+                        (1..=2).contains(&count)
+                    }
+                    TypePredicateKind::IsLoc
+                    | TypePredicateKind::IsMovable
+                    | TypePredicateKind::IsTurf => count >= 1,
                     _ => count == 1,
                 };
                 if !valid_count || frames[frame_index].stack.len() < count {
@@ -5492,7 +5652,7 @@ fn run_frames(
                     let stack = &mut frames[frame_index].stack;
                     stack.split_off(stack.len() - count)
                 };
-                let result = type_predicate_builtin(kind, &arguments, &state.heap)
+                let result = type_predicate_builtin(kind, &arguments, state)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 frames[frame_index]
                     .stack
@@ -5723,28 +5883,75 @@ fn run_frames(
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                let datum = match datum_receiver(&receiver, "field read") {
-                    Ok(datum) => datum,
+                let value = match receiver {
+                    Value::TypePath(path) if name.as_str() == "parent_type" => state
+                        .type_parent(&path)
+                        .cloned()
+                        .map_or(Value::Null, Value::TypePath),
+                    Value::Datum(datum) => {
+                        let runtime_type = match state.heap.datum(datum) {
+                            Ok(datum) => datum.type_path().clone(),
+                            Err(error) => {
+                                return Err(execution_error(module, &frames, error.to_string()));
+                            }
+                        };
+                        if name.as_str() == "type" {
+                            Value::TypePath(runtime_type)
+                        } else if name.as_str() == "parent_type" {
+                            state
+                                .type_parent(&runtime_type)
+                                .cloned()
+                                .map_or(Value::Null, Value::TypePath)
+                        } else {
+                            match state.heap.datum_field(datum, &name) {
+                                Ok(value) => value.clone(),
+                                Err(error) => {
+                                    return Err(execution_error(
+                                        module,
+                                        &frames,
+                                        error.to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    value => {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("field read requires a datum, received {value}"),
+                        ));
+                    }
+                };
+                frames[frame_index].stack.push(value);
+            }
+            Instruction::InitialField(name) => {
+                let receiver = match pop(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                // `datum.type` is a built-in, read-only field.  It is not a
-                // materialized user field: its value always reflects the
-                // heap datum's canonical runtime type.
-                let value = if name.as_str() == "type" {
-                    match state.heap.datum(datum) {
-                        Ok(datum) => Value::TypePath(datum.type_path().clone()),
+                let runtime_type = match receiver {
+                    Value::TypePath(path) => path,
+                    Value::Datum(datum) => match state.heap.datum(datum) {
+                        Ok(datum) => datum.type_path().clone(),
                         Err(error) => {
                             return Err(execution_error(module, &frames, error.to_string()));
                         }
-                    }
-                } else {
-                    match state.heap.datum_field(datum, &name) {
-                        Ok(value) => value.clone(),
-                        Err(error) => {
-                            return Err(execution_error(module, &frames, error.to_string()));
-                        }
+                    },
+                    value => {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!(
+                                "initial requires a datum or type path receiver, received {value}"
+                            ),
+                        ));
                     }
                 };
+                let value = state
+                    .initial_value(&runtime_type, &name)
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 frames[frame_index].stack.push(value);
             }
             Instruction::StoreField(ref name) | Instruction::StoreFieldKeep(ref name) => {
@@ -5892,9 +6099,33 @@ fn run_frames(
                     .stack
                     .push(Value::number(f32::from(!is_truthy)));
             }
-            Instruction::Add
-            | Instruction::Subtract
+            Instruction::Add => {
+                let right = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let left = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let value = match (left, right) {
+                    (Value::Number(left), Value::Number(right)) => {
+                        Value::number(left.to_f32() + right.to_f32())
+                    }
+                    (Value::Text(left), Value::Text(right)) => {
+                        Value::text(format!("{left}{right}"))
+                    }
+                    (left, right) => {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!(
+                                "addition requires two numbers or two text values, received {left} and {right}"
+                            ),
+                        ));
+                    }
+                };
+                frames[frame_index].stack.push(value);
+            }
+            Instruction::Subtract
             | Instruction::Multiply
+            | Instruction::Power
             | Instruction::Divide
             | Instruction::Remainder
             | Instruction::BitAnd
@@ -6238,6 +6469,7 @@ fn execute_numeric_binary(instruction: &Instruction, left: f32, right: f32) -> f
         Instruction::Add => left + right,
         Instruction::Subtract => left - right,
         Instruction::Multiply => left * right,
+        Instruction::Power => left.powf(right),
         Instruction::Divide => left / right,
         Instruction::Remainder => left % right,
         Instruction::BitAnd => bitwise_binary(left, right, |left, right| left & right),
@@ -6867,45 +7099,47 @@ fn typesof_builtin(
 fn type_predicate_builtin(
     kind: TypePredicateKind,
     arguments: &[Value],
-    heap: &ValueHeap,
+    state: &ExecutionState,
 ) -> Result<bool, String> {
+    let heap = &state.heap;
     let value = arguments
         .first()
         .ok_or_else(|| "type predicate requires a value".to_owned())?;
     match kind {
         TypePredicateKind::IsNull => Ok(matches!(value, Value::Null)),
         TypePredicateKind::IsNum => Ok(matches!(value, Value::Number(_))),
-        TypePredicateKind::IsPath => Ok(matches!(value, Value::TypePath(_))),
+        TypePredicateKind::IsPath => {
+            let Value::TypePath(candidate) = value else {
+                return Ok(false);
+            };
+            let Some(target) = arguments.get(1) else {
+                return Ok(true);
+            };
+            let Value::TypePath(target) = target else {
+                return Ok(false);
+            };
+            Ok(is_subtype(state, candidate, target))
+        }
         TypePredicateKind::IsList => Ok(matches!(value, Value::List(_))),
         TypePredicateKind::IsMovable => {
-            let Value::Datum(datum) = value else {
-                return Ok(false);
-            };
-            let type_path = heap
-                .datum(*datum)
-                .map_err(|error| error.to_string())?
-                .type_path()
-                .as_str();
-            // `/obj` and `/mob` are conventional direct children of
-            // `/atom/movable`, despite their path spelling not retaining that
-            // parent segment. Their descendants are movable too.
-            Ok(type_path == "/atom/movable"
-                || type_path.starts_with("/atom/movable/")
-                || type_path == "/obj"
-                || type_path.starts_with("/obj/")
-                || type_path == "/mob"
-                || type_path.starts_with("/mob/"))
+            let target = TypePath::parse("/atom/movable").expect("built-in movable path is valid");
+            Ok(arguments.iter().all(|value| {
+                let Value::Datum(datum) = value else {
+                    return false;
+                };
+                heap.datum(*datum)
+                    .is_ok_and(|datum| is_subtype(state, datum.type_path(), &target))
+            }))
         }
         TypePredicateKind::IsTurf => {
-            let Value::Datum(datum) = value else {
-                return Ok(false);
-            };
-            let type_path = heap
-                .datum(*datum)
-                .map_err(|error| error.to_string())?
-                .type_path()
-                .as_str();
-            Ok(type_path == "/turf" || type_path.starts_with("/turf/"))
+            let target = TypePath::parse("/turf").expect("built-in turf path is valid");
+            Ok(arguments.iter().all(|value| {
+                let Value::Datum(datum) = value else {
+                    return false;
+                };
+                heap.datum(*datum)
+                    .is_ok_and(|datum| is_subtype(state, datum.type_path(), &target))
+            }))
         }
         TypePredicateKind::IsIcon => match value {
             Value::Text(text) => Ok(text.to_ascii_lowercase().ends_with(".dmi")),
@@ -6919,28 +7153,16 @@ fn type_predicate_builtin(
             }
             _ => Ok(false),
         },
-        TypePredicateKind::IsLoc => Ok(arguments.iter().all(|value| {
-            let Value::Datum(datum) = value else {
-                return false;
-            };
-            let Ok(datum) = heap.datum(*datum) else {
-                return false;
-            };
-            let type_path = datum.type_path().as_str();
-            // The four concrete atom roots are conventionally spelled as
-            // `/area`, `/turf`, `/obj`, and `/mob`, even though they inherit
-            // `/atom` rather than retaining that segment in their paths.
-            type_path == "/atom"
-                || type_path.starts_with("/atom/")
-                || type_path == "/area"
-                || type_path.starts_with("/area/")
-                || type_path == "/turf"
-                || type_path.starts_with("/turf/")
-                || type_path == "/obj"
-                || type_path.starts_with("/obj/")
-                || type_path == "/mob"
-                || type_path.starts_with("/mob/")
-        })),
+        TypePredicateKind::IsLoc => {
+            let target = TypePath::parse("/atom").expect("built-in atom path is valid");
+            Ok(arguments.iter().all(|value| {
+                let Value::Datum(datum) = value else {
+                    return false;
+                };
+                heap.datum(*datum)
+                    .is_ok_and(|datum| is_subtype(state, datum.type_path(), &target))
+            }))
+        }
         TypePredicateKind::IsType => {
             let Some(target) = arguments.get(1) else {
                 return Ok(matches!(value, Value::Datum(_)));
@@ -6956,12 +7178,7 @@ fn type_predicate_builtin(
                     .type_path(),
                 _ => return Ok(false),
             };
-            let target = target.as_str();
-            let candidate = candidate.as_str();
-            Ok(candidate == target
-                || candidate
-                    .strip_prefix(target)
-                    .is_some_and(|suffix| suffix.starts_with('/')))
+            Ok(is_subtype(state, candidate, target))
         }
     }
 }
@@ -8390,6 +8607,68 @@ mod tests {
         assert_eq!(
             execute_module(&module, entry, &[Value::number(1.0), Value::number(1.0)]),
             Ok(Value::number(7.0))
+        );
+    }
+
+    #[test]
+    fn documented_native_builtins_cover_text_math_and_type_helpers() {
+        let source = parse(
+            "/proc/native(kind)\n\tvar/path = text2path(\"/datum/child\")\n\tif(!path)\n\t\treturn 0\n\treturn (2 ** 3 ** 2) + floor(1.9) + abs(-2) + findlasttext(\"/datum/child\", \"/\") + initial(kind.flag)\n",
+        )
+        .expect("native builtin source should parse");
+        let module = compile_module(&source.definitions).expect("native builtins should compile");
+        let mut state = ExecutionState::new();
+        let base = TypePath::parse("/datum/base").unwrap();
+        let child = TypePath::parse("/datum/child").unwrap();
+        state.set_type_paths([base.clone(), child.clone()]);
+        state.set_type_parents(BTreeMap::from([
+            (base.clone(), Some(TypePath::parse("/datum").unwrap())),
+            (child.clone(), Some(base.clone())),
+        ]));
+        state.set_initial_values(BTreeMap::from([(
+            child.clone(),
+            BTreeMap::from([(field("flag"), Value::number(7.0))]),
+        )]));
+        let result = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/native").unwrap(),
+            &[Value::TypePath(child)],
+            &mut state,
+        )
+        .expect("native builtin procedure should execute");
+        // 2 ** (3 ** 2) = 512; floor=1; abs=2; final slash is byte 7; initial=7.
+        assert_eq!(result, Value::number(529.0));
+    }
+
+    #[test]
+    fn type_predicates_follow_runtime_parent_catalog_not_path_spelling() {
+        let source = parse(
+            "/proc/check(value)\n\treturn istype(value, /atom/movable) && ismovable(value)\n",
+        )
+        .expect("predicate source should parse");
+        let module = compile_module(&source.definitions).expect("predicate source should compile");
+        let mut state = ExecutionState::new();
+        let obj = TypePath::parse("/obj/item").unwrap();
+        state.set_type_parents(BTreeMap::from([
+            (obj.clone(), Some(TypePath::parse("/obj").unwrap())),
+            (
+                TypePath::parse("/obj").unwrap(),
+                Some(TypePath::parse("/atom/movable").unwrap()),
+            ),
+            (
+                TypePath::parse("/atom/movable").unwrap(),
+                Some(TypePath::parse("/atom").unwrap()),
+            ),
+        ]));
+        let datum = state.heap_mut().allocate_datum(obj);
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/check").unwrap(),
+                &[Value::Datum(datum)],
+                &mut state,
+            ),
+            Ok(Value::number(1.0))
         );
     }
 

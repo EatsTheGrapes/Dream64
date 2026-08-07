@@ -786,7 +786,21 @@ fn standard_instance_fields(path: Option<&CodePath>, fields: &mut BTreeMap<Strin
         // Every datum exposes its canonical runtime type through this
         // read-only built-in field. The VM materializes its value from the
         // datum record rather than from a user-declared default.
-        "/datum" => &["tag", "type"],
+        "/datum" => &["tag", "type", "parent_type"],
+        "/world" => &[
+            "system_type",
+            "icon_size",
+            "tick_lag",
+            "fps",
+            "timezone",
+            "cpu",
+            "time",
+            "timeofday",
+            "realtime",
+            "maxx",
+            "maxy",
+            "maxz",
+        ],
         "/atom" => &[
             "alpha",
             "appearance_flags",
