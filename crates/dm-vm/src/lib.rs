@@ -5915,6 +5915,9 @@ fn run_frames(
                             }
                         }
                     }
+                    Value::Null => {
+                        return Err(execution_error(module, &frames, "field read received null"));
+                    }
                     value => {
                         return Err(execution_error(
                             module,
@@ -9211,7 +9214,11 @@ mod tests {
         let error =
             execute_module(&module, entry, &[]).expect_err("numeric operation on text should fail");
 
-        assert!(error.message.contains("numeric operation received"));
+        assert!(
+            error
+                .message
+                .contains("addition requires compatible DM values")
+        );
         assert_eq!(error.source_span, Some(expected_span));
         assert_eq!(error.call_stack.len(), 2);
         assert_eq!(error.call_stack[0].procedure, "/proc/main");
@@ -9880,13 +9887,14 @@ mod tests {
             execute(&program, &[Value::number(10.0)]),
             Ok(Value::number(17.0))
         );
-        let error = execute(
-            &program,
-            &[Value::number(10.0), Value::Null, Value::number(1.0)],
-        )
-        .expect_err("explicit null should suppress the second parameter default");
-        assert_eq!(error.message, "numeric operation received null");
-        assert_eq!(error.source_span, Some(syntax.definitions[0].body[0].span));
+        assert_eq!(
+            execute(
+                &program,
+                &[Value::number(10.0), Value::Null, Value::number(1.0)],
+            ),
+            Ok(Value::number(11.0)),
+            "explicit null suppresses the default and participates in arithmetic as numeric zero",
+        );
     }
 
     #[test]
