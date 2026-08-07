@@ -6307,7 +6307,10 @@ fn copy_text_builtin(
     let start = start.saturating_sub(1);
     let end = end.saturating_sub(1);
     let (start, end) = if character_indices {
-        (character_offset(&source, start), character_offset(&source, end))
+        (
+            character_offset(&source, start),
+            character_offset(&source, end),
+        )
     } else {
         (
             previous_char_boundary(&source, start),
@@ -6331,7 +6334,9 @@ fn signed_text_index(value: Option<&Value>, default: i64) -> Result<i64, String>
             }
             Ok(number.trunc() as i64)
         }
-        Some(value) => Err(format!("copytext bounds require a number, received {value}")),
+        Some(value) => Err(format!(
+            "copytext bounds require a number, received {value}"
+        )),
     }
 }
 
@@ -7951,7 +7956,7 @@ mod tests {
     #[test]
     fn copytext_char_uses_character_positions_and_negative_offsets() {
         let source = parse(
-            "/proc/middle()\n\treturn copytext_char("AéB", 2, 3)\n/proc/tail()\n\treturn copytext_char("Hi there", -5)\n",
+            "/proc/middle()\n\treturn copytext_char(\"AéB\", 2, 3)\n/proc/tail()\n\treturn copytext_char(\"Hi there\", -5)\n",
         )
         .expect("copytext_char source should parse");
         let module = compile_module(&source.definitions).expect("copytext_char should compile");
@@ -7972,9 +7977,18 @@ mod tests {
         let mut turfs = Vec::new();
         for (x_value, y_value) in [(1.0, 1.0), (2.0, 1.0), (1.0, 2.0), (2.0, 2.0)] {
             let turf = state.heap_mut().allocate_datum(turf_path.clone());
-            state.heap_mut().set_datum_field(turf, field("x"), Value::number(x_value)).unwrap();
-            state.heap_mut().set_datum_field(turf, field("y"), Value::number(y_value)).unwrap();
-            state.heap_mut().set_datum_field(turf, field("z"), Value::number(1.0)).unwrap();
+            state
+                .heap_mut()
+                .set_datum_field(turf, field("x"), Value::number(x_value))
+                .unwrap();
+            state
+                .heap_mut()
+                .set_datum_field(turf, field("y"), Value::number(y_value))
+                .unwrap();
+            state
+                .heap_mut()
+                .set_datum_field(turf, field("z"), Value::number(1.0))
+                .unwrap();
             turfs.push(turf);
         }
         let result = execute_module_in_state(
