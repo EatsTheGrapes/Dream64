@@ -19,6 +19,25 @@ use dm_object_tree::{CodePath, NodeId, NodeKind};
 use dm_syntax::DefinitionKind;
 use dm_value::FieldName;
 
+const STANDARD_LOCATION_BUILTINS: &str = concat!(
+    "/proc/isarea(...)\n",
+    "\tfor(var/location in args)\n",
+    "\t\tif(!istype(location, /area))\n",
+    "\t\t\treturn 0\n",
+    "\treturn 1\n",
+    "/proc/ismob(...)\n",
+    "\tfor(var/location in args)\n",
+    "\t\tif(!istype(location, /mob))\n",
+    "\t\t\treturn 0\n",
+    "\treturn 1\n",
+    "/proc/isobj(...)\n",
+    "\tfor(var/location in args)\n",
+    "\t\tif(!istype(location, /obj))\n",
+    "\t\t\treturn 0\n",
+    "\treturn 1\n",
+);
+const STANDARD_LOCATION_BUILTIN_NAMES: [&str; 3] = ["isarea", "ismob", "isobj"];
+
 /// Tree-local identity of a canonical procedure.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProcedureId(u32);
@@ -39,7 +58,7 @@ pub struct ProcedureImplementationId {
 }
 
 impl ProcedureImplementationId {
-    /// Returns this identity's index in [`ProcedureRegistry::procedures`].
+    /// Returns the canonical procedure containing this implementation.
     #[must_use]
     pub const fn procedure(self) -> ProcedureId {
         self.procedure
@@ -420,7 +439,22 @@ impl ProcedureRegistry {
             .enumerate()
             .map(|(index, (_, implementation, _))| (implementation.id, index))
             .collect();
-        let specs: Vec<_> = ordered
+        let builtin_syntax = dm_syntax::parse(STANDARD_LOCATION_BUILTINS).map_err(|error| {
+            dm_vm::CompileError {
+                message: format!("failed to parse Dream64 standard location builtins: {error}"),
+            }
+        })?;
+        if builtin_syntax.definitions.len() != STANDARD_LOCATION_BUILTIN_NAMES.len() {
+            return Err(dm_vm::CompileError {
+                message: "Dream64 standard location builtin catalog is malformed".to_owned(),
+            });
+        }
+        let builtin_indices: BTreeMap<_, _> = STANDARD_LOCATION_BUILTIN_NAMES
+            .iter()
+            .enumerate()
+            .map(|(offset, name)| ((*name).to_owned(), ordered.len() + offset))
+            .collect();
+        let mut specs: Vec<_> = ordered
             .iter()
             .map(|(procedure, implementation, definition)| {
                 let parent = if include_parent_targets {
@@ -441,18 +475,25 @@ impl ProcedureRegistry {
                 } else {
                     None
                 };
+                let selectors = static_call_selectors(definition);
+                let mut static_calls: BTreeMap<_, _> = selectors
+                    .iter()
+                    .filter_map(|selector| {
+                        self.static_call_target(implementation.id, selector, compilation)
+                            .and_then(|target| indices.get(&target).copied())
+                            .map(|target| (selector.clone(), target))
+                    })
+                    .collect();
+                for selector in selectors {
+                    if let Some(target) = builtin_indices.get(&selector) {
+                        static_calls.entry(selector).or_insert(*target);
+                    }
+                }
                 Ok(dm_vm::ProcedureSpec {
                     path: format!("{}@{}", procedure.path, implementation.ordinal),
                     definition,
                     parent,
-                    static_calls: static_call_selectors(definition)
-                        .into_iter()
-                        .filter_map(|selector| {
-                            self.static_call_target(implementation.id, &selector, compilation)
-                                .and_then(|target| indices.get(&target).copied())
-                                .map(|target| (selector, target))
-                        })
-                        .collect(),
+                    static_calls,
                     src_fields: procedure
                         .owner_type
                         .map(|owner| {
@@ -468,6 +509,17 @@ impl ProcedureRegistry {
                 })
             })
             .collect::<Result<_, dm_vm::CompileError>>()?;
+        for (offset, definition) in builtin_syntax.definitions.iter().enumerate() {
+            let name = STANDARD_LOCATION_BUILTIN_NAMES[offset];
+            specs.push(dm_vm::ProcedureSpec {
+                path: format!("/proc/{name}@dream64_builtin"),
+                definition,
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: global_fields.clone(),
+            });
+        }
         let module = dm_vm::compile_module_specs(&specs)?;
         let implementations = ordered
             .iter()
@@ -995,10 +1047,10 @@ mod tests {
             )
             .expect_err("atom fields must not become datum locals");
         assert!(
-    error.message.contains("unknown local \"alpha\""),
-    "unexpected diagnostic: {}",
-    error.message
-);
+            error.message.contains("unknown local \"alpha\""),
+            "unexpected diagnostic: {}",
+            error.message
+        );
     }
 
     #[test]
@@ -1012,6 +1064,25 @@ mod tests {
                 datum.implementations.iter().map(|body| body.id),
             )
             .expect("datum type should compile as its built-in src field");
+    }
+
+    #[test]
+    fn links_standard_location_predicates_as_variadic_builtins() {
+        let compilation = TestProject::compile(concat!(
+            "/proc/valid_locations()\n",
+            "\treturn isarea(new /area, new /area/station) + isobj(new /obj, new /obj/item) + ismob(new /mob, new /mob/living)\n",
+            "/proc/invalid_locations()\n",
+            "\treturn isarea(new /turf) + isobj(new /mob) + ismob(new /obj)\n",
+        ));
+
+        assert_eq!(
+            execute_effective(&compilation, "/proc/valid_locations", &[]),
+            Ok(Value::number(3.0))
+        );
+        assert_eq!(
+            execute_effective(&compilation, "/proc/invalid_locations", &[]),
+            Ok(Value::number(0.0))
+        );
     }
 
     #[test]
