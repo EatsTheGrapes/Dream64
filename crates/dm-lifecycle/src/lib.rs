@@ -666,15 +666,7 @@ pub fn execute_initialization_plan(
         .compile_vm_implementations(compilation, targets)
         .map_err(InitializationExecutionError::Compile)?;
     eprintln!("boot-progress: compiled lifecycle targets");
-    let world = if plan.events.iter().any(|event| {
-        matches!(
-            event,
-            InitializationEvent::Lifecycle {
-                subject: EventSubject::World,
-                ..
-            }
-        )
-    }) {
+    let world = if plan.world_type.is_some() {
         Some(
             runtime
                 .allocate_datum(
@@ -687,6 +679,12 @@ pub fn execute_initialization_plan(
     };
 
     let mut state = runtime.take_execution_state();
+    if let Some(world) = world {
+        state.set_global(
+            FieldName::parse("world").expect("built-in world global name is valid"),
+            Value::Datum(world),
+        );
+    }
     let execution = (|| {
         eprintln!("boot-progress: applying dynamic map overrides");
         apply_dynamic_map_overrides(plan, allocation, &bindings, runtime, &mut state)?;
