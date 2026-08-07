@@ -4931,7 +4931,7 @@ impl ExecutionState {
         self.type_paths.iter()
     }
 
-    /// Replaces the runtime type-parent catalog used by subtype and parent_type lookups.
+    /// Replaces the runtime type-parent catalog used by subtype and `parent_type` lookups.
     pub fn set_type_parents(&mut self, parents: BTreeMap<TypePath, Option<TypePath>>) {
         self.type_parents = Arc::new(parents);
     }
@@ -4941,7 +4941,7 @@ impl ExecutionState {
         self.initial_values = Arc::new(values);
     }
 
-    /// Sets the project root used by BYOND filesystem procedures such as fexists().
+    /// Sets the project root used by BYOND filesystem procedures such as `fexists()`.
     pub fn set_project_root(&mut self, root: PathBuf) {
         self.project_root = Some(Arc::new(root));
     }

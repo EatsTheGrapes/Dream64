@@ -4,6 +4,15 @@
 //! source when their behavior depends on host state, type metadata, or precise
 //! text-indexing semantics.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::unnecessary_wraps,
+    reason = "DM uses binary32 numbers for integer/index boundaries and native builtin dispatch shares a Result ABI"
+)]
+
 use std::fs;
 use std::path::PathBuf;
 
@@ -26,9 +35,9 @@ pub(super) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
         | "findlasttext"
         | "findlasttextEx"
         | "findlasttext_char"
-        | "findlasttextEx_char" => (2, 4),
+        | "findlasttextEx_char"
+        | "jointext" => (2, 4),
         "splittext" | "splittext_char" => (2, 5),
-        "jointext" => (2, 4),
         "addtext" => (0, usize::MAX),
         "spantext" | "spantext_char" | "nonspantext" | "nonspantext_char" => (2, 3),
         "splicetext" | "splicetext_char" => (4, 4),
@@ -660,10 +669,8 @@ fn fallback_parent(path: &TypePath) -> Option<TypePath> {
     let path = path.as_str();
     let explicit = match path {
         "/obj" | "/mob" => Some("/atom/movable"),
-        "/area" | "/turf" => Some("/atom"),
-        "/atom/movable" => Some("/atom"),
+        "/area" | "/turf" | "/atom/movable" => Some("/atom"),
         "/atom" => Some("/datum"),
-        "/datum" | "/world" | "/list" | "/client" => None,
         _ => None,
     };
     if let Some(parent) = explicit {
@@ -698,13 +705,13 @@ fn astype(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> 
 }
 
 fn turn(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    const DIRECTIONS: [i32; 8] = [1, 9, 8, 10, 2, 6, 4, 5];
     let direction = number(&arguments[0], "turn direction")?.trunc() as i32;
     let angle = number(&arguments[1], "turn angle")?;
     let steps = (angle / 45.0).trunc() as i32;
     if steps == 0 {
         return Ok(Value::number(direction as f32));
     }
-    const DIRECTIONS: [i32; 8] = [1, 9, 8, 10, 2, 6, 4, 5];
     let index = DIRECTIONS
         .iter()
         .position(|candidate| *candidate == direction);
