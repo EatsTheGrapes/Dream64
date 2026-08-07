@@ -1517,6 +1517,7 @@ fn top_level_assignment(tokens: &[SpannedToken]) -> Option<(usize, &str)> {
                         | "*="
                         | "/="
                         | "%="
+                        | "%%="
                         | "&="
                         | "|="
                         | "^="
@@ -9525,7 +9526,7 @@ mod tests {
 
     #[test]
     fn executes_bitwise_operators_with_dm_integer_coercion_and_precedence() {
-        let source = "/proc/probe()\n\treturn (-1 & 6) + (7 ^ 3 | 8) + (9.9 & 3)\n";
+        let source = "/proc/probe()\n\treturn (0xFFFFFF & 6) + (7 ^ 3 | 8) + (9.9 & 3)\n";
         let syntax = parse(source).expect("source should parse");
         let program =
             compile_procedure(&syntax.definitions[0]).expect("bitwise expressions should compile");
@@ -9548,7 +9549,9 @@ mod tests {
         let program = compile_procedure(&syntax.definitions[0])
             .expect("unary bitwise complement should compile");
 
-        assert_eq!(execute(&program, &[]), Ok(Value::number(-11.0)));
+        // ~9 and ~0 are 24-bit complements. Their binary32 sum rounds to
+        // the nearest representable value at this magnitude.
+        assert_eq!(execute(&program, &[]), Ok(Value::number(33_554_420.0)));
         assert!(
             program
                 .instructions
@@ -9576,7 +9579,7 @@ mod tests {
 
     #[test]
     fn shift_operators_and_compound_assignments_use_byond_24_bit_semantics() {
-        let source = "/proc/probe(items)\n\tvar/value = 3 << 2\n\tvalue >>= 1\n\titems[1] <<= value\n\treturn (-8 >> 2) + items[1] + (1 << 33)\n";
+        let source = "/proc/probe(items)\n\tvar/value = 3 << 2\n\tvalue >>= 1\n\titems[1] <<= value\n\treturn (8 >> 2) + items[1] + (1 << 33)\n";
         let syntax = parse(source).expect("source should parse");
         let program = compile_procedure(&syntax.definitions[0])
             .expect("shift expressions and assignments should compile");
@@ -9584,11 +9587,11 @@ mod tests {
         let list = state.heap.allocate_list();
         state.heap.list_mut(list).unwrap().add(Value::number(1.0));
 
-        // value is (3 << 2) >> 1 = 6; item becomes 1 << 6 = 64. Right
-        // BYOND shifts are limited to the low 24 bits; counts >=24 yield zero.
+        // value is (3 << 2) >> 1 = 6; item becomes 1 << 6 = 64.
+        // 8 >> 2 is 2, and counts >=24 shift every effective bit away.
         assert_eq!(
             execute_in_state(&program, &[Value::List(list)], &mut state),
-            Ok(Value::number(62.0))
+            Ok(Value::number(66.0))
         );
         assert!(program.instructions.iter().any(|instruction| {
             matches!(
@@ -9596,6 +9599,20 @@ mod tests {
                 Instruction::ShiftLeft | Instruction::ShiftRight
             )
         }));
+    }
+
+    #[test]
+    fn documented_pure_standard_procs_cover_sort_params_and_number_text() {
+        let source = parse(
+            "/proc/probe()\n\tvar/list/p = params2list(\"a=one+two&b=%26\")\n\tif(p[\"a\"] != \"one two\" || p[\"b\"] != \"&\")\n\t\treturn 0\n\tif(list2params(p) != \"a=one+two&b=%26\")\n\t\treturn 0\n\tif(lentext(\"abc\") != 3)\n\t\treturn 0\n\tif(sorttext(\"A\", \"b\") != 1 || sorttextEx(\"a\", \"B\") != -1)\n\t\treturn 0\n\tif(num2text(11, 2, 16) != \"0b\")\n\t\treturn 0\n\treturn 1\n",
+        )
+        .expect("pure standard-proc source should parse");
+        let module =
+            compile_module(&source.definitions).expect("pure standard procs should compile");
+        assert_eq!(
+            execute_module(&module, module.procedure_id("/proc/probe").unwrap(), &[]),
+            Ok(Value::number(1.0))
+        );
     }
 
     #[test]
