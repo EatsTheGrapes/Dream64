@@ -52,8 +52,10 @@ fn built_in_world_global_resolves_to_the_singleton_world_during_atom_lifecycle()
     let procedures = ProcedureRegistry::build(&compilation);
     let mut runtime = RuntimeImage::from_compilation(&compilation).expect("runtime should build");
     let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
-    let map = parse("\"a\" = (/obj/test, /turf/test, /area/test)\n(1,1,1) = {\"\na\n\"}\n")
-        .expect("map should parse");
+    let map = parse(
+        "\"a\" = (/obj/test, /turf/test, /area/test)\n(1,1,1) = {\"\na\n\"}\n",
+    )
+    .expect("map should parse");
     let world_plan = build_plan(&map, &compilation);
     let plan = build_initialization_plan(&runtime, &index, &world_plan, "boot.dmm");
     let allocation = allocate_world(&world_plan, &mut runtime).expect("world should allocate");
@@ -68,7 +70,10 @@ fn built_in_world_global_resolves_to_the_singleton_world_during_atom_lifecycle()
     )
     .expect("world global should be available during lifecycle execution");
 
-    assert!(execution.world.is_some(), "the /world singleton should be allocated");
+    assert!(
+        execution.world.is_some(),
+        "the /world singleton should be allocated"
+    );
     let object = allocation
         .coordinate(WorldCoordinate { x: 1, y: 1, z: 1 })
         .expect("map coordinate should exist")
