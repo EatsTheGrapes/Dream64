@@ -97,6 +97,12 @@ fn materialize_builtin_atom_defaults(
     is_atom: bool,
     is_movable: bool,
 ) -> Result<(), ValueError> {
+    // Every /datum has BYOND's built-in tag field, even though it has no
+    // source declaration in user projects.
+    let tag = FieldName::parse("tag").expect("built-in datum field name is valid");
+    if heap.datum_field(datum, &tag).is_err() {
+        heap.set_datum_field(datum, tag, Value::Null)?;
+    }
     if !is_atom {
         return Ok(());
     }
@@ -1152,7 +1158,7 @@ mod tests {
             .map(|(name, _)| name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, ["name", "health", "speed"]);
+        assert_eq!(names, ["name", "health", "speed", "tag"]);
         assert_eq!(datum.field(&field("name")), Ok(&Value::text("reopened")));
         assert_eq!(
             datum.field(&field("health")).unwrap().as_number(),

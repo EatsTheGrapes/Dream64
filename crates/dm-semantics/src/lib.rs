@@ -19,7 +19,7 @@ use dm_object_tree::{CodePath, NodeId, NodeKind};
 use dm_syntax::DefinitionKind;
 use dm_value::FieldName;
 
-const STANDARD_LOCATION_BUILTINS: &str = concat!(
+const STANDARD_BUILTINS: &str = concat!(
     "/proc/isarea(...)\n",
     "\tfor(var/location in args)\n",
     "\t\tif(!istype(location, /area))\n",
@@ -35,8 +35,39 @@ const STANDARD_LOCATION_BUILTINS: &str = concat!(
     "\t\tif(!istype(location, /obj))\n",
     "\t\t\treturn 0\n",
     "\treturn 1\n",
+    "/proc/get_dir(reference, target)\n",
+    "\tif(!istype(reference, /atom) || !istype(target, /atom))\n",
+    "\t\treturn 0\n",
+    "\tvar/direction = 0\n",
+    "\tif(target.y > reference.y)\n",
+    "\t\tdirection |= 1\n",
+    "\telse if(target.y < reference.y)\n",
+    "\t\tdirection |= 2\n",
+    "\tif(target.x > reference.x)\n",
+    "\t\tdirection |= 4\n",
+    "\telse if(target.x < reference.x)\n",
+    "\t\tdirection |= 8\n",
+    "\treturn direction\n",
+    "/proc/istext(value)\n",
+    "\treturn !isnull(value) && !isnum(value) && !ispath(value) && !islist(value) && !istype(value)\n",
+    "/proc/orange(first, second = usr)\n",
+    "\tvar/distance\n",
+    "\tvar/center\n",
+    "\tif(isnum(first))\n",
+    "\t\tdistance = first\n",
+    "\t\tcenter = second\n",
+    "\telse\n",
+    "\t\tcenter = first\n",
+    "\t\tdistance = second\n",
+    "\tvar/output = list()\n",
+    "\tfor(var/atom/candidate in range(distance, center))\n",
+    "\t\tif(candidate == center || candidate.loc == center)\n",
+    "\t\t\tcontinue\n",
+    "\t\toutput[length(output) + 1] = candidate\n",
+    "\treturn output\n",
 );
-const STANDARD_LOCATION_BUILTIN_NAMES: [&str; 3] = ["isarea", "ismob", "isobj"];
+const STANDARD_BUILTIN_NAMES: [&str; 6] =
+    ["isarea", "ismob", "isobj", "get_dir", "istext", "orange"];
 
 /// Tree-local identity of a canonical procedure.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -406,6 +437,7 @@ impl ProcedureRegistry {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn compile_vm_selected_with_fields(
         &self,
         compilation: &Compilation,
@@ -439,17 +471,16 @@ impl ProcedureRegistry {
             .enumerate()
             .map(|(index, (_, implementation, _))| (implementation.id, index))
             .collect();
-        let builtin_syntax = dm_syntax::parse(STANDARD_LOCATION_BUILTINS).map_err(|error| {
-            dm_vm::CompileError {
+        let builtin_syntax =
+            dm_syntax::parse(STANDARD_BUILTINS).map_err(|error| dm_vm::CompileError {
                 message: format!("failed to parse Dream64 standard location builtins: {error}"),
-            }
-        })?;
-        if builtin_syntax.definitions.len() != STANDARD_LOCATION_BUILTIN_NAMES.len() {
+            })?;
+        if builtin_syntax.definitions.len() != STANDARD_BUILTIN_NAMES.len() {
             return Err(dm_vm::CompileError {
                 message: "Dream64 standard location builtin catalog is malformed".to_owned(),
             });
         }
-        let builtin_indices: BTreeMap<_, _> = STANDARD_LOCATION_BUILTIN_NAMES
+        let builtin_indices: BTreeMap<_, _> = STANDARD_BUILTIN_NAMES
             .iter()
             .enumerate()
             .map(|(offset, name)| ((*name).to_owned(), ordered.len() + offset))
@@ -510,7 +541,7 @@ impl ProcedureRegistry {
             })
             .collect::<Result<_, dm_vm::CompileError>>()?;
         for (offset, definition) in builtin_syntax.definitions.iter().enumerate() {
-            let name = STANDARD_LOCATION_BUILTIN_NAMES[offset];
+            let name = STANDARD_BUILTIN_NAMES[offset];
             specs.push(dm_vm::ProcedureSpec {
                 path: format!("/proc/{name}@dream64_builtin"),
                 definition,
@@ -732,7 +763,7 @@ fn standard_instance_fields(path: Option<&CodePath>, fields: &mut BTreeMap<Strin
         // Every datum exposes its canonical runtime type through this
         // read-only built-in field. The VM materializes its value from the
         // datum record rather than from a user-declared default.
-        "/datum" => &["type"],
+        "/datum" => &["tag", "type"],
         "/atom" => &[
             "alpha",
             "appearance_flags",
@@ -1055,7 +1086,8 @@ mod tests {
 
     #[test]
     fn lowers_standard_datum_type_field_for_all_datums() {
-        let compilation = TestProject::compile("/datum/example\n\tproc/read()\n\t\treturn type\n");
+        let compilation =
+            TestProject::compile("/datum/example\n\tproc/read()\n\t\treturn list(type, tag)\n");
         let registry = ProcedureRegistry::build(&compilation);
         let datum = procedure_by_path(&registry, "/datum/example/proc/read");
         registry
@@ -1082,6 +1114,24 @@ mod tests {
         assert_eq!(
             execute_effective(&compilation, "/proc/invalid_locations", &[]),
             Ok(Value::number(0.0))
+        );
+    }
+
+    #[test]
+    fn links_direction_text_and_orange_standard_builtins() {
+        let compilation = TestProject::compile(concat!(
+            "/proc/classify()\n",
+            "\treturn istext(\"hello\") + istext(3)\n",
+            "/atom/example/proc/neighbors(other)\n",
+            "\treturn get_dir(src, other) + length(orange(1, src))\n",
+        ));
+        let registry = ProcedureRegistry::build(&compilation);
+        registry
+            .compile_vm(&compilation)
+            .expect("standard direction/text/orange builtins should link");
+        assert_eq!(
+            execute_effective(&compilation, "/proc/classify", &[]),
+            Ok(Value::number(1.0))
         );
     }
 

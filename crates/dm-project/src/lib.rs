@@ -841,6 +841,7 @@ impl CompilerSourceBuilder {
         macros: &HashMap<String, MacroDefinition>,
         path: &Path,
     ) -> Result<(), ProjectError> {
+        let file_macro = path.to_string_lossy().replace('\\', "/");
         let text = &source[span.start..span.end];
         let mut offset = 0usize;
         let mut literal_start = 0usize;
@@ -853,6 +854,18 @@ impl CompilerSourceBuilder {
             if is_identifier_start(byte) {
                 let identifier_end = identifier_end(text, offset);
                 let name = &text[offset..identifier_end];
+                if name == "__FILE__" {
+                    self.append_original(
+                        source,
+                        SourceSpan::new(span.start + literal_start, span.start + offset),
+                    );
+                    let invocation =
+                        SourceSpan::new(span.start + offset, span.start + identifier_end);
+                    self.append_replacement(&format!("{file_macro:?}"), invocation);
+                    offset = identifier_end;
+                    literal_start = offset;
+                    continue;
+                }
                 if let Some(definition) = macros.get(name) {
                     let invocation_end = if definition.parameters.is_some() {
                         let open = skip_horizontal_whitespace(text, identifier_end);
@@ -882,14 +895,18 @@ impl CompilerSourceBuilder {
                             .expect("arguments were validated above")
                             .0
                     });
-                    let replacement =
-                        expand_macro(name, arguments.as_deref(), macros, &mut Vec::new()).map_err(
-                            |message| ProjectError::MacroExpansion {
-                                path: path.to_path_buf(),
-                                offset: invocation.start,
-                                message,
-                            },
-                        )?;
+                    let replacement = expand_macro(
+                        name,
+                        arguments.as_deref(),
+                        macros,
+                        &mut Vec::new(),
+                        &file_macro,
+                    )
+                    .map_err(|message| ProjectError::MacroExpansion {
+                        path: path.to_path_buf(),
+                        offset: invocation.start,
+                        message,
+                    })?;
                     self.append_replacement(&replacement, invocation);
                     offset = invocation_end;
                     literal_start = offset;
@@ -963,7 +980,11 @@ fn expand_macro(
     arguments: Option<&[String]>,
     macros: &HashMap<String, MacroDefinition>,
     stack: &mut Vec<String>,
+    file_macro: &str,
 ) -> Result<String, String> {
+    if name == "__FILE__" {
+        return Ok(format!("{file_macro:?}"));
+    }
     if let Some(cycle_start) = stack.iter().position(|entry| entry == name) {
         let mut cycle = stack[cycle_start..].to_vec();
         cycle.push(name.to_owned());
@@ -982,11 +1003,13 @@ fn expand_macro(
         arguments.map_or_else(
             || Err(format!("function macro {name} requires a call")),
             |arguments| {
-                substitute_function_macro(name, definition, parameters, arguments, macros, stack)
+                substitute_function_macro(
+                    name, definition, parameters, arguments, macros, stack, file_macro,
+                )
             },
         )
     } else {
-        expand_replacement(&definition.replacement, macros, stack)
+        expand_replacement(&definition.replacement, macros, stack, file_macro)
     };
     stack.pop();
     result
@@ -996,6 +1019,7 @@ fn expand_replacement(
     replacement: &str,
     macros: &HashMap<String, MacroDefinition>,
     stack: &mut Vec<String>,
+    file_macro: &str,
 ) -> Result<String, String> {
     let mut output = String::with_capacity(replacement.len());
     let mut offset = 0usize;
@@ -1009,6 +1033,12 @@ fn expand_replacement(
         if is_identifier_start(byte) {
             let end = identifier_end(replacement, offset);
             let name = &replacement[offset..end];
+            if name == "__FILE__" {
+                let file_literal = format!("{file_macro:?}");
+                output.push_str(&file_literal);
+                offset = end;
+                continue;
+            }
             if let Some(definition) = macros.get(name) {
                 if definition.parameters.is_some() {
                     let open = skip_horizontal_whitespace(replacement, end);
@@ -1017,14 +1047,20 @@ fn expand_replacement(
                         if stack.iter().any(|active| active == name) {
                             output.push_str(&replacement[offset..invocation_end]);
                         } else {
-                            output.push_str(&expand_macro(name, Some(&arguments), macros, stack)?);
+                            output.push_str(&expand_macro(
+                                name,
+                                Some(&arguments),
+                                macros,
+                                stack,
+                                file_macro,
+                            )?);
                         }
                         offset = invocation_end;
                         continue;
                     }
                     output.push_str(name);
                 } else {
-                    output.push_str(&expand_macro(name, None, macros, stack)?);
+                    output.push_str(&expand_macro(name, None, macros, stack, file_macro)?);
                 }
             } else {
                 output.push_str(name);
@@ -1049,6 +1085,7 @@ fn substitute_function_macro(
     arguments: &[String],
     macros: &HashMap<String, MacroDefinition>,
     stack: &mut Vec<String>,
+    file_macro: &str,
 ) -> Result<String, String> {
     if arguments.len() < parameters.fixed.len()
         || (parameters.variadic.is_none() && arguments.len() > parameters.fixed.len())
@@ -1129,7 +1166,7 @@ fn substitute_function_macro(
         substituted.push(character);
         offset += character.len_utf8();
     }
-    expand_replacement(&substituted, macros, stack)
+    expand_replacement(&substituted, macros, stack, file_macro)
 }
 
 fn parse_macro_arguments(source: &str, open: usize) -> Result<(Vec<String>, usize), String> {
@@ -2195,6 +2232,28 @@ mod tests {
             )),
             SourceSpan::new(invocation_start, invocation_start + "TYPE(example)".len())
         );
+    }
+
+    #[test]
+    fn expands_predefined_file_macro_inside_user_macros() {
+        let scratch = ScratchDirectory::new();
+        let source = concat!(
+            "#define SOURCE_FILE __FILE__\n",
+            "/proc/source_file()\n",
+            "\treturn SOURCE_FILE\n",
+        );
+        fs::write(scratch.path().join("world.dme"), source)
+            .expect("file macro fixture should be written");
+
+        let project = Project::load(scratch.path().join("world.dme"))
+            .expect("predefined file macro should expand");
+        let expanded = project.files[0]
+            .compiler_text()
+            .expect("expanded source should remain UTF-8");
+
+        assert!(!expanded.contains("__FILE__"));
+        assert!(!expanded.contains("SOURCE_FILE"));
+        assert!(expanded.contains("world.dme"));
     }
 
     #[test]
