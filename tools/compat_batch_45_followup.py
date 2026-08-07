@@ -15,3 +15,11 @@ new = '                let file_literal = format!("{file_macro:?}");\n          
 if text.count(old) != 1:
     raise SystemExit(f"expected one file-macro string append, found {text.count(old)}")
 project.write_text(text.replace(old, new, 1))
+
+semantics = Path("crates/dm-semantics/src/lib.rs")
+text = semantics.read_text()
+old = '''    fn compile_vm_selected_with_fields(\n'''
+new = '''    #[allow(clippy::too_many_lines)]\n    fn compile_vm_selected_with_fields(\n'''
+if text.count(old) != 1:
+    raise SystemExit(f"expected one selected linker function, found {text.count(old)}")
+semantics.write_text(text.replace(old, new, 1))
