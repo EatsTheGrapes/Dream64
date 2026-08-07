@@ -1277,9 +1277,11 @@ mod tests {
             execute_effective(&compilation, "/datum/base/child/proc/run", &[]),
             Ok(Value::number(13.0))
         );
-        let error = execute_effective(&compilation, "/datum/base/child/proc/run", &[Value::Null])
-            .expect_err("explicit null should be reused rather than defaulted");
-        assert_eq!(error.message, "numeric operation received null");
+        assert_eq!(
+            execute_effective(&compilation, "/datum/base/child/proc/run", &[Value::Null]),
+            Ok(Value::number(11.0)),
+            "explicit null is reused and BYOND arithmetic treats it as numeric zero",
+        );
     }
 
     #[test]

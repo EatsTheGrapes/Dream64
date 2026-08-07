@@ -6108,6 +6108,9 @@ fn run_frames(
                     (Value::Number(left), Value::Number(right)) => {
                         Value::number(left.to_f32() + right.to_f32())
                     }
+                    (Value::Null, Value::Number(right)) => Value::number(right.to_f32()),
+                    (Value::Number(left), Value::Null) => Value::number(left.to_f32()),
+                    (Value::Null, Value::Null) => Value::number(0.0),
                     (Value::Text(left), Value::Text(right)) => {
                         Value::text(format!("{left}{right}"))
                     }
@@ -6116,7 +6119,7 @@ fn run_frames(
                             module,
                             &frames,
                             format!(
-                                "addition requires two numbers or two text values, received {left} and {right}"
+                                "addition requires compatible DM values, received {left} and {right}"
                             ),
                         ));
                     }
@@ -7414,9 +7417,11 @@ fn pop(stack: &mut Vec<Value>) -> Result<Value, String> {
 
 fn pop_number(stack: &mut Vec<Value>) -> Result<f32, String> {
     let value = pop(stack)?;
-    value
-        .as_number()
-        .ok_or_else(|| format!("numeric operation received {value}"))
+    match value {
+        Value::Null => Ok(0.0),
+        Value::Number(number) => Ok(number.to_f32()),
+        value => Err(format!("numeric operation received {value}")),
+    }
 }
 
 /// Resolves a compact static call count or the count marker produced by an
