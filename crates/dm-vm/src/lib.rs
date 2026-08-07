@@ -6000,7 +6000,6 @@ fn run_frames(
                                 .to_string()
                                 .parse::<usize>()
                                 .unwrap_or(usize::MAX),
-                            Value::Null => 0,
                             _ => 0,
                         };
                         if let Err(error) = state
@@ -7354,14 +7353,6 @@ fn replace_text_ascii_insensitive(target: &str, needle: &str, replacement: &str)
 
 fn runtime_truthy(heap: &ValueHeap, value: &Value) -> Result<bool, String> {
     heap.truthy(value).map_err(|error| error.to_string())
-}
-
-fn datum_receiver(value: &Value, operation: &str) -> Result<DatumId, String> {
-    match value {
-        Value::Datum(datum) => Ok(*datum),
-        Value::Null => Err(format!("{operation} received null")),
-        _ => Err(format!("{operation} requires a datum, received {value}")),
-    }
 }
 
 fn dynamic_call_target(

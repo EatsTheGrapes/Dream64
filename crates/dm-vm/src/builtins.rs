@@ -1104,7 +1104,7 @@ fn list_splice(
         return Ok(Value::Null);
     }
     let values = flattened_list_arguments(&arguments[2..], state)?;
-    let mut index = start.min(
+    let index = start.min(
         state
             .heap
             .list(list)
@@ -1116,11 +1116,10 @@ fn list_splice(
         .heap
         .list_mut(list)
         .map_err(|error| error.to_string())?;
-    for value in values {
+    for (offset, value) in values.into_iter().enumerate() {
         target
-            .insert(index, value)
+            .insert(index + offset, value)
             .map_err(|error| error.to_string())?;
-        index += 1;
     }
     Ok(Value::Null)
 }
