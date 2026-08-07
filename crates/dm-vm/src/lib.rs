@@ -8791,7 +8791,7 @@ mod tests {
             path: "/datum/example/proc/read@0".to_owned(),
             definition: &source.definitions[0],
             parent: None,
-            static_calls: BTreeMap::from([("bump".to_owned(), ProcedureId(2))]),
+            static_calls: BTreeMap::from([("bump".to_owned(), super::ProcedureId(2))]),
             src_fields: BTreeMap::new(),
             global_fields: BTreeMap::from([("calls".to_owned(), field("calls"))]),
         });
