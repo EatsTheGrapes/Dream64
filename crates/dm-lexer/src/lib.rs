@@ -365,10 +365,10 @@ impl<'source> Lexer<'source> {
 
     fn lex_operator(&mut self) -> Result<(), LexError> {
         const OPERATORS: &[&str] = &[
-            "<<=", ">>=", "&&=", "||=", "**=", "...", "::", "?.", "?[", "==", "!=", "<=", ">=",
-            "<<", ">>", "&&", "||", "++", "--", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
-            "~=", "**", "..", "/", ".", ":", "?", "=", "+", "-", "*", "%", "<", ">", "!", "~", "&",
-            "|", "^", "#", "@",
+            "<<=", ">>=", "&&=", "||=", "**=", "...", "::", "?.", "?:", "?[", "==", "!=", "<=",
+            ">=", "<<", ">>", "&&", "||", "++", "--", "+=", "-=", "*=", "/=", "%=", "&=", "|=",
+            "^=", "~=", "**", "..", "/", ".", ":", "?", "=", "+", "-", "*", "%", "<", ">", "!",
+            "~", "&", "|", "^", "#", "@",
         ];
         let Some(operator) = OPERATORS
             .iter()
@@ -455,6 +455,20 @@ mod tests {
         let error = lex("value = \"missing").expect_err("literal should fail");
 
         assert_eq!(error.message, "unterminated quoted literal");
+    }
+
+    #[test]
+    fn retains_null_conditional_member_and_index_operators() {
+        let tokens = lex("value?.field value?:dynamic values?[key]\n")
+            .expect("null-conditional operators should lex");
+        let operators: Vec<_> = tokens
+            .into_iter()
+            .filter_map(|token| match token.kind {
+                TokenKind::Operator(operator) => Some(operator),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(operators, ["?.", "?:", "?["]);
     }
 
     #[test]
