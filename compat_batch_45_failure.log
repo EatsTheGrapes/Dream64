@@ -1,0 +1,74 @@
+=== PATCH ===
+=== FMT ===
+=== FOCUSED TESTS ===
+   Compiling dm-core v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-core)
+   Compiling dm-lexer v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-lexer)
+   Compiling dm-project v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-project)
+   Compiling dm-syntax v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-syntax)
+   Compiling dm-object-tree v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-object-tree)
+   Compiling dm-compiler v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-compiler)
+   Compiling dm-value v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-value)
+   Compiling dm-globals v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-globals)
+   Compiling dm-vm v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-vm)
+   Compiling dm-runtime v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-runtime)
+   Compiling dm-semantics v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-semantics)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.07s
+     Running unittests src/lib.rs (target/debug/deps/dm_project-abd2ce70a9e44c90)
+
+running 19 tests
+test tests::borrows_byte_identical_source_when_no_directives_need_masking ... ok
+test tests::expands_function_macros_with_nested_and_variadic_arguments ... ok
+test tests::expands_predefined_file_macro_inside_user_macros ... ok
+test tests::expands_nested_object_macros_across_includes_with_source_mapping ... ok
+test tests::exposes_target_compiler_version_to_conditions ... ok
+test tests::ignores_directives_in_block_comments_and_accepts_comments_as_whitespace ... ok
+test tests::loads_quoted_includes_once_in_first_discovery_order ... ok
+test tests::masks_complete_multiline_define_values ... ok
+test tests::multiline_macro_continuations_do_not_add_definition_indentation ... ok
+test tests::masks_directives_and_nested_inactive_branches_without_shifting_bytes ... ok
+test tests::records_system_includes_without_resolving_them ... ok
+test tests::rejects_duplicate_else_and_elif_after_else ... ok
+test tests::rejects_includes_outside_the_project_directory ... ok
+test tests::reports_the_innermost_unterminated_conditional_and_stack_depth ... ok
+test tests::reports_unmatched_elif_before_parsing_its_expression ... ok
+test tests::shares_defines_across_recursive_includes ... ok
+test tests::skips_includes_in_inactive_conditional_branches ... ok
+test tests::reports_deterministic_recursive_and_depth_macro_errors ... ok
+test tests::validates_conditional_directive_arguments ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/dm_runtime-6555e837af8cd67b)
+
+running 12 tests
+test tests::applies_only_proven_constant_field_expressions ... ok
+test tests::applies_global_and_static_overrides_in_project_order ... ok
+test tests::dynamic_initializer_global_writes_persist_into_later_steps ... ok
+test tests::converts_nested_associative_lists_and_preserves_default_aliases ... ok
+test tests::executes_identifier_dependencies_and_overrides_in_source_order ... ok
+test tests::evaluates_live_datum_expressions_with_materialized_globals ... ok
+test tests::executes_list_expressions_with_runtime_values ... ok
+test tests::executes_src_field_and_explicit_global_references ... ok
+test tests::execution_states_share_the_image_type_catalog ... ok
+test tests::layers_ancestor_defaults_and_reopen_overrides_deterministically ... FAILED
+test tests::materializes_builtin_atom_appearance_defaults_without_overriding_source ... ok
+test tests::retains_source_mapped_unsupported_initializers_without_guessing ... ok
+
+failures:
+
+---- tests::layers_ancestor_defaults_and_reopen_overrides_deterministically stdout ----
+
+thread 'tests::layers_ancestor_defaults_and_reopen_overrides_deterministically' (3333) panicked at crates/dm-runtime/src/lib.rs:1161:9:
+assertion `left == right` failed
+  left: ["name", "health", "speed", "tag"]
+ right: ["name", "health", "speed"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::layers_ancestor_defaults_and_reopen_overrides_deterministically
+
+test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p dm-runtime --lib`
+=== EXIT 101 ===
