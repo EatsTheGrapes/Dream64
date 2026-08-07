@@ -1,0 +1,55 @@
+name: Run documented native list compatibility batch 49
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    if: github.event.issue.title == 'Run compatibility list 49'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: compat-list-49
+          fetch-depth: 0
+      - name: Apply native list surface and verify
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          (
+            set -e
+            python3 tools/compat_list_49.py
+            cargo fmt --all
+            cargo test -p dm-value -p dm-vm
+            cargo test
+            cargo clippy --workspace --all-targets -- -D warnings
+          ) 2>&1 | tee compat_list_49.log
+          status=${PIPESTATUS[0]}
+          git config user.name "Dream64 Compatibility Bot"
+          git config user.email "actions@users.noreply.github.com"
+          if [ "$status" -ne 0 ]; then
+            git add -A
+            git commit -m "Capture compatibility list 49 failure" || true
+            git push origin HEAD:compat-list-49
+            exit "$status"
+          fi
+          rm -f tools/compat_list_49.py compat_list_49.log
+          git add -A
+          git commit -m "Documented native list compatibility batch 49"
+          git push origin HEAD:compat-list-49
+      - name: Remove trigger from main
+        if: always()
+        shell: bash
+        run: |
+          git fetch origin main
+          git switch --force-create cleanup origin/main
+          git rm -f .github/workflows/run-compat-list-49.yml
+          git config user.name "Dream64 Compatibility Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git commit -m "Remove compatibility list 49 verifier"
+          git push origin HEAD:main
