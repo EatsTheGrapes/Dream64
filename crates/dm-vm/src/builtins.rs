@@ -741,7 +741,8 @@ struct ListOperatorEntry {
 
 fn list_operator_snapshot(list: ListId, state: &ExecutionState) -> Result<Vec<ListOperatorEntry>, String> {
     let list = state.heap.list(list).map_err(|error| error.to_string())?;
-    list.positions()
+    Ok(list
+        .positions()
         .map(|(_, key)| {
             let associated = list.get_key(key).ok().cloned();
             ListOperatorEntry {
@@ -749,16 +750,8 @@ fn list_operator_snapshot(list: ListId, state: &ExecutionState) -> Result<Vec<Li
                 associated,
             }
         })
-        .collect::<Vec<_>>()
-        .pipe(Ok)
+        .collect())
 }
-
-trait Pipe: Sized {
-    fn pipe<T>(self, function: impl FnOnce(Self) -> T) -> T {
-        function(self)
-    }
-}
-impl<T> Pipe for T {}
 
 fn add_operator_entry(
     list: ListId,

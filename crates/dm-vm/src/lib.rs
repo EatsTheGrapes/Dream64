@@ -9,7 +9,10 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use builtins::{execute_list_method, execute_standard_builtin, is_subtype, standard_builtin_arity};
+use builtins::{
+    execute_list_binary_operator, execute_list_compound_operator, execute_list_method,
+    execute_standard_builtin, is_subtype, standard_builtin_arity,
+};
 
 use dm_core::{DmNumberBits, SourceSpan};
 use dm_lexer::{SpannedToken, TokenKind};
@@ -213,7 +216,9 @@ pub enum Instruction {
         /// Number of already-evaluated locator arguments to discard.
         argument_count: u16,
     },
-    /// Numeric addition.
+    /// Executes a compound assignment while preserving type-specific mutation semantics.
+    CompoundAssignment(CompoundAssignmentOperator),
+    /// Numeric/list/text addition.
     Add,
     /// Numeric subtraction.
     Subtract,
@@ -315,6 +320,31 @@ pub enum Instruction {
     },
     /// Returns the top stack value.
     Return,
+}
+
+/// Calculate-and-assign operator used by [`Instruction::CompoundAssignment`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompoundAssignmentOperator {
+    /// Addition assignment (`+=`).
+    Add,
+    /// Subtraction assignment (`-=`).
+    Subtract,
+    /// Multiplication assignment (`*=`).
+    Multiply,
+    /// Division assignment (`/=`).
+    Divide,
+    /// Remainder assignment (`%=`).
+    Remainder,
+    /// Bitwise/list-mask assignment (`&=`).
+    BitAnd,
+    /// Bitwise/list-union assignment (`|=`).
+    BitOr,
+    /// Bitwise/list-symmetric-difference assignment (`^=`).
+    BitXor,
+    /// Left-shift assignment (`<<=`).
+    ShiftLeft,
+    /// Right-shift assignment (`>>=`).
+    ShiftRight,
 }
 
 /// Numeric operation used by [`Instruction::CompoundListIndex`].
@@ -1593,23 +1623,20 @@ fn compile_assignment_statement(
 }
 
 fn compound_instruction(operator: &str) -> Result<Instruction, CompileError> {
-    Ok(match operator {
-        "+=" => Instruction::Add,
-        "-=" => Instruction::Subtract,
-        "*=" => Instruction::Multiply,
-        "/=" => Instruction::Divide,
-        "%=" => Instruction::Remainder,
-        "&=" => Instruction::BitAnd,
-        "|=" => Instruction::BitOr,
-        "^=" => Instruction::BitXor,
-        "<<=" => Instruction::ShiftLeft,
-        ">>=" => Instruction::ShiftRight,
-        _ => {
-            return Err(compile_error(format!(
-                "unsupported compound operator {operator:?}"
-            )));
-        }
-    })
+    let operator = match operator {
+        "+=" => CompoundAssignmentOperator::Add,
+        "-=" => CompoundAssignmentOperator::Subtract,
+        "*=" => CompoundAssignmentOperator::Multiply,
+        "/=" => CompoundAssignmentOperator::Divide,
+        "%=" => CompoundAssignmentOperator::Remainder,
+        "&=" => CompoundAssignmentOperator::BitAnd,
+        "|=" => CompoundAssignmentOperator::BitOr,
+        "^=" => CompoundAssignmentOperator::BitXor,
+        "<<=" => CompoundAssignmentOperator::ShiftLeft,
+        ">>=" => CompoundAssignmentOperator::ShiftRight,
+        _ => return Err(compile_error(format!("unsupported compound operator {operator}"))),
+    };
+    Ok(Instruction::CompoundAssignment(operator))
 }
 
 fn compound_list_index_operator(operator: &str) -> Result<CompoundListIndexOperator, CompileError> {
@@ -6150,41 +6177,62 @@ fn run_frames(
                     .stack
                     .push(Value::number(f32::from(!is_truthy)));
             }
+            Instruction::CompoundAssignment(operator) => {
+                let right = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let left = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let value = if let Value::List(list) = left {
+                    execute_list_compound_operator(operator, list, &right, state)
+                        .map_err(|message| execution_error(module, &frames, message))?
+                } else {
+                    execute_scalar_compound_assignment(operator, left, right)
+                        .map_err(|message| execution_error(module, &frames, message))?
+                };
+                frames[frame_index].stack.push(value);
+            }
             Instruction::Add => {
                 let right = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let left = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
-                let value = match (left, right) {
-                    (Value::Number(left), Value::Number(right)) => {
-                        Value::number(left.to_f32() + right.to_f32())
-                    }
-                    (Value::Null, Value::Number(right)) => Value::number(right.to_f32()),
-                    (Value::Number(left), Value::Null) => Value::number(left.to_f32()),
-                    (Value::Null, Value::Null) => Value::number(0.0),
-                    (Value::Text(left), Value::Text(right)) => {
-                        Value::text(format!("{left}{right}"))
-                    }
-                    (left, right) => {
-                        return Err(execution_error(
-                            module,
-                            &frames,
-                            format!(
-                                "addition requires compatible DM values, received {left} and {right}"
-                            ),
-                        ));
-                    }
+                let value = if let Value::List(list) = left {
+                    execute_list_binary_operator("+", list, &right, state)
+                        .map_err(|message| execution_error(module, &frames, message))?
+                } else {
+                    execute_scalar_add(left, right)
+                        .map_err(|message| execution_error(module, &frames, message))?
                 };
                 frames[frame_index].stack.push(value);
             }
-            Instruction::Subtract
-            | Instruction::Multiply
+            Instruction::Subtract | Instruction::BitAnd | Instruction::BitOr | Instruction::BitXor => {
+                let right = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let left = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let operator = match instruction {
+                    Instruction::Subtract => "-",
+                    Instruction::BitAnd => "&",
+                    Instruction::BitOr => "|",
+                    Instruction::BitXor => "^",
+                    _ => unreachable!(),
+                };
+                let value = if let Value::List(list) = left {
+                    execute_list_binary_operator(operator, list, &right, state)
+                        .map_err(|message| execution_error(module, &frames, message))?
+                } else {
+                    let left = scalar_number_string(left)
+                        .map_err(|message| execution_error(module, &frames, message))?;
+                    let right = scalar_number_string(right)
+                        .map_err(|message| execution_error(module, &frames, message))?;
+                    Value::number(execute_numeric_binary(&instruction, left, right))
+                };
+                frames[frame_index].stack.push(value);
+            }
+            Instruction::Multiply
             | Instruction::Power
             | Instruction::Divide
             | Instruction::Remainder
-            | Instruction::BitAnd
-            | Instruction::BitOr
-            | Instruction::BitXor
             | Instruction::ShiftLeft
             | Instruction::ShiftRight
             | Instruction::Less
@@ -7478,6 +7526,56 @@ fn pop(stack: &mut Vec<Value>) -> Result<Value, String> {
         .ok_or_else(|| "bytecode stack underflow".to_owned())
 }
 
+fn scalar_number_string(value: Value) -> Result<f32, String> {
+    match value {
+        Value::Null => Ok(0.0),
+        Value::Number(number) => Ok(number.to_f32()),
+        value => Err(format!("numeric operation received {value}")),
+    }
+}
+
+fn execute_scalar_add(left: Value, right: Value) -> Result<Value, String> {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => {
+            Ok(Value::number(left.to_f32() + right.to_f32()))
+        }
+        (Value::Null, Value::Number(right)) => Ok(Value::number(right.to_f32())),
+        (Value::Number(left), Value::Null) => Ok(Value::number(left.to_f32())),
+        (Value::Null, Value::Null) => Ok(Value::number(0.0)),
+        (Value::Text(left), Value::Text(right)) => Ok(Value::text(format!("{left}{right}"))),
+        (left, right) => Err(format!(
+            "addition requires compatible DM values, received {left} and {right}"
+        )),
+    }
+}
+
+fn execute_scalar_compound_assignment(
+    operator: CompoundAssignmentOperator,
+    left: Value,
+    right: Value,
+) -> Result<Value, String> {
+    if matches!(operator, CompoundAssignmentOperator::Add)
+        && matches!((&left, &right), (Value::Text(_), Value::Text(_)))
+    {
+        return execute_scalar_add(left, right);
+    }
+    let left = scalar_number_string(left)?;
+    let right = scalar_number_string(right)?;
+    let value = match operator {
+        CompoundAssignmentOperator::Add => left + right,
+        CompoundAssignmentOperator::Subtract => left - right,
+        CompoundAssignmentOperator::Multiply => left * right,
+        CompoundAssignmentOperator::Divide => left / right,
+        CompoundAssignmentOperator::Remainder => left % right,
+        CompoundAssignmentOperator::BitAnd => bitwise_binary(left, right, |a, b| a & b),
+        CompoundAssignmentOperator::BitOr => bitwise_binary(left, right, |a, b| a | b),
+        CompoundAssignmentOperator::BitXor => bitwise_binary(left, right, |a, b| a ^ b),
+        CompoundAssignmentOperator::ShiftLeft => shift_binary(left, right, true),
+        CompoundAssignmentOperator::ShiftRight => shift_binary(left, right, false),
+    };
+    Ok(Value::number(value))
+}
+
 fn pop_number(stack: &mut Vec<Value>) -> Result<f32, String> {
     let value = pop(stack)?;
     match value {
@@ -8675,6 +8773,32 @@ mod tests {
         assert_eq!(
             execute_module(&module, entry, &[Value::number(1.0), Value::number(1.0)]),
             Ok(Value::number(7.0))
+        );
+    }
+
+    #[test]
+    fn list_binary_operators_return_new_lists_without_mutating_the_left_operand() {
+        let source = parse(
+            "/proc/run()\n\tvar/list/a = list(1, 2, 2, 3)\n\tvar/list/b = list(2, 4)\n\tvar/list/added = a + b\n\tvar/list/subtracted = a - b\n\tvar/list/unioned = a | b\n\tvar/list/masked = a & b\n\tvar/list/xored = a ^ b\n\treturn a.len + added.len + subtracted.len + unioned.len + masked.len + xored.len + (a[2] == 2) + (unioned[4] == 4)\n",
+        )
+        .expect("list operator source should parse");
+        let module = compile_module(&source.definitions).expect("list operators should compile");
+        assert_eq!(
+            execute_module(&module, module.procedure_id("/proc/run").unwrap(), &[]),
+            Ok(Value::number(24.0))
+        );
+    }
+
+    #[test]
+    fn compound_list_operators_mutate_shared_alias_identity() {
+        let source = parse(
+            "/proc/run()\n\tvar/list/a = list(1, 2)\n\tvar/list/alias = a\n\ta += list(2, 3)\n\tvar/after_add = alias.len\n\ta -= 2\n\tvar/after_remove = alias.len\n\ta |= list(3, 4)\n\tvar/after_union = alias.len\n\ta &= list(1, 4)\n\tvar/after_mask = alias.len\n\ta ^= list(4, 5)\n\treturn after_add + after_remove + after_union + after_mask + alias.len + (alias[1] == 1) + (alias[2] == 5)\n",
+        )
+        .expect("compound list operator source should parse");
+        let module = compile_module(&source.definitions).expect("compound list operators should compile");
+        assert_eq!(
+            execute_module(&module, module.procedure_id("/proc/run").unwrap(), &[]),
+            Ok(Value::number(17.0))
         );
     }
 
