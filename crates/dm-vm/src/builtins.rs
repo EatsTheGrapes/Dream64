@@ -24,10 +24,12 @@ pub(super) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
     Some(match name {
         "abs" | "ceil" | "floor" | "fract" | "trunc" | "sign" | "sqrt" | "sin" | "cos" | "tan"
         | "length_char" | "lowertext" | "uppertext" | "trimtext" | "ascii2text" | "text2path"
-        | "isinf" | "isnan" | "ckey" | "fexists" | "file2text" => (1, 1),
+        | "isinf" | "isnan" | "ckey" | "fexists" | "file2text" | "lentext" | "list2params"
+        | "params2list" => (1, 1),
         "log" | "text2ascii" | "text2ascii_char" | "text2num" => (1, 2),
         "lerp" => (3, 3),
-        "cmptext" | "cmptextEx" => (1, usize::MAX),
+        "cmptext" | "cmptextEx" | "sorttext" | "sorttextEx" | "sortText" => (0, usize::MAX),
+        "num2text" => (1, 3),
         "findtext"
         | "findtextEx"
         | "findtext_char"
@@ -109,8 +111,177 @@ pub(super) fn execute_standard_builtin(
         "ckey" => ckey(arguments, state),
         "fexists" => fexists(arguments, state),
         "file2text" => file2text(arguments, state),
+        "lentext" => lentext(arguments, state),
+        "sorttext" => sorttext(arguments, state, false),
+        "sorttextEx" | "sortText" => sorttext(arguments, state, true),
+        "num2text" => num2text(arguments),
+        "list2params" => list2params(arguments, state),
+        "params2list" => params2list(arguments, state),
         _ => Err(format!("unknown native DM builtin {name:?}")),
     }
+}
+
+fn lentext(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
+    let text = strict_text(&arguments[0], state, "lentext")?;
+    Ok(Value::number(text.len() as f32))
+}
+
+fn sorttext(arguments: &[Value], state: &ExecutionState, exact: bool) -> Result<Value, String> {
+    if arguments.len() < 2 {
+        return Ok(Value::number(0.0));
+    }
+    let values = arguments
+        .iter()
+        .map(|value| strict_text(value, state, "sorttext"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let compare = |left: &str, right: &str| {
+        if exact {
+            left.cmp(right)
+        } else {
+            left.to_lowercase().cmp(&right.to_lowercase())
+        }
+    };
+    let ascending = values
+        .windows(2)
+        .all(|pair| compare(&pair[0], &pair[1]).is_lt());
+    let descending = values
+        .windows(2)
+        .all(|pair| compare(&pair[0], &pair[1]).is_gt());
+    Ok(Value::number(if ascending {
+        1.0
+    } else if descending {
+        -1.0
+    } else {
+        0.0
+    }))
+}
+
+fn num2text(arguments: &[Value]) -> Result<Value, String> {
+    let value = number(&arguments[0], "num2text")?;
+    if arguments.len() == 3 {
+        let digits = number(&arguments[1], "num2text digits")?.trunc().max(0.0) as usize;
+        let radix = number(&arguments[2], "num2text radix")?.trunc() as u32;
+        if !(2..=36).contains(&radix) {
+            return Err(format!("num2text radix {radix} is outside 2..=36"));
+        }
+        let negative = value.is_sign_negative();
+        let mut integer = value.abs().trunc() as u32;
+        let alphabet = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let mut encoded = Vec::new();
+        loop {
+            encoded.push(alphabet[(integer % radix) as usize] as char);
+            integer /= radix;
+            if integer == 0 {
+                break;
+            }
+        }
+        while encoded.len() < digits {
+            encoded.push('0');
+        }
+        if negative {
+            encoded.push('-');
+        }
+        encoded.reverse();
+        return Ok(Value::text(encoded.into_iter().collect::<String>()));
+    }
+    let sigfig = arguments.get(1).map_or(Ok(6_usize), |value| {
+        number(value, "num2text sigfig").map(|value| value.trunc().max(1.0) as usize)
+    })?;
+    let plain = value.to_string();
+    let significant_digits = plain.chars().filter(char::is_ascii_digit).count();
+    if significant_digits <= sigfig || value == 0.0 {
+        return Ok(Value::text(plain));
+    }
+    Ok(Value::text(format!(
+        "{:.*e}",
+        sigfig.saturating_sub(1),
+        value
+    )))
+}
+
+fn form_encode(value: &str) -> String {
+    let mut output = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                output.push(char::from(byte))
+            }
+            b' ' => output.push('+'),
+            _ => output.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    output
+}
+
+fn form_decode(value: &str) -> Result<String, String> {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                output.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3])
+                    .map_err(|error| error.to_string())?;
+                let byte = u8::from_str_radix(hex, 16)
+                    .map_err(|_| format!("invalid parameter escape %{hex}"))?;
+                output.push(byte);
+                index += 3;
+            }
+            byte => {
+                output.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(output).map_err(|error| format!("parameter text is not UTF-8: {error}"))
+}
+
+fn list2params(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
+    let Value::List(list_id) = arguments[0] else {
+        return Err(format!(
+            "list2params requires a list, received {}",
+            arguments[0]
+        ));
+    };
+    let list = state
+        .heap
+        .list(list_id)
+        .map_err(|error| error.to_string())?;
+    let mut pairs = Vec::with_capacity(list.len());
+    for (_, key) in list.positions() {
+        let key_text = runtime_text(key, state, "list2params key")?;
+        let associated = list.get_key(key).cloned().unwrap_or(Value::Null);
+        let value_text = runtime_text(&associated, state, "list2params value")?;
+        pairs.push(format!(
+            "{}={}",
+            form_encode(&key_text),
+            form_encode(&value_text)
+        ));
+    }
+    Ok(Value::text(pairs.join("&")))
+}
+
+fn params2list(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    let params = strict_text(&arguments[0], state, "params2list")?;
+    let result = state.heap.allocate_list();
+    for part in params.split(['&', ';']) {
+        if part.is_empty() {
+            continue;
+        }
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        let key = Value::text(form_decode(key)?);
+        let value = Value::text(form_decode(value)?);
+        state
+            .heap
+            .list_mut(result)
+            .map_err(|error| error.to_string())?
+            .set_key(key, value);
+    }
+    Ok(Value::List(result))
 }
 
 fn unary_number(arguments: &[Value], operation: impl FnOnce(f32) -> f32) -> Result<Value, String> {

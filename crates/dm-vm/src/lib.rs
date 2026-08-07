@@ -228,17 +228,19 @@ pub enum Instruction {
     Power,
     /// Numeric division.
     Divide,
-    /// Numeric remainder.
+    /// Legacy integer remainder (`%`), after truncating both operands.
     Remainder,
-    /// 32-bit integer bitwise conjunction.
+    /// Fractional remainder (`%%`) without integer truncation.
+    FractionalRemainder,
+    /// 24-bit integer bitwise conjunction.
     BitAnd,
-    /// 32-bit integer bitwise disjunction.
+    /// 24-bit integer bitwise disjunction.
     BitOr,
-    /// 32-bit integer bitwise exclusive disjunction.
+    /// 24-bit integer bitwise exclusive disjunction.
     BitXor,
-    /// 32-bit integer left shift.
+    /// 24-bit integer left shift.
     ShiftLeft,
-    /// 32-bit arithmetic right shift.
+    /// 24-bit logical right shift.
     ShiftRight,
     /// 32-bit integer bitwise complement.
     BitNot,
@@ -250,6 +252,12 @@ pub enum Instruction {
     Equal,
     /// Inequality comparison.
     NotEqual,
+    /// Shallow BYOND equivalence comparison (`~=`).
+    Equivalent,
+    /// Negated shallow equivalence comparison (`~!`).
+    NotEquivalent,
+    /// Three-way comparison (`<=>`), yielding -1, 0, or 1.
+    Compare,
     /// List membership comparison.
     ///
     /// The left value is compared against the list's iteration entries, which
@@ -339,8 +347,10 @@ pub enum CompoundAssignmentOperator {
     Multiply,
     /// Division assignment (`/=`).
     Divide,
-    /// Remainder assignment (`%=`).
+    /// Legacy integer remainder assignment (`%=`).
     Remainder,
+    /// Fractional remainder assignment (`%%=`).
+    FractionalRemainder,
     /// Bitwise/list-mask assignment (`&=`).
     BitAnd,
     /// Bitwise/list-union assignment (`|=`).
@@ -364,8 +374,10 @@ pub enum CompoundListIndexOperator {
     Multiply,
     /// Division assignment (`/=`).
     Divide,
-    /// Remainder assignment (`%=`).
+    /// Legacy integer remainder assignment (`%=`).
     Remainder,
+    /// Fractional remainder assignment (`%%=`).
+    FractionalRemainder,
     /// Bitwise conjunction assignment (`&=`).
     BitAnd,
     /// Bitwise disjunction assignment (`|=`).
@@ -1680,6 +1692,7 @@ fn compound_instruction(operator: &str) -> Result<Instruction, CompileError> {
         "*=" => CompoundAssignmentOperator::Multiply,
         "/=" => CompoundAssignmentOperator::Divide,
         "%=" => CompoundAssignmentOperator::Remainder,
+        "%%=" => CompoundAssignmentOperator::FractionalRemainder,
         "&=" => CompoundAssignmentOperator::BitAnd,
         "|=" => CompoundAssignmentOperator::BitOr,
         "^=" => CompoundAssignmentOperator::BitXor,
@@ -1701,6 +1714,7 @@ fn compound_list_index_operator(operator: &str) -> Result<CompoundListIndexOpera
         "*=" => CompoundListIndexOperator::Multiply,
         "/=" => CompoundListIndexOperator::Divide,
         "%=" => CompoundListIndexOperator::Remainder,
+        "%%=" => CompoundListIndexOperator::FractionalRemainder,
         "&=" => CompoundListIndexOperator::BitAnd,
         "|=" => CompoundListIndexOperator::BitOr,
         "^=" => CompoundListIndexOperator::BitXor,
@@ -3380,6 +3394,7 @@ impl<'a> ExpressionParser<'a> {
                 | "*="
                 | "/="
                 | "%="
+                | "%%="
                 | "&="
                 | "|="
                 | "^="
@@ -4261,10 +4276,10 @@ const fn binary_precedence(operator: &str) -> Option<u8> {
         b"|" => Some(3),
         b"^" => Some(4),
         b"&" => Some(5),
-        b"==" | b"!=" => Some(6),
-        b"<<" | b">>" | b"<" | b"<=" | b">" | b">=" | b"in" => Some(7),
+        b"==" | b"!=" | b"<>" | b"~=" | b"~!" => Some(6),
+        b"<<" | b">>" | b"<" | b"<=" | b">" | b">=" | b"<=>" | b"in" => Some(7),
         b"+" | b"-" => Some(8),
-        b"*" | b"/" | b"%" => Some(9),
+        b"*" | b"/" | b"%" | b"%%" => Some(9),
         b"**" => Some(10),
         _ => None,
     }
@@ -4685,35 +4700,61 @@ fn emit_expression(
             left,
             right,
         } => {
-            emit_expression(left, locals, instructions, procedures)?;
-            emit_expression(right, locals, instructions, procedures)?;
-            instructions.push(match operator.as_str() {
-                "+" => Instruction::Add,
-                "-" => Instruction::Subtract,
-                "*" => Instruction::Multiply,
-                "**" => Instruction::Power,
-                "/" => Instruction::Divide,
-                "%" => Instruction::Remainder,
-                "&" => Instruction::BitAnd,
-                "|" => Instruction::BitOr,
-                "^" => Instruction::BitXor,
-                "<<" => Instruction::ShiftLeft,
-                ">>" => Instruction::ShiftRight,
-                "==" => Instruction::Equal,
-                "!=" => Instruction::NotEqual,
-                "in" => Instruction::Contains,
-                "<" => Instruction::Less,
-                "<=" => Instruction::LessEqual,
-                ">" => Instruction::Greater,
-                ">=" => Instruction::GreaterEqual,
-                "&&" => Instruction::And,
-                "||" => Instruction::Or,
-                _ => {
-                    return Err(compile_error(format!(
-                        "unsupported binary operator {operator}"
-                    )));
-                }
-            });
+            if operator == "&&" {
+                emit_expression(left, locals, instructions, procedures)?;
+                instructions.push(Instruction::Duplicate);
+                let false_jump = instructions.len();
+                instructions.push(Instruction::JumpIfFalse(usize::MAX));
+                instructions.push(Instruction::Pop);
+                emit_expression(right, locals, instructions, procedures)?;
+                let end = instructions.len();
+                patch_jump(instructions, false_jump, end)?;
+            } else if operator == "||" {
+                emit_expression(left, locals, instructions, procedures)?;
+                instructions.push(Instruction::Duplicate);
+                let false_jump = instructions.len();
+                instructions.push(Instruction::JumpIfFalse(usize::MAX));
+                let end_jump = instructions.len();
+                instructions.push(Instruction::Jump(usize::MAX));
+                let false_target = instructions.len();
+                patch_jump(instructions, false_jump, false_target)?;
+                instructions.push(Instruction::Pop);
+                emit_expression(right, locals, instructions, procedures)?;
+                let end = instructions.len();
+                patch_jump(instructions, end_jump, end)?;
+            } else {
+                emit_expression(left, locals, instructions, procedures)?;
+                emit_expression(right, locals, instructions, procedures)?;
+                instructions.push(match operator.as_str() {
+                    "+" => Instruction::Add,
+                    "-" => Instruction::Subtract,
+                    "*" => Instruction::Multiply,
+                    "**" => Instruction::Power,
+                    "/" => Instruction::Divide,
+                    "%" => Instruction::Remainder,
+                    "%%" => Instruction::FractionalRemainder,
+                    "&" => Instruction::BitAnd,
+                    "|" => Instruction::BitOr,
+                    "^" => Instruction::BitXor,
+                    "<<" => Instruction::ShiftLeft,
+                    ">>" => Instruction::ShiftRight,
+                    "==" => Instruction::Equal,
+                    "!=" | "<>" => Instruction::NotEqual,
+                    "~=" => Instruction::Equivalent,
+                    "~!" => Instruction::NotEquivalent,
+                    "<=>" => Instruction::Compare,
+                    "in" => Instruction::Contains,
+                    "<" => Instruction::Less,
+                    "<=" => Instruction::LessEqual,
+                    ">" => Instruction::Greater,
+                    ">=" => Instruction::GreaterEqual,
+                    _ => {
+                        return Err(compile_error(format!(
+                            "unsupported binary operator {operator}"
+                        )));
+                    }
+                });
+            }
         }
         Expression::Conditional {
             condition,
@@ -6404,12 +6445,9 @@ fn run_frames(
             | Instruction::Power
             | Instruction::Divide
             | Instruction::Remainder
+            | Instruction::FractionalRemainder
             | Instruction::ShiftLeft
-            | Instruction::ShiftRight
-            | Instruction::Less
-            | Instruction::LessEqual
-            | Instruction::Greater
-            | Instruction::GreaterEqual => {
+            | Instruction::ShiftRight => {
                 let right = match pop_number(&mut frames[frame_index].stack) {
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
@@ -6425,6 +6463,37 @@ fn run_frames(
                         left,
                         right,
                     )));
+            }
+            Instruction::Less
+            | Instruction::LessEqual
+            | Instruction::Greater
+            | Instruction::GreaterEqual
+            | Instruction::Compare => {
+                let right = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let left = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let comparison = compare_values(&left, &right)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let result = match instruction {
+                    Instruction::Less => comparison.is_some_and(|value| value.is_lt()),
+                    Instruction::LessEqual => comparison.is_some_and(|value| value.is_le()),
+                    Instruction::Greater => comparison.is_some_and(|value| value.is_gt()),
+                    Instruction::GreaterEqual => comparison.is_some_and(|value| value.is_ge()),
+                    Instruction::Compare => {
+                        let value = comparison.map_or(0.0, |value| match value {
+                            std::cmp::Ordering::Less => -1.0,
+                            std::cmp::Ordering::Equal => 0.0,
+                            std::cmp::Ordering::Greater => 1.0,
+                        });
+                        frames[frame_index].stack.push(Value::number(value));
+                        continue;
+                    }
+                    _ => unreachable!(),
+                };
+                frames[frame_index]
+                    .stack
+                    .push(Value::number(f32::from(result)));
             }
             Instruction::Equal | Instruction::NotEqual => {
                 let right = match pop(&mut frames[frame_index].stack) {
@@ -6445,28 +6514,37 @@ fn run_frames(
                     .stack
                     .push(Value::number(f32::from(result)));
             }
+            Instruction::Equivalent | Instruction::NotEquivalent => {
+                let right = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let left = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let equivalent = values_equivalent(&left, &right, &state.heap)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let result = if matches!(instruction, Instruction::NotEquivalent) {
+                    !equivalent
+                } else {
+                    equivalent
+                };
+                frames[frame_index]
+                    .stack
+                    .push(Value::number(f32::from(result)));
+            }
             Instruction::Contains => {
-                let list = match pop(&mut frames[frame_index].stack) {
-                    Ok(Value::List(list)) => list,
-                    Ok(value) => {
-                        return Err(execution_error(
-                            module,
-                            &frames,
-                            format!("right operand of 'in' must be a list, received {value}"),
-                        ));
-                    }
-                    Err(message) => return Err(execution_error(module, &frames, message)),
+                let container = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let needle = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let contains = if let Value::List(list) = container {
+                    state
+                        .heap
+                        .list(list)
+                        .map_err(|error| execution_error(module, &frames, error.to_string()))?
+                        .positions()
+                        .any(|(_, value)| values_equal(&needle, value))
+                } else {
+                    false
                 };
-                let needle = match pop(&mut frames[frame_index].stack) {
-                    Ok(value) => value,
-                    Err(message) => return Err(execution_error(module, &frames, message)),
-                };
-                let contains = state
-                    .heap
-                    .list(list)
-                    .map_err(|error| execution_error(module, &frames, error.to_string()))?
-                    .positions()
-                    .any(|(_, value)| values_equal(&needle, value));
                 frames[frame_index]
                     .stack
                     .push(Value::number(f32::from(contains)));
@@ -6777,7 +6855,8 @@ fn execute_numeric_binary(instruction: &Instruction, left: f32, right: f32) -> f
         Instruction::Multiply => left * right,
         Instruction::Power => left.powf(right),
         Instruction::Divide => left / right,
-        Instruction::Remainder => left % right,
+        Instruction::Remainder => integer_remainder(left, right),
+        Instruction::FractionalRemainder => fractional_remainder(left, right),
         Instruction::BitAnd => bitwise_binary(left, right, |left, right| left & right),
         Instruction::BitOr => bitwise_binary(left, right, |left, right| left | right),
         Instruction::BitXor => bitwise_binary(left, right, |left, right| left ^ right),
@@ -6801,7 +6880,8 @@ fn execute_compound_list_index_operation(
         CompoundListIndexOperator::Subtract => left - right,
         CompoundListIndexOperator::Multiply => left * right,
         CompoundListIndexOperator::Divide => left / right,
-        CompoundListIndexOperator::Remainder => left % right,
+        CompoundListIndexOperator::Remainder => integer_remainder(left, right),
+        CompoundListIndexOperator::FractionalRemainder => fractional_remainder(left, right),
         CompoundListIndexOperator::BitAnd => {
             bitwise_binary(left, right, |left, right| left & right)
         }
@@ -6818,39 +6898,99 @@ fn execute_compound_list_index_operation(
     }
 }
 
-/// DM bitwise operations coerce their binary32 numeric operands to signed
-/// 32-bit integers by truncation and return the resulting integer as a DM
-/// number. Rust's float-to-int conversion also gives deterministic saturation
-/// for values outside the integer range.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    reason = "DM bitwise operators intentionally bridge binary32 numbers and signed 32-bit integers"
-)]
-fn bitwise_binary(left: f32, right: f32, operation: impl FnOnce(i32, i32) -> i32) -> f32 {
-    operation(left as i32, right as i32) as f32
+const DM_BIT_MASK: u32 = (1 << 24) - 1;
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn dm_u24(value: f32) -> u32 {
+    (value.trunc() as i64 as u32) & DM_BIT_MASK
 }
 
-/// Executes a DM bitwise complement after integer coercion.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    reason = "DM bitwise operators intentionally bridge binary32 numbers and signed 32-bit integers"
-)]
+#[allow(clippy::cast_precision_loss)]
+fn bitwise_binary(left: f32, right: f32, operation: impl FnOnce(u32, u32) -> u32) -> f32 {
+    (operation(dm_u24(left), dm_u24(right)) & DM_BIT_MASK) as f32
+}
+
+#[allow(clippy::cast_precision_loss)]
 fn bitwise_not(value: f32) -> f32 {
-    (!(value as i32)) as f32
+    ((!dm_u24(value)) & DM_BIT_MASK) as f32
 }
 
-/// Executes a DM shift after integer coercion. Shift counts are masked to the
-/// low five bits, matching the fixed-width 32-bit integer representation.
 #[allow(
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    reason = "DM bitwise operators intentionally bridge binary32 numbers and signed 32-bit integers"
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
 )]
-fn bitwise_shift(left: f32, right: f32, operation: impl FnOnce(i32, u32) -> i32) -> f32 {
-    let count = u32::from_ne_bytes((right as i32).to_ne_bytes()) & 31;
-    operation(left as i32, count) as f32
+fn bitwise_shift(left: f32, right: f32, operation: impl FnOnce(u32, u32) -> u32) -> f32 {
+    let count = right.trunc().max(0.0) as u32;
+    if count >= 24 {
+        return 0.0;
+    }
+    (operation(dm_u24(left), count) & DM_BIT_MASK) as f32
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn integer_remainder(left: f32, right: f32) -> f32 {
+    let left = left.trunc() as i32;
+    let right = right.trunc() as i32;
+    if right == 0 {
+        f32::NAN
+    } else {
+        (left % right) as f32
+    }
+}
+
+fn fractional_remainder(left: f32, right: f32) -> f32 {
+    if right == 0.0 {
+        f32::NAN
+    } else {
+        right * (left / right).fract()
+    }
+}
+
+fn compare_values(left: &Value, right: &Value) -> Result<Option<std::cmp::Ordering>, String> {
+    match (left, right) {
+        (Value::Text(left), Value::Text(right)) => Ok(Some(left.as_ref().cmp(right.as_ref()))),
+        (Value::Null | Value::Number(_), Value::Null | Value::Number(_)) => {
+            let left = match left {
+                Value::Null => 0.0,
+                Value::Number(number) => number.to_f32(),
+                _ => unreachable!(),
+            };
+            let right = match right {
+                Value::Null => 0.0,
+                Value::Number(number) => number.to_f32(),
+                _ => unreachable!(),
+            };
+            Ok(left.partial_cmp(&right))
+        }
+        _ => Err(format!(
+            "comparison requires two numbers or two text values, received {left} and {right}"
+        )),
+    }
+}
+
+fn values_equivalent(left: &Value, right: &Value, heap: &ValueHeap) -> Result<bool, String> {
+    let (Value::List(left_id), Value::List(right_id)) = (left, right) else {
+        return Ok(left.semantic_eq(right));
+    };
+    let left = heap.list(*left_id).map_err(|error| error.to_string())?;
+    let right = heap.list(*right_id).map_err(|error| error.to_string())?;
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for index in 1..=left.len() {
+        let left_key = left.get(index).map_err(|error| error.to_string())?;
+        let right_key = right.get(index).map_err(|error| error.to_string())?;
+        if !left_key.semantic_eq(right_key) {
+            return Ok(false);
+        }
+        let left_assoc = left.get_key(left_key).cloned().unwrap_or(Value::Null);
+        let right_assoc = right.get_key(right_key).cloned().unwrap_or(Value::Null);
+        if !left_assoc.semantic_eq(&right_assoc) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn validate_jump(target: usize, instruction_count: usize) -> Result<(), String> {
@@ -7750,7 +7890,8 @@ fn execute_scalar_compound_assignment(
         CompoundAssignmentOperator::Subtract => left - right,
         CompoundAssignmentOperator::Multiply => left * right,
         CompoundAssignmentOperator::Divide => left / right,
-        CompoundAssignmentOperator::Remainder => left % right,
+        CompoundAssignmentOperator::Remainder => integer_remainder(left, right),
+        CompoundAssignmentOperator::FractionalRemainder => fractional_remainder(left, right),
         CompoundAssignmentOperator::BitAnd => bitwise_binary(left, right, |a, b| a & b),
         CompoundAssignmentOperator::BitOr => bitwise_binary(left, right, |a, b| a | b),
         CompoundAssignmentOperator::BitXor => bitwise_binary(left, right, |a, b| a ^ b),
@@ -9434,7 +9575,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_operators_and_compound_assignments_use_signed_32_bit_semantics() {
+    fn shift_operators_and_compound_assignments_use_byond_24_bit_semantics() {
         let source = "/proc/probe(items)\n\tvar/value = 3 << 2\n\tvalue >>= 1\n\titems[1] <<= value\n\treturn (-8 >> 2) + items[1] + (1 << 33)\n";
         let syntax = parse(source).expect("source should parse");
         let program = compile_procedure(&syntax.definitions[0])
@@ -9444,10 +9585,10 @@ mod tests {
         state.heap.list_mut(list).unwrap().add(Value::number(1.0));
 
         // value is (3 << 2) >> 1 = 6; item becomes 1 << 6 = 64. Right
-        // shifts preserve the sign bit, and a count of 33 masks to one.
+        // BYOND shifts are limited to the low 24 bits; counts >=24 yield zero.
         assert_eq!(
             execute_in_state(&program, &[Value::List(list)], &mut state),
-            Ok(Value::number(64.0))
+            Ok(Value::number(62.0))
         );
         assert!(program.instructions.iter().any(|instruction| {
             matches!(
@@ -9455,6 +9596,33 @@ mod tests {
                 Instruction::ShiftLeft | Instruction::ShiftRight
             )
         }));
+    }
+
+    #[test]
+    fn documented_operator_semantics_cover_short_circuit_modulo_compare_and_equivalence() {
+        let source = parse(
+            "/proc/probe()\n\tvar/list/a = list(\"key\" = 7, 2)\n\tvar/list/b = list(\"key\" = 7, 2)\n\tvar/list/c = list(\"key\" = 8, 2)\n\tvar/legacy = 5.9 % 2.1\n\tvar/fractional = 5.5 %% 2\n\tlegacy %= 2\n\tfractional %%= 1.25\n\tif((a ~= b) != 1 || (a ~! c) != 1)\n\t\treturn -100\n\tif((3 <=> 4) != -1 || (\"b\" <=> \"a\") != 1 || (1 <> 2) != 1)\n\t\treturn -101\n\tif((99 in null) != 0)\n\t\treturn -102\n\tvar/or_value = \"\" || \"fallback\"\n\tvar/and_value = \"left\" && \"right\"\n\tvar/skip_or = 1 || list()[99]\n\tvar/skip_and = 0 && list()[99]\n\tif(or_value != \"fallback\" || and_value != \"right\" || skip_or != 1 || skip_and != 0)\n\t\treturn -103\n\treturn legacy + fractional\n",
+        )
+        .expect("documented operator source should parse");
+        let module =
+            compile_module(&source.definitions).expect("documented operators should compile");
+        assert_eq!(
+            execute_module(&module, module.procedure_id("/proc/probe").unwrap(), &[]),
+            Ok(Value::number(1.25))
+        );
+    }
+
+    #[test]
+    fn bitwise_operators_use_byonds_24_effective_bits() {
+        let source = parse(
+            "/proc/probe()\n\tvar/a = ~0\n\tvar/b = 1 << 24\n\tvar/c = 0xFFFFFF >> 23\n\treturn a + b + c\n",
+        )
+        .expect("bitwise source should parse");
+        let module = compile_module(&source.definitions).expect("bitwise source should compile");
+        assert_eq!(
+            execute_module(&module, module.procedure_id("/proc/probe").unwrap(), &[]),
+            Ok(Value::number(16_777_216.0))
+        );
     }
 
     #[test]
