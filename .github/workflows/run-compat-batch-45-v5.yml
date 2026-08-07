@@ -1,0 +1,51 @@
+name: Run compatibility batch 45 final gate
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/run-compat-batch-45-v5.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: compat-batch-45
+          fetch-depth: 0
+      - name: Verify and commit
+        shell: bash
+        run: |
+          set +e
+          LOG=/tmp/compat45v5.log
+          python3 tools/compat_batch_45.py > "$LOG" 2>&1; STATUS=$?
+          if [ $STATUS -eq 0 ]; then python3 tools/compat_batch_45_followup.py >> "$LOG" 2>&1; STATUS=$?; fi
+          if [ $STATUS -eq 0 ]; then cargo fmt --all >> "$LOG" 2>&1; STATUS=$?; fi
+          if [ $STATUS -eq 0 ]; then cargo test -p dm-project -p dm-semantics -p dm-runtime >> "$LOG" 2>&1; STATUS=$?; fi
+          if [ $STATUS -eq 0 ]; then cargo clippy --workspace --all-targets -- -D warnings >> "$LOG" 2>&1; STATUS=$?; fi
+          git config user.name "Dream64 Compatibility Bot"
+          git config user.email "actions@users.noreply.github.com"
+          if [ $STATUS -eq 0 ]; then
+            rm -f .github/workflows/compat-batch-45.yml tools/compat_batch_45.py tools/compat_batch_45_followup.py compat_batch_45_failure.log compat_batch_45_failure_v2.log compat_batch_45_failure_v3.log compat_batch_45_failure_v4.log
+            git add -A
+            git commit -m "Batch Monkestation compatibility primitives"
+          else
+            git reset --hard HEAD
+            cp "$LOG" compat_batch_45_failure_v5.log
+            git add compat_batch_45_failure_v5.log
+            git commit -m "Capture compatibility batch 45 final gate failure"
+          fi
+          git push origin HEAD:compat-batch-45
+      - name: Remove trigger from main
+        if: always()
+        run: |
+          git fetch origin main
+          git switch --force-create cleanup origin/main
+          git rm -f .github/workflows/run-compat-batch-45-v5.yml
+          git config user.name "Dream64 Compatibility Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git commit -m "Remove compatibility batch final gate trigger"
+          git push origin HEAD:main
