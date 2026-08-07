@@ -9,13 +9,13 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use builtins::{execute_standard_builtin, is_subtype, standard_builtin_arity};
+use builtins::{execute_list_method, execute_standard_builtin, is_subtype, standard_builtin_arity};
 
 use dm_core::{DmNumberBits, SourceSpan};
 use dm_lexer::{SpannedToken, TokenKind};
 use dm_syntax::{Definition, DefinitionKind, SourceLine};
 pub use dm_value::Value;
-use dm_value::{DatumId, FieldName, ListId, TypePath, ValueError, ValueHeap};
+use dm_value::{FieldName, ListId, TypePath, ValueError, ValueHeap};
 
 /// One instruction in the portable reference bytecode.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5888,6 +5888,20 @@ fn run_frames(
                         .type_parent(&path)
                         .cloned()
                         .map_or(Value::Null, Value::TypePath),
+                    Value::List(list) if name.as_str() == "len" => {
+                        let len = state
+                            .heap
+                            .list(list)
+                            .map_err(|error| execution_error(module, &frames, error.to_string()))?
+                            .len();
+                        Value::number(len.to_string().parse::<f32>().map_err(|error| {
+                            execution_error(
+                                module,
+                                &frames,
+                                format!("list length cannot be represented as binary32: {error}"),
+                            )
+                        })?)
+                    }
                     Value::Datum(datum) => {
                         let runtime_type = match state.heap.datum(datum) {
                             Ok(datum) => datum.type_path().clone(),
@@ -5967,15 +5981,49 @@ fn run_frames(
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                let datum = match datum_receiver(&receiver, "field write") {
-                    Ok(datum) => datum,
-                    Err(message) => return Err(execution_error(module, &frames, message)),
-                };
-                if let Err(error) = state
-                    .heap
-                    .set_datum_field(datum, name.clone(), value.clone())
-                {
-                    return Err(execution_error(module, &frames, error.to_string()));
+                match receiver {
+                    Value::Datum(datum) => {
+                        if let Err(error) =
+                            state
+                                .heap
+                                .set_datum_field(datum, name.clone(), value.clone())
+                        {
+                            return Err(execution_error(module, &frames, error.to_string()));
+                        }
+                    }
+                    Value::List(list) if name.as_str() == "len" => {
+                        let new_len = match &value {
+                            Value::Number(number) if number.to_f32().is_finite() => number
+                                .to_f32()
+                                .trunc()
+                                .max(0.0)
+                                .to_string()
+                                .parse::<usize>()
+                                .unwrap_or(usize::MAX),
+                            _ => 0,
+                        };
+                        if let Err(error) = state
+                            .heap
+                            .list_mut(list)
+                            .and_then(|values| values.resize(new_len))
+                        {
+                            return Err(execution_error(module, &frames, error.to_string()));
+                        }
+                    }
+                    Value::Null => {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            "field write received null",
+                        ));
+                    }
+                    value => {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("field write requires a datum or list.len, received {value}"),
+                        ));
+                    }
                 }
                 if keep {
                     frames[frame_index].stack.push(value);
@@ -6350,13 +6398,6 @@ fn run_frames(
                 continue;
             }
             Instruction::CallDynamic { argument_count } => {
-                if frames.len() >= limits.max_call_depth {
-                    return Err(execution_error(
-                        module,
-                        &frames,
-                        format!("maximum call depth {} exceeded", limits.max_call_depth),
-                    ));
-                }
                 let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let stack_length = frames[frame_index].stack.len();
@@ -6373,19 +6414,46 @@ fn run_frames(
                     .stack
                     .pop()
                     .expect("stack length was checked");
-                let caller_context = frame_context(&frames[frame_index]);
-                let (target, context) =
-                    dynamic_call_target(module, state, &receiver, &selector, &caller_context)
-                        .map_err(|message| execution_error(module, &frames, message))?;
-                let Some(target_program) = module.procedure(target) else {
-                    return Err(execution_error(
-                        module,
-                        &frames,
-                        format!("invalid dynamic call target {}", target.index()),
-                    ));
-                };
-                frames.push(make_frame(target, target_program, &arguments, &context));
-                continue;
+                if let Value::List(list) = receiver {
+                    let Value::Text(method) = selector else {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("list procedure selector must be text, received {selector}"),
+                        ));
+                    };
+                    let Some(result) = execute_list_method(&method, list, &arguments, state) else {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("unknown /list procedure {method:?}"),
+                        ));
+                    };
+                    let result =
+                        result.map_err(|message| execution_error(module, &frames, message))?;
+                    frames[frame_index].stack.push(result);
+                } else {
+                    if frames.len() >= limits.max_call_depth {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("maximum call depth {} exceeded", limits.max_call_depth),
+                        ));
+                    }
+                    let caller_context = frame_context(&frames[frame_index]);
+                    let (target, context) =
+                        dynamic_call_target(module, state, &receiver, &selector, &caller_context)
+                            .map_err(|message| execution_error(module, &frames, message))?;
+                    let Some(target_program) = module.procedure(target) else {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("invalid dynamic call target {}", target.index()),
+                        ));
+                    };
+                    frames.push(make_frame(target, target_program, &arguments, &context));
+                    continue;
+                }
             }
             Instruction::Return => {
                 let result = match pop(&mut frames[frame_index].stack) {
@@ -7285,14 +7353,6 @@ fn replace_text_ascii_insensitive(target: &str, needle: &str, replacement: &str)
 
 fn runtime_truthy(heap: &ValueHeap, value: &Value) -> Result<bool, String> {
     heap.truthy(value).map_err(|error| error.to_string())
-}
-
-fn datum_receiver(value: &Value, operation: &str) -> Result<DatumId, String> {
-    match value {
-        Value::Datum(datum) => Ok(*datum),
-        Value::Null => Err(format!("{operation} received null")),
-        _ => Err(format!("{operation} requires a datum, received {value}")),
-    }
 }
 
 fn dynamic_call_target(
@@ -8615,6 +8675,33 @@ mod tests {
         assert_eq!(
             execute_module(&module, entry, &[Value::number(1.0), Value::number(1.0)]),
             Ok(Value::number(7.0))
+        );
+    }
+
+    #[test]
+    fn documented_list_methods_and_len_execute_natively() {
+        let source = parse(
+            "/proc/run()\n\tvar/list/values = list(\"a\", \"b\", \"c\")\n\tvalues.Add(list(\"d\", \"e\"))\n\tvar/list/copied = values.Copy(2, 5)\n\tvalues.Cut(2, 3)\n\tvar/found = values.Find(\"d\")\n\tvar/next_index = values.Insert(2, list(\"x\", \"y\"))\n\tvalues.Splice(-1, 0, \"z\")\n\tvalues.Swap(1, 6)\n\tvalues.len = 7\n\tvar/removed = values.Remove(\"d\")\n\tvar/removed_all = values.RemoveAll(\"x\")\n\treturn copied.len + (copied[1] == \"b\") + (copied[3] == \"d\") + found + next_index + removed + removed_all + values.len + (values[1] == \"z\") + (values[2] == \"y\")\n",
+        )
+        .expect("list method source should parse");
+        let module = compile_module(&source.definitions).expect("list methods should compile");
+        assert_eq!(
+            execute_module(&module, module.procedure_id("/proc/run").unwrap(), &[]),
+            Ok(Value::number(21.0))
+        );
+    }
+
+    #[test]
+    fn list_copy_and_swap_keep_associative_values_attached_to_keys() {
+        let source = parse(
+            "/proc/run()\n\tvar/list/values = list(\"red\" = 1, \"blue\" = 2, \"green\" = 3)\n\tvar/list/copied = values.Copy()\n\tvalues.Swap(1, 3)\n\treturn (values[1] == \"green\") + (values[\"green\"] == 3) + (copied[1] == \"red\") + (copied[\"red\"] == 1)\n",
+        )
+        .expect("associative list method source should parse");
+        let module =
+            compile_module(&source.definitions).expect("associative list methods should compile");
+        assert_eq!(
+            execute_module(&module, module.procedure_id("/proc/run").unwrap(), &[]),
+            Ok(Value::number(4.0))
         );
     }
 
