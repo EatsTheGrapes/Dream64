@@ -3527,7 +3527,7 @@ impl<'a> ExpressionParser<'a> {
                 };
                 continue;
             }
-            if matches!(self.current_operator(), Some("." | ":" | "?." | "?:")) {
+            if matches!(self.current_operator(), Some("." | "?." | "?:")) {
                 let safe_member = matches!(self.current_operator(), Some("?." | "?:"));
                 self.index += 1;
                 let Some(TokenKind::Identifier(name)) =
