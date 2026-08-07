@@ -171,6 +171,8 @@ pub enum Instruction {
     LoadField(FieldName),
     /// Pops a value and datum receiver, then writes one named field.
     StoreField(FieldName),
+    /// Stores one datum field while preserving the assigned value on the stack.
+    StoreFieldKeep(FieldName),
     /// Pushes one persistent runtime global.
     LoadGlobal(FieldName),
     /// Pops and stores one persistent runtime global.
@@ -341,6 +343,8 @@ pub enum TypePredicateKind {
     IsTurf,
     /// Whether every value is a valid DM location (an atom).
     IsLoc,
+    /// Whether the value is an icon datum or a headless icon resource.
+    IsIcon,
     /// Whether a datum or type path belongs to an optional type hierarchy.
     IsType,
 }
@@ -1444,7 +1448,18 @@ fn top_level_assignment(tokens: &[SpannedToken]) -> Option<(usize, &str)> {
             TokenKind::Operator(operator)
                 if matches!(
                     operator.as_str(),
-                    "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>="
+                    "=" | "+="
+                        | "-="
+                        | "*="
+                        | "/="
+                        | "%="
+                        | "&="
+                        | "|="
+                        | "^="
+                        | "<<="
+                        | ">>="
+                        | "&&="
+                        | "||="
                 ) && depth == 0 =>
             {
                 return Some((index, operator));
@@ -1463,6 +1478,11 @@ fn compile_assignment_statement(
 ) -> Result<(), CompileError> {
     let (assignment, operator) = top_level_assignment(tokens)
         .ok_or_else(|| compile_error("assignment statement requires '='"))?;
+    if matches!(operator, "||=" | "&&=") {
+        compile_expression(tokens, locals, instructions, procedures)?;
+        instructions.push(Instruction::Pop);
+        return Ok(());
+    }
     if assignment == 0 || assignment + 1 == tokens.len() {
         return Err(compile_error("assignment requires a target and value"));
     }
@@ -3166,19 +3186,22 @@ enum ListExpressionEntry {
 fn dm_builtin_numeric_constant(identifier: &str) -> Option<f32> {
     match identifier {
         "FALSE" | "BLEND_DEFAULT" => Some(0.0),
-        "TRUE" | "BLEND_OVERLAY" | "KEEP_TOGETHER" => Some(1.0),
-        "BLEND_ADD" | "KEEP_APART" => Some(2.0),
+        "TRUE" | "BLEND_OVERLAY" | "KEEP_TOGETHER" | "NORTH" => Some(1.0),
+        "BLEND_ADD" | "KEEP_APART" | "SOUTH" => Some(2.0),
         "BLEND_SUBTRACT" => Some(3.0),
-        "BLEND_MULTIPLY" | "LONG_GLIDE" => Some(4.0),
-        "BLEND_INSET_OVERLAY" => Some(5.0),
+        "BLEND_MULTIPLY" | "LONG_GLIDE" | "EAST" => Some(4.0),
+        "BLEND_INSET_OVERLAY" | "NORTHEAST" => Some(5.0),
+        "SOUTHEAST" => Some(6.0),
+        "WEST" | "RESET_TRANSFORM" => Some(8.0),
+        "NORTHWEST" => Some(9.0),
+        "SOUTHWEST" => Some(10.0),
+        "UP" | "RESET_COLOR" => Some(16.0),
+        "DOWN" | "RESET_ALPHA" => Some(32.0),
         // Appearance flags are BYOND bitflags. Keep the complete contiguous
         // built-in flag family here rather than teaching project code about
         // individual flags as each one is encountered.
         // These make an overlay/image ignore the corresponding value
         // inherited from its parent.
-        "RESET_TRANSFORM" => Some(8.0),
-        "RESET_COLOR" => Some(16.0),
-        "RESET_ALPHA" => Some(32.0),
         "PIXEL_SCALE" => Some(64.0),
         "TILE_BOUND" => Some(128.0),
         "INHERIT_ID" => Some(256.0),
@@ -3224,13 +3247,48 @@ impl<'a> ExpressionParser<'a> {
         };
         if !matches!(
             operator.as_str(),
-            "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>="
+            "=" | "+="
+                | "-="
+                | "*="
+                | "/="
+                | "%="
+                | "&="
+                | "|="
+                | "^="
+                | "<<="
+                | ">>="
+                | "&&="
+                | "||="
         ) {
             return Ok(target);
         }
         let operator = operator.clone();
         self.index += 1;
         let value = self.parse_assignment()?;
+        if operator == "||=" {
+            let assignment = Expression::Assignment {
+                target: Box::new(target.clone()),
+                operator: "=".to_owned(),
+                value: Box::new(value),
+            };
+            return Ok(Expression::Conditional {
+                condition: Box::new(target.clone()),
+                when_true: Box::new(target),
+                when_false: Box::new(assignment),
+            });
+        }
+        if operator == "&&=" {
+            let assignment = Expression::Assignment {
+                target: Box::new(target.clone()),
+                operator: "=".to_owned(),
+                value: Box::new(value),
+            };
+            return Ok(Expression::Conditional {
+                condition: Box::new(target.clone()),
+                when_true: Box::new(assignment),
+                when_false: Box::new(target),
+            });
+        }
         Ok(Expression::Assignment {
             target: Box::new(target),
             operator,
@@ -3978,6 +4036,7 @@ fn type_predicate_kind(identifier: &str) -> Option<TypePredicateKind> {
         "ismovable" => Some(TypePredicateKind::IsMovable),
         "isturf" => Some(TypePredicateKind::IsTurf),
         "isloc" => Some(TypePredicateKind::IsLoc),
+        "isicon" => Some(TypePredicateKind::IsIcon),
         "istype" => Some(TypePredicateKind::IsType),
         _ => None,
     }
@@ -4496,8 +4555,7 @@ fn emit_assignment_expression(
             if operator != "=" {
                 instructions.push(compound_instruction(operator)?);
             }
-            instructions.push(Instruction::Duplicate);
-            instructions.push(Instruction::StoreField(name.clone()));
+            instructions.push(Instruction::StoreFieldKeep(name.clone()));
         }
         Expression::Index { list, index } => {
             emit_expression(list, locals, instructions, procedures)?;
@@ -5527,6 +5585,10 @@ fn run_frames(
                 };
                 let value = match read_list_value(&state.heap, list, &key) {
                     Ok(value) => value.clone(),
+                    // BYOND associative lookup returns null for an absent key.
+                    // Lazy-list idioms such as `lists[target] ||= list()` rely
+                    // on this before inserting the new association.
+                    Err(ValueError::MissingKey) => Value::Null,
                     Err(error) => {
                         return Err(execution_error(module, &frames, error.to_string()));
                     }
@@ -5685,7 +5747,8 @@ fn run_frames(
                 };
                 frames[frame_index].stack.push(value);
             }
-            Instruction::StoreField(name) => {
+            Instruction::StoreField(ref name) | Instruction::StoreFieldKeep(ref name) => {
+                let keep = matches!(instruction, Instruction::StoreFieldKeep(_));
                 let value = match pop(&mut frames[frame_index].stack) {
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
@@ -5698,8 +5761,14 @@ fn run_frames(
                     Ok(datum) => datum,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                if let Err(error) = state.heap.set_datum_field(datum, name, value) {
+                if let Err(error) = state
+                    .heap
+                    .set_datum_field(datum, name.clone(), value.clone())
+                {
                     return Err(execution_error(module, &frames, error.to_string()));
+                }
+                if keep {
+                    frames[frame_index].stack.push(value);
                 }
             }
             Instruction::LoadGlobal(name) => {
@@ -6838,6 +6907,18 @@ fn type_predicate_builtin(
                 .as_str();
             Ok(type_path == "/turf" || type_path.starts_with("/turf/"))
         }
+        TypePredicateKind::IsIcon => match value {
+            Value::Text(text) => Ok(text.to_ascii_lowercase().ends_with(".dmi")),
+            Value::Datum(datum) => {
+                let path = heap
+                    .datum(*datum)
+                    .map_err(|error| error.to_string())?
+                    .type_path()
+                    .as_str();
+                Ok(path == "/icon" || path.starts_with("/icon/"))
+            }
+            _ => Ok(false),
+        },
         TypePredicateKind::IsLoc => Ok(arguments.iter().all(|value| {
             let Value::Datum(datum) = value else {
                 return false;
@@ -8260,6 +8341,81 @@ mod tests {
         let stale_error = execute_in_context(&program, &[], &mut state, &context).unwrap_err();
         assert_eq!(stale_error.message, format!("stale datum handle {datum:?}"));
         assert_eq!(stale_error.source_span, Some(span));
+    }
+
+    #[test]
+    fn logical_assignment_short_circuits_locals_fields_and_list_entries() {
+        let source = parse(
+            "/datum/example/proc/run()\n\tvar/local\n\tlocal ||= 3\n\tvar/list/values = list()\n\tvalues[\"entry\"] ||= 4\n\tsrc.flag ||= 5\n\treturn local + values[\"entry\"] + src.flag\n",
+        )
+        .expect("logical assignment source should parse");
+        let module = compile_module_specs(&[ProcedureSpec {
+            path: "/datum/example/proc/run@0".to_owned(),
+            definition: &source.definitions[0],
+            parent: None,
+            static_calls: BTreeMap::new(),
+            src_fields: BTreeMap::from([("flag".to_owned(), field("flag"))]),
+            global_fields: BTreeMap::new(),
+        }])
+        .expect("logical assignments should compile");
+        let entry = module.procedure_id_at(0).expect("entry");
+        let mut state = ExecutionState::new();
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(datum, field("flag"), Value::Null)
+            .unwrap();
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                entry,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(datum), Value::Null),
+            ),
+            Ok(Value::number(12.0))
+        );
+    }
+
+    #[test]
+    fn plane_macro_nested_scope_keeps_cached_locals_visible() {
+        let source = parse(
+            "/proc/plane_macro(flag, other)\n\tvar/output = 0\n\tdo { if(flag) { var/_cached_plane = 7; var/_our_turf = other; if(_our_turf) { output = _cached_plane; } else if(other) { output = _cached_plane; } else { output = _cached_plane; } } else { output = 2; } } while(0)\n\treturn output\n",
+        )
+        .expect("plane macro source should parse");
+        let module = compile_module(&source.definitions).expect("plane macro scope should compile");
+        let entry = module.procedure_id("/proc/plane_macro").expect("entry");
+        assert_eq!(
+            execute_module(&module, entry, &[Value::number(1.0), Value::number(1.0)]),
+            Ok(Value::number(7.0))
+        );
+    }
+
+    #[test]
+    fn direction_and_icon_builtins_cover_lifecycle_shapes() {
+        let source = parse(
+            "/proc/directions()\n\treturn NORTH + SOUTH + EAST + WEST + NORTHEAST + NORTHWEST + SOUTHEAST + SOUTHWEST\n/proc/icon_resource()\n\treturn isicon('icons/test.dmi')\n",
+        )
+        .expect("builtin source should parse");
+        let module = compile_module(&source.definitions).expect("builtins should compile");
+        assert_eq!(
+            execute_module(
+                &module,
+                module.procedure_id("/proc/directions").unwrap(),
+                &[]
+            ),
+            Ok(Value::number(45.0))
+        );
+        assert_eq!(
+            execute_module(
+                &module,
+                module.procedure_id("/proc/icon_resource").unwrap(),
+                &[]
+            ),
+            Ok(Value::number(1.0))
+        );
     }
 
     #[test]
