@@ -15,7 +15,7 @@ use dm_core::{DmNumberBits, SourceSpan};
 use dm_lexer::{SpannedToken, TokenKind};
 use dm_syntax::{Definition, DefinitionKind, SourceLine};
 pub use dm_value::Value;
-use dm_value::{DatumId, FieldName, ListId, TypePath, ValueError, ValueHeap};
+use dm_value::{FieldName, ListId, TypePath, ValueError, ValueHeap};
 
 /// One instruction in the portable reference bytecode.
 #[derive(Clone, Debug, Eq, PartialEq)]
