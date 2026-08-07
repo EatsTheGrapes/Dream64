@@ -1646,7 +1646,7 @@ mod tests {
             state.initial_value(&child, &field("value")),
             Some(&Value::number(7.0))
         );
-        assert_eq!(state.project_root(), Some(fixture.root.as_path()));
+        assert_eq!(state.project_root(), Some(fixture.0.as_path()));
     }
 
     #[test]

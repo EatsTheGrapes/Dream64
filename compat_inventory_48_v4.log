@@ -1,0 +1,70 @@
+   Compiling dm-core v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-core)
+   Compiling dm-lexer v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-lexer)
+   Compiling dm-syntax v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-syntax)
+   Compiling dm-value v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-value)
+   Compiling dm-object-tree v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-object-tree)
+   Compiling dm-project v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-project)
+   Compiling dm-compiler v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-compiler)
+   Compiling dm-vm v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-vm)
+   Compiling dm-globals v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-globals)
+   Compiling dm-runtime v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-runtime)
+   Compiling dm-semantics v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-semantics)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.00s
+     Running unittests src/lib.rs (target/debug/deps/dm_runtime-6555e837af8cd67b)
+
+running 13 tests
+test tests::applies_global_and_static_overrides_in_project_order ... ok
+test tests::applies_only_proven_constant_field_expressions ... ok
+test tests::converts_nested_associative_lists_and_preserves_default_aliases ... ok
+test tests::dynamic_initializer_global_writes_persist_into_later_steps ... ok
+test tests::executes_identifier_dependencies_and_overrides_in_source_order ... ok
+test tests::evaluates_live_datum_expressions_with_materialized_globals ... ok
+test tests::executes_list_expressions_with_runtime_values ... ok
+test tests::executes_src_field_and_explicit_global_references ... ok
+test tests::execution_states_share_the_image_type_catalog ... ok
+test tests::execution_state_carries_initial_parent_and_project_metadata ... ok
+test tests::layers_ancestor_defaults_and_reopen_overrides_deterministically ... ok
+test tests::materializes_builtin_atom_appearance_defaults_without_overriding_source ... ok
+test tests::retains_source_mapped_unsupported_initializers_without_guessing ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/dm_semantics-f0f2c9e0a5d3ba34)
+
+running 18 tests
+test tests::chains_multiple_reopenings_in_expanded_source_order ... ok
+test tests::executes_multiple_reopenings_through_the_exact_parent_chain ... ok
+test tests::executes_an_inherited_override_and_reuses_omitted_arguments ... FAILED
+test tests::follows_a_resolved_explicit_parent_type ... ok
+test tests::indexes_a_base_procedure_with_source_identity ... ok
+test tests::executes_parent_target_from_explicit_parent_type_and_explicit_arguments ... ok
+test tests::links_a_child_override_to_the_inherited_effective_body ... ok
+test tests::indexes_a_global_procedure_without_an_owner_or_parent ... ok
+test tests::links_direction_text_and_orange_standard_builtins ... ok
+test tests::lowers_bare_inherited_fields_as_src_fields_after_local_resolution ... ok
+test tests::links_standard_location_predicates_as_variadic_builtins ... ok
+test tests::lowers_standard_datum_type_field_for_all_datums ... ok
+test tests::lowers_standard_atom_fields_only_for_their_builtin_hierarchy ... ok
+test tests::missing_parent_target_is_a_source_mapped_runtime_error ... ok
+test tests::parent_failure_preserves_both_source_mapped_frames ... ok
+test tests::selected_method_includes_and_resolves_direct_helper_calls ... ok
+test tests::selected_dynamic_literal_call_includes_matching_method_implementation ... ok
+test tests::selected_static_call_uses_object_tree_ancestor_not_lexical_path_ancestor ... ok
+
+failures:
+
+---- tests::executes_an_inherited_override_and_reuses_omitted_arguments stdout ----
+
+thread 'tests::executes_an_inherited_override_and_reuses_omitted_arguments' (3504) panicked at crates/dm-semantics/src/lib.rs:1282:9:
+assertion `left == right` failed
+  left: "addition requires two numbers or two text values, received null and 1"
+ right: "numeric operation received null"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::executes_an_inherited_override_and_reuses_omitted_arguments
+
+test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p dm-semantics --lib`
