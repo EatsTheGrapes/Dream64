@@ -590,9 +590,38 @@ impl DmList {
         {
             return Some(std::mem::replace(current, value));
         }
+        if let Some((order_index, position)) =
+            self.order.iter().enumerate().find_map(|(index, entry)| {
+                let ListOrder::Positional(position) = entry else {
+                    return None;
+                };
+                self.positional[*position]
+                    .semantic_eq(&key)
+                    .then_some((index, *position))
+            })
+        {
+            let existing_key = self.positional.remove(position);
+            for entry in &mut self.order {
+                if let ListOrder::Positional(other) = entry
+                    && *other > position
+                {
+                    *other -= 1;
+                }
+            }
+            self.order[order_index] = ListOrder::Associative(existing_key.clone());
+            self.associative.push((existing_key, value));
+            return None;
+        }
         self.order.push(ListOrder::Associative(key.clone()));
         self.associative.push((key, value));
         None
+    }
+
+    /// Returns whether an iteration entry is semantically equal to `value`.
+    #[must_use]
+    pub fn contains(&self, value: &Value) -> bool {
+        self.positions()
+            .any(|(_, candidate)| candidate.semantic_eq(value))
     }
 
     /// Removes an associative key and returns its value.
@@ -1187,6 +1216,21 @@ mod tests {
         assert!(list.remove_first(&Value::number(0.0)).is_some());
         assert_eq!(list.len(), 1);
         assert!(list.get(1).unwrap().semantic_eq(&Value::number(0.0)));
+    }
+
+    #[test]
+    fn assigning_an_existing_item_as_a_key_preserves_length_and_order() {
+        let mut list = DmList::default();
+        list.add(text("key"));
+        list.add(text("other"));
+        assert_eq!(list.set_key(text("key"), Value::number(7.0)), None);
+        assert_eq!(list.len(), 2);
+        assert!(list.get(1).unwrap().semantic_eq(&text("key")));
+        assert!(
+            list.get_key(&text("key"))
+                .unwrap()
+                .semantic_eq(&Value::number(7.0))
+        );
     }
 
     #[test]
