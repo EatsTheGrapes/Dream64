@@ -1119,6 +1119,7 @@ pub(super) fn execute_list_compound_operator(
         CompoundAssignmentOperator::Multiply
         | CompoundAssignmentOperator::Divide
         | CompoundAssignmentOperator::Remainder
+        | CompoundAssignmentOperator::FractionalRemainder
         | CompoundAssignmentOperator::ShiftLeft
         | CompoundAssignmentOperator::ShiftRight => {
             return Err(format!(
