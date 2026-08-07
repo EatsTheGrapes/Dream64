@@ -854,14 +854,24 @@ impl CompilerSourceBuilder {
             if is_identifier_start(byte) {
                 let identifier_end = identifier_end(text, offset);
                 let name = &text[offset..identifier_end];
-                if name == "__FILE__" {
+                if matches!(name, "__FILE__" | "__LINE__") {
                     self.append_original(
                         source,
                         SourceSpan::new(span.start + literal_start, span.start + offset),
                     );
                     let invocation =
                         SourceSpan::new(span.start + offset, span.start + identifier_end);
-                    self.append_replacement(&format!("{file_macro:?}"), invocation);
+                    let replacement = if name == "__FILE__" {
+                        format!("{file_macro:?}")
+                    } else {
+                        source.as_bytes()[..invocation.start]
+                            .iter()
+                            .filter(|byte| **byte == b'\n')
+                            .count()
+                            .saturating_add(1)
+                            .to_string()
+                    };
+                    self.append_replacement(&replacement, invocation);
                     offset = identifier_end;
                     literal_start = offset;
                     continue;
@@ -895,12 +905,18 @@ impl CompilerSourceBuilder {
                             .expect("arguments were validated above")
                             .0
                     });
+                    let line_macro = source.as_bytes()[..invocation.start]
+                        .iter()
+                        .filter(|byte| **byte == b'\n')
+                        .count()
+                        .saturating_add(1);
                     let replacement = expand_macro(
                         name,
                         arguments.as_deref(),
                         macros,
                         &mut Vec::new(),
                         &file_macro,
+                        line_macro,
                     )
                     .map_err(|message| ProjectError::MacroExpansion {
                         path: path.to_path_buf(),
@@ -981,9 +997,13 @@ fn expand_macro(
     macros: &HashMap<String, MacroDefinition>,
     stack: &mut Vec<String>,
     file_macro: &str,
+    line_macro: usize,
 ) -> Result<String, String> {
     if name == "__FILE__" {
         return Ok(format!("{file_macro:?}"));
+    }
+    if name == "__LINE__" {
+        return Ok(line_macro.to_string());
     }
     if let Some(cycle_start) = stack.iter().position(|entry| entry == name) {
         let mut cycle = stack[cycle_start..].to_vec();
@@ -1004,12 +1024,18 @@ fn expand_macro(
             || Err(format!("function macro {name} requires a call")),
             |arguments| {
                 substitute_function_macro(
-                    name, definition, parameters, arguments, macros, stack, file_macro,
+                    name, definition, parameters, arguments, macros, stack, file_macro, line_macro,
                 )
             },
         )
     } else {
-        expand_replacement(&definition.replacement, macros, stack, file_macro)
+        expand_replacement(
+            &definition.replacement,
+            macros,
+            stack,
+            file_macro,
+            line_macro,
+        )
     };
     stack.pop();
     result
@@ -1020,6 +1046,7 @@ fn expand_replacement(
     macros: &HashMap<String, MacroDefinition>,
     stack: &mut Vec<String>,
     file_macro: &str,
+    line_macro: usize,
 ) -> Result<String, String> {
     let mut output = String::with_capacity(replacement.len());
     let mut offset = 0usize;
@@ -1039,6 +1066,11 @@ fn expand_replacement(
                 offset = end;
                 continue;
             }
+            if name == "__LINE__" {
+                output.push_str(&line_macro.to_string());
+                offset = end;
+                continue;
+            }
             if let Some(definition) = macros.get(name) {
                 if definition.parameters.is_some() {
                     let open = skip_horizontal_whitespace(replacement, end);
@@ -1053,6 +1085,7 @@ fn expand_replacement(
                                 macros,
                                 stack,
                                 file_macro,
+                                line_macro,
                             )?);
                         }
                         offset = invocation_end;
@@ -1060,7 +1093,9 @@ fn expand_replacement(
                     }
                     output.push_str(name);
                 } else {
-                    output.push_str(&expand_macro(name, None, macros, stack, file_macro)?);
+                    output.push_str(&expand_macro(
+                        name, None, macros, stack, file_macro, line_macro,
+                    )?);
                 }
             } else {
                 output.push_str(name);
@@ -1086,6 +1121,7 @@ fn substitute_function_macro(
     macros: &HashMap<String, MacroDefinition>,
     stack: &mut Vec<String>,
     file_macro: &str,
+    line_macro: usize,
 ) -> Result<String, String> {
     if arguments.len() < parameters.fixed.len()
         || (parameters.variadic.is_none() && arguments.len() > parameters.fixed.len())
@@ -1166,7 +1202,7 @@ fn substitute_function_macro(
         substituted.push(character);
         offset += character.len_utf8();
     }
-    expand_replacement(&substituted, macros, stack, file_macro)
+    expand_replacement(&substituted, macros, stack, file_macro, line_macro)
 }
 
 fn parse_macro_arguments(source: &str, open: usize) -> Result<(Vec<String>, usize), String> {
@@ -2254,6 +2290,31 @@ mod tests {
         assert!(!expanded.contains("__FILE__"));
         assert!(!expanded.contains("SOURCE_FILE"));
         assert!(expanded.contains("world.dme"));
+    }
+
+    #[test]
+    fn expands_predefined_line_macro_at_the_invocation_line() {
+        let scratch = ScratchDirectory::new();
+        let source = concat!(
+            "#define SOURCE_LINE __LINE__\n",
+            "/proc/source_line()\n",
+            "\treturn SOURCE_LINE\n",
+        );
+        fs::write(scratch.path().join("world.dme"), source)
+            .expect("line macro fixture should be written");
+
+        let project = Project::load(scratch.path().join("world.dme"))
+            .expect("predefined line macro should expand");
+        let expanded = project.files[0]
+            .compiler_text()
+            .expect("expanded source should remain UTF-8");
+
+        assert!(!expanded.contains("__LINE__"));
+        assert!(!expanded.contains("SOURCE_LINE"));
+        assert!(
+            expanded.contains("\treturn 3\n"),
+            "expanded source was {expanded:?}"
+        );
     }
 
     #[test]
