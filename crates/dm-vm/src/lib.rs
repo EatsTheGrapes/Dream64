@@ -5588,6 +5588,10 @@ fn run_frames(
                 };
                 let value = match read_list_value(&state.heap, list, &key) {
                     Ok(value) => value.clone(),
+                    // BYOND associative lookup returns null for an absent key.
+                    // Lazy-list idioms such as `lists[target] ||= list()` rely
+                    // on this before inserting the new association.
+                    Err(ValueError::MissingKey) => Value::Null,
                     Err(error) => {
                         return Err(execution_error(module, &frames, error.to_string()));
                     }
@@ -8345,7 +8349,7 @@ mod tests {
     #[test]
     fn logical_assignment_short_circuits_locals_fields_and_list_entries() {
         let source = parse(
-            "/datum/example/proc/run()\n\tvar/local\n\tlocal ||= 3\n\tvar/list/values = list()\n\tvalues[1] ||= 4\n\tsrc.flag ||= 5\n\treturn local + values[1] + src.flag\n",
+            "/datum/example/proc/run()\n\tvar/local\n\tlocal ||= 3\n\tvar/list/values = list()\n\tvalues[\"entry\"] ||= 4\n\tsrc.flag ||= 5\n\treturn local + values[\"entry\"] + src.flag\n",
         )
         .expect("logical assignment source should parse");
         let module = compile_module_specs(&[ProcedureSpec {
