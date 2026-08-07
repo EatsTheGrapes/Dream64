@@ -1,0 +1,269 @@
+name: One-shot Boot44 isarea verification
+
+on:
+  issues:
+    types:
+      - opened
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.issue.title == '[dream64-internal] boot44-isarea'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch DM location predicates
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("crates/dm-vm/src/lib.rs")
+          source = path.read_text(encoding="utf-8")
+
+          def replace_once(old: str, new: str) -> None:
+              global source
+              count = source.count(old)
+              if count != 1:
+                  raise SystemExit(f"expected exactly one match, found {count}: {old[:80]!r}")
+              source = source.replace(old, new, 1)
+
+          replace_once(
+              '''    /// Whether the value is an `/atom/movable` datum or one of its subtypes.
+              IsMovable,
+              /// Whether the value is a turf datum or one of its subtypes.
+              IsTurf,
+              /// Whether every value is a valid DM location (an atom).
+              IsLoc,
+''',
+              '''    /// Whether every value is an `/atom/movable`, `/obj`, or `/mob` datum.
+              IsMovable,
+              /// Whether every value is a turf datum.
+              IsTurf,
+              /// Whether every value is an area datum.
+              IsArea,
+              /// Whether every value is an object datum.
+              IsObj,
+              /// Whether every value is a mob datum.
+              IsMob,
+              /// Whether every value is a valid DM location (an atom).
+              IsLoc,
+''',
+          )
+
+          replace_once(
+              '''                    let valid_count = match kind {
+                          TypePredicateKind::IsType => (1..=2).contains(&arguments.len()),
+                          // BYOND `isloc` is variadic and succeeds only when
+                          // every supplied value is a location.
+                          TypePredicateKind::IsLoc => !arguments.is_empty(),
+                          _ => arguments.len() == 1,
+                      };
+''',
+              '''                    let valid_count = match kind {
+                          TypePredicateKind::IsType => (1..=2).contains(&arguments.len()),
+                          // BYOND's location classifiers are variadic and succeed
+                          // only when every supplied value belongs to that class.
+                          TypePredicateKind::IsArea
+                          | TypePredicateKind::IsLoc
+                          | TypePredicateKind::IsMob
+                          | TypePredicateKind::IsMovable
+                          | TypePredicateKind::IsObj
+                          | TypePredicateKind::IsTurf => !arguments.is_empty(),
+                          _ => arguments.len() == 1,
+                      };
+''',
+          )
+
+          replace_once(
+              '''        "islist" => Some(TypePredicateKind::IsList),
+              "ismovable" => Some(TypePredicateKind::IsMovable),
+              "isturf" => Some(TypePredicateKind::IsTurf),
+              "isloc" => Some(TypePredicateKind::IsLoc),
+              "istype" => Some(TypePredicateKind::IsType),
+''',
+              '''        "islist" => Some(TypePredicateKind::IsList),
+              "isarea" => Some(TypePredicateKind::IsArea),
+              "ismob" => Some(TypePredicateKind::IsMob),
+              "ismovable" => Some(TypePredicateKind::IsMovable),
+              "isobj" => Some(TypePredicateKind::IsObj),
+              "isturf" => Some(TypePredicateKind::IsTurf),
+              "isloc" => Some(TypePredicateKind::IsLoc),
+              "istype" => Some(TypePredicateKind::IsType),
+''',
+          )
+
+          replace_once(
+              '''                let valid_count = match kind {
+                      TypePredicateKind::IsType => (1..=2).contains(&count),
+                      TypePredicateKind::IsLoc => count >= 1,
+                      _ => count == 1,
+                  };
+''',
+              '''                let valid_count = match kind {
+                      TypePredicateKind::IsType => (1..=2).contains(&count),
+                      TypePredicateKind::IsArea
+                      | TypePredicateKind::IsLoc
+                      | TypePredicateKind::IsMob
+                      | TypePredicateKind::IsMovable
+                      | TypePredicateKind::IsObj
+                      | TypePredicateKind::IsTurf => count >= 1,
+                      _ => count == 1,
+                  };
+''',
+          )
+
+          replace_once(
+              '''        TypePredicateKind::IsMovable => {
+              let Value::Datum(datum) = value else {
+                  return Ok(false);
+              };
+              let type_path = heap
+                  .datum(*datum)
+                  .map_err(|error| error.to_string())?
+                  .type_path()
+                  .as_str();
+              // `/obj` and `/mob` are conventional direct children of
+              // `/atom/movable`, despite their path spelling not retaining that
+              // parent segment. Their descendants are movable too.
+              Ok(type_path == "/atom/movable"
+                  || type_path.starts_with("/atom/movable/")
+                  || type_path == "/obj"
+                  || type_path.starts_with("/obj/")
+                  || type_path == "/mob"
+                  || type_path.starts_with("/mob/"))
+          }
+          TypePredicateKind::IsTurf => {
+              let Value::Datum(datum) = value else {
+                  return Ok(false);
+              };
+              let type_path = heap
+                  .datum(*datum)
+                  .map_err(|error| error.to_string())?
+                  .type_path()
+                  .as_str();
+              Ok(type_path == "/turf" || type_path.starts_with("/turf/"))
+          }
+          TypePredicateKind::IsLoc => Ok(arguments.iter().all(|value| {
+              let Value::Datum(datum) = value else {
+                  return false;
+              };
+              let Ok(datum) = heap.datum(*datum) else {
+                  return false;
+              };
+              let type_path = datum.type_path().as_str();
+              // The four concrete atom roots are conventionally spelled as
+              // `/area`, `/turf`, `/obj`, and `/mob`, even though they inherit
+              // `/atom` rather than retaining that segment in their paths.
+              type_path == "/atom"
+                  || type_path.starts_with("/atom/")
+                  || type_path == "/area"
+                  || type_path.starts_with("/area/")
+                  || type_path == "/turf"
+                  || type_path.starts_with("/turf/")
+                  || type_path == "/obj"
+                  || type_path.starts_with("/obj/")
+                  || type_path == "/mob"
+                  || type_path.starts_with("/mob/")
+          })),
+''',
+              '''        TypePredicateKind::IsMovable => all_datums_in_roots(
+              arguments,
+              heap,
+              &["/atom/movable", "/obj", "/mob"],
+          ),
+          TypePredicateKind::IsTurf => all_datums_in_roots(arguments, heap, &["/turf"]),
+          TypePredicateKind::IsArea => all_datums_in_roots(arguments, heap, &["/area"]),
+          TypePredicateKind::IsObj => all_datums_in_roots(arguments, heap, &["/obj"]),
+          TypePredicateKind::IsMob => all_datums_in_roots(arguments, heap, &["/mob"]),
+          TypePredicateKind::IsLoc => all_datums_in_roots(
+              arguments,
+              heap,
+              &["/atom", "/area", "/turf", "/obj", "/mob"],
+          ),
+''',
+          )
+
+          replace_once(
+              '''}
+
+fn replacement_bounds(
+''',
+              '''}
+
+fn all_datums_in_roots(
+    values: &[Value],
+    heap: &ValueHeap,
+    roots: &[&str],
+) -> Result<bool, String> {
+    for value in values {
+        let Value::Datum(datum) = value else {
+            return Ok(false);
+        };
+        let datum = heap.datum(*datum).map_err(|error| error.to_string())?;
+        let candidate = datum.type_path().as_str();
+        if !roots.iter().any(|root| {
+            candidate == *root
+                || candidate
+                    .strip_prefix(root)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        }) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn replacement_bounds(
+''',
+          )
+
+          replace_once(
+              '''            ("/proc/test()\\n\\treturn isturf(new /turf)\\n", 1.0),
+              ("/proc/test()\\n\\treturn isturf(new /turf/open/floor)\\n", 1.0),
+              ("/proc/test()\\n\\treturn isturf(new /obj/item)\\n", 0.0),
+              ("/proc/test()\\n\\treturn isturf(/turf/open/floor)\\n", 0.0),
+              ("/proc/test()\\n\\treturn isloc(new /area)\\n", 1.0),
+''',
+              '''            ("/proc/test()\\n\\treturn isturf(new /turf)\\n", 1.0),
+              ("/proc/test()\\n\\treturn isturf(new /turf/open/floor)\\n", 1.0),
+              ("/proc/test()\\n\\treturn isturf(new /turf, new /turf/open/floor)\\n", 1.0),
+              ("/proc/test()\\n\\treturn isturf(new /obj/item)\\n", 0.0),
+              ("/proc/test()\\n\\treturn isturf(/turf/open/floor)\\n", 0.0),
+              ("/proc/test()\\n\\treturn isarea(new /area)\\n", 1.0),
+              ("/proc/test()\\n\\treturn isarea(new /area/station, new /area)\\n", 1.0),
+              ("/proc/test()\\n\\treturn isarea(new /area, new /turf)\\n", 0.0),
+              ("/proc/test()\\n\\treturn isarea(/area/station)\\n", 0.0),
+              ("/proc/test()\\n\\treturn isobj(new /obj/item, new /obj)\\n", 1.0),
+              ("/proc/test()\\n\\treturn isobj(new /mob)\\n", 0.0),
+              ("/proc/test()\\n\\treturn ismob(new /mob/living)\\n", 1.0),
+              ("/proc/test()\\n\\treturn ismob(new /obj)\\n", 0.0),
+              ("/proc/test()\\n\\treturn ismovable(new /obj, new /mob)\\n", 1.0),
+              ("/proc/test()\\n\\treturn isloc(new /area)\\n", 1.0),
+''',
+          )
+
+          path.write_text(source, encoding="utf-8")
+          PY
+
+      - name: Format dm-vm
+        run: cargo fmt -p dm-vm
+
+      - name: Test dm-vm
+        run: cargo test -p dm-vm
+
+      - name: Strict clippy dm-vm
+        run: cargo clippy -p dm-vm --all-targets -- -D warnings
+
+      - name: Commit verified patch
+        shell: bash
+        run: |
+          git config user.name "Dream64 compatibility bot"
+          git config user.email "actions@users.noreply.github.com"
+          git rm .github/workflows/boot44-isarea-main.yml
+          git add crates/dm-vm/src/lib.rs
+          git commit -m "Implement BYOND location type predicates"
+          git push origin HEAD:main
