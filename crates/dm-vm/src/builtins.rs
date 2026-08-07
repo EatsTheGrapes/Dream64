@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use dm_value::{FieldName, ListId, TypePath, Value};
 
-use super::ExecutionState;
+use super::{CompoundAssignmentOperator, ExecutionState};
 
 pub(super) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
     Some(match name {
@@ -731,6 +731,220 @@ fn ckey(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
             .flat_map(char::to_lowercase)
             .collect::<String>(),
     ))
+}
+
+#[derive(Clone)]
+struct ListOperatorEntry {
+    key: Value,
+    associated: Option<Value>,
+}
+
+fn list_operator_snapshot(list: ListId, state: &ExecutionState) -> Result<Vec<ListOperatorEntry>, String> {
+    let list = state.heap.list(list).map_err(|error| error.to_string())?;
+    list.positions()
+        .map(|(_, key)| {
+            let associated = list.get_key(key).ok().cloned();
+            ListOperatorEntry {
+                key: key.clone(),
+                associated,
+            }
+        })
+        .collect::<Vec<_>>()
+        .pipe(Ok)
+}
+
+trait Pipe: Sized {
+    fn pipe<T>(self, function: impl FnOnce(Self) -> T) -> T {
+        function(self)
+    }
+}
+impl<T> Pipe for T {}
+
+fn add_operator_entry(
+    list: ListId,
+    entry: ListOperatorEntry,
+    state: &mut ExecutionState,
+    only_if_absent: bool,
+) -> Result<(), String> {
+    let target = state.heap.list_mut(list).map_err(|error| error.to_string())?;
+    if only_if_absent && target.contains(&entry.key) {
+        return Ok(());
+    }
+    if let Some(associated) = entry.associated {
+        target.set_key(entry.key, associated);
+    } else {
+        target.add(entry.key);
+    }
+    Ok(())
+}
+
+fn remove_all_operator_matches(
+    list: ListId,
+    value: &Value,
+    state: &mut ExecutionState,
+) -> Result<usize, String> {
+    let mut removed = 0;
+    while state
+        .heap
+        .list_mut(list)
+        .map_err(|error| error.to_string())?
+        .remove_last(value)
+        .is_some()
+    {
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn operator_rhs_entries(value: &Value, state: &ExecutionState) -> Result<Vec<ListOperatorEntry>, String> {
+    if let Value::List(list) = value {
+        list_operator_snapshot(*list, state)
+    } else {
+        Ok(vec![ListOperatorEntry {
+            key: value.clone(),
+            associated: None,
+        }])
+    }
+}
+
+pub(super) fn execute_list_binary_operator(
+    operator: &str,
+    left: ListId,
+    right: &Value,
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    match operator {
+        "+" => {
+            let result = state.heap.copy_list(left).map_err(|error| error.to_string())?;
+            for entry in operator_rhs_entries(right, state)? {
+                add_operator_entry(result, entry, state, false)?;
+            }
+            Ok(Value::List(result))
+        }
+        "-" => {
+            let result = state.heap.copy_list(left).map_err(|error| error.to_string())?;
+            for entry in operator_rhs_entries(right, state)? {
+                state
+                    .heap
+                    .list_mut(result)
+                    .map_err(|error| error.to_string())?
+                    .remove_last(&entry.key);
+            }
+            Ok(Value::List(result))
+        }
+        "|" => {
+            let result = state.heap.allocate_list();
+            for entry in list_operator_snapshot(left, state)? {
+                add_operator_entry(result, entry, state, true)?;
+            }
+            for entry in operator_rhs_entries(right, state)? {
+                add_operator_entry(result, entry, state, true)?;
+            }
+            Ok(Value::List(result))
+        }
+        "&" => {
+            let result = state.heap.copy_list(left).map_err(|error| error.to_string())?;
+            let right_entries = operator_rhs_entries(right, state)?;
+            let snapshot = list_operator_snapshot(result, state)?;
+            for entry in snapshot {
+                if !right_entries
+                    .iter()
+                    .any(|candidate| candidate.key.semantic_eq(&entry.key))
+                {
+                    remove_all_operator_matches(result, &entry.key, state)?;
+                }
+            }
+            Ok(Value::List(result))
+        }
+        "^" => {
+            let result = state.heap.allocate_list();
+            let left_entries = list_operator_snapshot(left, state)?;
+            let right_entries = operator_rhs_entries(right, state)?;
+            for entry in &left_entries {
+                if !right_entries
+                    .iter()
+                    .any(|candidate| candidate.key.semantic_eq(&entry.key))
+                {
+                    add_operator_entry(result, entry.clone(), state, true)?;
+                }
+            }
+            for entry in right_entries {
+                if !left_entries
+                    .iter()
+                    .any(|candidate| candidate.key.semantic_eq(&entry.key))
+                {
+                    add_operator_entry(result, entry, state, true)?;
+                }
+            }
+            Ok(Value::List(result))
+        }
+        _ => Err(format!("unsupported /list binary operator {operator:?}")),
+    }
+}
+
+pub(super) fn execute_list_compound_operator(
+    operator: CompoundAssignmentOperator,
+    left: ListId,
+    right: &Value,
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    match operator {
+        CompoundAssignmentOperator::Add => {
+            for entry in operator_rhs_entries(right, state)? {
+                add_operator_entry(left, entry, state, false)?;
+            }
+        }
+        CompoundAssignmentOperator::Subtract => {
+            for entry in operator_rhs_entries(right, state)? {
+                state
+                    .heap
+                    .list_mut(left)
+                    .map_err(|error| error.to_string())?
+                    .remove_last(&entry.key);
+            }
+        }
+        CompoundAssignmentOperator::BitOr => {
+            for entry in operator_rhs_entries(right, state)? {
+                add_operator_entry(left, entry, state, true)?;
+            }
+        }
+        CompoundAssignmentOperator::BitAnd => {
+            let right_entries = operator_rhs_entries(right, state)?;
+            let snapshot = list_operator_snapshot(left, state)?;
+            for entry in snapshot {
+                if !right_entries
+                    .iter()
+                    .any(|candidate| candidate.key.semantic_eq(&entry.key))
+                {
+                    remove_all_operator_matches(left, &entry.key, state)?;
+                }
+            }
+        }
+        CompoundAssignmentOperator::BitXor => {
+            let right_entries = operator_rhs_entries(right, state)?;
+            let original = list_operator_snapshot(left, state)?;
+            for entry in right_entries {
+                if original
+                    .iter()
+                    .any(|candidate| candidate.key.semantic_eq(&entry.key))
+                {
+                    remove_all_operator_matches(left, &entry.key, state)?;
+                } else {
+                    add_operator_entry(left, entry, state, true)?;
+                }
+            }
+        }
+        CompoundAssignmentOperator::Multiply
+        | CompoundAssignmentOperator::Divide
+        | CompoundAssignmentOperator::Remainder
+        | CompoundAssignmentOperator::ShiftLeft
+        | CompoundAssignmentOperator::ShiftRight => {
+            return Err(format!(
+                "operator {operator:?} is not defined for a BYOND list"
+            ));
+        }
+    }
+    Ok(Value::List(left))
 }
 
 pub(super) fn execute_list_method(
