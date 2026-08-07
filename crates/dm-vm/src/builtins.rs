@@ -739,7 +739,10 @@ struct ListOperatorEntry {
     associated: Option<Value>,
 }
 
-fn list_operator_snapshot(list: ListId, state: &ExecutionState) -> Result<Vec<ListOperatorEntry>, String> {
+fn list_operator_snapshot(
+    list: ListId,
+    state: &ExecutionState,
+) -> Result<Vec<ListOperatorEntry>, String> {
     let list = state.heap.list(list).map_err(|error| error.to_string())?;
     Ok(list
         .positions()
@@ -759,7 +762,10 @@ fn add_operator_entry(
     state: &mut ExecutionState,
     only_if_absent: bool,
 ) -> Result<(), String> {
-    let target = state.heap.list_mut(list).map_err(|error| error.to_string())?;
+    let target = state
+        .heap
+        .list_mut(list)
+        .map_err(|error| error.to_string())?;
     if only_if_absent && target.contains(&entry.key) {
         return Ok(());
     }
@@ -789,7 +795,10 @@ fn remove_all_operator_matches(
     Ok(removed)
 }
 
-fn operator_rhs_entries(value: &Value, state: &ExecutionState) -> Result<Vec<ListOperatorEntry>, String> {
+fn operator_rhs_entries(
+    value: &Value,
+    state: &ExecutionState,
+) -> Result<Vec<ListOperatorEntry>, String> {
     if let Value::List(list) = value {
         list_operator_snapshot(*list, state)
     } else {
@@ -808,14 +817,20 @@ pub(super) fn execute_list_binary_operator(
 ) -> Result<Value, String> {
     match operator {
         "+" => {
-            let result = state.heap.copy_list(left).map_err(|error| error.to_string())?;
+            let result = state
+                .heap
+                .copy_list(left)
+                .map_err(|error| error.to_string())?;
             for entry in operator_rhs_entries(right, state)? {
                 add_operator_entry(result, entry, state, false)?;
             }
             Ok(Value::List(result))
         }
         "-" => {
-            let result = state.heap.copy_list(left).map_err(|error| error.to_string())?;
+            let result = state
+                .heap
+                .copy_list(left)
+                .map_err(|error| error.to_string())?;
             for entry in operator_rhs_entries(right, state)? {
                 state
                     .heap
@@ -836,7 +851,10 @@ pub(super) fn execute_list_binary_operator(
             Ok(Value::List(result))
         }
         "&" => {
-            let result = state.heap.copy_list(left).map_err(|error| error.to_string())?;
+            let result = state
+                .heap
+                .copy_list(left)
+                .map_err(|error| error.to_string())?;
             let right_entries = operator_rhs_entries(right, state)?;
             let snapshot = list_operator_snapshot(result, state)?;
             for entry in snapshot {

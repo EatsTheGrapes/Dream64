@@ -1,0 +1,20 @@
+   Compiling dm-core v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-core)
+   Compiling dm-value v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-value)
+   Compiling dm-lexer v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-lexer)
+   Compiling dm-syntax v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-syntax)
+   Compiling dm-vm v0.1.0 (/home/runner/work/Dream64/Dream64/crates/dm-vm)
+error[E0425]: cannot find function `shift_binary` in this scope
+    --> crates/dm-vm/src/lib.rs:7580:50
+     |
+7580 |         CompoundAssignmentOperator::ShiftLeft => shift_binary(left, right, true),
+     |                                                  ^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `shift_binary` in this scope
+    --> crates/dm-vm/src/lib.rs:7581:51
+     |
+7581 |         CompoundAssignmentOperator::ShiftRight => shift_binary(left, right, false),
+     |                                                   ^^^^^^^^^^^^ not found in this scope
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `dm-vm` (lib) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...

@@ -1634,7 +1634,11 @@ fn compound_instruction(operator: &str) -> Result<Instruction, CompileError> {
         "^=" => CompoundAssignmentOperator::BitXor,
         "<<=" => CompoundAssignmentOperator::ShiftLeft,
         ">>=" => CompoundAssignmentOperator::ShiftRight,
-        _ => return Err(compile_error(format!("unsupported compound operator {operator}"))),
+        _ => {
+            return Err(compile_error(format!(
+                "unsupported compound operator {operator}"
+            )));
+        }
     };
     Ok(Instruction::CompoundAssignment(operator))
 }
@@ -6205,7 +6209,10 @@ fn run_frames(
                 };
                 frames[frame_index].stack.push(value);
             }
-            Instruction::Subtract | Instruction::BitAnd | Instruction::BitOr | Instruction::BitXor => {
+            Instruction::Subtract
+            | Instruction::BitAnd
+            | Instruction::BitOr
+            | Instruction::BitXor => {
                 let right = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let left = pop(&mut frames[frame_index].stack)
@@ -8795,7 +8802,8 @@ mod tests {
             "/proc/run()\n\tvar/list/a = list(1, 2)\n\tvar/list/alias = a\n\ta += list(2, 3)\n\tvar/after_add = alias.len\n\ta -= 2\n\tvar/after_remove = alias.len\n\ta |= list(3, 4)\n\tvar/after_union = alias.len\n\ta &= list(1, 4)\n\tvar/after_mask = alias.len\n\ta ^= list(4, 5)\n\treturn after_add + after_remove + after_union + after_mask + alias.len + (alias[1] == 1) + (alias[2] == 5)\n",
         )
         .expect("compound list operator source should parse");
-        let module = compile_module(&source.definitions).expect("compound list operators should compile");
+        let module =
+            compile_module(&source.definitions).expect("compound list operators should compile");
         assert_eq!(
             execute_module(&module, module.procedure_id("/proc/run").unwrap(), &[]),
             Ok(Value::number(17.0))

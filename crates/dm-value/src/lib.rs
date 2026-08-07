@@ -590,14 +590,16 @@ impl DmList {
         {
             return Some(std::mem::replace(current, value));
         }
-        if let Some((order_index, position)) = self.order.iter().enumerate().find_map(|(index, entry)| {
-            let ListOrder::Positional(position) = entry else {
-                return None;
-            };
-            self.positional[*position]
-                .semantic_eq(&key)
-                .then_some((index, *position))
-        }) {
+        if let Some((order_index, position)) =
+            self.order.iter().enumerate().find_map(|(index, entry)| {
+                let ListOrder::Positional(position) = entry else {
+                    return None;
+                };
+                self.positional[*position]
+                    .semantic_eq(&key)
+                    .then_some((index, *position))
+            })
+        {
             let existing_key = self.positional.remove(position);
             for entry in &mut self.order {
                 if let ListOrder::Positional(other) = entry
