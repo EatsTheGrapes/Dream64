@@ -1,0 +1,55 @@
+name: Run final documented list operator batch 50 gate
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    if: github.event.issue.title == 'Run final compatibility listops 50'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: compat-listops-50
+          fetch-depth: 0
+      - name: Verify documented list operators
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          (
+            set -e
+            cargo fmt --all
+            cargo test -p dm-value -p dm-vm
+            cargo test
+            cargo clippy --workspace --all-targets -- -D warnings
+          ) 2>&1 | tee compat_listops_50_v3.log
+          status=${PIPESTATUS[0]}
+          git config user.name "Dream64 Compatibility Bot"
+          git config user.email "actions@users.noreply.github.com"
+          if [ "$status" -ne 0 ]; then
+            git add -A
+            git commit -m "Capture compatibility listops 50 final failure" || true
+            git push origin HEAD:compat-listops-50
+            exit "$status"
+          fi
+          rm -f tools/compat_listops_50.py tools/compat_listops_50_followup.py tools/compat_listops_50_cleanup.py
+          rm -f compat_listops_50.log compat_listops_50_v2.log compat_listops_50_v3.log
+          git add -A
+          git commit -m "Documented list operator compatibility batch 50"
+          git push origin HEAD:compat-listops-50
+      - name: Remove trigger from main
+        if: always()
+        shell: bash
+        run: |
+          git fetch origin main
+          git switch --force-create cleanup origin/main
+          git rm -f .github/workflows/run-compat-listops-50-v3.yml
+          git config user.name "Dream64 Compatibility Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git commit -m "Remove compatibility listops 50 final verifier"
+          git push origin HEAD:main
