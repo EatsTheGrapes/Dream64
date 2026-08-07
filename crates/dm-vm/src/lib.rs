@@ -1522,6 +1522,7 @@ fn top_level_assignment(tokens: &[SpannedToken]) -> Option<(usize, &str)> {
     None
 }
 
+#[allow(clippy::too_many_lines)]
 fn compile_assignment_statement(
     tokens: &[SpannedToken],
     locals: &LocalTable,
@@ -4740,6 +4741,7 @@ fn emit_expression(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn emit_assignment_expression(
     target: &Expression,
     operator: &str,
@@ -8781,6 +8783,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::vec_init_then_push)]
     fn null_conditional_field_index_and_call_short_circuit_without_rhs_evaluation() {
         let source = parse(
             "/datum/example/proc/read(value, list/values)\n\tvar/a = value?.field\n\tvar/b = values?[bump()]\n\tvar/c = value?:take(bump())\n\tvalue?.field = bump()\n\tvalues?[bump()] = bump()\n\treturn isnull(a) + isnull(b) + isnull(c) + GLOB.calls\n/datum/example/proc/take(value)\n\treturn value\n/proc/bump()\n\tGLOB.calls += 1\n\treturn 1\n",
