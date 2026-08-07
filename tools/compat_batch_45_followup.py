@@ -23,3 +23,11 @@ new = '''    #[allow(clippy::too_many_lines)]\n    fn compile_vm_selected_with_f
 if text.count(old) != 1:
     raise SystemExit(f"expected one selected linker function, found {text.count(old)}")
 semantics.write_text(text.replace(old, new, 1))
+
+lifecycle = Path("crates/dm-lifecycle/src/lib.rs")
+text = lifecycle.read_text()
+old = '''/// # Errors\n///\n/// Returns a source-aware error when a planned target cannot be compiled,\n'''
+new = '''/// # Panics\n///\n/// Panics only if Dream64's hard-coded `world` built-in identifier stops being\n/// a valid DM field name, which would violate an internal engine invariant.\n///\n/// # Errors\n///\n/// Returns a source-aware error when a planned target cannot be compiled,\n'''
+if text.count(old) != 1:
+    raise SystemExit(f"expected one lifecycle errors section, found {text.count(old)}")
+lifecycle.write_text(text.replace(old, new, 1))
