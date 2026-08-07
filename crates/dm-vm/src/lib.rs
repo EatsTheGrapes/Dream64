@@ -6476,10 +6476,10 @@ fn run_frames(
                 let comparison = compare_values(&left, &right)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let result = match instruction {
-                    Instruction::Less => comparison.is_some_and(|value| value.is_lt()),
-                    Instruction::LessEqual => comparison.is_some_and(|value| value.is_le()),
-                    Instruction::Greater => comparison.is_some_and(|value| value.is_gt()),
-                    Instruction::GreaterEqual => comparison.is_some_and(|value| value.is_ge()),
+                    Instruction::Less => comparison.is_some_and(std::cmp::Ordering::is_lt),
+                    Instruction::LessEqual => comparison.is_some_and(std::cmp::Ordering::is_le),
+                    Instruction::Greater => comparison.is_some_and(std::cmp::Ordering::is_gt),
+                    Instruction::GreaterEqual => comparison.is_some_and(std::cmp::Ordering::is_ge),
                     _ => unreachable!(),
                 };
                 frames[frame_index]

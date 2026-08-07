@@ -13,6 +13,7 @@
     reason = "DM uses binary32 numbers for integer/index boundaries and native builtin dispatch shares a Result ABI"
 )]
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 
@@ -28,7 +29,9 @@ pub(super) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
         | "params2list" => (1, 1),
         "log" | "text2ascii" | "text2ascii_char" | "text2num" => (1, 2),
         "lerp" => (3, 3),
-        "cmptext" | "cmptextEx" | "sorttext" | "sorttextEx" | "sortText" => (0, usize::MAX),
+        "cmptext" | "cmptextEx" | "sorttext" | "sorttextEx" | "sortText" | "addtext" => {
+            (0, usize::MAX)
+        }
         "num2text" => (1, 3),
         "findtext"
         | "findtextEx"
@@ -40,7 +43,6 @@ pub(super) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
         | "findlasttextEx_char"
         | "jointext" => (2, 4),
         "splittext" | "splittext_char" => (2, 5),
-        "addtext" => (0, usize::MAX),
         "spantext" | "spantext_char" | "nonspantext" | "nonspantext_char" => (2, 3),
         "splicetext" | "splicetext_char" => (4, 4),
         "get_dist" | "turn" | "astype" => (2, 2),
@@ -204,10 +206,10 @@ fn form_encode(value: &str) -> String {
     for byte in value.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                output.push(char::from(byte))
+                output.push(char::from(byte));
             }
             b' ' => output.push('+'),
-            _ => output.push_str(&format!("%{byte:02X}")),
+            _ => write!(&mut output, "%{byte:02X}").expect("writing to a String cannot fail"),
         }
     }
     output
