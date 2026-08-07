@@ -171,6 +171,8 @@ pub enum Instruction {
     LoadField(FieldName),
     /// Pops a value and datum receiver, then writes one named field.
     StoreField(FieldName),
+    /// Stores one datum field while preserving the assigned value on the stack.
+    StoreFieldKeep(FieldName),
     /// Pushes one persistent runtime global.
     LoadGlobal(FieldName),
     /// Pops and stores one persistent runtime global.
@@ -341,6 +343,8 @@ pub enum TypePredicateKind {
     IsTurf,
     /// Whether every value is a valid DM location (an atom).
     IsLoc,
+    /// Whether the value is an icon datum or a headless icon resource.
+    IsIcon,
     /// Whether a datum or type path belongs to an optional type hierarchy.
     IsType,
 }
@@ -1444,7 +1448,18 @@ fn top_level_assignment(tokens: &[SpannedToken]) -> Option<(usize, &str)> {
             TokenKind::Operator(operator)
                 if matches!(
                     operator.as_str(),
-                    "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>="
+                    "=" | "+="
+                        | "-="
+                        | "*="
+                        | "/="
+                        | "%="
+                        | "&="
+                        | "|="
+                        | "^="
+                        | "<<="
+                        | ">>="
+                        | "&&="
+                        | "||="
                 ) && depth == 0 =>
             {
                 return Some((index, operator));
@@ -1463,6 +1478,11 @@ fn compile_assignment_statement(
 ) -> Result<(), CompileError> {
     let (assignment, operator) = top_level_assignment(tokens)
         .ok_or_else(|| compile_error("assignment statement requires '='"))?;
+    if matches!(operator, "||=" | "&&=") {
+        compile_expression(tokens, locals, instructions, procedures)?;
+        instructions.push(Instruction::Pop);
+        return Ok(());
+    }
     if assignment == 0 || assignment + 1 == tokens.len() {
         return Err(compile_error("assignment requires a target and value"));
     }
@@ -3166,11 +3186,17 @@ enum ListExpressionEntry {
 fn dm_builtin_numeric_constant(identifier: &str) -> Option<f32> {
     match identifier {
         "FALSE" | "BLEND_DEFAULT" => Some(0.0),
-        "TRUE" | "BLEND_OVERLAY" | "KEEP_TOGETHER" => Some(1.0),
-        "BLEND_ADD" | "KEEP_APART" => Some(2.0),
+        "TRUE" | "BLEND_OVERLAY" | "KEEP_TOGETHER" | "NORTH" => Some(1.0),
+        "BLEND_ADD" | "KEEP_APART" | "SOUTH" => Some(2.0),
         "BLEND_SUBTRACT" => Some(3.0),
-        "BLEND_MULTIPLY" | "LONG_GLIDE" => Some(4.0),
-        "BLEND_INSET_OVERLAY" => Some(5.0),
+        "BLEND_MULTIPLY" | "LONG_GLIDE" | "EAST" => Some(4.0),
+        "BLEND_INSET_OVERLAY" | "NORTHEAST" => Some(5.0),
+        "SOUTHEAST" => Some(6.0),
+        "WEST" => Some(8.0),
+        "NORTHWEST" => Some(9.0),
+        "SOUTHWEST" => Some(10.0),
+        "UP" => Some(16.0),
+        "DOWN" => Some(32.0),
         // Appearance flags are BYOND bitflags. Keep the complete contiguous
         // built-in flag family here rather than teaching project code about
         // individual flags as each one is encountered.
@@ -3224,13 +3250,48 @@ impl<'a> ExpressionParser<'a> {
         };
         if !matches!(
             operator.as_str(),
-            "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>="
+            "=" | "+="
+                | "-="
+                | "*="
+                | "/="
+                | "%="
+                | "&="
+                | "|="
+                | "^="
+                | "<<="
+                | ">>="
+                | "&&="
+                | "||="
         ) {
             return Ok(target);
         }
         let operator = operator.clone();
         self.index += 1;
         let value = self.parse_assignment()?;
+        if operator == "||=" {
+            let assignment = Expression::Assignment {
+                target: Box::new(target.clone()),
+                operator: "=".to_owned(),
+                value: Box::new(value),
+            };
+            return Ok(Expression::Conditional {
+                condition: Box::new(target.clone()),
+                when_true: Box::new(target),
+                when_false: Box::new(assignment),
+            });
+        }
+        if operator == "&&=" {
+            let assignment = Expression::Assignment {
+                target: Box::new(target.clone()),
+                operator: "=".to_owned(),
+                value: Box::new(value),
+            };
+            return Ok(Expression::Conditional {
+                condition: Box::new(target.clone()),
+                when_true: Box::new(assignment),
+                when_false: Box::new(target),
+            });
+        }
         Ok(Expression::Assignment {
             target: Box::new(target),
             operator,
@@ -3978,6 +4039,7 @@ fn type_predicate_kind(identifier: &str) -> Option<TypePredicateKind> {
         "ismovable" => Some(TypePredicateKind::IsMovable),
         "isturf" => Some(TypePredicateKind::IsTurf),
         "isloc" => Some(TypePredicateKind::IsLoc),
+        "isicon" => Some(TypePredicateKind::IsIcon),
         "istype" => Some(TypePredicateKind::IsType),
         _ => None,
     }
@@ -4496,8 +4558,7 @@ fn emit_assignment_expression(
             if operator != "=" {
                 instructions.push(compound_instruction(operator)?);
             }
-            instructions.push(Instruction::Duplicate);
-            instructions.push(Instruction::StoreField(name.clone()));
+            instructions.push(Instruction::StoreFieldKeep(name.clone()));
         }
         Expression::Index { list, index } => {
             emit_expression(list, locals, instructions, procedures)?;
@@ -5685,7 +5746,8 @@ fn run_frames(
                 };
                 frames[frame_index].stack.push(value);
             }
-            Instruction::StoreField(name) => {
+            Instruction::StoreField(name) | Instruction::StoreFieldKeep(name) => {
+                let keep = matches!(instruction, Instruction::StoreFieldKeep(_));
                 let value = match pop(&mut frames[frame_index].stack) {
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
@@ -5698,8 +5760,11 @@ fn run_frames(
                     Ok(datum) => datum,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                if let Err(error) = state.heap.set_datum_field(datum, name, value) {
+                if let Err(error) = state.heap.set_datum_field(datum, name, value.clone()) {
                     return Err(execution_error(module, &frames, error.to_string()));
+                }
+                if keep {
+                    frames[frame_index].stack.push(value);
                 }
             }
             Instruction::LoadGlobal(name) => {
@@ -6838,6 +6903,18 @@ fn type_predicate_builtin(
                 .as_str();
             Ok(type_path == "/turf" || type_path.starts_with("/turf/"))
         }
+        TypePredicateKind::IsIcon => match value {
+            Value::Text(text) => Ok(text.to_ascii_lowercase().ends_with(".dmi")),
+            Value::Datum(datum) => {
+                let path = heap
+                    .datum(*datum)
+                    .map_err(|error| error.to_string())?
+                    .type_path()
+                    .as_str();
+                Ok(path == "/icon" || path.starts_with("/icon/"))
+            }
+            _ => Ok(false),
+        },
         TypePredicateKind::IsLoc => Ok(arguments.iter().all(|value| {
             let Value::Datum(datum) = value else {
                 return false;
