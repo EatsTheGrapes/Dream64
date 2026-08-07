@@ -65,9 +65,32 @@ const STANDARD_BUILTINS: &str = concat!(
     "\t\t\tcontinue\n",
     "\t\toutput[length(output) + 1] = candidate\n",
     "\treturn output\n",
+    "/proc/min(...)\n",
+    "\tvar/list/values = args\n",
+    "\tif(length(args) == 1 && islist(args[1]))\n",
+    "\t\tvalues = args[1]\n",
+    "\tif(!length(values))\n",
+    "\t\treturn null\n",
+    "\tvar/result = values[1]\n",
+    "\tfor(var/value in values)\n",
+    "\t\tif(value < result)\n",
+    "\t\t\tresult = value\n",
+    "\treturn result\n",
+    "/proc/max(...)\n",
+    "\tvar/list/values = args\n",
+    "\tif(length(args) == 1 && islist(args[1]))\n",
+    "\t\tvalues = args[1]\n",
+    "\tif(!length(values))\n",
+    "\t\treturn null\n",
+    "\tvar/result = values[1]\n",
+    "\tfor(var/value in values)\n",
+    "\t\tif(value > result)\n",
+    "\t\t\tresult = value\n",
+    "\treturn result\n",
 );
-const STANDARD_BUILTIN_NAMES: [&str; 6] =
-    ["isarea", "ismob", "isobj", "get_dir", "istext", "orange"];
+const STANDARD_BUILTIN_NAMES: [&str; 8] = [
+    "isarea", "ismob", "isobj", "get_dir", "istext", "orange", "min", "max",
+];
 
 /// Tree-local identity of a canonical procedure.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

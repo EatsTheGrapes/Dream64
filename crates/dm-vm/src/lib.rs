@@ -5746,7 +5746,7 @@ fn run_frames(
                 };
                 frames[frame_index].stack.push(value);
             }
-            Instruction::StoreField(name) | Instruction::StoreFieldKeep(name) => {
+            Instruction::StoreField(ref name) | Instruction::StoreFieldKeep(ref name) => {
                 let keep = matches!(instruction, Instruction::StoreFieldKeep(_));
                 let value = match pop(&mut frames[frame_index].stack) {
                     Ok(value) => value,
@@ -5760,7 +5760,10 @@ fn run_frames(
                     Ok(datum) => datum,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                if let Err(error) = state.heap.set_datum_field(datum, name, value.clone()) {
+                if let Err(error) = state
+                    .heap
+                    .set_datum_field(datum, name.clone(), value.clone())
+                {
                     return Err(execution_error(module, &frames, error.to_string()));
                 }
                 if keep {
@@ -8337,6 +8340,81 @@ mod tests {
         let stale_error = execute_in_context(&program, &[], &mut state, &context).unwrap_err();
         assert_eq!(stale_error.message, format!("stale datum handle {datum:?}"));
         assert_eq!(stale_error.source_span, Some(span));
+    }
+
+    #[test]
+    fn logical_assignment_short_circuits_locals_fields_and_list_entries() {
+        let source = parse(
+            "/datum/example/proc/run()\n\tvar/local\n\tlocal ||= 3\n\tvar/list/values = list()\n\tvalues[1] ||= 4\n\tsrc.flag ||= 5\n\treturn local + values[1] + src.flag\n",
+        )
+        .expect("logical assignment source should parse");
+        let module = compile_module_specs(&[ProcedureSpec {
+            path: "/datum/example/proc/run@0".to_owned(),
+            definition: &source.definitions[0],
+            parent: None,
+            static_calls: BTreeMap::new(),
+            src_fields: BTreeMap::from([("flag".to_owned(), field("flag"))]),
+            global_fields: BTreeMap::new(),
+        }])
+        .expect("logical assignments should compile");
+        let entry = module.procedure_id_at(0).expect("entry");
+        let mut state = ExecutionState::new();
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(datum, field("flag"), Value::Null)
+            .unwrap();
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                entry,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(datum), Value::Null),
+            ),
+            Ok(Value::number(12.0))
+        );
+    }
+
+    #[test]
+    fn plane_macro_nested_scope_keeps_cached_locals_visible() {
+        let source = parse(
+            "/proc/plane_macro(flag, other)\n\tvar/output = 0\n\tdo { if(flag) { var/_cached_plane = 7; var/_our_turf = other; if(_our_turf) { output = _cached_plane; } else if(other) { output = _cached_plane; } else { output = _cached_plane; } } else { output = 2; } } while(0)\n\treturn output\n",
+        )
+        .expect("plane macro source should parse");
+        let module = compile_module(&source.definitions).expect("plane macro scope should compile");
+        let entry = module.procedure_id("/proc/plane_macro").expect("entry");
+        assert_eq!(
+            execute_module(&module, entry, &[Value::number(1.0), Value::number(1.0)]),
+            Ok(Value::number(7.0))
+        );
+    }
+
+    #[test]
+    fn direction_and_icon_builtins_cover_lifecycle_shapes() {
+        let source = parse(
+            "/proc/directions()\n\treturn NORTH + SOUTH + EAST + WEST + NORTHEAST + NORTHWEST + SOUTHEAST + SOUTHWEST\n/proc/icon_resource()\n\treturn isicon('icons/test.dmi')\n",
+        )
+        .expect("builtin source should parse");
+        let module = compile_module(&source.definitions).expect("builtins should compile");
+        assert_eq!(
+            execute_module(
+                &module,
+                module.procedure_id("/proc/directions").unwrap(),
+                &[]
+            ),
+            Ok(Value::number(45.0))
+        );
+        assert_eq!(
+            execute_module(
+                &module,
+                module.procedure_id("/proc/icon_resource").unwrap(),
+                &[]
+            ),
+            Ok(Value::number(1.0))
+        );
     }
 
     #[test]
