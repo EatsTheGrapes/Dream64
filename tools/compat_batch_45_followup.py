@@ -31,3 +31,11 @@ new = '''/// # Panics\n///\n/// Panics only if Dream64's hard-coded `world` buil
 if text.count(old) != 1:
     raise SystemExit(f"expected one lifecycle errors section, found {text.count(old)}")
 lifecycle.write_text(text.replace(old, new, 1))
+
+sweep = Path("crates/dm-lifecycle/examples/sweep_closure_stream.rs")
+text = sweep.read_text()
+old = '''fn main() -> ExitCode {\n'''
+new = '''#[allow(clippy::too_many_lines)]\nfn main() -> ExitCode {\n'''
+if text.count(old) != 1:
+    raise SystemExit(f"expected one streaming sweep main function, found {text.count(old)}")
+sweep.write_text(text.replace(old, new, 1))
