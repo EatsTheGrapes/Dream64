@@ -1390,10 +1390,16 @@ fn splice_continuations(source: &str) -> String {
             }
             if bytes.get(offset + 1) == Some(&b'\n') {
                 offset += 2;
+                while matches!(bytes.get(offset), Some(b' ' | b'\t')) {
+                    offset += 1;
+                }
                 continue;
             }
             if bytes.get(offset + 1) == Some(&b'\r') && bytes.get(offset + 2) == Some(&b'\n') {
                 offset += 3;
+                while matches!(bytes.get(offset), Some(b' ' | b'\t')) {
+                    offset += 1;
+                }
                 continue;
             }
         }
@@ -2049,6 +2055,39 @@ mod tests {
             "/datum/after_macros\n"
         );
         assert!(project.includes.is_empty());
+    }
+
+    #[test]
+    fn multiline_macro_continuations_do_not_add_definition_indentation() {
+        let scratch = ScratchDirectory::new();
+        fs::write(
+            scratch.path().join("world.dme"),
+            r"#define WRAP(value) \
+	do { \
+		if (value) { \
+			value = 1; \
+		} \
+	} while (0)
+/proc/example(value)
+	WRAP(value)
+",
+        )
+        .expect("environment should be written");
+
+        let project = Project::load(scratch.path().join("world.dme"))
+            .expect("continued macro source should load");
+        let expanded = project.files[0]
+            .compiler_text()
+            .expect("expanded source should be UTF-8");
+
+        // The invocation contributes its one tab of procedure indentation.
+        // Formatting tabs from the macro definition must not survive ahead
+        // of the first replacement token and turn this into a nested block.
+        assert!(
+            expanded.contains("\tdo { if (value) { value = 1; } } while (0)"),
+            "expanded source was {expanded:?}"
+        );
+        assert!(!expanded.contains("\t\tdo {"));
     }
 
     #[test]

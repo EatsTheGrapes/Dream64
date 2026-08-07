@@ -103,6 +103,11 @@ impl<'source> Lexer<'source> {
                 '0'..='9' => self.lex_number(),
                 '@' if self.remaining().starts_with("@@") => self.lex_at_raw_string()?,
                 '@' if self.remaining().starts_with("@{") => self.lex_braced_string(true)?,
+                // DM also accepts the compact C#-style spelling used heavily
+                // for regular expressions: `@"\\d+"`.  Unlike an ordinary
+                // quoted string its backslashes are literal, so it must not
+                // go through `scan_quoted_body` (which consumes escapes).
+                '@' if self.remaining().starts_with("@\"") => self.lex_at_quoted_raw_string()?,
                 '"' => self.lex_quoted('"', false)?,
                 '\'' => self.lex_quoted('\'', true)?,
                 '{' if self.remaining().starts_with("{\"") => self.lex_braced_string(false)?,
@@ -285,6 +290,26 @@ impl<'source> Lexer<'source> {
             self.offset = self.source.len();
             return Err(LexError {
                 message: "unterminated at-delimited raw string".to_owned(),
+                span: SourceSpan::new(start, self.offset),
+            });
+        };
+        let content_end = self.offset + relative_end;
+        let content = self.source[content_start..content_end].to_owned();
+        self.offset = content_end + 1;
+        self.push_range(start, TokenKind::RawString(content));
+        Ok(())
+    }
+
+    fn lex_at_quoted_raw_string(&mut self) -> Result<(), LexError> {
+        let start = self.offset;
+        // Skip the `@"` delimiter.  Raw strings deliberately do not treat a
+        // backslash as an escape; the next quote ends the literal.
+        self.offset += 2;
+        let content_start = self.offset;
+        let Some(relative_end) = self.remaining().find('"') else {
+            self.offset = self.source.len();
+            return Err(LexError {
+                message: "unterminated at-quoted raw string".to_owned(),
                 span: SourceSpan::new(start, self.offset),
             });
         };
@@ -529,6 +554,19 @@ mod tests {
             matches!(
                 &token.kind,
                 TokenKind::RawString(content) if content == "[a-z \\\\n+\"quoted\"]"
+            )
+        }));
+    }
+
+    #[test]
+    fn retains_at_quoted_raw_strings_without_unescaping_backslashes() {
+        let source = "value = @\"[\\n\\t]\\\\d+\"\n";
+        let tokens = lex(source).expect("at-quoted raw string should lex");
+
+        assert!(tokens.iter().any(|token| {
+            matches!(
+                &token.kind,
+                TokenKind::RawString(content) if content == "[\\n\\t]\\\\d+"
             )
         }));
     }

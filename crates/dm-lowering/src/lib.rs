@@ -365,6 +365,9 @@ fn compile_parent_chain(
             path: format!("{}@{}", procedure.path, implementation.ordinal),
             definition,
             parent,
+            static_calls: BTreeMap::new(),
+            src_fields: BTreeMap::new(),
+            global_fields: BTreeMap::new(),
         });
     }
     let entry_index = reverse_chain
@@ -506,7 +509,7 @@ mod tests {
         let diagnostic = &inventory.diagnostics()[0];
         assert_eq!(diagnostic.procedure_path, "/proc/later");
         assert_eq!(diagnostic.source_path, "unsupported.dm");
-        assert_eq!(diagnostic.category, UnsupportedCategory::Statement);
+        assert_eq!(diagnostic.category, UnsupportedCategory::CallResolution);
         assert!(!diagnostic.original_span.is_empty());
     }
 

@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 
 use dm_compiler::{Compilation, CompilerDatabase, CompilerError};
 use dm_core::{FileId, SourceSpan};
@@ -90,6 +91,74 @@ pub struct RuntimeType {
     defaults: DatumDefaults,
 }
 
+fn materialize_builtin_atom_defaults(
+    heap: &mut ValueHeap,
+    datum: DatumId,
+    is_atom: bool,
+    is_movable: bool,
+) -> Result<(), ValueError> {
+    if !is_atom {
+        return Ok(());
+    }
+    // These names exist without source declarations in BYOND's built-in atom
+    // hierarchy.  Materialize only absent values so a project declaration on a
+    // descendant retains its normal inherited/default-layer precedence.
+    let atom_defaults: &[(&str, Value)] = &[
+        ("alpha", Value::number(255.0)),
+        ("appearance_flags", Value::number(0.0)),
+        ("blend_mode", Value::number(0.0)),
+        ("color", Value::Null),
+        ("density", Value::number(0.0)),
+        ("dir", Value::number(2.0)),
+        ("icon", Value::Null),
+        ("icon_state", Value::Null),
+        ("invisibility", Value::number(0.0)),
+        ("layer", Value::number(1.0)),
+        ("loc", Value::Null),
+        ("maptext", Value::Null),
+        ("maptext_height", Value::number(32.0)),
+        ("maptext_width", Value::number(32.0)),
+        ("mouse_opacity", Value::number(1.0)),
+        ("name", Value::Null),
+        ("opacity", Value::number(0.0)),
+        ("overlays", Value::Null),
+        ("plane", Value::number(0.0)),
+        ("pixel_w", Value::number(0.0)),
+        ("pixel_z", Value::number(0.0)),
+        ("render_source", Value::Null),
+        ("render_target", Value::Null),
+        ("transform", Value::Null),
+        ("underlays", Value::Null),
+        ("vis_contents", Value::Null),
+        ("vis_flags", Value::number(0.0)),
+        ("x", Value::number(0.0)),
+        ("y", Value::number(0.0)),
+        ("z", Value::number(0.0)),
+    ];
+    let movable_defaults: &[(&str, Value)] = &[
+        ("animate_movement", Value::number(0.0)),
+        ("bound_height", Value::number(32.0)),
+        ("bound_width", Value::number(32.0)),
+        ("bound_x", Value::number(0.0)),
+        ("bound_y", Value::number(0.0)),
+        ("glide_size", Value::number(0.0)),
+        ("pixel_x", Value::number(0.0)),
+        ("pixel_y", Value::number(0.0)),
+        ("screen_loc", Value::Null),
+        ("step_size", Value::number(32.0)),
+    ];
+    for (name, value) in atom_defaults
+        .iter()
+        .chain(is_movable.then_some(movable_defaults).into_iter().flatten())
+    {
+        let name = FieldName::parse(name).expect("built-in atom field name is valid");
+        if heap.datum_field(datum, &name).is_err() {
+            heap.set_datum_field(datum, name, value.clone())?;
+        }
+    }
+    Ok(())
+}
+
 impl RuntimeType {
     /// Returns the canonical type path.
     #[must_use]
@@ -140,6 +209,7 @@ pub struct RuntimeImage {
     heap: ValueHeap,
     variables: Vec<RuntimeVariable>,
     types: BTreeMap<TypePath, RuntimeType>,
+    type_paths: Arc<BTreeSet<TypePath>>,
     binding_index: RuntimeBindingIndex,
     diagnostics: Vec<RuntimeInitializerDiagnostic>,
     stats: RuntimeImageStats,
@@ -204,10 +274,13 @@ impl RuntimeImage {
         let registry = VariableRegistry::build(compilation);
         let plans = registry.initialization_plans();
         let binding_index = RuntimeBindingIndex::build(&registry)?;
+        let types = runtime_types(compilation)?;
+        let type_paths = Arc::new(types.keys().cloned().collect());
         let mut image = Self {
             heap: ValueHeap::new(),
             variables: Vec::new(),
-            types: runtime_types(compilation)?,
+            types,
+            type_paths,
             binding_index,
             diagnostics: Vec::new(),
             stats: RuntimeImageStats {
@@ -233,18 +306,26 @@ impl RuntimeImage {
             )
             .collect::<Vec<_>>();
         steps.sort_by_key(|step| step.ordinal);
+
+        // Dynamic initializers form one ordered execution phase.  Keep their
+        // globals and heap in a single state: constructing a new state for
+        // every initializer copies the entire growing heap (and loses writes
+        // made by an earlier initializer).
+        let mut state = image.take_execution_state();
         for step in steps {
             let entry = &registry.entries()[step.entry_index];
             match &step.evaluation {
                 ConstantEvaluation::Value(constant) => {
-                    let value = image.convert_constant(constant)?;
+                    let value = image.convert_constant_in(constant, state.heap_mut())?;
                     image.apply_step_value(entry, step, value)?;
+                    image.sync_initializer_global(step, &mut state)?;
                     image.stats.constants_materialized += 1;
                 }
                 ConstantEvaluation::Unsupported(unsupported) => {
-                    match image.execute_dynamic_initializer(entry, step) {
+                    match image.execute_dynamic_initializer(entry, step, &mut state) {
                         Ok(value) => {
                             image.apply_step_value(entry, step, value)?;
+                            image.sync_initializer_global(step, &mut state)?;
                             image.stats.dynamic_initializers_materialized += 1;
                         }
                         Err(failure) => image.retain_dynamic_failure(
@@ -258,6 +339,7 @@ impl RuntimeImage {
                 }
             }
         }
+        image.restore_execution_state(state);
         image.stats.runtime_variables = image.variables.len();
         image.stats.runtime_types = image.types.len();
         image.stats.default_layers = image
@@ -317,6 +399,10 @@ impl RuntimeImage {
     #[must_use]
     pub fn take_execution_state(&mut self) -> ExecutionState {
         let mut state = ExecutionState::from_heap(std::mem::take(&mut self.heap));
+        state.set_shared_type_paths(Arc::clone(&self.type_paths));
+        for field in self.binding_index.globals.values() {
+            state.set_global(field.clone(), Value::Null);
+        }
         for variable in self
             .variables
             .iter()
@@ -363,6 +449,8 @@ impl RuntimeImage {
         let mut chain = Vec::new();
         let mut current = Some(type_path.clone());
         let mut visited = BTreeSet::new();
+        let mut is_atom = false;
+        let mut is_movable = false;
         while let Some(path) = current.take() {
             if !visited.insert(path.clone()) {
                 return Err(RuntimeImageError::InheritanceCycle(path));
@@ -371,6 +459,8 @@ impl RuntimeImage {
                 .types
                 .get(&path)
                 .ok_or_else(|| RuntimeImageError::UnknownType(path.clone()))?;
+            is_atom |= path.as_str() == "/atom";
+            is_movable |= path.as_str() == "/atom/movable";
             chain.push(runtime_type.defaults.clone());
             current.clone_from(&runtime_type.parent);
         }
@@ -378,6 +468,7 @@ impl RuntimeImage {
         let datum = self
             .heap
             .allocate_datum_with_defaults(type_path.clone(), &chain);
+        materialize_builtin_atom_defaults(&mut self.heap, datum, is_atom, is_movable)?;
         self.stats.datums_allocated += 1;
         Ok(datum)
     }
@@ -419,7 +510,10 @@ impl RuntimeImage {
         };
         match evaluate_constant(&tokens) {
             ConstantEvaluation::Value(constant) => {
-                let value = self.convert_constant(&constant)?;
+                let mut heap = std::mem::take(&mut self.heap);
+                let result = self.convert_constant_in(&constant, &mut heap);
+                self.heap = heap;
+                let value = result?;
                 self.heap.set_datum_field(datum, field, value)?;
                 Ok(ConstantFieldApplication::Applied)
             }
@@ -486,25 +580,29 @@ impl RuntimeImage {
         .map_err(RuntimeImageError::ExpressionExecution)
     }
 
-    fn convert_constant(&mut self, constant: &ConstantValue) -> Result<Value, RuntimeImageError> {
+    fn convert_constant_in(
+        &mut self,
+        constant: &ConstantValue,
+        heap: &mut ValueHeap,
+    ) -> Result<Value, RuntimeImageError> {
         Ok(match constant {
             ConstantValue::Null => Value::Null,
             ConstantValue::Number(number) => Value::Number(*number),
             ConstantValue::Text(text) => Value::text(text.as_str()),
             ConstantValue::TypePath(path) => Value::TypePath(parse_type_path(path)?),
             ConstantValue::List(entries) => {
-                let list = self.heap.allocate_list();
+                let list = heap.allocate_list();
                 self.stats.constant_lists += 1;
                 for entry in entries {
                     match entry {
                         ConstantListEntry::Positional(constant) => {
-                            let value = self.convert_constant(constant)?;
-                            self.heap.list_mut(list)?.add(value);
+                            let value = self.convert_constant_in(constant, heap)?;
+                            heap.list_mut(list)?.add(value);
                         }
                         ConstantListEntry::Associative { key, value } => {
-                            let key = self.convert_constant(key)?;
-                            let value = self.convert_constant(value)?;
-                            self.heap.list_mut(list)?.set_key(key, value);
+                            let key = self.convert_constant_in(key, heap)?;
+                            let value = self.convert_constant_in(value, heap)?;
+                            heap.list_mut(list)?.set_key(key, value);
                         }
                     }
                 }
@@ -552,10 +650,30 @@ impl RuntimeImage {
         Ok(())
     }
 
+    fn sync_initializer_global(
+        &self,
+        step: &InitializationStep,
+        state: &mut ExecutionState,
+    ) -> Result<(), RuntimeImageError> {
+        if step.storage != StorageClass::Global {
+            return Ok(());
+        }
+        let field = variable_field(&step.path)?;
+        let value = self
+            .variables
+            .iter()
+            .find(|variable| variable.path == step.path)
+            .map(|variable| variable.value.clone())
+            .ok_or_else(|| RuntimeImageError::MissingInitializer(step.path.clone()))?;
+        state.set_global(field, value);
+        Ok(())
+    }
+
     fn execute_dynamic_initializer(
-        &mut self,
+        &self,
         entry: &VariableEntry,
         step: &InitializationStep,
+        state: &mut ExecutionState,
     ) -> Result<Value, DynamicInitializerFailure> {
         let initializer = entry
             .initializer
@@ -596,28 +714,19 @@ impl RuntimeImage {
                 failure
             })?;
             Some(
-                self.heap
+                state
+                    .heap_mut()
                     .allocate_datum_with_defaults(owner, layers.as_slice()),
             )
         } else {
             None
         };
 
-        let mut state = ExecutionState::from_heap(std::mem::take(&mut self.heap));
-        for name in self.binding_index.globals.values() {
-            state.set_global(name.clone(), Value::Null);
-        }
-        for variable in &self.variables {
-            if let Ok(name) = variable_field(&variable.path) {
-                state.set_global(name, variable.value.clone());
-            }
-        }
         let context = ExecutionContext::new(src.map_or(Value::Null, Value::Datum), Value::Null);
         let result =
-            execute_module_in_context(program.module(), program.entry(), &[], &mut state, &context);
-        self.heap = state.into_heap();
+            execute_module_in_context(program.module(), program.entry(), &[], state, &context);
         if let Some(src) = src {
-            let _ = self.heap.destroy_datum(src);
+            let _ = state.heap_mut().destroy_datum(src);
         }
         match result {
             Ok(Value::Datum(_)) => Err(DynamicInitializerFailure {
@@ -938,6 +1047,7 @@ impl std::error::Error for RuntimeImageLoadError {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use dm_compiler::CompilerDatabase;
@@ -1050,6 +1160,30 @@ mod tests {
         );
         assert_eq!(datum.field(&field("speed")).unwrap().as_number(), Some(2.0));
         assert_eq!(image.stats().default_layers, 2);
+    }
+
+    #[test]
+    fn materializes_builtin_atom_appearance_defaults_without_overriding_source() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write("types.dm", "/obj/example\n\talpha = 127\n");
+
+        let mut image = fixture.image();
+        let datum_id = image
+            .allocate_datum(&type_path("/obj/example"))
+            .expect("atom subtype should allocate");
+        let datum = image.heap().datum(datum_id).expect("datum should be live");
+        assert_eq!(
+            datum.field(&field("alpha")).unwrap().as_number(),
+            Some(127.0)
+        );
+        assert_eq!(
+            datum.field(&field("appearance_flags")).unwrap().as_number(),
+            Some(0.0)
+        );
+        assert_eq!(datum.field(&field("layer")).unwrap().as_number(), Some(1.0));
+        assert_eq!(datum.field(&field("plane")).unwrap().as_number(), Some(0.0));
+        assert_eq!(datum.field(&field("transform")), Ok(&Value::Null));
     }
 
     #[test]
@@ -1183,6 +1317,29 @@ mod tests {
         assert_eq!(image.stats().constants_materialized, 2);
         assert_eq!(image.stats().dynamic_initializers_materialized, 2);
         assert!(image.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn dynamic_initializer_global_writes_persist_into_later_steps() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"vars.dm\"\n");
+        fixture.write(
+            "vars.dm",
+            "var/global/base = 1\nvar/global/assigned = (base = base + 2)\nvar/global/observed = base\n",
+        );
+
+        let image = fixture.image();
+        let number = |suffix: &str| {
+            image
+                .variables()
+                .iter()
+                .find(|variable| variable.path.ends_with(suffix))
+                .and_then(|variable| variable.value.as_number())
+        };
+        assert_eq!(number("/base"), Some(3.0));
+        assert_eq!(number("/assigned"), Some(3.0));
+        assert_eq!(number("/observed"), Some(3.0));
+        assert!(image.diagnostics().is_empty(), "{:?}", image.diagnostics());
     }
 
     #[test]
@@ -1320,5 +1477,19 @@ mod tests {
             RuntimeImageError::ExpressionExecution(ref error)
                 if error.source_span.is_some() && !error.call_stack.is_empty()
         ));
+    }
+
+    #[test]
+    fn execution_states_share_the_image_type_catalog() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write("types.dm", "/datum/child\n/obj/item\n");
+        let mut image = fixture.image();
+
+        assert_eq!(Arc::strong_count(&image.type_paths), 1);
+        let state = image.take_execution_state();
+        assert_eq!(Arc::strong_count(&image.type_paths), 2);
+        drop(state);
+        assert_eq!(Arc::strong_count(&image.type_paths), 1);
     }
 }

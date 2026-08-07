@@ -88,6 +88,9 @@ fn allocates_defaults_and_constants_but_defers_dynamic_map_values() {
         Some(9.0),
         "deferred override leaves the inherited default and New() is not called"
     );
+    assert_eq!(object.field(&field("x")).unwrap().as_number(), Some(3.0));
+    assert_eq!(object.field(&field("y")).unwrap().as_number(), Some(4.0));
+    assert_eq!(object.field(&field("z")).unwrap().as_number(), Some(1.0));
     let area = image
         .heap()
         .datum(first.area.expect("area should exist"))

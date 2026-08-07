@@ -4,12 +4,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::sync::Arc;
 
 use dm_core::{DmNumberBits, SourceSpan};
 use dm_lexer::{SpannedToken, TokenKind};
 use dm_syntax::{Definition, DefinitionKind, SourceLine};
 pub use dm_value::Value;
-use dm_value::{DatumId, FieldName, ListId, ValueError, ValueHeap};
+use dm_value::{DatumId, FieldName, ListId, TypePath, ValueError, ValueHeap};
 
 /// One instruction in the portable reference bytecode.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20,16 +21,130 @@ pub enum Instruction {
     PushNumber(DmNumberBits),
     /// Pushes a text constant.
     PushText(String),
+    /// Pushes a canonical absolute DM type path.
+    PushTypePath(TypePath),
+    /// Pops constructor arguments followed by a type path, allocates a datum,
+    /// and pushes its stable handle. Constructor dispatch is intentionally
+    /// deferred to the lifecycle layer; this establishes allocation identity.
+    AllocateDatum {
+        /// Number of already-evaluated constructor arguments to discard.
+        argument_count: u16,
+    },
+    /// Allocates another datum of the current `src` datum's runtime type.
+    ///
+    /// This is the headless interpretation of an unqualified `new(...)`.
+    AllocateCurrentDatum {
+        /// Number of already-evaluated constructor arguments to discard.
+        argument_count: u16,
+    },
+    /// Constructs BYOND's built-in `/regex` datum from a pattern and optional
+    /// flags value. The resulting datum preserves its source pattern in
+    /// `text` and its flags in `flags`, allowing later regex-aware builtins to
+    /// consume the same object identity rather than a fabricated text value.
+    MakeRegex {
+        /// Number of already-evaluated constructor arguments (one or two).
+        argument_count: u8,
+    },
+    /// Constructs BYOND's built-in `/mutable_appearance` datum.
+    ///
+    /// Constructor arguments are discarded after evaluation; rendering and
+    /// appearance inheritance are outside this headless VM's scope.
+    MakeMutableAppearance {
+        /// Number of already-evaluated constructor arguments to discard.
+        argument_count: u16,
+    },
+    /// Replaces every matching text fragment in a bounded 1-based region.
+    ///
+    /// This implements the `replacetext` builtin family. `exact` selects
+    /// BYOND's `Ex` case-sensitive form; `character_indices` selects the
+    /// `_char` family rather than the legacy byte-indexed spelling.
+    ReplaceText {
+        /// Number of supplied arguments (three through five).
+        argument_count: u8,
+        /// Whether matches are case-sensitive.
+        exact: bool,
+        /// Whether optional bounds count Unicode scalar values.
+        character_indices: bool,
+    },
+    /// Produces a deterministic pseudo-random integer in an inclusive range.
+    Rand {
+        /// Number of supplied bounds (one or two).
+        argument_count: u8,
+    },
+    /// Selects one deterministic pseudo-random candidate, optionally using
+    /// BYOND's `weight; candidate` spelling.
+    Pick {
+        /// Whether each candidate has a preceding numeric weight on the stack.
+        weighted: Vec<bool>,
+    },
+    /// Evaluates BYOND's percentage chance predicate deterministically.
+    Prob,
+    /// Rounds a number using BYOND's legacy one-argument floor form or its
+    /// two-argument nearest-multiple form.
+    Round {
+        /// Number of supplied arguments (one or two).
+        argument_count: u8,
+    },
+    /// Returns the legacy BYOND length of text or a list.
+    ///
+    /// Text length uses the same UTF-8 byte indexing as ordinary DM text
+    /// operations; lists return their number of entries.
+    Length,
+    /// Returns a stable BYOND-style text reference for a heap datum or list.
+    Ref,
+    /// Returns the turf one BYOND direction away from an atom or turf.
+    ///
+    /// The headless world model identifies turfs by their materialized `x`,
+    /// `y`, and `z` fields, so this instruction searches the live turf set
+    /// deterministically rather than requiring a renderer or map facade.
+    GetStep,
+    /// Returns every materialized atom in BYOND tile range around a center.
+    ///
+    /// Range uses Chebyshev distance and includes the center tile.  The
+    /// headless VM derives membership from live atom `x`, `y`, and `z`
+    /// fields, which keeps it useful during map lifecycle execution without a
+    /// renderer or separate spatial index.
+    Range {
+        /// Number of explicitly supplied arguments (one or two).
+        argument_count: u8,
+    },
+    /// Returns a list containing a type path and every registered descendant.
+    ///
+    /// The catalog belongs to [`ExecutionState`], allowing the runtime image
+    /// to provide the complete object tree without coupling bytecode to its
+    /// materialization implementation.
+    TypesOf,
+    /// Classifies a value using BYOND's simple predicate builtins.
+    ///
+    /// `istype` additionally accepts an optional target type path and treats
+    /// descendants of that path as matches.
+    TypePredicate {
+        /// Predicate to apply.
+        kind: TypePredicateKind,
+        /// Number of already-evaluated arguments.
+        argument_count: u8,
+    },
     /// Pops `count` values, allocates a list, and pushes its stable handle.
     ///
     /// Values retain their original source order in 1-based list positions.
     MakeList(u16),
+    /// Allocates the current procedure's implicit `args` list.
+    ///
+    /// The list contains every value supplied to this call in positional
+    /// order, including values beyond the declared parameter list.
+    MakeArgs,
     /// Builds a list whose positional values and associative keys may intermix.
     MakeListEntries(Vec<ListEntryKind>),
     /// Pops a numeric 1-based index and a list handle, then pushes the entry.
     IndexList,
     /// Pops a value, index/key, and list handle and updates that list.
     SetListIndex,
+    /// Like [`Self::SetListIndex`], but leaves the stored value on the stack.
+    SetListIndexKeep,
+    /// Pops a value, index/key, and list handle, applies a numeric operation to
+    /// the current indexed value and the supplied value, then updates that
+    /// list.
+    CompoundListIndex(CompoundListIndexOperator),
     /// Pops a list handle and pushes its deterministic iteration length.
     ListLength,
     /// Pushes a local value.
@@ -56,6 +171,20 @@ pub enum Instruction {
     StoreResult,
     /// Discards the top stack value.
     Pop,
+    /// Pops a diagnostic value and terminates execution with a runtime error.
+    Crash,
+    /// Discards `locate` arguments and yields null when no world locator is
+    /// available to the headless interpreter.
+    Locate {
+        /// Number of already-evaluated locator arguments to discard.
+        argument_count: u16,
+    },
+    /// Discards `locate` arguments plus the search container, then yields null
+    /// when no world locator is available to the headless interpreter.
+    LocateIn {
+        /// Number of already-evaluated locator arguments to discard.
+        argument_count: u16,
+    },
     /// Numeric addition.
     Add,
     /// Numeric subtraction.
@@ -66,6 +195,18 @@ pub enum Instruction {
     Divide,
     /// Numeric remainder.
     Remainder,
+    /// 32-bit integer bitwise conjunction.
+    BitAnd,
+    /// 32-bit integer bitwise disjunction.
+    BitOr,
+    /// 32-bit integer bitwise exclusive disjunction.
+    BitXor,
+    /// 32-bit integer left shift.
+    ShiftLeft,
+    /// 32-bit arithmetic right shift.
+    ShiftRight,
+    /// 32-bit integer bitwise complement.
+    BitNot,
     /// Numeric negation.
     Negate,
     /// DM truth-value negation.
@@ -74,6 +215,11 @@ pub enum Instruction {
     Equal,
     /// Inequality comparison.
     NotEqual,
+    /// List membership comparison.
+    ///
+    /// The left value is compared against the list's iteration entries, which
+    /// includes positional values and associative keys.
+    Contains,
     /// Less-than comparison.
     Less,
     /// Less-than-or-equal comparison.
@@ -118,8 +264,73 @@ pub enum Instruction {
         /// argument vector of the current frame.
         argument_count: Option<u16>,
     },
+    /// Calls a procedure selected at runtime by `call(target, procedure)`.
+    ///
+    /// The stack holds the receiver (or null for a global procedure), the
+    /// procedure name, then the positional arguments.
+    CallDynamic {
+        /// Number of positional values supplied by the caller.
+        argument_count: u16,
+    },
+    /// Expands `arglist(list)` entries in a pending call argument vector.
+    ///
+    /// The instruction replaces the selected source positions with the
+    /// positional entries from their list values and leaves the resulting
+    /// runtime argument count on the stack for a following sentinel call.
+    ExpandArgumentLists {
+        /// Number of source argument expressions currently on the stack.
+        argument_count: u16,
+        /// Zero-based source positions whose values are `arglist(...)`.
+        expanded_indices: Vec<u16>,
+    },
     /// Returns the top stack value.
     Return,
+}
+
+/// Numeric operation used by [`Instruction::CompoundListIndex`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompoundListIndexOperator {
+    /// Addition assignment (`+=`).
+    Add,
+    /// Subtraction assignment (`-=`).
+    Subtract,
+    /// Multiplication assignment (`*=`).
+    Multiply,
+    /// Division assignment (`/=`).
+    Divide,
+    /// Remainder assignment (`%=`).
+    Remainder,
+    /// Bitwise conjunction assignment (`&=`).
+    BitAnd,
+    /// Bitwise disjunction assignment (`|=`).
+    BitOr,
+    /// Bitwise exclusive disjunction assignment (`^=`).
+    BitXor,
+    /// Left-shift assignment (`<<=`).
+    ShiftLeft,
+    /// Right-shift assignment (`>>=`).
+    ShiftRight,
+}
+
+/// Built-in value classifier used by [`Instruction::TypePredicate`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypePredicateKind {
+    /// Whether the value is DM `null`.
+    IsNull,
+    /// Whether the value is numeric.
+    IsNum,
+    /// Whether the value is a canonical type path.
+    IsPath,
+    /// Whether the value is a DM list.
+    IsList,
+    /// Whether the value is an `/atom/movable` datum or one of its subtypes.
+    IsMovable,
+    /// Whether the value is a turf datum or one of its subtypes.
+    IsTurf,
+    /// Whether every value is a valid DM location (an atom).
+    IsLoc,
+    /// Whether a datum or type path belongs to an optional type hierarchy.
+    IsType,
 }
 
 /// Stack shape of one entry consumed by [`Instruction::MakeListEntries`].
@@ -234,6 +445,17 @@ pub struct ProcedureSpec<'definition> {
     pub definition: &'definition Definition,
     /// Index of the exact parent implementation in the same spec slice.
     pub parent: Option<usize>,
+    /// Semantically resolved bare-call targets, keyed by selector.
+    ///
+    /// This preserves object-tree inheritance when it differs from lexical
+    /// path ancestry, such as `/area` inheriting `/datum`.
+    pub static_calls: BTreeMap<String, usize>,
+    /// Bare identifiers that resolve to fields on the executing procedure's
+    /// `src` datum when they do not name a parameter or local.
+    pub src_fields: BTreeMap<String, FieldName>,
+    /// Bare identifiers that resolve to persistent runtime globals when they
+    /// do not name a parameter, local, or `src` field.
+    pub global_fields: BTreeMap<String, FieldName>,
 }
 
 /// Failure while compiling the initial executable subset.
@@ -455,7 +677,17 @@ pub fn compile_module_specs(specs: &[ProcedureSpec<'_>]) -> Result<Module, Compi
             if let Some(parent) = spec.parent {
                 targets.insert("..".to_owned(), ProcedureId::from_index(parent)?);
             }
-            compile_procedure_with_resolver(spec.definition, &targets)
+            targets.extend(static_call_targets(&spec.path, &paths));
+            for (selector, target) in &spec.static_calls {
+                targets.insert(selector.clone(), ProcedureId::from_index(*target)?);
+            }
+            compile_procedure_with_resolver_and_fields(
+                spec.definition,
+                &targets,
+                &spec.src_fields,
+                &spec.global_fields,
+            )
+            .map_err(|error| compile_error(format!("{}: {}", spec.path, error.message)))
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Module {
@@ -465,9 +697,60 @@ pub fn compile_module_specs(specs: &[ProcedureSpec<'_>]) -> Result<Module, Compi
     })
 }
 
+fn static_call_targets(path: &str, paths: &[String]) -> HashMap<String, ProcedureId> {
+    let Some((owner, _)) = path.rsplit_once("/proc/") else {
+        return HashMap::new();
+    };
+    let mut targets = HashMap::new();
+    for candidate in paths {
+        let Some((_, name)) = candidate.rsplit_once("/proc/") else {
+            continue;
+        };
+        let name = name.split('@').next().unwrap_or(name);
+        if targets.contains_key(name) {
+            continue;
+        }
+        let mut current_owner = owner;
+        loop {
+            let expected = if current_owner.is_empty() {
+                format!("/proc/{name}")
+            } else {
+                format!("{current_owner}/proc/{name}")
+            };
+            if let Some((index, _)) = paths.iter().enumerate().rev().find(|(_, candidate)| {
+                *candidate == &expected || candidate.starts_with(&format!("{expected}@"))
+            }) {
+                if let Ok(procedure) = ProcedureId::from_index(index) {
+                    targets.insert(name.to_owned(), procedure);
+                }
+                break;
+            }
+            let Some((parent, _)) = current_owner.rsplit_once('/') else {
+                break;
+            };
+            current_owner = parent;
+        }
+    }
+    targets
+}
+
 fn compile_procedure_with_resolver(
     definition: &Definition,
     procedures: &HashMap<String, ProcedureId>,
+) -> Result<Program, CompileError> {
+    compile_procedure_with_resolver_and_fields(
+        definition,
+        procedures,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    )
+}
+
+fn compile_procedure_with_resolver_and_fields(
+    definition: &Definition,
+    procedures: &HashMap<String, ProcedureId>,
+    src_fields: &BTreeMap<String, FieldName>,
+    global_fields: &BTreeMap<String, FieldName>,
 ) -> Result<Program, CompileError> {
     if !matches!(
         definition.kind,
@@ -476,16 +759,35 @@ fn compile_procedure_with_resolver(
         return Err(compile_error("definition is not executable"));
     }
 
-    let mut locals = LocalTable::default();
+    let mut locals = LocalTable::with_fields(src_fields.clone(), global_fields.clone());
     for (index, parameter) in definition.parameters.iter().enumerate() {
-        let name = parameter_name(&parameter.tokens)
-            .ok_or_else(|| compile_error("procedure parameter has no name"))?;
-        locals.insert_parameter(name.to_owned(), to_local_index(index)?);
+        // BYOND permits an unnamed trailing `...` parameter.  It still
+        // occupies an argument position, but cannot be referenced by name.
+        if let Some(name) = parameter_name(&parameter.tokens) {
+            locals.insert_parameter(name.to_owned(), to_local_index(index)?);
+        }
     }
+    locals.reserve_parameter_slots(definition.parameters.len())?;
+    // `args` is an implicit, per-call list in every DM procedure.  It must
+    // be a local (rather than a fabricated global) so recursive and nested
+    // calls retain their own complete supplied argument vectors.
+    let args_slot = locals.declare("args".to_owned())?;
 
     let mut instructions = Vec::new();
     let mut source_spans = Vec::new();
     let mut loops = Vec::new();
+    push_instruction(
+        &mut instructions,
+        &mut source_spans,
+        Instruction::MakeArgs,
+        definition.span,
+    );
+    push_instruction(
+        &mut instructions,
+        &mut source_spans,
+        Instruction::StoreLocal(args_slot),
+        definition.span,
+    );
     compile_parameter_defaults(
         definition,
         &locals,
@@ -493,10 +795,16 @@ fn compile_procedure_with_resolver(
         &mut source_spans,
         procedures,
     )?;
-    let falls_through = if let Some(first_line) = definition.body.first() {
+    // The DM preprocessor is allowed to expand a macro into several
+    // statements on one logical source line.  The common `QDEL_NULL(x)`
+    // helper, for example, becomes `qdel(x); x = null`.  Keep statement
+    // separators out of the expression parser by turning only top-level
+    // semicolons into ordinary logical lines before lowering the body.
+    let body = split_top_level_semicolon_statements(&definition.body);
+    let falls_through = if let Some(first_line) = body.first() {
         let block_indentation = indentation(first_line);
         let (next_line, falls_through) = compile_block(
-            &definition.body,
+            &body,
             0,
             block_indentation,
             &mut locals,
@@ -505,7 +813,7 @@ fn compile_procedure_with_resolver(
             procedures,
             &mut loops,
         )?;
-        if next_line != definition.body.len() {
+        if next_line != body.len() {
             return Err(compile_error("procedure body contains invalid indentation"));
         }
         falls_through
@@ -535,16 +843,92 @@ fn compile_procedure_with_resolver(
     })
 }
 
+/// Expands DM's macro-style statement separators and compact brace bodies.
+///
+/// BYOND macros commonly use C-style compact bodies even though ordinary DM
+/// source is indentation based: `if (!value) { value = list(); } value += x;`.
+/// The preprocessor leaves that expansion on the invocation's logical line.
+/// Re-present its braces and semicolons as indentation-based logical lines
+/// before statement lowering.  Parenthesized and indexed expressions retain
+/// their punctuation unchanged. Empty statements (including a physical line
+/// containing only `}`) are legal and discarded.
+fn split_top_level_semicolon_statements(lines: &[SourceLine]) -> Vec<SourceLine> {
+    let mut result = Vec::with_capacity(lines.len());
+    for line in lines {
+        let mut statement = Vec::new();
+        let mut grouping_depth = 0usize;
+        let mut brace_depth = 0usize;
+        let base_indentation = indentation(line);
+        let mut emit = |tokens: &mut Vec<SpannedToken>, brace_depth: usize| {
+            if tokens.is_empty() {
+                return;
+            }
+            let mut logical_line = line.clone();
+            logical_line.indentation.tabs = 0;
+            logical_line.indentation.spaces = base_indentation.saturating_add(brace_depth);
+            logical_line.tokens = std::mem::take(tokens);
+            result.push(logical_line);
+        };
+        for token in &line.tokens {
+            match token.kind {
+                TokenKind::Punctuation('(' | '[') => {
+                    grouping_depth += 1;
+                    statement.push(token.clone());
+                }
+                TokenKind::Punctuation(')' | ']') => {
+                    grouping_depth = grouping_depth.saturating_sub(1);
+                    statement.push(token.clone());
+                }
+                TokenKind::Punctuation('{') if grouping_depth == 0 => {
+                    emit(&mut statement, brace_depth);
+                    brace_depth += 1;
+                }
+                TokenKind::Punctuation('}') if grouping_depth == 0 => {
+                    emit(&mut statement, brace_depth);
+                    brace_depth = brace_depth.saturating_sub(1);
+                }
+                TokenKind::Punctuation(';') if grouping_depth == 0 => {
+                    emit(&mut statement, brace_depth);
+                }
+                _ => statement.push(token.clone()),
+            }
+        }
+        emit(&mut statement, brace_depth);
+    }
+    result
+}
+
 #[derive(Default)]
 struct LocalTable {
     names: HashMap<String, u16>,
+    src_fields: BTreeMap<String, FieldName>,
+    global_fields: BTreeMap<String, FieldName>,
     slot_count: usize,
 }
 
 impl LocalTable {
+    fn with_fields(
+        src_fields: BTreeMap<String, FieldName>,
+        global_fields: BTreeMap<String, FieldName>,
+    ) -> Self {
+        Self {
+            names: HashMap::new(),
+            src_fields,
+            global_fields,
+            slot_count: 0,
+        }
+    }
     fn insert_parameter(&mut self, name: String, slot: u16) {
         self.names.insert(name, slot);
         self.slot_count = self.slot_count.max(usize::from(slot) + 1);
+    }
+
+    fn reserve_parameter_slots(&mut self, count: usize) -> Result<(), CompileError> {
+        // Keep unnamed varargs positions available to the frame binder and
+        // ensure subsequent locals are allocated after every parameter.
+        let count = usize::from(to_local_index(count)?);
+        self.slot_count = self.slot_count.max(count);
+        Ok(())
     }
 
     fn declare(&mut self, name: String) -> Result<u16, CompileError> {
@@ -565,6 +949,14 @@ impl LocalTable {
 
     fn get(&self, name: &str) -> Option<u16> {
         self.names.get(name).copied()
+    }
+
+    fn src_field(&self, name: &str) -> Option<&FieldName> {
+        self.src_fields.get(name)
+    }
+
+    fn global_field(&self, name: &str) -> Option<&FieldName> {
+        self.global_fields.get(name)
     }
 
     fn remove(&mut self, name: &str) {
@@ -601,7 +993,6 @@ fn compile_parameter_defaults(
             parameter.span,
         );
         let expression = ExpressionParser::new(default_tokens).parse()?;
-        validate_parameter_default(&expression)?;
         let first_default_instruction = instructions.len();
         emit_expression(&expression, locals, instructions, procedures)?;
         instructions.push(Instruction::StoreLocal(parameter_slot));
@@ -613,37 +1004,6 @@ fn compile_parameter_defaults(
         patch_jump(instructions, default_jump, end_target)?;
     }
     Ok(())
-}
-
-fn validate_parameter_default(expression: &Expression) -> Result<(), CompileError> {
-    match expression {
-        Expression::Null | Expression::Number(_) | Expression::Text(_) => Ok(()),
-        Expression::Local(name) => Err(compile_error(format!(
-            "parameter default reference {name:?} requires BYOND conformance confirmation"
-        ))),
-        Expression::Src
-        | Expression::Usr
-        | Expression::GlobalNamespace
-        | Expression::Field { .. }
-        | Expression::GlobalField(_) => Err(compile_error(
-            "runtime object access is not supported in parameter defaults",
-        )),
-        Expression::Result => Err(compile_error(
-            "special return value '.' is not supported in parameter defaults",
-        )),
-        Expression::Call { .. }
-        | Expression::CurrentCall { .. }
-        | Expression::ParentCall { .. }
-        | Expression::List(_)
-        | Expression::Index { .. } => Err(compile_error(
-            "procedure calls in parameter defaults are not supported",
-        )),
-        Expression::Unary { operand, .. } => validate_parameter_default(operand),
-        Expression::Binary { left, right, .. } => {
-            validate_parameter_default(left)?;
-            validate_parameter_default(right)
-        }
-    }
 }
 
 struct LoopContext {
@@ -692,8 +1052,42 @@ fn compile_block(
                 line_index = next_line;
                 continue;
             }
+            // `switch` is a statement in DM, not a procedure call.  Each
+            // indented `if` arm is a case list (with comma-separated values
+            // and `low to high` ranges), while `else` is the default arm.
+            // Keep this distinct from ordinary `if`: a switch selector is
+            // evaluated exactly once and every case compares against it.
+            TokenKind::Identifier(keyword) if keyword == "switch" => {
+                let (next_line, statement_falls_through) = compile_switch(
+                    lines,
+                    line_index,
+                    block_indentation,
+                    locals,
+                    instructions,
+                    source_spans,
+                    procedures,
+                    loops,
+                )?;
+                falls_through &= statement_falls_through;
+                line_index = next_line;
+                continue;
+            }
             TokenKind::Identifier(keyword) if keyword == "while" => {
                 let next_line = compile_while(
+                    lines,
+                    line_index,
+                    block_indentation,
+                    locals,
+                    instructions,
+                    source_spans,
+                    procedures,
+                    loops,
+                )?;
+                line_index = next_line;
+                continue;
+            }
+            TokenKind::Identifier(keyword) if keyword == "do" => {
+                let next_line = compile_do_while(
                     lines,
                     line_index,
                     block_indentation,
@@ -774,6 +1168,21 @@ fn compile_block(
                 ));
                 falls_through = false;
             }
+            TokenKind::Identifier(keyword) if keyword == "CRASH" => {
+                let first_instruction = instructions.len();
+                compile_crash_statement(&line.tokens, locals, instructions, procedures)?;
+                source_spans.extend(std::iter::repeat_n(
+                    line.span,
+                    instructions.len() - first_instruction,
+                ));
+                falls_through = false;
+            }
+            // `waitfor` controls BYOND's cooperative scheduling of a procedure.
+            // Dream64's current headless executor is synchronous and has no
+            // sleeping instructions, so the declaration is intentionally a
+            // compile-time no-op rather than an executable assignment.
+            TokenKind::Identifier(keyword)
+                if keyword == "set" && is_waitfor_directive(&line.tokens) => {}
             TokenKind::Identifier(keyword) if keyword == "var" => {
                 let first_instruction = instructions.len();
                 let _ = compile_local(&line.tokens, locals, instructions, procedures)?;
@@ -790,9 +1199,100 @@ fn compile_block(
                     instructions.len() - first_instruction,
                 ));
             }
+            // Postfix/prefix increments are valid standalone statements as
+            // well as for-loop clauses.  In particular, bare datum fields
+            // such as `areasize++` resolve through `src` rather than a local
+            // binding, so they must take the same lowering path as compound
+            // assignments.
+            TokenKind::Identifier(_) | TokenKind::Operator(_)
+                if local_increment(&line.tokens).is_some() =>
+            {
+                let first_instruction = instructions.len();
+                // `compile_for_clause` owns the shared prefix/postfix
+                // increment lowering (including bare `src` fields).  The
+                // standalone statement form has identical semantics.
+                compile_for_clause(&line.tokens, false, locals, instructions, procedures)?;
+                source_spans.extend(std::iter::repeat_n(
+                    line.span,
+                    instructions.len() - first_instruction,
+                ));
+            }
             TokenKind::Operator(operator) if operator == "." => {
                 let first_instruction = instructions.len();
                 compile_result_assignment(&line.tokens, locals, instructions, procedures)?;
+                source_spans.extend(std::iter::repeat_n(
+                    line.span,
+                    instructions.len() - first_instruction,
+                ));
+            }
+            TokenKind::Identifier(keyword) if keyword == "call" => {
+                let first_instruction = instructions.len();
+                compile_expression(&line.tokens, locals, instructions, procedures)?;
+                instructions.push(Instruction::Pop);
+                source_spans.extend(std::iter::repeat_n(
+                    line.span,
+                    instructions.len() - first_instruction,
+                ));
+            }
+            // `new /type(...)` is also commonly written as a pure
+            // side-effect statement, especially for controller singletons.
+            TokenKind::Identifier(keyword) if keyword == "new" => {
+                let first_instruction = instructions.len();
+                compile_expression(&line.tokens, locals, instructions, procedures)?;
+                instructions.push(Instruction::Pop);
+                source_spans.extend(std::iter::repeat_n(
+                    line.span,
+                    instructions.len() - first_instruction,
+                ));
+            }
+            // A parent call is also a valid side-effect-only statement.  It
+            // starts with the `..` operator rather than an identifier, so it
+            // cannot share the ordinary static-call statement arm below.
+            TokenKind::Operator(operator)
+                if operator == ".."
+                    && matches!(
+                        line.tokens.get(1).map(|token| &token.kind),
+                        Some(TokenKind::Punctuation('('))
+                    ) =>
+            {
+                let first_instruction = instructions.len();
+                compile_expression(&line.tokens, locals, instructions, procedures)?;
+                instructions.push(Instruction::Pop);
+                source_spans.extend(std::iter::repeat_n(
+                    line.span,
+                    instructions.len() - first_instruction,
+                ));
+            }
+            // Parenthesized expressions are valid as discarded-result
+            // statements too.  Macro expansions commonly wrap an assignment
+            // or a side-effecting call in parentheses, which means these
+            // lines begin with punctuation rather than an identifier.
+            TokenKind::Punctuation('(') => {
+                let first_instruction = instructions.len();
+                compile_expression(&line.tokens, locals, instructions, procedures)?;
+                instructions.push(Instruction::Pop);
+                source_spans.extend(std::iter::repeat_n(
+                    line.span,
+                    instructions.len() - first_instruction,
+                ));
+            }
+            // Calls may be used purely for their side effects.  `call(...)`
+            // has its own syntax above, but ordinary static calls (including
+            // datum helper calls such as `RegisterSignals(...)`) and dotted
+            // datum calls such as `atom_storage.set_holdable(...)` both begin
+            // with an identifier.  The latter have the opening parenthesis
+            // after the receiver and selector rather than immediately after
+            // the first identifier, so recognize any call-shaped expression
+            // on the source line and lower its discarded result uniformly.
+            TokenKind::Identifier(_)
+                if line
+                    .tokens
+                    .iter()
+                    .any(|token| token.kind == TokenKind::Punctuation('(')) =>
+            {
+                let first_instruction = instructions.len();
+                compile_expression(&line.tokens, locals, instructions, procedures)?;
+                instructions.push(Instruction::Pop);
                 source_spans.extend(std::iter::repeat_n(
                     line.span,
                     instructions.len() - first_instruction,
@@ -810,6 +1310,90 @@ fn compile_block(
     Ok((line_index, falls_through))
 }
 
+fn is_waitfor_directive(tokens: &[SpannedToken]) -> bool {
+    matches!(
+        tokens,
+        [
+            SpannedToken {
+                kind: TokenKind::Identifier(set),
+                ..
+            },
+            SpannedToken {
+                kind: TokenKind::Identifier(name),
+                ..
+            },
+            SpannedToken {
+                kind: TokenKind::Operator(operator),
+                ..
+            },
+            SpannedToken {
+                kind: TokenKind::Identifier(value),
+                ..
+            }
+        ] if set == "set"
+            && name == "waitfor"
+            && operator == "="
+            && matches!(value.as_str(), "TRUE" | "FALSE")
+    ) || matches!(
+        tokens,
+        [
+            SpannedToken {
+                kind: TokenKind::Identifier(set),
+                ..
+            },
+            SpannedToken {
+                kind: TokenKind::Identifier(name),
+                ..
+            },
+            SpannedToken {
+                kind: TokenKind::Operator(operator),
+                ..
+            },
+            SpannedToken {
+                kind: TokenKind::Number(value),
+                ..
+            }
+        ] if set == "set"
+            && name == "waitfor"
+            && operator == "="
+            && matches!(value.as_str(), "0" | "1")
+    )
+}
+
+fn compile_crash_statement(
+    tokens: &[SpannedToken],
+    locals: &LocalTable,
+    instructions: &mut Vec<Instruction>,
+    procedures: &HashMap<String, ProcedureId>,
+) -> Result<(), CompileError> {
+    let Some((first, rest)) = tokens.split_first() else {
+        return Err(compile_error("CRASH requires a message expression"));
+    };
+    if !matches!(&first.kind, TokenKind::Identifier(keyword) if keyword == "CRASH")
+        || rest.len() < 2
+        || !matches!(
+            rest.first().map(|token| &token.kind),
+            Some(TokenKind::Punctuation('('))
+        )
+        || !matches!(
+            rest.last().map(|token| &token.kind),
+            Some(TokenKind::Punctuation(')'))
+        )
+    {
+        return Err(compile_error(
+            "CRASH requires one parenthesized message expression",
+        ));
+    }
+    let expression = &rest[1..rest.len() - 1];
+    if expression.is_empty() {
+        instructions.push(Instruction::PushText("CRASH".to_owned()));
+    } else {
+        compile_expression(expression, locals, instructions, procedures)?;
+    }
+    instructions.push(Instruction::Crash);
+    Ok(())
+}
+
 fn top_level_assignment(tokens: &[SpannedToken]) -> Option<(usize, &str)> {
     let mut depth = 0_usize;
     for (index, token) in tokens.iter().enumerate() {
@@ -817,8 +1401,10 @@ fn top_level_assignment(tokens: &[SpannedToken]) -> Option<(usize, &str)> {
             TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
             TokenKind::Punctuation(')' | ']' | '}') => depth = depth.saturating_sub(1),
             TokenKind::Operator(operator)
-                if matches!(operator.as_str(), "=" | "+=" | "-=" | "*=" | "/=" | "%=")
-                    && depth == 0 =>
+                if matches!(
+                    operator.as_str(),
+                    "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>="
+                ) && depth == 0 =>
             {
                 return Some((index, operator));
             }
@@ -842,9 +1428,45 @@ fn compile_assignment_statement(
     let target = ExpressionParser::new(&tokens[..assignment]).parse()?;
     match target {
         Expression::Local(name) => {
-            let slot = locals
-                .get(&name)
-                .ok_or_else(|| compile_error(format!("unknown local {name:?}")))?;
+            let local = locals.get(&name);
+            let field = locals.src_field(&name).cloned();
+            let global = locals.global_field(&name).cloned();
+            let Some(slot) = local else {
+                if field.is_none() && global.is_none() {
+                    return Err(compile_error(format!("unknown local {name:?}")));
+                }
+                if let Some(global) = global {
+                    if operator != "=" {
+                        instructions.push(Instruction::LoadGlobal(global.clone()));
+                    }
+                    compile_expression(
+                        &tokens[assignment + 1..],
+                        locals,
+                        instructions,
+                        procedures,
+                    )?;
+                    if operator != "=" {
+                        instructions.push(compound_instruction(operator)?);
+                    }
+                    instructions.push(Instruction::StoreGlobal(global));
+                    return Ok(());
+                }
+                if operator == "=" {
+                    instructions.push(Instruction::LoadSrc);
+                } else {
+                    instructions.push(Instruction::LoadSrc);
+                    instructions.push(Instruction::Duplicate);
+                    instructions.push(Instruction::LoadField(
+                        field.clone().expect("field was checked"),
+                    ));
+                }
+                compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
+                if operator != "=" {
+                    instructions.push(compound_instruction(operator)?);
+                }
+                instructions.push(Instruction::StoreField(field.expect("field was checked")));
+                return Ok(());
+            };
             if operator != "=" {
                 instructions.push(Instruction::LoadLocal(slot));
             }
@@ -855,15 +1477,16 @@ fn compile_assignment_statement(
             instructions.push(Instruction::StoreLocal(slot));
         }
         Expression::Index { list, index } => {
-            if operator != "=" {
-                return Err(compile_error(
-                    "compound list-index assignment is not implemented",
-                ));
-            }
             emit_expression(&list, locals, instructions, procedures)?;
             emit_expression(&index, locals, instructions, procedures)?;
             compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
-            instructions.push(Instruction::SetListIndex);
+            if operator == "=" {
+                instructions.push(Instruction::SetListIndex);
+            } else {
+                instructions.push(Instruction::CompoundListIndex(
+                    compound_list_index_operator(operator)?,
+                ));
+            }
         }
         Expression::Field { receiver, name } => {
             emit_expression(&receiver, locals, instructions, procedures)?;
@@ -899,6 +1522,31 @@ fn compound_instruction(operator: &str) -> Result<Instruction, CompileError> {
         "*=" => Instruction::Multiply,
         "/=" => Instruction::Divide,
         "%=" => Instruction::Remainder,
+        "&=" => Instruction::BitAnd,
+        "|=" => Instruction::BitOr,
+        "^=" => Instruction::BitXor,
+        "<<=" => Instruction::ShiftLeft,
+        ">>=" => Instruction::ShiftRight,
+        _ => {
+            return Err(compile_error(format!(
+                "unsupported compound operator {operator:?}"
+            )));
+        }
+    })
+}
+
+fn compound_list_index_operator(operator: &str) -> Result<CompoundListIndexOperator, CompileError> {
+    Ok(match operator {
+        "+=" => CompoundListIndexOperator::Add,
+        "-=" => CompoundListIndexOperator::Subtract,
+        "*=" => CompoundListIndexOperator::Multiply,
+        "/=" => CompoundListIndexOperator::Divide,
+        "%=" => CompoundListIndexOperator::Remainder,
+        "&=" => CompoundListIndexOperator::BitAnd,
+        "|=" => CompoundListIndexOperator::BitOr,
+        "^=" => CompoundListIndexOperator::BitXor,
+        "<<=" => CompoundListIndexOperator::ShiftLeft,
+        ">>=" => CompoundListIndexOperator::ShiftRight,
         _ => {
             return Err(compile_error(format!(
                 "unsupported compound operator {operator:?}"
@@ -974,6 +1622,97 @@ fn compile_while(
     Ok(after_body)
 }
 
+/// Compiles BYOND's post-test `do`/`while` loop form.  The trailing `while`
+/// belongs to the `do` statement, at its original indentation, rather than
+/// beginning a second statement after the body.
+#[allow(clippy::too_many_arguments)]
+fn compile_do_while(
+    lines: &[SourceLine],
+    line_index: usize,
+    block_indentation: usize,
+    locals: &mut LocalTable,
+    instructions: &mut Vec<Instruction>,
+    source_spans: &mut Vec<SourceSpan>,
+    procedures: &HashMap<String, ProcedureId>,
+    loops: &mut Vec<LoopContext>,
+) -> Result<usize, CompileError> {
+    let do_line = &lines[line_index];
+    if do_line.tokens.len() != 1 {
+        return Err(compile_error("do statement does not accept a condition"));
+    }
+    let child_index = line_index + 1;
+    let child = lines
+        .get(child_index)
+        .ok_or_else(|| compile_error("do statement requires an indented body"))?;
+    let child_indentation = indentation(child);
+    if child_indentation <= block_indentation {
+        return Err(compile_error("do statement requires an indented body"));
+    }
+
+    let body_target = instructions.len();
+    loops.push(LoopContext {
+        continue_target: None,
+        continue_jumps: Vec::new(),
+        break_jumps: Vec::new(),
+    });
+    let body = compile_block(
+        lines,
+        child_index,
+        child_indentation,
+        locals,
+        instructions,
+        source_spans,
+        procedures,
+        loops,
+    );
+    let loop_context = loops.pop().expect("the active do context was pushed");
+    let (while_index, _) = body?;
+    let while_line = lines
+        .get(while_index)
+        .ok_or_else(|| compile_error("do statement requires a trailing while condition"))?;
+    if indentation(while_line) != block_indentation
+        || !matches!(
+            while_line.tokens.first().map(|token| &token.kind),
+            Some(TokenKind::Identifier(keyword)) if keyword == "while"
+        )
+    {
+        return Err(compile_error(
+            "do statement requires a trailing while condition",
+        ));
+    }
+
+    let condition_target = instructions.len();
+    for continue_jump in loop_context.continue_jumps {
+        patch_jump(instructions, continue_jump, condition_target)?;
+    }
+    let condition = condition_tokens(&while_line.tokens, "while")?;
+    let condition_start = instructions.len();
+    compile_expression(condition, locals, instructions, procedures)?;
+    source_spans.extend(std::iter::repeat_n(
+        while_line.span,
+        instructions.len() - condition_start,
+    ));
+    let false_jump = instructions.len();
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::JumpIfFalse(usize::MAX),
+        while_line.span,
+    );
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::Jump(body_target),
+        while_line.span,
+    );
+    let end_target = instructions.len();
+    patch_jump(instructions, false_jump, end_target)?;
+    for break_jump in loop_context.break_jumps {
+        patch_jump(instructions, break_jump, end_target)?;
+    }
+    Ok(while_index + 1)
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn compile_for(
     lines: &[SourceLine],
@@ -986,6 +1725,22 @@ fn compile_for(
     loops: &mut Vec<LoopContext>,
 ) -> Result<usize, CompileError> {
     let line = &lines[line_index];
+    if let Some((local_name, start, end, step)) = for_to_parts(&line.tokens)? {
+        return compile_for_to(
+            lines,
+            line_index,
+            block_indentation,
+            locals,
+            instructions,
+            source_spans,
+            procedures,
+            loops,
+            &local_name,
+            start,
+            end,
+            step,
+        );
+    }
     if let Some((local_name, iterable)) = for_in_parts(&line.tokens)? {
         return compile_for_in(
             lines,
@@ -1076,6 +1831,125 @@ fn compile_for(
     if let Some(scoped_local) = scoped_local {
         locals.remove(&scoped_local);
     }
+    Ok(after_body)
+}
+
+/// Compiles DM's inclusive numeric range loop, `for(var/i in first to last)`.
+/// The end expression is evaluated once, matching the normal DM range-loop
+/// header semantics and avoiding re-evaluating a mutable field on each turn.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn compile_for_to(
+    lines: &[SourceLine],
+    line_index: usize,
+    block_indentation: usize,
+    locals: &mut LocalTable,
+    instructions: &mut Vec<Instruction>,
+    source_spans: &mut Vec<SourceSpan>,
+    procedures: &HashMap<String, ProcedureId>,
+    loops: &mut Vec<LoopContext>,
+    local_name: &str,
+    start: &[SpannedToken],
+    end: &[SpannedToken],
+    step: Option<&[SpannedToken]>,
+) -> Result<usize, CompileError> {
+    let line = &lines[line_index];
+    let item_slot = locals.declare(local_name.to_owned())?;
+    let end_slot = locals.declare_hidden()?;
+    let step_slot = locals.declare_hidden()?;
+
+    let initialization_start = instructions.len();
+    compile_expression(start, locals, instructions, procedures)?;
+    instructions.push(Instruction::StoreLocal(item_slot));
+    compile_expression(end, locals, instructions, procedures)?;
+    instructions.push(Instruction::StoreLocal(end_slot));
+    if let Some(step) = step {
+        compile_expression(step, locals, instructions, procedures)?;
+    } else {
+        instructions.push(Instruction::PushNumber(DmNumberBits::from_f32(1.0)));
+    }
+    instructions.push(Instruction::StoreLocal(step_slot));
+    source_spans.extend(std::iter::repeat_n(
+        line.span,
+        instructions.len() - initialization_start,
+    ));
+
+    let condition_target = instructions.len();
+    // `step` controls both the increment and direction.  Keep the bounds
+    // inclusive, just like BYOND: positive steps run while `i <= end` and
+    // negative steps run while `i >= end`.  The step expression is evaluated
+    // once at loop entry, rather than once per iteration.
+    for instruction in [
+        Instruction::LoadLocal(step_slot),
+        Instruction::PushNumber(DmNumberBits::from_f32(0.0)),
+        Instruction::GreaterEqual,
+        Instruction::LoadLocal(item_slot),
+        Instruction::LoadLocal(end_slot),
+        Instruction::LessEqual,
+        Instruction::And,
+        Instruction::LoadLocal(step_slot),
+        Instruction::PushNumber(DmNumberBits::from_f32(0.0)),
+        Instruction::Less,
+        Instruction::LoadLocal(item_slot),
+        Instruction::LoadLocal(end_slot),
+        Instruction::GreaterEqual,
+        Instruction::And,
+        Instruction::Or,
+    ] {
+        push_instruction(instructions, source_spans, instruction, line.span);
+    }
+    let false_jump = instructions.len();
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::JumpIfFalse(usize::MAX),
+        line.span,
+    );
+
+    let child_index = line_index + 1;
+    let child = lines
+        .get(child_index)
+        .ok_or_else(|| compile_error("for-to statement requires an indented body"))?;
+    let child_indentation = indentation(child);
+    if child_indentation <= block_indentation {
+        return Err(compile_error("for-to statement requires an indented body"));
+    }
+    loops.push(LoopContext {
+        continue_target: None,
+        continue_jumps: Vec::new(),
+        break_jumps: Vec::new(),
+    });
+    let body = compile_block(
+        lines,
+        child_index,
+        child_indentation,
+        locals,
+        instructions,
+        source_spans,
+        procedures,
+        loops,
+    );
+    let loop_context = loops.pop().expect("the active for-to context was pushed");
+    let (after_body, _) = body?;
+
+    let increment_target = instructions.len();
+    for continue_jump in loop_context.continue_jumps {
+        patch_jump(instructions, continue_jump, increment_target)?;
+    }
+    for instruction in [
+        Instruction::LoadLocal(item_slot),
+        Instruction::LoadLocal(step_slot),
+        Instruction::Add,
+        Instruction::StoreLocal(item_slot),
+        Instruction::Jump(condition_target),
+    ] {
+        push_instruction(instructions, source_spans, instruction, line.span);
+    }
+    let end_target = instructions.len();
+    patch_jump(instructions, false_jump, end_target)?;
+    for break_jump in loop_context.break_jumps {
+        patch_jump(instructions, break_jump, end_target)?;
+    }
+    locals.remove(local_name);
     Ok(after_body)
 }
 
@@ -1249,7 +2123,19 @@ fn for_in_parts(
     ) {
         return Err(compile_error("for-in currently requires a declared var"));
     }
-    let local_name = declaration
+    // A typed loop declaration may carry a cast qualifier after the local,
+    // e.g. `var/turf/area_turf as anything`.  The qualifier describes the
+    // iteration mode, not a second local name.  Restrict the name search to
+    // the declaration portion before `as`, otherwise the old reverse scan
+    // incorrectly registered `anything` and left `area_turf` unresolved in
+    // the loop body.
+    let declaration_end = declaration
+        .iter()
+        .position(
+            |token| matches!(&token.kind, TokenKind::Identifier(identifier) if identifier == "as"),
+        )
+        .unwrap_or(declaration.len());
+    let local_name = declaration[..declaration_end]
         .iter()
         .rev()
         .find_map(|token| match &token.kind {
@@ -1258,6 +2144,69 @@ fn for_in_parts(
         })
         .ok_or_else(|| compile_error("for-in variable declaration has no name"))?;
     Ok(Some((local_name, iterable)))
+}
+
+/// Recognizes `for(var/name in first to last [step increment])`, rather than treating the
+/// range's `to` keyword as the beginning of a normal iterable expression.
+#[allow(clippy::type_complexity)]
+fn for_to_parts(
+    tokens: &[SpannedToken],
+) -> Result<
+    Option<(
+        String,
+        &[SpannedToken],
+        &[SpannedToken],
+        Option<&[SpannedToken]>,
+    )>,
+    CompileError,
+> {
+    let Some((local_name, iterable)) = for_in_parts(tokens)? else {
+        return Ok(None);
+    };
+    let separators = top_level_keyword_positions(iterable, "to");
+    let [separator] = separators.as_slice() else {
+        return Ok(None);
+    };
+    let start = &iterable[..*separator];
+    let after_to = &iterable[*separator + 1..];
+    // The first top-level `step` begins the increment expression. Subsequent
+    // occurrences are ordinary identifiers inside that expression (for
+    // example, `step step` when the increment is held in a local named
+    // `step`).
+    let step_separator = top_level_keyword_positions(after_to, "step")
+        .into_iter()
+        .next();
+    let (end, step) = match step_separator {
+        None => (after_to, None),
+        Some(separator) => (&after_to[..separator], Some(&after_to[separator + 1..])),
+    };
+    if start.is_empty() || end.is_empty() {
+        return Err(compile_error("for-to range requires both bounds"));
+    }
+    if step.is_some_and(<[SpannedToken]>::is_empty) {
+        return Err(compile_error("for-to range step requires an increment"));
+    }
+    Ok(Some((local_name, start, end, step)))
+}
+
+/// Finds DM header keywords outside nested calls, indexes, and list literals.
+/// Range bounds may legally refer to locals named `to` or `step` inside a
+/// nested expression, so only a top-level occurrence can delimit a `for`
+/// range clause.
+fn top_level_keyword_positions(tokens: &[SpannedToken], keyword: &str) -> Vec<usize> {
+    let mut depth = 0usize;
+    let mut positions = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        match &token.kind {
+            TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+            TokenKind::Punctuation(')' | ']' | '}') => depth = depth.saturating_sub(1),
+            TokenKind::Identifier(identifier) if depth == 0 && identifier == keyword => {
+                positions.push(index);
+            }
+            _ => {}
+        }
+    }
+    positions
 }
 
 fn for_clauses(tokens: &[SpannedToken]) -> Result<[&[SpannedToken]; 3], CompileError> {
@@ -1325,25 +2274,50 @@ fn compile_for_clause(
             (&first.kind, &operator.kind)
         && operator == "="
     {
-        let slot = locals
-            .get(name)
-            .ok_or_else(|| compile_error(format!("unknown local {name:?}")))?;
-        compile_expression(expression, locals, instructions, procedures)?;
-        instructions.push(Instruction::StoreLocal(slot));
+        if let Some(slot) = locals.get(name) {
+            compile_expression(expression, locals, instructions, procedures)?;
+            instructions.push(Instruction::StoreLocal(slot));
+        } else if let Some(field) = locals.src_field(name) {
+            instructions.push(Instruction::LoadSrc);
+            compile_expression(expression, locals, instructions, procedures)?;
+            instructions.push(Instruction::StoreField(field.clone()));
+        } else if let Some(global) = locals.global_field(name) {
+            if operator != "=" {
+                instructions.push(Instruction::LoadGlobal(global.clone()));
+            }
+            compile_expression(expression, locals, instructions, procedures)?;
+            if operator != "=" {
+                instructions.push(compound_instruction(operator)?);
+            }
+            instructions.push(Instruction::StoreGlobal(global.clone()));
+        } else {
+            return Err(compile_error(format!("unknown local {name:?}")));
+        }
         return Ok(None);
     }
     if let Some((name, increment)) = local_increment(tokens) {
-        let slot = locals
-            .get(name)
-            .ok_or_else(|| compile_error(format!("unknown local {name:?}")))?;
-        instructions.push(Instruction::LoadLocal(slot));
+        let local = locals.get(name);
+        let field = locals.src_field(name).cloned();
+        if let Some(slot) = local {
+            instructions.push(Instruction::LoadLocal(slot));
+        } else if let Some(field) = &field {
+            instructions.push(Instruction::LoadSrc);
+            instructions.push(Instruction::Duplicate);
+            instructions.push(Instruction::LoadField(field.clone()));
+        } else {
+            return Err(compile_error(format!("unknown local {name:?}")));
+        }
         instructions.push(Instruction::PushNumber(DmNumberBits::from_f32(1.0)));
         instructions.push(if increment {
             Instruction::Add
         } else {
             Instruction::Subtract
         });
-        instructions.push(Instruction::StoreLocal(slot));
+        if let Some(slot) = local {
+            instructions.push(Instruction::StoreLocal(slot));
+        } else {
+            instructions.push(Instruction::StoreField(field.expect("field was checked")));
+        }
         return Ok(None);
     }
     compile_expression(tokens, locals, instructions, procedures)?;
@@ -1366,7 +2340,7 @@ fn local_increment(tokens: &[SpannedToken]) -> Option<(&str, bool)> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn compile_if(
     lines: &[SourceLine],
     line_index: usize,
@@ -1392,24 +2366,47 @@ fn compile_if(
         Instruction::JumpIfFalse(usize::MAX),
         line.span,
     );
-    let child_index = line_index + 1;
-    let child = lines
-        .get(child_index)
-        .ok_or_else(|| compile_error("if statement requires an indented body"))?;
-    let child_indentation = indentation(child);
-    if child_indentation <= block_indentation {
-        return Err(compile_error("if statement requires an indented body"));
-    }
-    let (after_then, then_falls_through) = compile_block(
-        lines,
-        child_index,
-        child_indentation,
-        locals,
-        instructions,
-        source_spans,
-        procedures,
-        loops,
-    )?;
+    // DM permits a single statement after the closing condition delimiter,
+    // e.g. `if (ready) continue` and `if (missing) return`.  SourceLine
+    // keeps that statement on the same physical line, so compile it through
+    // the ordinary block machinery using a synthetic one-line block.  This
+    // deliberately also preserves `break`/`continue` loop context and all
+    // ordinary statement lowering instead of special-casing return here.
+    let (after_then, then_falls_through) = if let Some(body) = inline_conditional_body(&line.tokens)
+    {
+        let mut inline_line = line.clone();
+        inline_line.tokens = body.to_vec();
+        let (_, falls_through) = compile_block(
+            std::slice::from_ref(&inline_line),
+            0,
+            block_indentation,
+            locals,
+            instructions,
+            source_spans,
+            procedures,
+            loops,
+        )?;
+        (line_index + 1, falls_through)
+    } else {
+        let child_index = line_index + 1;
+        let child = lines
+            .get(child_index)
+            .ok_or_else(|| compile_error("if statement requires an indented body"))?;
+        let child_indentation = indentation(child);
+        if child_indentation <= block_indentation {
+            return Err(compile_error("if statement requires an indented body"));
+        }
+        compile_block(
+            lines,
+            child_index,
+            child_indentation,
+            locals,
+            instructions,
+            source_spans,
+            procedures,
+            loops,
+        )?
+    };
     if !lines
         .get(after_then)
         .is_some_and(|candidate| is_else(candidate, block_indentation))
@@ -1429,50 +2426,424 @@ fn compile_if(
     );
     let else_target = instructions.len();
     patch_jump(instructions, false_jump, else_target)?;
-    let else_child_index = after_then + 1;
-    let else_child = lines
-        .get(else_child_index)
-        .ok_or_else(|| compile_error("else statement requires an indented body"))?;
-    let else_indentation = indentation(else_child);
-    if else_indentation <= block_indentation {
-        return Err(compile_error("else statement requires an indented body"));
-    }
-    let (after_else, else_falls_through) = compile_block(
-        lines,
-        else_child_index,
-        else_indentation,
-        locals,
-        instructions,
-        source_spans,
-        procedures,
-        loops,
-    )?;
+    let (after_else, else_falls_through) = if is_else_if(else_line) {
+        // `else if` is a nested conditional in DM.  Re-present the tail of
+        // the source as an `if` block so its condition and any inline body
+        // take the same lowering path as a top-level conditional.
+        let mut nested_lines = lines[after_then..].to_vec();
+        nested_lines[0].tokens = nested_lines[0].tokens[1..].to_vec();
+        let (after_nested, falls_through) = compile_if(
+            &nested_lines,
+            0,
+            block_indentation,
+            locals,
+            instructions,
+            source_spans,
+            procedures,
+            loops,
+        )?;
+        (after_then + after_nested, falls_through)
+    } else if let Some(body) = inline_else_body(&else_line.tokens) {
+        let mut inline_line = else_line.clone();
+        inline_line.tokens = body.to_vec();
+        let (_, falls_through) = compile_block(
+            std::slice::from_ref(&inline_line),
+            0,
+            block_indentation,
+            locals,
+            instructions,
+            source_spans,
+            procedures,
+            loops,
+        )?;
+        (after_then + 1, falls_through)
+    } else {
+        let else_child_index = after_then + 1;
+        let else_child = lines
+            .get(else_child_index)
+            .ok_or_else(|| compile_error("else statement requires an indented body"))?;
+        let else_indentation = indentation(else_child);
+        if else_indentation <= block_indentation {
+            return Err(compile_error("else statement requires an indented body"));
+        }
+        compile_block(
+            lines,
+            else_child_index,
+            else_indentation,
+            locals,
+            instructions,
+            source_spans,
+            procedures,
+            loops,
+        )?
+    };
     let end_target = instructions.len();
     patch_jump(instructions, end_jump, end_target)?;
     Ok((after_else, then_falls_through || else_falls_through))
+}
+
+/// Compiles DM's selector-based `switch` statement.
+///
+/// Unlike C, DM switch arms do not fall through.  Case arms are written as
+/// `if(value)` (or `if(first to last)`) below the selector and are therefore
+/// not ordinary conditional statements despite sharing their spelling.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn compile_switch(
+    lines: &[SourceLine],
+    line_index: usize,
+    block_indentation: usize,
+    locals: &mut LocalTable,
+    instructions: &mut Vec<Instruction>,
+    source_spans: &mut Vec<SourceSpan>,
+    procedures: &HashMap<String, ProcedureId>,
+    loops: &mut Vec<LoopContext>,
+) -> Result<(usize, bool), CompileError> {
+    let switch_line = &lines[line_index];
+    let selector = condition_tokens(&switch_line.tokens, "switch")?;
+    let selector_start = instructions.len();
+    compile_expression(selector, locals, instructions, procedures)?;
+    let selector_slot = locals.declare_hidden()?;
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::StoreLocal(selector_slot),
+        switch_line.span,
+    );
+    source_spans.extend(std::iter::repeat_n(
+        switch_line.span,
+        instructions.len() - selector_start - 1,
+    ));
+
+    let first_case_index = line_index + 1;
+    let first_case = lines
+        .get(first_case_index)
+        .ok_or_else(|| compile_error("switch statement requires an indented case body"))?;
+    let case_indentation = indentation(first_case);
+    if case_indentation <= block_indentation {
+        return Err(compile_error(
+            "switch statement requires an indented case body",
+        ));
+    }
+
+    let mut next_case_index = first_case_index;
+    let mut end_jumps = Vec::new();
+    let mut saw_default = false;
+    while let Some(case_line) = lines.get(next_case_index) {
+        let current_indentation = indentation(case_line);
+        if current_indentation < case_indentation {
+            break;
+        }
+        if current_indentation > case_indentation {
+            return Err(compile_error("unexpected indentation in switch statement"));
+        }
+        let is_case = matches!(
+            case_line.tokens.first().map(|token| &token.kind),
+            Some(TokenKind::Identifier(keyword)) if keyword == "if"
+        );
+        let is_default = matches!(
+            case_line.tokens.first().map(|token| &token.kind),
+            Some(TokenKind::Identifier(keyword)) if keyword == "else"
+        );
+        if !is_case && !is_default {
+            return Err(compile_error(
+                "switch statement requires if cases or an else default",
+            ));
+        }
+        if saw_default {
+            return Err(compile_error("switch case cannot follow an else default"));
+        }
+        if is_default {
+            if case_line.tokens.len() != 1 {
+                return Err(compile_error(
+                    "switch else default does not accept a condition",
+                ));
+            }
+            saw_default = true;
+        } else {
+            let condition_start = instructions.len();
+            emit_switch_case_condition(
+                condition_tokens(&case_line.tokens, "switch case")?,
+                selector_slot,
+                locals,
+                instructions,
+                procedures,
+            )?;
+            source_spans.extend(std::iter::repeat_n(
+                case_line.span,
+                instructions.len() - condition_start,
+            ));
+        }
+        let false_jump = if is_case {
+            let jump = instructions.len();
+            push_instruction(
+                instructions,
+                source_spans,
+                Instruction::JumpIfFalse(usize::MAX),
+                case_line.span,
+            );
+            Some(jump)
+        } else {
+            None
+        };
+        let body_index = next_case_index + 1;
+        let body_line = lines
+            .get(body_index)
+            .ok_or_else(|| compile_error("switch case requires an indented body"))?;
+        let body_indentation = indentation(body_line);
+        if body_indentation <= case_indentation {
+            return Err(compile_error("switch case requires an indented body"));
+        }
+        let (after_body, _) = compile_block(
+            lines,
+            body_index,
+            body_indentation,
+            locals,
+            instructions,
+            source_spans,
+            procedures,
+            loops,
+        )?;
+        if !saw_default {
+            let end_jump = instructions.len();
+            push_instruction(
+                instructions,
+                source_spans,
+                Instruction::Jump(usize::MAX),
+                case_line.span,
+            );
+            end_jumps.push(end_jump);
+        }
+        if let Some(jump) = false_jump {
+            let next_case_target = instructions.len();
+            patch_jump(instructions, jump, next_case_target)?;
+        }
+        next_case_index = after_body;
+        if saw_default {
+            if lines
+                .get(next_case_index)
+                .is_some_and(|next| indentation(next) == case_indentation)
+            {
+                return Err(compile_error("switch case cannot follow an else default"));
+            }
+            break;
+        }
+    }
+    let end_target = instructions.len();
+    for jump in end_jumps {
+        patch_jump(instructions, jump, end_target)?;
+    }
+    Ok((next_case_index, true))
+}
+
+fn emit_switch_case_condition(
+    tokens: &[SpannedToken],
+    selector_slot: u16,
+    locals: &LocalTable,
+    instructions: &mut Vec<Instruction>,
+    procedures: &HashMap<String, ProcedureId>,
+) -> Result<(), CompileError> {
+    let alternatives = split_switch_tokens(tokens, ',')?;
+    if alternatives.is_empty() {
+        return Err(compile_error("switch case requires at least one value"));
+    }
+    for (alternative_index, alternative) in alternatives.iter().enumerate() {
+        if alternative.is_empty() {
+            return Err(compile_error("switch case contains an empty value"));
+        }
+        let range = split_switch_keyword(alternative, "to")?;
+        if let Some((lower, upper)) = range {
+            if lower.is_empty() || upper.is_empty() {
+                return Err(compile_error("switch range requires both bounds"));
+            }
+            instructions.push(Instruction::LoadLocal(selector_slot));
+            compile_expression(lower, locals, instructions, procedures)?;
+            instructions.push(Instruction::GreaterEqual);
+            instructions.push(Instruction::LoadLocal(selector_slot));
+            compile_expression(upper, locals, instructions, procedures)?;
+            instructions.push(Instruction::LessEqual);
+            instructions.push(Instruction::And);
+        } else {
+            instructions.push(Instruction::LoadLocal(selector_slot));
+            compile_expression(alternative, locals, instructions, procedures)?;
+            instructions.push(Instruction::Equal);
+        }
+        if alternative_index > 0 {
+            instructions.push(Instruction::Or);
+        }
+    }
+    Ok(())
+}
+
+fn split_switch_tokens(
+    tokens: &[SpannedToken],
+    separator: char,
+) -> Result<Vec<&[SpannedToken]>, CompileError> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match token.kind {
+            TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+            TokenKind::Punctuation(')' | ']' | '}') => {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    compile_error("switch case contains unmatched closing punctuation")
+                })?;
+            }
+            TokenKind::Punctuation(punctuation) if punctuation == separator && depth == 0 => {
+                groups.push(&tokens[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err(compile_error(
+            "switch case contains unmatched opening punctuation",
+        ));
+    }
+    groups.push(&tokens[start..]);
+    Ok(groups)
+}
+
+#[allow(clippy::type_complexity)]
+fn split_switch_keyword<'a>(
+    tokens: &'a [SpannedToken],
+    keyword: &str,
+) -> Result<Option<(&'a [SpannedToken], &'a [SpannedToken])>, CompileError> {
+    let mut depth = 0usize;
+    let mut found = None;
+    for (index, token) in tokens.iter().enumerate() {
+        match &token.kind {
+            TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+            TokenKind::Punctuation(')' | ']' | '}') => {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    compile_error("switch range contains unmatched closing punctuation")
+                })?;
+            }
+            TokenKind::Identifier(name)
+                if name == keyword && depth == 0 && found.replace(index).is_some() =>
+            {
+                return Err(compile_error(
+                    "switch range contains multiple 'to' keywords",
+                ));
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err(compile_error(
+            "switch range contains unmatched opening punctuation",
+        ));
+    }
+    Ok(found.map(|index| (&tokens[..index], &tokens[index + 1..])))
 }
 
 fn condition_tokens<'a>(
     tokens: &'a [SpannedToken],
     keyword: &str,
 ) -> Result<&'a [SpannedToken], CompileError> {
-    let expression = &tokens[1..];
+    let mut expression = &tokens[1..];
+    // The preprocessor can retain the opening brace from a compact C-style
+    // conditional such as `if (condition) {`.  Block structure remains
+    // indentation-based in the lowered syntax, so it is not expression input.
+    if matches!(
+        expression.last().map(|token| &token.kind),
+        Some(TokenKind::Punctuation('{'))
+    ) {
+        expression = &expression[..expression.len() - 1];
+    }
     if matches!(
         expression.first().map(|token| &token.kind),
         Some(TokenKind::Punctuation('('))
     ) {
-        if !matches!(
-            expression.last().map(|token| &token.kind),
-            Some(TokenKind::Punctuation(')'))
-        ) {
-            return Err(compile_error(format!("{keyword} condition is missing ')'")));
+        let mut depth = 0usize;
+        for (index, token) in expression.iter().enumerate() {
+            match &token.kind {
+                TokenKind::Punctuation('(') => depth += 1,
+                TokenKind::Punctuation(')') => {
+                    depth = depth.checked_sub(1).ok_or_else(|| {
+                        compile_error(format!("{keyword} condition is missing '('"))
+                    })?;
+                    if depth == 0 {
+                        return Ok(&expression[1..index]);
+                    }
+                }
+                _ => {}
+            }
         }
-        return Ok(&expression[1..expression.len() - 1]);
+        return Err(compile_error(format!("{keyword} condition is missing ')'")));
     }
     if expression.is_empty() {
         return Err(compile_error(format!("{keyword} requires a condition")));
     }
     Ok(expression)
+}
+
+/// Returns the statement written after a parenthesized conditional on the
+/// same physical source line.  A trailing `{` belongs to the preprocessor's
+/// compact brace form and is not an inline DM statement.
+fn inline_conditional_body(tokens: &[SpannedToken]) -> Option<&[SpannedToken]> {
+    let expression = tokens.get(1..)?;
+    if !matches!(
+        expression.first().map(|token| &token.kind),
+        Some(TokenKind::Punctuation('('))
+    ) {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (index, token) in expression.iter().enumerate() {
+        match token.kind {
+            TokenKind::Punctuation('(') => depth += 1,
+            TokenKind::Punctuation(')') => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    let body = &expression[index + 1..];
+                    return (!body.is_empty()
+                        && !matches!(
+                            body.first().map(|token| &token.kind),
+                            Some(TokenKind::Punctuation('{'))
+                        ))
+                    .then_some(body);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Returns a body written directly after `else`, such as `else return`.
+/// `else if` deliberately remains a nested conditional form and is handled
+/// by the regular indented parser path.
+fn inline_else_body(tokens: &[SpannedToken]) -> Option<&[SpannedToken]> {
+    let body = tokens.get(1..)?;
+    (!body.is_empty()
+        && !matches!(
+            body.first().map(|token| &token.kind),
+            Some(TokenKind::Identifier(keyword)) if keyword == "if"
+        )
+        && !matches!(
+            body.first().map(|token| &token.kind),
+            Some(TokenKind::Punctuation('{'))
+        ))
+    .then_some(body)
+}
+
+fn is_else_if(line: &SourceLine) -> bool {
+    matches!(
+        line.tokens.as_slice(),
+        [
+            SpannedToken {
+                kind: TokenKind::Identifier(else_keyword),
+                ..
+            },
+            SpannedToken {
+                kind: TokenKind::Identifier(if_keyword),
+                ..
+            },
+            ..
+        ] if else_keyword == "else" && if_keyword == "if"
+    )
 }
 
 fn indentation(line: &SourceLine) -> usize {
@@ -1548,6 +2919,11 @@ fn compile_result_assignment(
             "*=" => Instruction::Multiply,
             "/=" => Instruction::Divide,
             "%=" => Instruction::Remainder,
+            "&=" => Instruction::BitAnd,
+            "|=" => Instruction::BitOr,
+            "^=" => Instruction::BitXor,
+            "<<=" => Instruction::ShiftLeft,
+            ">>=" => Instruction::ShiftRight,
             _ => {
                 return Err(compile_error(format!(
                     "unsupported special return value assignment operator {assignment:?}"
@@ -1567,9 +2943,9 @@ fn compile_local(
 ) -> Result<String, CompileError> {
     let assignment = tokens
         .iter()
-        .position(|token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="))
-        .ok_or_else(|| compile_error("local declaration requires an initializer"))?;
-    let name = tokens[1..assignment]
+        .position(|token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="));
+    let declaration_end = assignment.unwrap_or(tokens.len());
+    let name = tokens[1..declaration_end]
         .iter()
         .rev()
         .find_map(|token| match &token.kind {
@@ -1577,8 +2953,14 @@ fn compile_local(
             _ => None,
         })
         .ok_or_else(|| compile_error("local declaration has no name"))?;
-    compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
     let slot = locals.declare(name.clone())?;
+    if let Some(assignment) = assignment {
+        compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
+    } else {
+        // Typed and untyped local declarations without an initializer begin
+        // as null in DM.
+        instructions.push(Instruction::PushNull);
+    }
     instructions.push(Instruction::StoreLocal(slot));
     Ok(name)
 }
@@ -1616,6 +2998,52 @@ enum Expression {
     Null,
     Number(DmNumberBits),
     Text(String),
+    TypePath(TypePath),
+    New {
+        type_path: Option<Box<Self>>,
+        arguments: Vec<Self>,
+    },
+    Regex {
+        arguments: Vec<Self>,
+    },
+    MutableAppearance {
+        arguments: Vec<Self>,
+    },
+    ReplaceText {
+        arguments: Vec<Self>,
+        exact: bool,
+        character_indices: bool,
+    },
+    Rand {
+        arguments: Vec<Self>,
+    },
+    Pick {
+        entries: Vec<(Option<Self>, Self)>,
+    },
+    Prob(Box<Self>),
+    Round {
+        arguments: Vec<Self>,
+    },
+    Length {
+        value: Box<Self>,
+    },
+    Ref {
+        value: Box<Self>,
+    },
+    GetStep {
+        source: Box<Self>,
+        direction: Box<Self>,
+    },
+    Range {
+        arguments: Vec<Self>,
+    },
+    TypesOf {
+        value: Box<Self>,
+    },
+    TypePredicate {
+        kind: TypePredicateKind,
+        arguments: Vec<Self>,
+    },
     Local(String),
     Src,
     Usr,
@@ -1630,11 +3058,26 @@ enum Expression {
         procedure: String,
         arguments: Vec<Self>,
     },
+    /// A list expansion used only in an enclosing call or constructor
+    /// argument list (`target(arglist(values))`).
+    ArgList(Box<Self>),
+    Locate {
+        arguments: Vec<Self>,
+    },
+    LocateIn {
+        arguments: Vec<Self>,
+        container: Box<Self>,
+    },
     CurrentCall {
         arguments: Option<Vec<Self>>,
     },
     ParentCall {
         arguments: Option<Vec<Self>>,
+    },
+    DynamicCall {
+        target: Box<Self>,
+        procedure: Box<Self>,
+        arguments: Vec<Self>,
     },
     List(Vec<ListExpressionEntry>),
     Index {
@@ -1650,12 +3093,54 @@ enum Expression {
         left: Box<Self>,
         right: Box<Self>,
     },
+    Conditional {
+        condition: Box<Self>,
+        when_true: Box<Self>,
+        when_false: Box<Self>,
+    },
+    Assignment {
+        target: Box<Self>,
+        operator: String,
+        value: Box<Self>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ListExpressionEntry {
     Positional(Expression),
     Associative { key: Expression, value: Expression },
+}
+
+/// Numeric constants supplied by the BYOND language rather than by project
+/// source. Keep this deliberately finite: an unrecognised identifier must
+/// continue through ordinary local/field resolution and retain its useful
+/// diagnostic instead of silently becoming a number.
+fn dm_builtin_numeric_constant(identifier: &str) -> Option<f32> {
+    match identifier {
+        "FALSE" | "BLEND_DEFAULT" => Some(0.0),
+        "TRUE" | "BLEND_OVERLAY" | "KEEP_TOGETHER" => Some(1.0),
+        "BLEND_ADD" | "KEEP_APART" => Some(2.0),
+        "BLEND_SUBTRACT" => Some(3.0),
+        "BLEND_MULTIPLY" | "LONG_GLIDE" => Some(4.0),
+        "BLEND_INSET_OVERLAY" => Some(5.0),
+        // Appearance flags are BYOND bitflags. Keep the complete contiguous
+        // built-in flag family here rather than teaching project code about
+        // individual flags as each one is encountered.
+        // These make an overlay/image ignore the corresponding value
+        // inherited from its parent.
+        "RESET_TRANSFORM" => Some(8.0),
+        "RESET_COLOR" => Some(16.0),
+        "RESET_ALPHA" => Some(32.0),
+        "PIXEL_SCALE" => Some(64.0),
+        "TILE_BOUND" => Some(128.0),
+        "INHERIT_ID" => Some(256.0),
+        "NO_CLIENT_COLOR" => Some(512.0),
+        "RESET_CONTENTS" => Some(1024.0),
+        "PLANE_MASTER" => Some(2048.0),
+        "PASS_MOUSE" => Some(4096.0),
+        "TILE_MOVER" => Some(8192.0),
+        _ => None,
+    }
 }
 
 struct ExpressionParser<'a> {
@@ -1669,7 +3154,7 @@ impl<'a> ExpressionParser<'a> {
     }
 
     fn parse(mut self) -> Result<Expression, CompileError> {
-        let expression = self.parse_binary(1)?;
+        let expression = self.parse_assignment()?;
         if self.index != self.tokens.len() {
             return Err(compile_error(format!(
                 "unexpected token {:?} in expression",
@@ -1677,6 +3162,57 @@ impl<'a> ExpressionParser<'a> {
             )));
         }
         Ok(expression)
+    }
+
+    /// Parses right-associative assignment expressions. DM permits an
+    /// assignment anywhere an expression is accepted, for example
+    /// `(GLOB.initialized = TRUE)` in a macro expansion.
+    fn parse_assignment(&mut self) -> Result<Expression, CompileError> {
+        let target = self.parse_conditional()?;
+        let Some(TokenKind::Operator(operator)) =
+            self.tokens.get(self.index).map(|token| &token.kind)
+        else {
+            return Ok(target);
+        };
+        if !matches!(
+            operator.as_str(),
+            "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>="
+        ) {
+            return Ok(target);
+        }
+        let operator = operator.clone();
+        self.index += 1;
+        let value = self.parse_assignment()?;
+        Ok(Expression::Assignment {
+            target: Box::new(target),
+            operator,
+            value: Box::new(value),
+        })
+    }
+
+    /// Parses DM's right-associative `condition ? when_true : when_false`
+    /// expression.  It deliberately sits below every binary operator, so a
+    /// condition such as `a || b ? c : d` is parsed as expected.
+    fn parse_conditional(&mut self) -> Result<Expression, CompileError> {
+        let condition = self.parse_binary(1)?;
+        if !matches!(
+            self.tokens.get(self.index).map(|token| &token.kind),
+            Some(TokenKind::Operator(operator)) if operator == "?"
+        ) {
+            return Ok(condition);
+        }
+        self.index += 1;
+        let when_true = self.parse_assignment()?;
+        match self.tokens.get(self.index).map(|token| &token.kind) {
+            Some(TokenKind::Operator(operator)) if operator == ":" => self.index += 1,
+            _ => return Err(compile_error("expected ':' in conditional expression")),
+        }
+        let when_false = self.parse_assignment()?;
+        Ok(Expression::Conditional {
+            condition: Box::new(condition),
+            when_true: Box::new(when_true),
+            when_false: Box::new(when_false),
+        })
     }
 
     fn parse_binary(&mut self, minimum_precedence: u8) -> Result<Expression, CompileError> {
@@ -1691,17 +3227,31 @@ impl<'a> ExpressionParser<'a> {
             let operator = operator.to_owned();
             self.index += 1;
             let right = self.parse_binary(precedence + 1)?;
-            left = Expression::Binary {
-                operator,
-                left: Box::new(left),
-                right: Box::new(right),
+            left = if operator == "in" {
+                match left {
+                    Expression::Locate { arguments } => Expression::LocateIn {
+                        arguments,
+                        container: Box::new(right),
+                    },
+                    left => Expression::Binary {
+                        operator,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    },
+                }
+            } else {
+                Expression::Binary {
+                    operator,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                }
             };
         }
         Ok(left)
     }
 
     fn parse_unary(&mut self) -> Result<Expression, CompileError> {
-        if let Some(operator @ ("!" | "+" | "-")) = self.current_operator() {
+        if let Some(operator @ ("!" | "+" | "-" | "~")) = self.current_operator() {
             let operator = operator.to_owned();
             self.index += 1;
             return Ok(Expression::Unary {
@@ -1711,10 +3261,11 @@ impl<'a> ExpressionParser<'a> {
         }
         let mut expression = self.parse_primary()?;
         loop {
-            if matches!(
+            let starts_list_index = matches!(
                 self.tokens.get(self.index).map(|token| &token.kind),
                 Some(TokenKind::Punctuation('['))
-            ) {
+            ) || matches!(self.current_operator(), Some("?["));
+            if starts_list_index {
                 self.index += 1;
                 let index = self.parse_binary(1)?;
                 if !matches!(
@@ -1730,7 +3281,7 @@ impl<'a> ExpressionParser<'a> {
                 };
                 continue;
             }
-            if matches!(self.current_operator(), Some(".")) {
+            if matches!(self.current_operator(), Some("." | "?.")) {
                 self.index += 1;
                 let Some(TokenKind::Identifier(name)) =
                     self.tokens.get(self.index).map(|token| &token.kind)
@@ -1750,11 +3301,33 @@ impl<'a> ExpressionParser<'a> {
                 };
                 continue;
             }
+            // A datum procedure call is a postfix operation in DM.  The
+            // regular `name(...)` arm in `parse_primary` handles static
+            // calls, while `receiver.name(...)` must retain both the datum
+            // receiver and its dynamically-selected procedure name.  This
+            // occurs extensively in lifecycle code after macro expansion
+            // (for example signal dispatch helpers).
+            if matches!(
+                self.tokens.get(self.index).map(|token| &token.kind),
+                Some(TokenKind::Punctuation('('))
+            ) {
+                let Expression::Field { receiver, name } = expression else {
+                    break;
+                };
+                let arguments = self.parse_call_arguments()?;
+                expression = Expression::DynamicCall {
+                    target: receiver,
+                    procedure: Box::new(Expression::Text(name.as_str().to_owned())),
+                    arguments,
+                };
+                continue;
+            }
             break;
         }
         Ok(expression)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn parse_primary(&mut self) -> Result<Expression, CompileError> {
         let token = self
             .tokens
@@ -1762,6 +3335,31 @@ impl<'a> ExpressionParser<'a> {
             .ok_or_else(|| compile_error("expected an expression"))?;
         self.index += 1;
         match &token.kind {
+            // Type paths are expression values in DM: `/obj/item/tool` is
+            // distinct from text and is accepted by builtins such as
+            // `istype`, `ispath`, and `new`. The lexer exposes every slash as
+            // an operator, so consume the complete slash-delimited sequence
+            // here before ordinary binary division is considered.
+            TokenKind::Operator(operator) if operator == "/" => {
+                let mut path = String::new();
+                loop {
+                    let Some(TokenKind::Identifier(segment)) =
+                        self.tokens.get(self.index).map(|token| &token.kind)
+                    else {
+                        return Err(compile_error("expected a type path segment after '/'"));
+                    };
+                    path.push('/');
+                    path.push_str(segment);
+                    self.index += 1;
+                    if !matches!(self.current_operator(), Some("/")) {
+                        break;
+                    }
+                    self.index += 1;
+                }
+                TypePath::parse(&path)
+                    .map(Expression::TypePath)
+                    .map_err(|error| compile_error(error.to_string()))
+            }
             TokenKind::Operator(operator)
                 if operator == ".."
                     && matches!(
@@ -1796,20 +3394,109 @@ impl<'a> ExpressionParser<'a> {
             }
             TokenKind::Operator(operator) if operator == "." => Ok(Expression::Result),
             TokenKind::Number(spelling) => parse_number(spelling).map(Expression::Number),
-            TokenKind::String(text) | TokenKind::RawString(text) | TokenKind::TextBlock(text) => {
-                Ok(Expression::Text(text.clone()))
-            }
+            // A resource literal is a first-class DM value.  The headless VM
+            // has no asset loader, so preserve its canonical path as text;
+            // this allows resource-valued arguments and field assignments to
+            // compile while retaining a deterministic value for inspection.
+            TokenKind::String(text)
+            | TokenKind::RawString(text)
+            | TokenKind::TextBlock(text)
+            | TokenKind::Resource(text) => Ok(Expression::Text(text.clone())),
             TokenKind::Identifier(identifier) if identifier == "null" => Ok(Expression::Null),
-            TokenKind::Identifier(identifier) if identifier == "TRUE" => {
-                Ok(Expression::Number(DmNumberBits::from_f32(1.0)))
-            }
-            TokenKind::Identifier(identifier) if identifier == "FALSE" => {
-                Ok(Expression::Number(DmNumberBits::from_f32(0.0)))
+            TokenKind::Identifier(identifier)
+                if let Some(value) = dm_builtin_numeric_constant(identifier) =>
+            {
+                Ok(Expression::Number(DmNumberBits::from_f32(value)))
             }
             TokenKind::Identifier(identifier) if identifier == "src" => Ok(Expression::Src),
             TokenKind::Identifier(identifier) if identifier == "usr" => Ok(Expression::Usr),
-            TokenKind::Identifier(identifier) if identifier == "global" => {
+            // `GLOB` is the conventional SS13 alias for DM's built-in
+            // `global` namespace. It is not a local datum and must lower to
+            // the same persistent-global operations as the spelling BYOND
+            // exposes directly.
+            TokenKind::Identifier(identifier) if identifier == "global" || identifier == "GLOB" => {
                 Ok(Expression::GlobalNamespace)
+            }
+            TokenKind::Identifier(identifier) if identifier == "new" => {
+                // `new /path(args)` is the common explicit form.  An
+                // unqualified `new(args)` constructs the current datum type.
+                // Keep the constructor arguments in the AST even though the
+                // headless VM currently only establishes object identity.
+                if matches!(self.current_operator(), Some("/")) {
+                    let type_path = self.parse_primary()?;
+                    let arguments = if matches!(
+                        self.tokens.get(self.index).map(|token| &token.kind),
+                        Some(TokenKind::Punctuation('('))
+                    ) {
+                        self.parse_call_arguments()?
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(Expression::New {
+                        type_path: Some(Box::new(type_path)),
+                        arguments,
+                    })
+                } else if matches!(
+                    self.tokens.get(self.index).map(|token| &token.kind),
+                    Some(TokenKind::Punctuation('('))
+                ) {
+                    Ok(Expression::New {
+                        type_path: None,
+                        arguments: self.parse_call_arguments()?,
+                    })
+                } else if let Some(TokenKind::Identifier(type_name)) =
+                    self.tokens.get(self.index).map(|token| &token.kind)
+                {
+                    // DM also permits a runtime type expression, for example
+                    // `new starting_organ(src)`.  This is distinct from
+                    // unqualified `new(...)`: the identifier is the type to
+                    // instantiate, not a constructor argument.
+                    // Do not delegate this to `parse_unary`: its ordinary
+                    // identifier rule interprets the following `(` as a
+                    // static procedure call. Here it belongs to `new`.
+                    let type_path = Expression::Local(type_name.clone());
+                    self.index += 1;
+                    let arguments = if matches!(
+                        self.tokens.get(self.index).map(|token| &token.kind),
+                        Some(TokenKind::Punctuation('('))
+                    ) {
+                        self.parse_call_arguments()?
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(Expression::New {
+                        type_path: Some(Box::new(type_path)),
+                        arguments,
+                    })
+                } else {
+                    Ok(Expression::New {
+                        type_path: None,
+                        arguments: Vec::new(),
+                    })
+                }
+            }
+            TokenKind::Identifier(identifier) if identifier == "call" => {
+                let selectors = self.parse_call_arguments()?;
+                let (target, procedure) = match selectors.as_slice() {
+                    [procedure] => (Expression::Null, procedure.clone()),
+                    [target, procedure] => (target.clone(), procedure.clone()),
+                    _ => {
+                        return Err(compile_error(
+                            "call requires a procedure or a receiver and procedure",
+                        ));
+                    }
+                };
+                if !matches!(
+                    self.tokens.get(self.index).map(|token| &token.kind),
+                    Some(TokenKind::Punctuation('('))
+                ) {
+                    return Err(compile_error("call selector requires an argument list"));
+                }
+                Ok(Expression::DynamicCall {
+                    target: Box::new(target),
+                    procedure: Box::new(procedure),
+                    arguments: self.parse_call_arguments()?,
+                })
             }
             TokenKind::Identifier(identifier)
                 if matches!(
@@ -1819,6 +3506,162 @@ impl<'a> ExpressionParser<'a> {
             {
                 if identifier == "list" {
                     Ok(Expression::List(self.parse_list_arguments()?))
+                } else if identifier == "arglist" {
+                    let mut arguments = self.parse_call_arguments()?;
+                    if arguments.len() != 1 {
+                        return Err(compile_error(format!(
+                            "arglist requires exactly one list, received {} arguments",
+                            arguments.len()
+                        )));
+                    }
+                    Ok(Expression::ArgList(Box::new(arguments.pop().expect("argument count was validated"))))
+                } else if let Some(kind) = type_predicate_kind(identifier) {
+                    let arguments = self.parse_call_arguments()?;
+                    let valid_count = match kind {
+                        TypePredicateKind::IsType => (1..=2).contains(&arguments.len()),
+                        // BYOND `isloc` is variadic and succeeds only when
+                        // every supplied value is a location.
+                        TypePredicateKind::IsLoc => !arguments.is_empty(),
+                        _ => arguments.len() == 1,
+                    };
+                    if !valid_count {
+                        return Err(compile_error(format!(
+                            "{identifier} received {} arguments",
+                            arguments.len()
+                        )));
+                    }
+                    Ok(Expression::TypePredicate { kind, arguments })
+                } else if identifier == "regex" {
+                    let arguments = self.parse_call_arguments()?;
+                    if !(1..=2).contains(&arguments.len()) {
+                        return Err(compile_error(format!(
+                            "regex requires a pattern and optional flags, received {} arguments",
+                            arguments.len()
+                        )));
+                    }
+                    Ok(Expression::Regex { arguments })
+                } else if identifier == "mutable_appearance" {
+                    Ok(Expression::MutableAppearance {
+                        arguments: self.parse_call_arguments()?,
+                    })
+                } else if let Some((exact, character_indices)) = replacetext_kind(identifier) {
+                    let arguments = self.parse_call_arguments()?;
+                    if !(3..=5).contains(&arguments.len()) {
+                        return Err(compile_error(format!(
+                            "{identifier} requires text, needle, replacement, and optional start/end; received {} arguments",
+                            arguments.len()
+                        )));
+                    }
+                    Ok(Expression::ReplaceText {
+                        arguments,
+                        exact,
+                        character_indices,
+                    })
+                } else if identifier == "length" {
+                    let mut arguments = self.parse_call_arguments()?;
+                    if arguments.len() != 1 {
+                        return Err(compile_error(format!(
+                            "length requires exactly one argument, received {} arguments",
+                            arguments.len()
+                        )));
+                    }
+                    Ok(Expression::Length {
+                        value: Box::new(
+                            arguments
+                                .pop()
+                                .expect("length argument count was validated"),
+                        ),
+                    })
+                } else if identifier == "ref" {
+                    let mut arguments = self.parse_call_arguments()?;
+                    if arguments.len() != 1 {
+                        return Err(compile_error(format!(
+                            "ref requires exactly one argument, received {} arguments",
+                            arguments.len()
+                        )));
+                    }
+                    Ok(Expression::Ref {
+                        value: Box::new(arguments.pop().expect("ref argument count was validated")),
+                    })
+                } else if identifier == "get_step" {
+                    let mut arguments = self.parse_call_arguments()?;
+                    if arguments.len() != 2 {
+                        return Err(compile_error(format!(
+                            "get_step requires exactly an atom/turf and direction, received {} arguments",
+                            arguments.len()
+                        )));
+                    }
+                    let direction = arguments
+                        .pop()
+                        .expect("get_step argument count was validated");
+                    let source = arguments
+                        .pop()
+                        .expect("get_step argument count was validated");
+                    Ok(Expression::GetStep {
+                        source: Box::new(source),
+                        direction: Box::new(direction),
+                    })
+                } else if identifier == "range" {
+                    let arguments = self.parse_call_arguments()?;
+                    if !(1..=2).contains(&arguments.len()) {
+                        return Err(compile_error(format!(
+                            "range requires a distance and optional center, received {} arguments",
+                            arguments.len()
+                        )));
+                    }
+                    Ok(Expression::Range { arguments })
+                } else if identifier == "typesof" {
+                    let mut arguments = self.parse_call_arguments()?;
+                    if arguments.len() != 1 {
+                        return Err(compile_error(format!(
+                            "typesof requires exactly one type argument, received {} arguments",
+                            arguments.len()
+                        )));
+                    }
+                    Ok(Expression::TypesOf {
+                        value: Box::new(
+                            arguments
+                                .pop()
+                                .expect("typesof argument count was validated"),
+                        ),
+                    })
+                } else if identifier == "rand" {
+                    let arguments = self.parse_call_arguments()?;
+                    if !(1..=2).contains(&arguments.len()) {
+                        return Err(compile_error(format!(
+                            "rand requires one or two numeric bounds, received {} arguments",
+                            arguments.len()
+                        )));
+                    }
+                    Ok(Expression::Rand { arguments })
+                } else if identifier == "pick" {
+                    Ok(Expression::Pick {
+                        entries: self.parse_pick_arguments()?,
+                    })
+                } else if identifier == "prob" {
+                    let arguments = self.parse_call_arguments()?;
+                    let [chance] = arguments.as_slice() else {
+                        return Err(compile_error(format!(
+                            "prob requires exactly one percentage, received {} arguments",
+                            arguments.len()
+                        )));
+                    };
+                    Ok(Expression::Prob(Box::new(chance.clone())))
+                } else if identifier == "round" {
+                    let arguments = self.parse_call_arguments()?;
+                    if !(1..=2).contains(&arguments.len()) {
+                        return Err(compile_error(format!(
+                            "round requires a number and optional multiple, received {} arguments",
+                            arguments.len()
+                        )));
+                    }
+                    Ok(Expression::Round { arguments })
+                } else if identifier == "locate" {
+                    Ok(Expression::Locate {
+                        arguments: self.parse_call_arguments()?,
+                    })
+                } else if identifier == "nameof" {
+                    self.parse_nameof_expression()
                 } else {
                     let arguments = self.parse_call_arguments()?;
                     Ok(Expression::Call {
@@ -1829,13 +3672,16 @@ impl<'a> ExpressionParser<'a> {
             }
             TokenKind::Identifier(identifier) => Ok(Expression::Local(identifier.clone())),
             TokenKind::Punctuation('(') => {
-                let expression = self.parse_binary(1)?;
+                let expression = self.parse_assignment()?;
                 match self.tokens.get(self.index).map(|token| &token.kind) {
                     Some(TokenKind::Punctuation(')')) => {
                         self.index += 1;
                         Ok(expression)
                     }
-                    _ => Err(compile_error("expected ')' after expression")),
+                    found => Err(compile_error(format!(
+                        "expected ')' after expression; found {found:?}; next {:?}",
+                        self.tokens.get(self.index + 1).map(|token| &token.kind),
+                    ))),
                 }
             }
             _ => Err(compile_error(format!(
@@ -1843,6 +3689,46 @@ impl<'a> ExpressionParser<'a> {
                 token.kind
             ))),
         }
+    }
+
+    /// Parses BYOND's compile-time `nameof(reference)` form.
+    ///
+    /// The argument is a reference grammar rather than an ordinary runtime
+    /// expression.  In particular, tgstation uses all of these shapes:
+    /// `nameof(.proc/name)`, `nameof(/datum/example.proc/name)`, and
+    /// `nameof(type::field)`.  Each evaluates to the referenced member's
+    /// final textual component.  Retaining that component is sufficient for
+    /// headless callback and signal registration and also supports
+    /// `NAMEOF_STATIC` without pretending its compile-time reference is a
+    /// datum field read.
+    fn parse_nameof_expression(&mut self) -> Result<Expression, CompileError> {
+        debug_assert!(matches!(
+            self.tokens.get(self.index).map(|token| &token.kind),
+            Some(TokenKind::Punctuation('('))
+        ));
+        self.index += 1;
+        let mut nesting = 0_usize;
+        let mut final_name = None;
+        loop {
+            let token = self
+                .tokens
+                .get(self.index)
+                .ok_or_else(|| compile_error("expected ')' after nameof reference"))?;
+            match &token.kind {
+                TokenKind::Punctuation('(') => nesting += 1,
+                TokenKind::Punctuation(')') if nesting == 0 => {
+                    self.index += 1;
+                    break;
+                }
+                TokenKind::Punctuation(')') => nesting -= 1,
+                TokenKind::Identifier(name) => final_name = Some(name.clone()),
+                _ => {}
+            }
+            self.index += 1;
+        }
+        final_name
+            .map(Expression::Text)
+            .ok_or_else(|| compile_error("nameof requires a named reference"))
     }
 
     fn parse_call_arguments(&mut self) -> Result<Vec<Expression>, CompileError> {
@@ -1857,9 +3743,45 @@ impl<'a> ExpressionParser<'a> {
             Some(TokenKind::Punctuation(')'))
         ) {
             loop {
-                arguments.push(self.parse_binary(1)?);
+                // BYOND permits keyword-style call arguments, e.g.
+                // `do_after(user, 4 SECONDS, target = src)`.  The current
+                // execution ABI is positional, but retaining the source
+                // order here is still the correct lowering for its existing
+                // subset and, importantly, lets the compiler continue on to
+                // report the next unsupported construct instead of rejecting
+                // the call syntax itself.
+                if matches!(
+                    (
+                        self.tokens.get(self.index).map(|token| &token.kind),
+                        self.tokens.get(self.index + 1).map(|token| &token.kind),
+                    ),
+                    (
+                        Some(TokenKind::Identifier(_)),
+                        Some(TokenKind::Operator(operator)),
+                    ) if operator == "="
+                ) {
+                    self.index += 2;
+                }
+                arguments.push(self.parse_assignment()?);
                 match self.tokens.get(self.index).map(|token| &token.kind) {
-                    Some(TokenKind::Punctuation(',')) => self.index += 1,
+                    // DM's weighted `pick()` syntax separates a weight from
+                    // its candidate with `;`, e.g. `pick(10; red, 1; blue)`.
+                    // The headless call ABI is positional, so retaining both
+                    // expressions is the most faithful representation it can
+                    // currently carry.
+                    Some(TokenKind::Punctuation(',' | ';')) => {
+                        self.index += 1;
+                        // DM accepts a trailing separator in a parenthesized
+                        // argument list, including multiline calls.  Do not
+                        // attempt to parse the closing parenthesis as the
+                        // next argument expression.
+                        if matches!(
+                            self.tokens.get(self.index).map(|token| &token.kind),
+                            Some(TokenKind::Punctuation(')'))
+                        ) {
+                            break;
+                        }
+                    }
                     Some(TokenKind::Punctuation(')')) => break,
                     _ => {
                         return Err(compile_error(
@@ -1873,6 +3795,44 @@ impl<'a> ExpressionParser<'a> {
         Ok(arguments)
     }
 
+    /// Parses `pick()` entries while retaining its `weight; candidate` form.
+    fn parse_pick_arguments(
+        &mut self,
+    ) -> Result<Vec<(Option<Expression>, Expression)>, CompileError> {
+        debug_assert!(matches!(
+            self.tokens.get(self.index).map(|token| &token.kind),
+            Some(TokenKind::Punctuation('('))
+        ));
+        self.index += 1;
+        let mut entries = Vec::new();
+        while !matches!(
+            self.tokens.get(self.index).map(|token| &token.kind),
+            Some(TokenKind::Punctuation(')'))
+        ) {
+            let first = self.parse_assignment()?;
+            let entry = if matches!(
+                self.tokens.get(self.index).map(|token| &token.kind),
+                Some(TokenKind::Punctuation(';'))
+            ) {
+                self.index += 1;
+                (Some(first), self.parse_assignment()?)
+            } else {
+                (None, first)
+            };
+            entries.push(entry);
+            match self.tokens.get(self.index).map(|token| &token.kind) {
+                Some(TokenKind::Punctuation(',')) => self.index += 1,
+                Some(TokenKind::Punctuation(')')) => break,
+                _ => return Err(compile_error("expected ',' or ')' after pick entry")),
+            }
+        }
+        if entries.is_empty() {
+            return Err(compile_error("pick requires at least one candidate"));
+        }
+        self.index += 1;
+        Ok(entries)
+    }
+
     fn parse_list_arguments(&mut self) -> Result<Vec<ListExpressionEntry>, CompileError> {
         debug_assert!(matches!(
             self.tokens.get(self.index).map(|token| &token.kind),
@@ -1884,10 +3844,14 @@ impl<'a> ExpressionParser<'a> {
             self.tokens.get(self.index).map(|token| &token.kind),
             Some(TokenKind::Punctuation(')'))
         ) {
-            let key_or_value = self.parse_binary(1)?;
+            // The unparenthesized `=` in a list literal introduces an
+            // associative entry rather than an assignment expression. A
+            // parenthesized assignment still reaches `parse_assignment` via
+            // primary-expression parsing.
+            let key_or_value = self.parse_conditional()?;
             if matches!(self.current_operator(), Some("=")) {
                 self.index += 1;
-                let value = self.parse_binary(1)?;
+                let value = self.parse_conditional()?;
                 entries.push(ListExpressionEntry::Associative {
                     key: key_or_value,
                     value,
@@ -1914,8 +3878,37 @@ impl<'a> ExpressionParser<'a> {
     fn current_operator(&self) -> Option<&str> {
         match self.tokens.get(self.index).map(|token| &token.kind) {
             Some(TokenKind::Operator(operator)) => Some(operator),
+            Some(TokenKind::Identifier(identifier)) if identifier == "in" => Some(identifier),
             _ => None,
         }
+    }
+}
+
+/// Classifies BYOND's four `replacetext` builtin spellings without treating
+/// them as project procedures.  The `_char` variants use character positions,
+/// while `Ex` means exact (case-sensitive) matching.
+fn replacetext_kind(identifier: &str) -> Option<(bool, bool)> {
+    match identifier {
+        "replacetext" => Some((false, false)),
+        "replacetextEx" => Some((true, false)),
+        "replacetext_char" => Some((false, true)),
+        "replacetextEx_char" => Some((true, true)),
+        _ => None,
+    }
+}
+
+/// Identifies the compiler-handled BYOND value predicates.
+fn type_predicate_kind(identifier: &str) -> Option<TypePredicateKind> {
+    match identifier {
+        "isnull" => Some(TypePredicateKind::IsNull),
+        "isnum" => Some(TypePredicateKind::IsNum),
+        "ispath" => Some(TypePredicateKind::IsPath),
+        "islist" => Some(TypePredicateKind::IsList),
+        "ismovable" => Some(TypePredicateKind::IsMovable),
+        "isturf" => Some(TypePredicateKind::IsTurf),
+        "isloc" => Some(TypePredicateKind::IsLoc),
+        "istype" => Some(TypePredicateKind::IsType),
+        _ => None,
     }
 }
 
@@ -1943,11 +3936,75 @@ const fn binary_precedence(operator: &str) -> Option<u8> {
     match operator.as_bytes() {
         b"||" => Some(1),
         b"&&" => Some(2),
-        b"==" | b"!=" => Some(3),
-        b"<" | b"<=" | b">" | b">=" => Some(4),
-        b"+" | b"-" => Some(5),
-        b"*" | b"/" | b"%" => Some(6),
+        b"|" => Some(3),
+        b"^" => Some(4),
+        b"&" => Some(5),
+        b"==" | b"!=" => Some(6),
+        b"<<" | b">>" | b"<" | b"<=" | b">" | b">=" | b"in" => Some(7),
+        b"+" | b"-" => Some(8),
+        b"*" | b"/" | b"%" => Some(9),
         _ => None,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+/// Emits an associative-list key, preserving macro-expanded named arguments.
+///
+/// Macro wrappers such as `AddComponent(...)` expand named arguments into
+/// `list(name = value)`. The original call grammar is no longer visible, so
+/// an unbound bare name here is a textual associative key, not an assignment
+/// target. Bound locals and fields retain their ordinary expression meaning.
+fn emit_associative_list_key(
+    key: &Expression,
+    locals: &LocalTable,
+    instructions: &mut Vec<Instruction>,
+    procedures: &HashMap<String, ProcedureId>,
+) -> Result<(), CompileError> {
+    if let Expression::Local(name) = key
+        && locals.get(name).is_none()
+        && locals.src_field(name).is_none()
+        && locals.global_field(name).is_none()
+    {
+        instructions.push(Instruction::PushText(name.clone()));
+        return Ok(());
+    }
+    emit_expression(key, locals, instructions, procedures)
+}
+
+/// Marker used by call-like instructions to consume the count produced by
+/// [`Instruction::ExpandArgumentLists`].  A source procedure cannot have
+/// this many arguments, so it is unambiguous in the compact bytecode ABI.
+const EXPANDED_ARGUMENT_COUNT: u16 = u16::MAX;
+
+/// Emits a call argument vector, retaining BYOND's runtime `arglist()`
+/// expansion semantics.  Ordinary expressions preserve the compact static
+/// count; an expansion emits a small preparation instruction and returns the
+/// sentinel consumed by the following call-like instruction.
+fn emit_call_arguments(
+    arguments: &[Expression],
+    locals: &LocalTable,
+    instructions: &mut Vec<Instruction>,
+    procedures: &HashMap<String, ProcedureId>,
+) -> Result<u16, CompileError> {
+    let argument_count = u16::try_from(arguments.len())
+        .map_err(|_| compile_error("call has more than 65535 positional arguments"))?;
+    let mut expanded_indices = Vec::new();
+    for (index, argument) in arguments.iter().enumerate() {
+        if let Expression::ArgList(value) = argument {
+            expanded_indices.push(to_local_index(index)?);
+            emit_expression(value, locals, instructions, procedures)?;
+        } else {
+            emit_expression(argument, locals, instructions, procedures)?;
+        }
+    }
+    if expanded_indices.is_empty() {
+        Ok(argument_count)
+    } else {
+        instructions.push(Instruction::ExpandArgumentLists {
+            argument_count,
+            expanded_indices,
+        });
+        Ok(EXPANDED_ARGUMENT_COUNT)
     }
 }
 
@@ -1962,11 +4019,135 @@ fn emit_expression(
         Expression::Null => instructions.push(Instruction::PushNull),
         Expression::Number(number) => instructions.push(Instruction::PushNumber(*number)),
         Expression::Text(text) => instructions.push(Instruction::PushText(text.clone())),
+        Expression::TypePath(path) => instructions.push(Instruction::PushTypePath(path.clone())),
+        Expression::New {
+            type_path,
+            arguments,
+        } => {
+            if let Some(type_path) = type_path {
+                emit_expression(type_path, locals, instructions, procedures)?;
+            }
+            let argument_count = emit_call_arguments(arguments, locals, instructions, procedures)?;
+            instructions.push(if type_path.is_some() {
+                Instruction::AllocateDatum { argument_count }
+            } else {
+                Instruction::AllocateCurrentDatum { argument_count }
+            });
+        }
+        Expression::Regex { arguments } => {
+            for argument in arguments {
+                emit_expression(argument, locals, instructions, procedures)?;
+            }
+            instructions.push(Instruction::MakeRegex {
+                argument_count: u8::try_from(arguments.len())
+                    .expect("regex argument count was validated by the parser"),
+            });
+        }
+        Expression::MutableAppearance { arguments } => {
+            for argument in arguments {
+                emit_expression(argument, locals, instructions, procedures)?;
+            }
+            instructions.push(Instruction::MakeMutableAppearance {
+                argument_count: u16::try_from(arguments.len()).map_err(|_| {
+                    compile_error("mutable_appearance has more than 65535 constructor arguments")
+                })?,
+            });
+        }
+        Expression::ReplaceText {
+            arguments,
+            exact,
+            character_indices,
+        } => {
+            for argument in arguments {
+                emit_expression(argument, locals, instructions, procedures)?;
+            }
+            instructions.push(Instruction::ReplaceText {
+                argument_count: u8::try_from(arguments.len())
+                    .expect("replacetext argument count was validated by the parser"),
+                exact: *exact,
+                character_indices: *character_indices,
+            });
+        }
+        Expression::Length { value } => {
+            emit_expression(value, locals, instructions, procedures)?;
+            instructions.push(Instruction::Length);
+        }
+        Expression::Ref { value } => {
+            emit_expression(value, locals, instructions, procedures)?;
+            instructions.push(Instruction::Ref);
+        }
+        Expression::GetStep { source, direction } => {
+            emit_expression(source, locals, instructions, procedures)?;
+            emit_expression(direction, locals, instructions, procedures)?;
+            instructions.push(Instruction::GetStep);
+        }
+        Expression::Range { arguments } => {
+            for argument in arguments {
+                emit_expression(argument, locals, instructions, procedures)?;
+            }
+            instructions.push(Instruction::Range {
+                argument_count: u8::try_from(arguments.len())
+                    .expect("range argument count was validated by the parser"),
+            });
+        }
+        Expression::TypesOf { value } => {
+            emit_expression(value, locals, instructions, procedures)?;
+            instructions.push(Instruction::TypesOf);
+        }
+        Expression::Rand { arguments } => {
+            for argument in arguments {
+                emit_expression(argument, locals, instructions, procedures)?;
+            }
+            instructions.push(Instruction::Rand {
+                argument_count: u8::try_from(arguments.len())
+                    .expect("rand argument count was validated by the parser"),
+            });
+        }
+        Expression::Pick { entries } => {
+            let mut weighted = Vec::with_capacity(entries.len());
+            for (weight, candidate) in entries {
+                weighted.push(weight.is_some());
+                if let Some(weight) = weight {
+                    emit_expression(weight, locals, instructions, procedures)?;
+                }
+                emit_expression(candidate, locals, instructions, procedures)?;
+            }
+            instructions.push(Instruction::Pick { weighted });
+        }
+        Expression::Prob(chance) => {
+            emit_expression(chance, locals, instructions, procedures)?;
+            instructions.push(Instruction::Prob);
+        }
+        Expression::Round { arguments } => {
+            for argument in arguments {
+                emit_expression(argument, locals, instructions, procedures)?;
+            }
+            instructions.push(Instruction::Round {
+                argument_count: u8::try_from(arguments.len())
+                    .expect("round argument count was validated by the parser"),
+            });
+        }
+        Expression::TypePredicate { kind, arguments } => {
+            for argument in arguments {
+                emit_expression(argument, locals, instructions, procedures)?;
+            }
+            instructions.push(Instruction::TypePredicate {
+                kind: *kind,
+                argument_count: u8::try_from(arguments.len())
+                    .expect("predicate argument count was validated by the parser"),
+            });
+        }
         Expression::Local(name) => {
-            let slot = locals
-                .get(name)
-                .ok_or_else(|| compile_error(format!("unknown local {name:?}")))?;
-            instructions.push(Instruction::LoadLocal(slot));
+            if let Some(slot) = locals.get(name) {
+                instructions.push(Instruction::LoadLocal(slot));
+            } else if let Some(field) = locals.src_field(name) {
+                instructions.push(Instruction::LoadSrc);
+                instructions.push(Instruction::LoadField(field.clone()));
+            } else if let Some(global) = locals.global_field(name) {
+                instructions.push(Instruction::LoadGlobal(global.clone()));
+            } else {
+                return Err(compile_error(format!("unknown local {name:?}")));
+            }
         }
         Expression::Src => instructions.push(Instruction::LoadSrc),
         Expression::Usr => instructions.push(Instruction::LoadUsr),
@@ -1981,6 +4162,9 @@ fn emit_expression(
             instructions.push(Instruction::LoadGlobal(name.clone()));
         }
         Expression::Result => instructions.push(Instruction::LoadResult),
+        Expression::ArgList(_) => {
+            return Err(compile_error("arglist may only appear in a call or constructor argument list"));
+        }
         Expression::Call {
             procedure,
             arguments,
@@ -1989,24 +4173,35 @@ fn emit_expression(
                 .get(procedure)
                 .copied()
                 .ok_or_else(|| compile_error(format!("unknown procedure {procedure:?}")))?;
-            let argument_count = u16::try_from(arguments.len())
-                .map_err(|_| compile_error("call has more than 65535 positional arguments"))?;
-            for argument in arguments {
-                emit_expression(argument, locals, instructions, procedures)?;
-            }
+            let argument_count = emit_call_arguments(arguments, locals, instructions, procedures)?;
             instructions.push(Instruction::Call {
                 procedure: target,
                 argument_count,
             });
         }
+        Expression::Locate { arguments } => {
+            let argument_count = u16::try_from(arguments.len())
+                .map_err(|_| compile_error("locate has more than 65535 positional arguments"))?;
+            for argument in arguments {
+                emit_expression(argument, locals, instructions, procedures)?;
+            }
+            instructions.push(Instruction::Locate { argument_count });
+        }
+        Expression::LocateIn {
+            arguments,
+            container,
+        } => {
+            let argument_count = u16::try_from(arguments.len())
+                .map_err(|_| compile_error("locate has more than 65535 positional arguments"))?;
+            for argument in arguments {
+                emit_expression(argument, locals, instructions, procedures)?;
+            }
+            emit_expression(container, locals, instructions, procedures)?;
+            instructions.push(Instruction::LocateIn { argument_count });
+        }
         Expression::CurrentCall { arguments } => {
             let argument_count = if let Some(arguments) = arguments {
-                let count = u16::try_from(arguments.len())
-                    .map_err(|_| compile_error("call has more than 65535 positional arguments"))?;
-                for argument in arguments {
-                    emit_expression(argument, locals, instructions, procedures)?;
-                }
-                Some(count)
+                Some(emit_call_arguments(arguments, locals, instructions, procedures)?)
             } else {
                 None
             };
@@ -2014,12 +4209,7 @@ fn emit_expression(
         }
         Expression::ParentCall { arguments } => {
             let argument_count = if let Some(arguments) = arguments {
-                let count = u16::try_from(arguments.len())
-                    .map_err(|_| compile_error("call has more than 65535 positional arguments"))?;
-                for argument in arguments {
-                    emit_expression(argument, locals, instructions, procedures)?;
-                }
-                Some(count)
+                Some(emit_call_arguments(arguments, locals, instructions, procedures)?)
             } else {
                 None
             };
@@ -2027,6 +4217,16 @@ fn emit_expression(
                 procedure: procedures.get("..").copied(),
                 argument_count,
             });
+        }
+        Expression::DynamicCall {
+            target,
+            procedure,
+            arguments,
+        } => {
+            emit_expression(target, locals, instructions, procedures)?;
+            emit_expression(procedure, locals, instructions, procedures)?;
+            let argument_count = emit_call_arguments(arguments, locals, instructions, procedures)?;
+            instructions.push(Instruction::CallDynamic { argument_count });
         }
         Expression::List(entries) => {
             let mut kinds = Vec::with_capacity(entries.len());
@@ -2037,7 +4237,7 @@ fn emit_expression(
                         kinds.push(ListEntryKind::Positional);
                     }
                     ListExpressionEntry::Associative { key, value } => {
-                        emit_expression(key, locals, instructions, procedures)?;
+                        emit_associative_list_key(key, locals, instructions, procedures)?;
                         emit_expression(value, locals, instructions, procedures)?;
                         kinds.push(ListEntryKind::Associative);
                     }
@@ -2056,6 +4256,7 @@ fn emit_expression(
                 "+" => {}
                 "-" => instructions.push(Instruction::Negate),
                 "!" => instructions.push(Instruction::Not),
+                "~" => instructions.push(Instruction::BitNot),
                 _ => {
                     return Err(compile_error(format!(
                         "unsupported unary operator {operator}"
@@ -2076,8 +4277,14 @@ fn emit_expression(
                 "*" => Instruction::Multiply,
                 "/" => Instruction::Divide,
                 "%" => Instruction::Remainder,
+                "&" => Instruction::BitAnd,
+                "|" => Instruction::BitOr,
+                "^" => Instruction::BitXor,
+                "<<" => Instruction::ShiftLeft,
+                ">>" => Instruction::ShiftRight,
                 "==" => Instruction::Equal,
                 "!=" => Instruction::NotEqual,
+                "in" => Instruction::Contains,
                 "<" => Instruction::Less,
                 "<=" => Instruction::LessEqual,
                 ">" => Instruction::Greater,
@@ -2091,10 +4298,125 @@ fn emit_expression(
                 }
             });
         }
+        Expression::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            emit_expression(condition, locals, instructions, procedures)?;
+            let false_jump = instructions.len();
+            instructions.push(Instruction::JumpIfFalse(usize::MAX));
+            emit_expression(when_true, locals, instructions, procedures)?;
+            let end_jump = instructions.len();
+            instructions.push(Instruction::Jump(usize::MAX));
+            let false_target = instructions.len();
+            patch_jump(instructions, false_jump, false_target)?;
+            emit_expression(when_false, locals, instructions, procedures)?;
+            let end_target = instructions.len();
+            patch_jump(instructions, end_jump, end_target)?;
+        }
+        Expression::Assignment {
+            target,
+            operator,
+            value,
+        } => emit_assignment_expression(target, operator, value, locals, instructions, procedures)?,
     }
     Ok(())
 }
 
+fn emit_assignment_expression(
+    target: &Expression,
+    operator: &str,
+    value: &Expression,
+    locals: &LocalTable,
+    instructions: &mut Vec<Instruction>,
+    procedures: &HashMap<String, ProcedureId>,
+) -> Result<(), CompileError> {
+    match target {
+        Expression::Local(name) => {
+            if let Some(slot) = locals.get(name) {
+                if operator != "=" {
+                    instructions.push(Instruction::LoadLocal(slot));
+                }
+                emit_expression(value, locals, instructions, procedures)?;
+                if operator != "=" {
+                    instructions.push(compound_instruction(operator)?);
+                }
+                instructions.push(Instruction::Duplicate);
+                instructions.push(Instruction::StoreLocal(slot));
+            } else if let Some(field) = locals.src_field(name) {
+                instructions.push(Instruction::LoadSrc);
+                if operator != "=" {
+                    instructions.push(Instruction::Duplicate);
+                    instructions.push(Instruction::LoadField(field.clone()));
+                }
+                emit_expression(value, locals, instructions, procedures)?;
+                if operator != "=" {
+                    instructions.push(compound_instruction(operator)?);
+                }
+                instructions.push(Instruction::Duplicate);
+                instructions.push(Instruction::StoreField(field.clone()));
+            } else if let Some(global) = locals.global_field(name) {
+                if operator != "=" {
+                    instructions.push(Instruction::LoadGlobal(global.clone()));
+                }
+                emit_expression(value, locals, instructions, procedures)?;
+                if operator != "=" {
+                    instructions.push(compound_instruction(operator)?);
+                }
+                instructions.push(Instruction::Duplicate);
+                instructions.push(Instruction::StoreGlobal(global.clone()));
+            } else {
+                return Err(compile_error(format!("unknown local {name:?}")));
+            }
+        }
+        Expression::GlobalField(name) => {
+            if operator != "=" {
+                instructions.push(Instruction::LoadGlobal(name.clone()));
+            }
+            emit_expression(value, locals, instructions, procedures)?;
+            if operator != "=" {
+                instructions.push(compound_instruction(operator)?);
+            }
+            instructions.push(Instruction::Duplicate);
+            instructions.push(Instruction::StoreGlobal(name.clone()));
+        }
+        Expression::Field { receiver, name } => {
+            emit_expression(receiver, locals, instructions, procedures)?;
+            if operator != "=" {
+                instructions.push(Instruction::Duplicate);
+                instructions.push(Instruction::LoadField(name.clone()));
+            }
+            emit_expression(value, locals, instructions, procedures)?;
+            if operator != "=" {
+                instructions.push(compound_instruction(operator)?);
+            }
+            instructions.push(Instruction::Duplicate);
+            instructions.push(Instruction::StoreField(name.clone()));
+        }
+        Expression::Index { list, index } => {
+            emit_expression(list, locals, instructions, procedures)?;
+            emit_expression(index, locals, instructions, procedures)?;
+            if operator == "=" {
+                emit_expression(value, locals, instructions, procedures)?;
+                instructions.push(Instruction::SetListIndexKeep);
+            } else {
+                // CompoundListIndex consumes the list, key, and right operand
+                // and leaves no value, so retain an independent copy of the
+                // computed result is not possible without a temporary. Keep
+                // compound assignment expressions explicit until the VM has a
+                // value-preserving variant.
+                return Err(compile_error(
+                    "compound list assignment is not supported as an expression",
+                ));
+            }
+        }
+        _ => return Err(compile_error("assignment target is not writable")),
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
 fn bind_initializer_expression(
     expression: &mut Expression,
     bindings: &BTreeMap<String, InitializerBinding>,
@@ -2115,7 +4437,65 @@ fn bind_initializer_expression(
         Expression::Field { receiver, .. } => {
             bind_initializer_expression(receiver, bindings)?;
         }
-        Expression::Call { arguments, .. } => {
+        Expression::Call { arguments, .. }
+        | Expression::Regex { arguments }
+        | Expression::MutableAppearance { arguments }
+        | Expression::ReplaceText { arguments, .. }
+        | Expression::Rand { arguments }
+        | Expression::Round { arguments }
+        | Expression::Range { arguments }
+        | Expression::TypePredicate { arguments, .. }
+        | Expression::Locate { arguments } => {
+            for argument in arguments {
+                bind_initializer_expression(argument, bindings)?;
+            }
+        }
+        Expression::Length { value }
+        | Expression::Ref { value }
+        | Expression::TypesOf { value } => {
+            bind_initializer_expression(value, bindings)?;
+        }
+        Expression::ArgList(value) => bind_initializer_expression(value, bindings)?,
+        Expression::GetStep { source, direction } => {
+            bind_initializer_expression(source, bindings)?;
+            bind_initializer_expression(direction, bindings)?;
+        }
+        Expression::Prob(chance) => bind_initializer_expression(chance, bindings)?,
+        Expression::Pick { entries } => {
+            for (weight, candidate) in entries {
+                if let Some(weight) = weight {
+                    bind_initializer_expression(weight, bindings)?;
+                }
+                bind_initializer_expression(candidate, bindings)?;
+            }
+        }
+        Expression::New {
+            type_path,
+            arguments,
+        } => {
+            if let Some(type_path) = type_path {
+                bind_initializer_expression(type_path, bindings)?;
+            }
+            for argument in arguments {
+                bind_initializer_expression(argument, bindings)?;
+            }
+        }
+        Expression::LocateIn {
+            arguments,
+            container,
+        } => {
+            for argument in arguments {
+                bind_initializer_expression(argument, bindings)?;
+            }
+            bind_initializer_expression(container, bindings)?;
+        }
+        Expression::DynamicCall {
+            target,
+            procedure,
+            arguments,
+        } => {
+            bind_initializer_expression(target, bindings)?;
+            bind_initializer_expression(procedure, bindings)?;
             for argument in arguments {
                 bind_initializer_expression(argument, bindings)?;
             }
@@ -2144,6 +4524,19 @@ fn bind_initializer_expression(
             bind_initializer_expression(left, bindings)?;
             bind_initializer_expression(right, bindings)?;
         }
+        Expression::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            bind_initializer_expression(condition, bindings)?;
+            bind_initializer_expression(when_true, bindings)?;
+            bind_initializer_expression(when_false, bindings)?;
+        }
+        Expression::Assignment { target, value, .. } => {
+            bind_initializer_expression(target, bindings)?;
+            bind_initializer_expression(value, bindings)?;
+        }
         Expression::CurrentCall { .. } | Expression::ParentCall { .. } | Expression::Result => {
             return Err(compile_error(
                 "current-procedure state is unavailable in a variable initializer",
@@ -2152,6 +4545,7 @@ fn bind_initializer_expression(
         Expression::Null
         | Expression::Number(_)
         | Expression::Text(_)
+        | Expression::TypePath(_)
         | Expression::Src
         | Expression::Usr
         | Expression::GlobalNamespace
@@ -2192,6 +4586,8 @@ impl Default for ExecutionLimits {
 pub struct ExecutionState {
     heap: ValueHeap,
     globals: BTreeMap<FieldName, Value>,
+    type_paths: Arc<std::collections::BTreeSet<TypePath>>,
+    random_state: u64,
 }
 
 impl ExecutionState {
@@ -2207,6 +4603,8 @@ impl ExecutionState {
         Self {
             heap,
             globals: BTreeMap::new(),
+            type_paths: Arc::new(std::collections::BTreeSet::new()),
+            random_state: 0,
         }
     }
 
@@ -2242,6 +4640,25 @@ impl ExecutionState {
     /// Deletes a persistent runtime global.
     pub fn delete_global(&mut self, name: &FieldName) -> Option<Value> {
         self.globals.remove(name)
+    }
+
+    /// Replaces the canonical type catalog used by `typesof()`.
+    pub fn set_type_paths(&mut self, paths: impl IntoIterator<Item = TypePath>) {
+        self.type_paths = Arc::new(paths.into_iter().collect());
+    }
+
+    /// Replaces the canonical type catalog used by `typesof()` with a shared
+    /// immutable catalog.
+    ///
+    /// Runtime images use this to avoid cloning a project's complete object
+    /// tree for every dynamically evaluated initializer.
+    pub fn set_shared_type_paths(&mut self, paths: Arc<std::collections::BTreeSet<TypePath>>) {
+        self.type_paths = paths;
+    }
+
+    /// Iterates the canonical type catalog in lexical path order.
+    pub fn type_paths(&self) -> impl Iterator<Item = &TypePath> {
+        self.type_paths.iter()
     }
 
     /// Iterates globals in canonical field-name order for snapshots.
@@ -2560,6 +4977,316 @@ fn run_frames(
                 frames[frame_index].stack.push(Value::Number(number));
             }
             Instruction::PushText(text) => frames[frame_index].stack.push(Value::text(text)),
+            Instruction::PushTypePath(path) => {
+                frames[frame_index].stack.push(Value::TypePath(path));
+            }
+            Instruction::ExpandArgumentLists {
+                argument_count,
+                expanded_indices,
+            } => {
+                let count = usize::from(argument_count);
+                if count > frames[frame_index].stack.len() {
+                    return Err(execution_error(module, &frames, "bytecode stack underflow"));
+                }
+                let source = {
+                    let stack = &mut frames[frame_index].stack;
+                    stack.split_off(stack.len() - count)
+                };
+                let mut expanded = Vec::new();
+                for (index, value) in source.into_iter().enumerate() {
+                    let index = u16::try_from(index).expect("source argument count is u16");
+                    if expanded_indices.binary_search(&index).is_ok() {
+                        let Value::List(list) = value else {
+                            return Err(execution_error(
+                                module,
+                                &frames,
+                                "arglist requires a list value",
+                            ));
+                        };
+                        let list = state.heap.list(list).map_err(|error| {
+                            execution_error(module, &frames, error.to_string())
+                        })?;
+                        expanded.extend(list.positions().map(|(_, value)| value.clone()));
+                    } else {
+                        expanded.push(value);
+                    }
+                }
+                let expanded_count = u16::try_from(expanded.len()).map_err(|_| {
+                    execution_error(module, &frames, "expanded call has more than 65535 arguments")
+                })?;
+                let stack = &mut frames[frame_index].stack;
+                stack.extend(expanded);
+                stack.push(Value::number(f32::from(expanded_count)));
+            }
+            Instruction::AllocateDatum { argument_count } => {
+                let count_result = runtime_argument_count(&mut frames[frame_index].stack, argument_count);
+                let count = count_result.map_err(|message| execution_error(module, &frames, message))?;
+                let stack = &mut frames[frame_index].stack;
+                if stack.len() < count + 1 {
+                    return Err(execution_error(module, &frames, "bytecode stack underflow"));
+                }
+                let arguments_start = stack.len() - count;
+                let type_path_index = arguments_start - 1;
+                let type_path = match stack[type_path_index].clone() {
+                    Value::TypePath(path) => path,
+                    value => {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("new requires a type path, received {value}"),
+                        ));
+                    }
+                };
+                stack.truncate(type_path_index);
+                let datum = state.heap.allocate_datum(type_path);
+                stack.push(Value::Datum(datum));
+            }
+            Instruction::AllocateCurrentDatum { argument_count } => {
+                let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                if frames[frame_index].stack.len() < count {
+                    return Err(execution_error(module, &frames, "bytecode stack underflow"));
+                }
+                let type_path = match frames[frame_index].src.clone() {
+                    Value::Datum(datum) => state
+                        .heap
+                        .datum(datum)
+                        .map_err(|error| execution_error(module, &frames, error.to_string()))?
+                        .type_path()
+                        .clone(),
+                    Value::TypePath(path) => path,
+                    value => {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("unqualified new requires datum src, received {value}"),
+                        ));
+                    }
+                };
+                let stack = &mut frames[frame_index].stack;
+                stack.truncate(stack.len() - count);
+                let datum = state.heap.allocate_datum(type_path);
+                stack.push(Value::Datum(datum));
+            }
+            Instruction::MakeRegex { argument_count } => {
+                let count = usize::from(argument_count);
+                if !(1..=2).contains(&count) || frames[frame_index].stack.len() < count {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "invalid regex constructor stack",
+                    ));
+                }
+                let arguments = {
+                    let stack = &mut frames[frame_index].stack;
+                    stack.split_off(stack.len() - count)
+                };
+                let pattern = arguments[0].clone();
+                let flags = arguments.get(1).cloned().unwrap_or(Value::Null);
+                let type_path =
+                    TypePath::parse("/regex").expect("the built-in regex type path is valid");
+                let text =
+                    FieldName::parse("text").expect("the built-in regex text field name is valid");
+                let flags_name = FieldName::parse("flags")
+                    .expect("the built-in regex flags field name is valid");
+                let datum = state.heap.allocate_datum(type_path);
+                state
+                    .heap
+                    .set_datum_field(datum, text, pattern)
+                    .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                state
+                    .heap
+                    .set_datum_field(datum, flags_name, flags)
+                    .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                frames[frame_index].stack.push(Value::Datum(datum));
+            }
+            Instruction::MakeMutableAppearance { argument_count } => {
+                let count = usize::from(argument_count);
+                if frames[frame_index].stack.len() < count {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "invalid mutable_appearance constructor stack",
+                    ));
+                }
+                let stack = &mut frames[frame_index].stack;
+                stack.truncate(stack.len() - count);
+                let type_path = TypePath::parse("/mutable_appearance")
+                    .expect("the built-in mutable_appearance type path is valid");
+                let datum = state.heap.allocate_datum(type_path);
+                stack.push(Value::Datum(datum));
+            }
+            Instruction::ReplaceText {
+                argument_count,
+                exact,
+                character_indices,
+            } => {
+                let count = usize::from(argument_count);
+                if !(3..=5).contains(&count) || frames[frame_index].stack.len() < count {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "invalid replacetext builtin stack",
+                    ));
+                }
+                let arguments = {
+                    let stack = &mut frames[frame_index].stack;
+                    stack.split_off(stack.len() - count)
+                };
+                let value = replace_text_builtin(&arguments, exact, character_indices, &state.heap)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].stack.push(Value::text(value));
+            }
+            Instruction::Length => {
+                let value = match pop(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let length = match builtin_length(&value, &state.heap) {
+                    Ok(length) => length,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                frames[frame_index].stack.push(Value::number(length));
+            }
+            Instruction::Ref => {
+                let value = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].stack.push(ref_builtin(&value));
+            }
+            Instruction::GetStep => {
+                let direction = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let source = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let value = get_step_builtin(&source, &direction, &state.heap)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].stack.push(value);
+            }
+            Instruction::Range { argument_count } => {
+                let count = usize::from(argument_count);
+                if !(1..=2).contains(&count) || frames[frame_index].stack.len() < count {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "invalid range builtin stack",
+                    ));
+                }
+                let arguments = {
+                    let stack = &mut frames[frame_index].stack;
+                    stack.split_off(stack.len() - count)
+                };
+                let value = range_builtin(&arguments, &frames[frame_index].src, &mut state.heap)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].stack.push(value);
+            }
+            Instruction::TypesOf => {
+                let selector = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let paths = typesof_builtin(&selector, &state.heap, &state.type_paths)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let list = state.heap.allocate_list();
+                for path in paths {
+                    state
+                        .heap
+                        .list_mut(list)
+                        .expect("a newly allocated list handle must be live")
+                        .add(Value::TypePath(path));
+                }
+                frames[frame_index].stack.push(Value::List(list));
+            }
+            Instruction::Rand { argument_count } => {
+                let count = usize::from(argument_count);
+                if !(1..=2).contains(&count) || frames[frame_index].stack.len() < count {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "invalid rand builtin stack",
+                    ));
+                }
+                let stack_length = frames[frame_index].stack.len();
+                let arguments = frames[frame_index].stack.split_off(stack_length - count);
+                let value = random_integer(&arguments, &mut state.random_state)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].stack.push(Value::number(value));
+            }
+            Instruction::Pick { weighted } => {
+                let value_count = weighted
+                    .iter()
+                    .map(|is_weighted| 1 + usize::from(*is_weighted))
+                    .sum::<usize>();
+                if value_count > frames[frame_index].stack.len() {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "invalid pick builtin stack",
+                    ));
+                }
+                let stack_length = frames[frame_index].stack.len();
+                let values = frames[frame_index]
+                    .stack
+                    .split_off(stack_length - value_count);
+                let value = pick_value(&values, &weighted, &state.heap, &mut state.random_state)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].stack.push(value);
+            }
+            Instruction::Prob => {
+                let chance = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let chance = chance.as_number().ok_or_else(|| {
+                    execution_error(
+                        module,
+                        &frames,
+                        format!("prob requires a number, received {chance}"),
+                    )
+                })?;
+                let result =
+                    deterministic_unit(&mut state.random_state) * 100.0 < chance.clamp(0.0, 100.0);
+                frames[frame_index]
+                    .stack
+                    .push(Value::number(f32::from(result)));
+            }
+            Instruction::Round { argument_count } => {
+                let count = usize::from(argument_count);
+                if !(1..=2).contains(&count) || frames[frame_index].stack.len() < count {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "invalid round builtin stack",
+                    ));
+                }
+                let stack = &mut frames[frame_index].stack;
+                let arguments = stack.split_off(stack.len() - count);
+                let value = round_builtin(&arguments)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].stack.push(Value::number(value));
+            }
+            Instruction::TypePredicate {
+                kind,
+                argument_count,
+            } => {
+                let count = usize::from(argument_count);
+                let valid_count = match kind {
+                    TypePredicateKind::IsType => (1..=2).contains(&count),
+                    TypePredicateKind::IsLoc => count >= 1,
+                    _ => count == 1,
+                };
+                if !valid_count || frames[frame_index].stack.len() < count {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "invalid type predicate builtin stack",
+                    ));
+                }
+                let arguments = {
+                    let stack = &mut frames[frame_index].stack;
+                    stack.split_off(stack.len() - count)
+                };
+                let result = type_predicate_builtin(kind, &arguments, &state.heap)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index]
+                    .stack
+                    .push(Value::number(f32::from(result)));
+            }
             Instruction::MakeList(item_count) => {
                 let count = usize::from(item_count);
                 let stack_length = frames[frame_index].stack.len();
@@ -2574,6 +5301,17 @@ fn run_frames(
                         .list_mut(list)
                         .expect("a newly allocated list handle must be live")
                         .add(item);
+                }
+                frames[frame_index].stack.push(Value::List(list));
+            }
+            Instruction::MakeArgs => {
+                let list = state.heap.allocate_list();
+                for value in &frames[frame_index].arguments {
+                    state
+                        .heap
+                        .list_mut(list)
+                        .expect("a newly allocated list handle must be live")
+                        .add(value.clone());
                 }
                 frames[frame_index].stack.push(Value::List(list));
             }
@@ -2666,6 +5404,70 @@ fn run_frames(
                     return Err(execution_error(module, &frames, error.to_string()));
                 }
             }
+            Instruction::SetListIndexKeep => {
+                let value = match pop(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let key = match pop(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let list = match pop(&mut frames[frame_index].stack) {
+                    Ok(Value::List(list)) => list,
+                    Ok(value) => {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("list assignment received {value}"),
+                        ));
+                    }
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                if let Err(error) = write_list_value(&mut state.heap, list, key, value.clone()) {
+                    return Err(execution_error(module, &frames, error.to_string()));
+                }
+                frames[frame_index].stack.push(value);
+            }
+            Instruction::CompoundListIndex(operator) => {
+                let right = match pop_number(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let key = match pop(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let list = match pop(&mut frames[frame_index].stack) {
+                    Ok(Value::List(list)) => list,
+                    Ok(value) => {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("list assignment received {value}"),
+                        ));
+                    }
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let current = match read_list_value(&state.heap, list, &key) {
+                    Ok(value) => value.clone(),
+                    Err(error) => {
+                        return Err(execution_error(module, &frames, error.to_string()));
+                    }
+                };
+                let Some(left) = current.as_number() else {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        format!("numeric operation received {current}"),
+                    ));
+                };
+                let value =
+                    Value::number(execute_compound_list_index_operation(operator, left, right));
+                if let Err(error) = write_list_value(&mut state.heap, list, key, value) {
+                    return Err(execution_error(module, &frames, error.to_string()));
+                }
+            }
             Instruction::ListLength => {
                 let list = match pop(&mut frames[frame_index].stack) {
                     Ok(Value::List(list)) => list,
@@ -2710,10 +5512,22 @@ fn run_frames(
                     Ok(datum) => datum,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                let value = match state.heap.datum_field(datum, &name) {
-                    Ok(value) => value.clone(),
-                    Err(error) => {
-                        return Err(execution_error(module, &frames, error.to_string()));
+                // `datum.type` is a built-in, read-only field.  It is not a
+                // materialized user field: its value always reflects the
+                // heap datum's canonical runtime type.
+                let value = if name.as_str() == "type" {
+                    match state.heap.datum(datum) {
+                        Ok(datum) => Value::TypePath(datum.type_path().clone()),
+                        Err(error) => {
+                            return Err(execution_error(module, &frames, error.to_string()));
+                        }
+                    }
+                } else {
+                    match state.heap.datum_field(datum, &name) {
+                        Ok(value) => value.clone(),
+                        Err(error) => {
+                            return Err(execution_error(module, &frames, error.to_string()));
+                        }
                     }
                 };
                 frames[frame_index].stack.push(value);
@@ -2798,12 +5612,52 @@ fn run_frames(
                     return Err(execution_error(module, &frames, message));
                 }
             }
+            Instruction::Crash => {
+                let message = match pop(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                return Err(execution_error(
+                    module,
+                    &frames,
+                    format!("CRASH: {message}"),
+                ));
+            }
+            Instruction::Locate { argument_count } => {
+                let count = usize::from(argument_count);
+                let stack_length = frames[frame_index].stack.len();
+                if count > stack_length {
+                    return Err(execution_error(module, &frames, "bytecode stack underflow"));
+                }
+                frames[frame_index].stack.truncate(stack_length - count);
+                frames[frame_index].stack.push(Value::Null);
+            }
+            Instruction::LocateIn { argument_count } => {
+                let count = usize::from(argument_count)
+                    .checked_add(1)
+                    .expect("u16 argument count plus container fits usize");
+                let stack_length = frames[frame_index].stack.len();
+                if count > stack_length {
+                    return Err(execution_error(module, &frames, "bytecode stack underflow"));
+                }
+                frames[frame_index].stack.truncate(stack_length - count);
+                frames[frame_index].stack.push(Value::Null);
+            }
             Instruction::Negate => {
                 let value = match pop_number(&mut frames[frame_index].stack) {
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
                 frames[frame_index].stack.push(Value::number(-value));
+            }
+            Instruction::BitNot => {
+                let value = match pop_number(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                frames[frame_index]
+                    .stack
+                    .push(Value::number(bitwise_not(value)));
             }
             Instruction::Not => {
                 let value = match pop(&mut frames[frame_index].stack) {
@@ -2821,6 +5675,11 @@ fn run_frames(
             | Instruction::Multiply
             | Instruction::Divide
             | Instruction::Remainder
+            | Instruction::BitAnd
+            | Instruction::BitOr
+            | Instruction::BitXor
+            | Instruction::ShiftLeft
+            | Instruction::ShiftRight
             | Instruction::Less
             | Instruction::LessEqual
             | Instruction::Greater
@@ -2859,6 +5718,32 @@ fn run_frames(
                 frames[frame_index]
                     .stack
                     .push(Value::number(f32::from(result)));
+            }
+            Instruction::Contains => {
+                let list = match pop(&mut frames[frame_index].stack) {
+                    Ok(Value::List(list)) => list,
+                    Ok(value) => {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("right operand of 'in' must be a list, received {value}"),
+                        ));
+                    }
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let needle = match pop(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let contains = state
+                    .heap
+                    .list(list)
+                    .map_err(|error| execution_error(module, &frames, error.to_string()))?
+                    .positions()
+                    .any(|(_, value)| values_equal(&needle, value));
+                frames[frame_index]
+                    .stack
+                    .push(Value::number(f32::from(contains)));
             }
             Instruction::And | Instruction::Or => {
                 let right = match pop(&mut frames[frame_index].stack) {
@@ -2922,7 +5807,8 @@ fn run_frames(
                         format!("maximum call depth {} exceeded", limits.max_call_depth),
                     ));
                 }
-                let count = usize::from(argument_count);
+                let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
+                    .map_err(|message| execution_error(module, &frames, message))?;
                 let stack_length = frames[frame_index].stack.len();
                 if count > stack_length {
                     return Err(execution_error(module, &frames, "bytecode stack underflow"));
@@ -2948,7 +5834,8 @@ fn run_frames(
                     ));
                 }
                 let arguments = if let Some(argument_count) = argument_count {
-                    let count = usize::from(argument_count);
+                    let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
+                        .map_err(|message| execution_error(module, &frames, message))?;
                     let stack_length = frames[frame_index].stack.len();
                     if count > stack_length {
                         return Err(execution_error(module, &frames, "bytecode stack underflow"));
@@ -2980,7 +5867,8 @@ fn run_frames(
                     ));
                 };
                 let arguments = if let Some(argument_count) = argument_count {
-                    let count = usize::from(argument_count);
+                    let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
+                        .map_err(|message| execution_error(module, &frames, message))?;
                     let stack_length = frames[frame_index].stack.len();
                     if count > stack_length {
                         return Err(execution_error(module, &frames, "bytecode stack underflow"));
@@ -2997,6 +5885,44 @@ fn run_frames(
                     ));
                 };
                 let context = frame_context(&frames[frame_index]);
+                frames.push(make_frame(target, target_program, &arguments, &context));
+                continue;
+            }
+            Instruction::CallDynamic { argument_count } => {
+                if frames.len() >= limits.max_call_depth {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        format!("maximum call depth {} exceeded", limits.max_call_depth),
+                    ));
+                }
+                let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let stack_length = frames[frame_index].stack.len();
+                // Receiver and selector precede all explicit arguments.
+                if stack_length < count + 2 {
+                    return Err(execution_error(module, &frames, "bytecode stack underflow"));
+                }
+                let arguments = frames[frame_index].stack.split_off(stack_length - count);
+                let selector = frames[frame_index]
+                    .stack
+                    .pop()
+                    .expect("stack length was checked");
+                let receiver = frames[frame_index]
+                    .stack
+                    .pop()
+                    .expect("stack length was checked");
+                let caller_context = frame_context(&frames[frame_index]);
+                let (target, context) =
+                    dynamic_call_target(module, state, &receiver, &selector, &caller_context)
+                        .map_err(|message| execution_error(module, &frames, message))?;
+                let Some(target_program) = module.procedure(target) else {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        format!("invalid dynamic call target {}", target.index()),
+                    ));
+                };
                 frames.push(make_frame(target, target_program, &arguments, &context));
                 continue;
             }
@@ -3090,12 +6016,79 @@ fn execute_numeric_binary(instruction: &Instruction, left: f32, right: f32) -> f
         Instruction::Multiply => left * right,
         Instruction::Divide => left / right,
         Instruction::Remainder => left % right,
+        Instruction::BitAnd => bitwise_binary(left, right, |left, right| left & right),
+        Instruction::BitOr => bitwise_binary(left, right, |left, right| left | right),
+        Instruction::BitXor => bitwise_binary(left, right, |left, right| left ^ right),
+        Instruction::ShiftLeft => bitwise_shift(left, right, |left, right| left << right),
+        Instruction::ShiftRight => bitwise_shift(left, right, |left, right| left >> right),
         Instruction::Less => f32::from(left < right),
         Instruction::LessEqual => f32::from(left <= right),
         Instruction::Greater => f32::from(left > right),
         Instruction::GreaterEqual => f32::from(left >= right),
         _ => unreachable!("instruction came from the numeric operation group"),
     }
+}
+
+fn execute_compound_list_index_operation(
+    operator: CompoundListIndexOperator,
+    left: f32,
+    right: f32,
+) -> f32 {
+    match operator {
+        CompoundListIndexOperator::Add => left + right,
+        CompoundListIndexOperator::Subtract => left - right,
+        CompoundListIndexOperator::Multiply => left * right,
+        CompoundListIndexOperator::Divide => left / right,
+        CompoundListIndexOperator::Remainder => left % right,
+        CompoundListIndexOperator::BitAnd => {
+            bitwise_binary(left, right, |left, right| left & right)
+        }
+        CompoundListIndexOperator::BitOr => bitwise_binary(left, right, |left, right| left | right),
+        CompoundListIndexOperator::BitXor => {
+            bitwise_binary(left, right, |left, right| left ^ right)
+        }
+        CompoundListIndexOperator::ShiftLeft => {
+            bitwise_shift(left, right, |left, right| left << right)
+        }
+        CompoundListIndexOperator::ShiftRight => {
+            bitwise_shift(left, right, |left, right| left >> right)
+        }
+    }
+}
+
+/// DM bitwise operations coerce their binary32 numeric operands to signed
+/// 32-bit integers by truncation and return the resulting integer as a DM
+/// number. Rust's float-to-int conversion also gives deterministic saturation
+/// for values outside the integer range.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "DM bitwise operators intentionally bridge binary32 numbers and signed 32-bit integers"
+)]
+fn bitwise_binary(left: f32, right: f32, operation: impl FnOnce(i32, i32) -> i32) -> f32 {
+    operation(left as i32, right as i32) as f32
+}
+
+/// Executes a DM bitwise complement after integer coercion.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "DM bitwise operators intentionally bridge binary32 numbers and signed 32-bit integers"
+)]
+fn bitwise_not(value: f32) -> f32 {
+    (!(value as i32)) as f32
+}
+
+/// Executes a DM shift after integer coercion. Shift counts are masked to the
+/// low five bits, matching the fixed-width 32-bit integer representation.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "DM bitwise operators intentionally bridge binary32 numbers and signed 32-bit integers"
+)]
+fn bitwise_shift(left: f32, right: f32, operation: impl FnOnce(i32, u32) -> i32) -> f32 {
+    let count = u32::from_ne_bytes((right as i32).to_ne_bytes()) & 31;
+    operation(left as i32, count) as f32
 }
 
 fn validate_jump(target: usize, instruction_count: usize) -> Result<(), String> {
@@ -3109,6 +6102,565 @@ fn values_equal(left: &Value, right: &Value) -> bool {
     left.semantic_eq(right)
 }
 
+fn replace_text_builtin(
+    arguments: &[Value],
+    exact: bool,
+    character_indices: bool,
+    heap: &ValueHeap,
+) -> Result<String, String> {
+    let source = builtin_text(&arguments[0], heap, "replacetext text")?;
+    let needle = builtin_text(&arguments[1], heap, "replacetext needle")?;
+    let replacement = builtin_text(&arguments[2], heap, "replacetext replacement")?;
+    if needle.is_empty() {
+        return Ok(source);
+    }
+
+    let (start, end) = replacement_bounds(&source, arguments, character_indices)?;
+    let prefix = &source[..start];
+    let target = &source[start..end];
+    let suffix = &source[end..];
+    let replaced = if exact {
+        target.replace(&needle, &replacement)
+    } else {
+        replace_text_ascii_insensitive(target, &needle, &replacement)
+    };
+    Ok(format!("{prefix}{replaced}{suffix}"))
+}
+
+fn builtin_text(value: &Value, heap: &ValueHeap, context: &str) -> Result<String, String> {
+    match value {
+        Value::Text(text) => Ok(String::from(text.as_ref())),
+        Value::Datum(datum)
+            if heap
+                .datum(*datum)
+                .map_err(|error| error.to_string())?
+                .type_path()
+                .to_string()
+                == "/regex" =>
+        {
+            Err(format!("{context} regex matching is not yet supported"))
+        }
+        _ => Err(format!("{context} requires text, received {value}")),
+    }
+}
+
+/// Advances the fixed-seed headless random stream and returns a unit interval
+/// sample. Keeping it in [`ExecutionState`] makes repeated calls vary while
+/// fresh headless worlds remain reproducible.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "the upper 24 generator bits deliberately map onto the binary32 unit interval"
+)]
+fn deterministic_unit(state: &mut u64) -> f32 {
+    if *state == 0 {
+        *state = 0x9e37_79b9_7f4a_7c15;
+    }
+    *state ^= *state << 7;
+    *state ^= *state >> 9;
+    *state ^= *state << 8;
+    let high = (*state >> 40) as u32;
+    high as f32 / 16_777_216.0
+}
+
+/// Implements DM's `round(A)` and `round(A, B)` forms for scalar numbers.
+///
+/// The single-argument form is the historical floor operation.  With a
+/// non-zero multiple, BYOND chooses the nearest multiple; an exact halfway
+/// value goes toward positive infinity, as in `floor(A / B + 0.5)`.  A zero
+/// multiple follows the legacy floor form rather than dividing by zero.
+fn round_builtin(arguments: &[Value]) -> Result<f32, String> {
+    let value = arguments[0]
+        .as_number()
+        .ok_or_else(|| format!("round requires a number, received {}", arguments[0]))?;
+    if arguments.len() == 1 {
+        return Ok(value.floor());
+    }
+    let multiple = arguments[1].as_number().ok_or_else(|| {
+        format!(
+            "round multiple requires a number, received {}",
+            arguments[1]
+        )
+    })?;
+    if multiple == 0.0 {
+        return Ok(value.floor());
+    }
+    // The sign of a multiple does not alter its set of multiples.  Using its
+    // magnitude also preserves BYOND's increasing-number-line tie rule.
+    Ok((value / multiple.abs() + 0.5).floor() * multiple.abs())
+}
+
+fn random_integer(arguments: &[Value], state: &mut u64) -> Result<f32, String> {
+    let bounds = arguments
+        .iter()
+        .map(|value| {
+            value
+                .as_number()
+                .ok_or_else(|| format!("rand requires numbers, received {value}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (low, high) = match bounds.as_slice() {
+        [high] => (0.0, *high),
+        [low, high] => (*low, *high),
+        _ => return Err("rand requires one or two bounds".to_owned()),
+    };
+    let low = low.ceil();
+    let high = high.floor();
+    if !low.is_finite() || !high.is_finite() || high < low {
+        return Err(format!("invalid rand range {low} through {high}"));
+    }
+    Ok(low + (deterministic_unit(state) * (high - low + 1.0)).floor())
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "the unit sample is non-negative and strictly below one, yielding a valid list offset"
+)]
+fn pick_value(
+    values: &[Value],
+    weighted: &[bool],
+    heap: &ValueHeap,
+    state: &mut u64,
+) -> Result<Value, String> {
+    if weighted.len() == 1
+        && !weighted[0]
+        && let [Value::List(list)] = values
+    {
+        let list = heap.list(*list).map_err(|error| error.to_string())?;
+        if list.is_empty() {
+            return Ok(Value::Null);
+        }
+        let index = (deterministic_unit(state) * list.len() as f32).floor() as usize + 1;
+        return list.get(index).cloned().map_err(|error| error.to_string());
+    }
+    let mut cursor = 0;
+    let mut entries = Vec::with_capacity(weighted.len());
+    let mut total = 0.0_f32;
+    for is_weighted in weighted {
+        let weight = if *is_weighted {
+            let value = values
+                .get(cursor)
+                .ok_or_else(|| "invalid pick weights".to_owned())?;
+            cursor += 1;
+            value
+                .as_number()
+                .ok_or_else(|| format!("pick weight requires a number, received {value}"))?
+                .max(0.0)
+        } else {
+            1.0
+        };
+        let candidate = values
+            .get(cursor)
+            .ok_or_else(|| "invalid pick candidates".to_owned())?
+            .clone();
+        cursor += 1;
+        total += weight;
+        entries.push((weight, candidate));
+    }
+    if total <= 0.0 {
+        return Ok(Value::Null);
+    }
+    let mut point = deterministic_unit(state) * total;
+    for (weight, candidate) in entries {
+        if point < weight {
+            return Ok(candidate);
+        }
+        point -= weight;
+    }
+    Ok(Value::Null)
+}
+
+/// Returns BYOND's legacy `length()` result for the runtime values accepted
+/// by the headless VM. Text uses byte length because regular DM text indices
+/// are byte indices; `_char` builtins are the explicit character-indexed API.
+fn builtin_length(value: &Value, heap: &ValueHeap) -> Result<f32, String> {
+    let length = match value {
+        Value::Null => 0,
+        Value::Text(text) => text.len(),
+        Value::List(list) => heap.list(*list).map_err(|error| error.to_string())?.len(),
+        _ => return Err(format!("length requires text or a list, received {value}")),
+    };
+    length
+        .to_string()
+        .parse::<f32>()
+        .map_err(|error| format!("length cannot be represented as binary32: {error}"))
+}
+
+/// Produces the opaque reference text used by DM's `ref()` builtin.
+///
+/// BYOND reserves the `0xe...` range for list references; preserving that
+/// convention matters to code which uses a list reference as an associative
+/// key. Dream64's headless heap keeps identities live for the execution, so
+/// its monotonic slot identity is sufficient for a stable reference.
+fn ref_builtin(value: &Value) -> Value {
+    let reference = match value {
+        Value::Datum(datum) => format!("[0xd{:06x}]", datum.index() + 1),
+        Value::List(list) => format!("[0xe{:06x}]", list.index() + 1),
+        // `ref` identifies runtime heap objects; scalar values have no
+        // object identity and therefore cannot yield a usable reference.
+        Value::Null | Value::Number(_) | Value::Text(_) | Value::TypePath(_) => return Value::Null,
+    };
+    Value::text(reference)
+}
+
+/// Resolves BYOND's `get_step(atom_or_turf, direction)` against live turfs.
+///
+/// BYOND directions are bit flags: north/south affect Y and east/west affect
+/// X, so diagonal values naturally combine their cardinal components.  A
+/// source atom's materialized coordinates are sufficient even when its `loc`
+/// has not been explicitly connected in the headless world model.
+fn get_step_builtin(source: &Value, direction: &Value, heap: &ValueHeap) -> Result<Value, String> {
+    let Value::Datum(source) = source else {
+        return Ok(Value::Null);
+    };
+    let Some(direction) = direction.as_number() else {
+        return Ok(Value::Null);
+    };
+    if !direction.is_finite() || direction.fract() != 0.0 {
+        return Ok(Value::Null);
+    }
+    let Ok(direction) = direction.to_string().parse::<i16>() else {
+        return Ok(Value::Null);
+    };
+    if !(0..=15).contains(&direction) {
+        return Ok(Value::Null);
+    }
+    // Unknown bits do not name a world direction.  `get_step(source, 0)` is
+    // useful as a normalized `get_turf` and returns the containing turf.
+    let x = FieldName::parse("x").expect("built-in coordinate field is valid");
+    let y = FieldName::parse("y").expect("built-in coordinate field is valid");
+    let z = FieldName::parse("z").expect("built-in coordinate field is valid");
+    let source = heap.datum(*source).map_err(|error| error.to_string())?;
+    let coordinate = |field: &FieldName| -> Result<f32, String> {
+        source
+            .field(field)
+            .map_err(|error| error.to_string())?
+            .as_number()
+            .ok_or_else(|| format!("get_step source coordinate {field} is not numeric"))
+    };
+    let source_x = coordinate(&x)?;
+    let source_y = coordinate(&y)?;
+    let source_z = coordinate(&z)?;
+    let target_x = source_x + f32::from(u8::from(direction & 4 != 0))
+        - f32::from(u8::from(direction & 8 != 0));
+    let target_y = source_y + f32::from(u8::from(direction & 1 != 0))
+        - f32::from(u8::from(direction & 2 != 0));
+    for (datum, candidate) in heap.datums() {
+        let path = candidate.type_path().as_str();
+        if path != "/turf" && !path.starts_with("/turf/") {
+            continue;
+        }
+        let matches = [(&x, target_x), (&y, target_y), (&z, source_z)]
+            .into_iter()
+            .all(|(field, expected)| {
+                candidate
+                    .field(field)
+                    .is_ok_and(|value| value.as_number() == Some(expected))
+            });
+        if matches {
+            return Ok(Value::Datum(datum));
+        }
+    }
+    Ok(Value::Null)
+}
+
+/// Resolves BYOND's `range()` over the materialized headless world.
+///
+/// The regular `range(distance, center)` spelling and BYOND's accepted
+/// reversed `range(center, distance)` spelling are both supported.  With one
+/// argument, the current procedure's `src` is the center.  BYOND range is a
+/// square tile radius (Chebyshev distance), not Euclidean distance; every
+/// atom on matching same-z tiles is returned in deterministic heap allocation
+/// order.  Areas are deliberately excluded because they describe tiles rather
+/// than being located contents of one.
+fn range_builtin(arguments: &[Value], src: &Value, heap: &mut ValueHeap) -> Result<Value, String> {
+    let null_center = Value::Null;
+    let (distance, center) = match arguments {
+        [distance] => (distance.as_number(), src),
+        [first, second] => match (first.as_number(), second.as_number()) {
+            (Some(distance), None) => (Some(distance), second),
+            (None, Some(distance)) => (Some(distance), first),
+            // A number cannot be a materialized map location.  Keeping this
+            // an empty result mirrors BYOND's non-loc center behavior while
+            // avoiding a fabricated coordinate.
+            _ => (None, &null_center),
+        },
+        _ => return Err("range accepts one or two arguments".to_owned()),
+    };
+    let list = heap.allocate_list();
+    let Some(distance) = distance else {
+        return Ok(Value::List(list));
+    };
+    if !distance.is_finite() || distance < 0.0 {
+        return Ok(Value::List(list));
+    }
+    let Value::Datum(center) = center else {
+        return Ok(Value::List(list));
+    };
+    let x = FieldName::parse("x").expect("built-in coordinate field is valid");
+    let y = FieldName::parse("y").expect("built-in coordinate field is valid");
+    let z = FieldName::parse("z").expect("built-in coordinate field is valid");
+    let center = heap.datum(*center).map_err(|error| error.to_string())?;
+    let coordinate = |field: &FieldName| center.field(field).ok().and_then(Value::as_number);
+    let (Some(center_x), Some(center_y), Some(center_z)) =
+        (coordinate(&x), coordinate(&y), coordinate(&z))
+    else {
+        return Ok(Value::List(list));
+    };
+    let distance = distance.floor();
+    let matching = heap
+        .datums()
+        .filter_map(|(datum, candidate)| {
+            let path = candidate.type_path().as_str();
+            if path == "/area" || path.starts_with("/area/") {
+                return None;
+            }
+            let candidate_x = candidate.field(&x).ok()?.as_number()?;
+            let candidate_y = candidate.field(&y).ok()?.as_number()?;
+            let candidate_z = candidate.field(&z).ok()?.as_number()?;
+            (candidate_z.total_cmp(&center_z).is_eq()
+                && (candidate_x - center_x).abs() <= distance
+                && (candidate_y - center_y).abs() <= distance)
+                .then_some(datum)
+        })
+        .collect::<Vec<_>>();
+    let result = heap
+        .list_mut(list)
+        .expect("a newly allocated list handle must be live");
+    for datum in matching {
+        result.add(Value::Datum(datum));
+    }
+    Ok(Value::List(list))
+}
+
+/// Resolves BYOND's `typesof()` selector against the runtime's canonical type
+/// catalog. The selected path itself is always present even for a deliberately
+/// partial headless catalog, matching the inclusive nature of `typesof`.
+fn typesof_builtin(
+    value: &Value,
+    heap: &ValueHeap,
+    catalog: &std::collections::BTreeSet<TypePath>,
+) -> Result<Vec<TypePath>, String> {
+    let selector = match value {
+        Value::TypePath(path) => path.clone(),
+        Value::Datum(datum) => heap
+            .datum(*datum)
+            .map_err(|error| error.to_string())?
+            .type_path()
+            .clone(),
+        value => {
+            return Err(format!(
+                "typesof requires a type path or datum, received {value}"
+            ));
+        }
+    };
+    let mut paths = catalog
+        .iter()
+        .filter(|path| {
+            path.as_str() == selector.as_str()
+                || path
+                    .as_str()
+                    .strip_prefix(selector.as_str())
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !catalog.contains(&selector) {
+        paths.insert(0, selector);
+    }
+    Ok(paths)
+}
+
+/// Evaluates the small family of BYOND value/type classifiers that need heap
+/// access for datum runtime paths. Type paths deliberately participate in
+/// `istype`: lifecycle helpers commonly validate deferred type values before
+/// constructing them.  `isloc` is variadic, unlike the other simple
+/// classifiers: all its supplied values must be atoms.
+fn type_predicate_builtin(
+    kind: TypePredicateKind,
+    arguments: &[Value],
+    heap: &ValueHeap,
+) -> Result<bool, String> {
+    let value = arguments
+        .first()
+        .ok_or_else(|| "type predicate requires a value".to_owned())?;
+    match kind {
+        TypePredicateKind::IsNull => Ok(matches!(value, Value::Null)),
+        TypePredicateKind::IsNum => Ok(matches!(value, Value::Number(_))),
+        TypePredicateKind::IsPath => Ok(matches!(value, Value::TypePath(_))),
+        TypePredicateKind::IsList => Ok(matches!(value, Value::List(_))),
+        TypePredicateKind::IsMovable => {
+            let Value::Datum(datum) = value else {
+                return Ok(false);
+            };
+            let type_path = heap
+                .datum(*datum)
+                .map_err(|error| error.to_string())?
+                .type_path()
+                .as_str();
+            // `/obj` and `/mob` are conventional direct children of
+            // `/atom/movable`, despite their path spelling not retaining that
+            // parent segment. Their descendants are movable too.
+            Ok(type_path == "/atom/movable"
+                || type_path.starts_with("/atom/movable/")
+                || type_path == "/obj"
+                || type_path.starts_with("/obj/")
+                || type_path == "/mob"
+                || type_path.starts_with("/mob/"))
+        }
+        TypePredicateKind::IsTurf => {
+            let Value::Datum(datum) = value else {
+                return Ok(false);
+            };
+            let type_path = heap
+                .datum(*datum)
+                .map_err(|error| error.to_string())?
+                .type_path()
+                .as_str();
+            Ok(type_path == "/turf" || type_path.starts_with("/turf/"))
+        }
+        TypePredicateKind::IsLoc => Ok(arguments.iter().all(|value| {
+            let Value::Datum(datum) = value else {
+                return false;
+            };
+            let Ok(datum) = heap.datum(*datum) else {
+                return false;
+            };
+            let type_path = datum.type_path().as_str();
+            // The four concrete atom roots are conventionally spelled as
+            // `/area`, `/turf`, `/obj`, and `/mob`, even though they inherit
+            // `/atom` rather than retaining that segment in their paths.
+            type_path == "/atom"
+                || type_path.starts_with("/atom/")
+                || type_path == "/area"
+                || type_path.starts_with("/area/")
+                || type_path == "/turf"
+                || type_path.starts_with("/turf/")
+                || type_path == "/obj"
+                || type_path.starts_with("/obj/")
+                || type_path == "/mob"
+                || type_path.starts_with("/mob/")
+        })),
+        TypePredicateKind::IsType => {
+            let Some(target) = arguments.get(1) else {
+                return Ok(matches!(value, Value::Datum(_)));
+            };
+            let Value::TypePath(target) = target else {
+                return Ok(false);
+            };
+            let candidate = match value {
+                Value::TypePath(path) => path,
+                Value::Datum(datum) => heap
+                    .datum(*datum)
+                    .map_err(|error| error.to_string())?
+                    .type_path(),
+                _ => return Ok(false),
+            };
+            let target = target.as_str();
+            let candidate = candidate.as_str();
+            Ok(candidate == target
+                || candidate
+                    .strip_prefix(target)
+                    .is_some_and(|suffix| suffix.starts_with('/')))
+        }
+    }
+}
+
+fn replacement_bounds(
+    source: &str,
+    arguments: &[Value],
+    character_indices: bool,
+) -> Result<(usize, usize), String> {
+    let index_limit = if character_indices {
+        source.chars().count()
+    } else {
+        source.len()
+    };
+    let start = optional_text_index(arguments.get(3), 1)?;
+    let end = optional_text_index(arguments.get(4), 0)?;
+    // BYOND text positions are 1-based and the end is exclusive; zero end
+    // extends through the whole remaining text.
+    let start = start.clamp(1, index_limit.saturating_add(1));
+    let end = if end == 0 {
+        index_limit.saturating_add(1)
+    } else {
+        end.clamp(start, index_limit.saturating_add(1))
+    };
+    if character_indices {
+        Ok((
+            character_offset(source, start.saturating_sub(1)),
+            character_offset(source, end.saturating_sub(1)),
+        ))
+    } else {
+        // Legacy DM indices count UTF-8 bytes. Clamp inward to valid Rust
+        // boundaries instead of manufacturing invalid text slices.
+        Ok((
+            previous_char_boundary(source, start.saturating_sub(1)),
+            previous_char_boundary(source, end.saturating_sub(1)),
+        ))
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "DM text positions are non-negative integral binary32 values"
+)]
+fn optional_text_index(value: Option<&Value>, default: usize) -> Result<usize, String> {
+    match value {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Number(number)) => Ok(number.to_f32().max(0.0) as usize),
+        Some(value) => Err(format!(
+            "replacetext bounds require a number, received {value}"
+        )),
+    }
+}
+
+fn character_offset(text: &str, character_index: usize) -> usize {
+    text.char_indices()
+        .nth(character_index)
+        .map_or(text.len(), |(byte, _)| byte)
+}
+
+fn previous_char_boundary(text: &str, mut byte_index: usize) -> usize {
+    byte_index = byte_index.min(text.len());
+    while byte_index > 0 && !text.is_char_boundary(byte_index) {
+        byte_index -= 1;
+    }
+    byte_index
+}
+
+fn replace_text_ascii_insensitive(target: &str, needle: &str, replacement: &str) -> String {
+    if !needle.is_ascii() {
+        // DM's Unicode case folding is more involved than Rust's simple
+        // lowercase mapping. Preserve deterministic exact text for the rare
+        // non-ASCII fallback rather than corrupting byte offsets.
+        return target.replace(needle, replacement);
+    }
+    let needle_lower = needle.to_ascii_lowercase();
+    let bytes = target.as_bytes();
+    let mut output = String::with_capacity(target.len());
+    let mut cursor = 0;
+    while cursor < target.len() {
+        let remaining = &target[cursor..];
+        if remaining.len() >= needle.len()
+            && remaining.as_bytes()[..needle.len()]
+                .iter()
+                .map(u8::to_ascii_lowercase)
+                .eq(needle_lower.bytes())
+        {
+            output.push_str(replacement);
+            cursor += needle.len();
+        } else {
+            let width = char::from(bytes[cursor]).len_utf8();
+            output.push_str(&target[cursor..cursor + width]);
+            cursor += width;
+        }
+    }
+    output
+}
+
 fn runtime_truthy(heap: &ValueHeap, value: &Value) -> Result<bool, String> {
     heap.truthy(value).map_err(|error| error.to_string())
 }
@@ -3119,6 +6671,78 @@ fn datum_receiver(value: &Value, operation: &str) -> Result<DatumId, String> {
         Value::Null => Err(format!("{operation} received null")),
         _ => Err(format!("{operation} requires a datum, received {value}")),
     }
+}
+
+fn dynamic_call_target(
+    module: &Module,
+    state: &ExecutionState,
+    receiver: &Value,
+    selector: &Value,
+    caller_context: &ExecutionContext,
+) -> Result<(ProcedureId, ExecutionContext), String> {
+    let selector = match selector {
+        Value::Text(selector) => String::from(selector.as_ref()),
+        Value::TypePath(selector) => selector.to_string(),
+        _ => {
+            return Err(format!(
+                "call procedure selector must be text or a type path, received {selector}"
+            ));
+        }
+    };
+
+    let (base_path, context) = match receiver {
+        Value::Null => ("/proc".to_owned(), caller_context.clone()),
+        Value::Datum(datum) => (
+            state
+                .heap()
+                .datum(*datum)
+                .map_err(|error| error.to_string())?
+                .type_path()
+                .to_string(),
+            ExecutionContext::new(receiver.clone(), caller_context.usr.clone()),
+        ),
+        Value::TypePath(path) => (path.to_string(), caller_context.clone()),
+        _ => {
+            return Err(format!(
+                "call receiver must be a datum, type path, or null, received {receiver}"
+            ));
+        }
+    };
+    let selector_path = selector.trim_start_matches('/');
+    let requested = if selector.starts_with('/') {
+        selector.clone()
+    } else {
+        format!("{base_path}/proc/{selector_path}")
+    };
+
+    let mut candidate = requested.clone();
+    loop {
+        let prefix = format!("{candidate}@");
+        if let Some((index, _)) = module
+            .paths
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, path)| *path == &candidate || path.starts_with(&prefix))
+        {
+            let procedure = ProcedureId::from_index(index).map_err(|error| error.message)?;
+            return Ok((procedure, context));
+        }
+        let Some(segment) = candidate.rfind("/proc/") else {
+            break;
+        };
+        let owner = &candidate[..segment];
+        if owner == "/proc" || owner.is_empty() {
+            break;
+        }
+        let Some(parent_end) = owner.rfind('/') else {
+            break;
+        };
+        candidate = format!("{}/proc/{selector_path}", &owner[..parent_end]);
+    }
+    Err(format!(
+        "dynamic call could not resolve procedure {requested:?}"
+    ))
 }
 
 fn read_list_value<'heap>(
@@ -3179,9 +6803,34 @@ fn pop_number(stack: &mut Vec<Value>) -> Result<f32, String> {
         .ok_or_else(|| format!("numeric operation received {value}"))
 }
 
+/// Resolves a compact static call count or the count marker produced by an
+/// immediately preceding `arglist()` expansion.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn runtime_argument_count(stack: &mut Vec<Value>, encoded: u16) -> Result<usize, String> {
+    if encoded != EXPANDED_ARGUMENT_COUNT {
+        return Ok(usize::from(encoded));
+    }
+    let value = stack
+        .pop()
+        .ok_or_else(|| "bytecode stack underflow".to_owned())?;
+    let Value::Number(number) = value else {
+        return Err("expanded call argument count is not numeric".to_owned());
+    };
+    let count = number.to_f32();
+    if !count.is_finite()
+        || count < 0.0
+        || count > f32::from(u16::MAX)
+        || count.fract() != 0.0
+    {
+        return Err("expanded call argument count is invalid".to_owned());
+    }
+    Ok(count as usize)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
 
     use dm_core::{DmNumberBits, SourceSpan};
     use dm_lexer::{SpannedToken, TokenKind, lex};
@@ -3189,17 +6838,244 @@ mod tests {
     use dm_value::{FieldName, TypePath};
 
     use super::{
-        ExecutionContext, ExecutionLimits, ExecutionState, InitializerBinding, Instruction,
-        ProcedureSpec, Program, Value, compile_initializer, compile_module, compile_module_specs,
-        compile_procedure, execute, execute_in_context, execute_in_state, execute_module,
-        execute_module_in_context, execute_module_with_limits, execute_with_limits,
-        execute_with_limits_in_state,
+        CompoundListIndexOperator, ExecutionContext, ExecutionLimits, ExecutionState,
+        InitializerBinding, Instruction, ProcedureSpec, Program, Value, compile_initializer,
+        compile_module, compile_module_specs, compile_procedure,
+        compile_procedure_with_resolver_and_fields, condition_tokens, execute, execute_in_context,
+        execute_in_state, execute_module, execute_module_in_context, execute_module_in_state,
+        execute_module_with_limits, execute_with_limits, execute_with_limits_in_state,
     };
 
     fn execute_source(source: &str, argument: f32) -> Value {
         let syntax = parse(source).expect("source should parse");
         let program = compile_procedure(&syntax.definitions[0]).expect("procedure should compile");
         execute(&program, &[Value::number(argument)]).expect("procedure should execute")
+    }
+
+    #[test]
+    fn condition_tokens_accepts_braced_macro_conditions_with_following_tokens() {
+        let tokens = lex("if(!(flags_1 & INITIALIZED_1)) { var/previous = 1")
+            .expect("condition source should lex");
+        let condition = condition_tokens(&tokens[1..], "if").expect("condition should compile");
+        assert!(matches!(condition[0].kind, TokenKind::Operator(ref op) if op == "!"));
+    }
+
+    #[test]
+    fn absolute_type_path_expressions_lower_to_type_path_values() {
+        let syntax =
+            parse("/proc/type_path()\n\treturn /obj/item/tool\n").expect("source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("type path expression should compile");
+
+        assert_eq!(
+            execute(&program, &[]),
+            Ok(Value::TypePath(TypePath::parse("/obj/item/tool").unwrap()))
+        );
+    }
+
+    #[test]
+    fn resource_literal_expressions_lower_to_their_path_text() {
+        let syntax = parse("/proc/resource_path()\n\treturn 'sound/effects/piano_hit.ogg'\n")
+            .expect("source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("resource literal should compile");
+
+        assert_eq!(
+            execute(&program, &[]),
+            Ok(Value::text("sound/effects/piano_hit.ogg"))
+        );
+    }
+
+    #[test]
+    fn top_level_semicolons_split_macro_style_statements() {
+        let syntax =
+            parse("/proc/semicolon_statements()\n\tvar/value = 1; value += 2; return value\n")
+                .expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("semicolon-separated statements should compile");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(3.0)));
+    }
+
+    #[test]
+    fn compact_brace_macro_body_is_lowered_as_an_indented_block() {
+        // This is the shape produced by Monkestation's lazy-list helpers at
+        // the bottom of an already-indented `for`/`if` body.  The statement
+        // following `}` must remain outside the inner conditional.
+        let syntax = parse(
+            "/proc/compact_macro(flag)\n\tvar/value = 0\n\tif(flag)\n\t\tif(!value) { value = 4; } value += 3;\n\treturn value\n",
+        )
+        .expect("source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("compact macro body should compile");
+
+        assert_eq!(
+            execute(&program, &[Value::number(1.0)]),
+            Ok(Value::number(7.0))
+        );
+        assert_eq!(
+            execute(&program, &[Value::number(0.0)]),
+            Ok(Value::number(0.0))
+        );
+    }
+
+    #[test]
+    fn compact_do_while_macro_body_preserves_nested_block_indentation() {
+        // Trait helper macros use a `do { ... } while (0)` wrapper to make a
+        // multi-statement expansion behave as one source statement.  Its
+        // nested brace blocks must remain children of the synthetic `do`
+        // block, while the trailing `while` returns to the caller's level.
+        let syntax = parse(
+            "/proc/compact_do_macro(flag)\n\tvar/value = 0\n\tdo { var/local = 1; if(flag) { local += 2; } else { local += 4; } value = local; } while(0)\n\treturn value\n",
+        )
+        .expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("compact do/while macro body should compile");
+
+        assert_eq!(
+            execute(&program, &[Value::number(1.0)]),
+            Ok(Value::number(3.0))
+        );
+        assert_eq!(
+            execute(&program, &[Value::number(0.0)]),
+            Ok(Value::number(5.0))
+        );
+    }
+
+    #[test]
+    fn conditional_accepts_a_preprocessor_retained_opening_brace() {
+        let syntax = parse("/proc/brace_if(flag)\n\tif(flag) {\n\t\treturn 1\n\t}\n\treturn 0\n")
+            .expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("brace-terminated condition should compile");
+
+        assert_eq!(
+            execute(&program, &[Value::number(1.0)]),
+            Ok(Value::number(1.0))
+        );
+        assert_eq!(
+            execute(&program, &[Value::number(0.0)]),
+            Ok(Value::number(0.0))
+        );
+    }
+
+    #[test]
+    fn conditional_accepts_same_line_return_body() {
+        let syntax = parse("/proc/inline_if(flag)\n\tif(flag) return 7\n\treturn 3\n")
+            .expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("same-line conditional body should compile");
+
+        assert_eq!(
+            execute(&program, &[Value::number(1.0)]),
+            Ok(Value::number(7.0))
+        );
+        assert_eq!(
+            execute(&program, &[Value::number(0.0)]),
+            Ok(Value::number(3.0))
+        );
+    }
+
+    #[test]
+    fn conditional_accepts_same_line_else_body() {
+        let syntax = parse("/proc/inline_else(flag)\n\tif(flag) return 7\n\telse return 3\n")
+            .expect("source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("same-line else body should compile");
+
+        assert_eq!(
+            execute(&program, &[Value::number(1.0)]),
+            Ok(Value::number(7.0))
+        );
+        assert_eq!(
+            execute(&program, &[Value::number(0.0)]),
+            Ok(Value::number(3.0))
+        );
+    }
+
+    #[test]
+    fn conditional_preserves_else_if_condition_with_inline_body() {
+        let syntax = parse(
+            "/proc/inline_else_if(value)\n\tif(value == 1) return 1\n\telse if(value == 2) return 2\n\telse return 3\n",
+        )
+        .expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("same-line else-if body should compile");
+
+        assert_eq!(
+            execute(&program, &[Value::number(1.0)]),
+            Ok(Value::number(1.0))
+        );
+        assert_eq!(
+            execute(&program, &[Value::number(2.0)]),
+            Ok(Value::number(2.0))
+        );
+        assert_eq!(
+            execute(&program, &[Value::number(3.0)]),
+            Ok(Value::number(3.0))
+        );
+    }
+
+    #[test]
+    fn conditional_accepts_same_line_continue_body() {
+        let syntax = parse(
+            "/proc/inline_continue()\n\tvar/total = 0\n\tfor(var/i = 0; i < 4; i++)\n\t\tif(i == 2) continue\n\t\ttotal += i\n\treturn total\n",
+        )
+        .expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("same-line continue body should compile");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(4.0)));
+    }
+
+    #[test]
+    fn new_type_path_allocates_a_datum_and_discards_constructor_arguments() {
+        let syntax = parse(
+            "/proc/build()\n\tvar/item = new /datum/example(41, \"ignored\")\n\treturn item\n",
+        )
+        .expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("new should compile");
+        assert!(matches!(
+            program.instructions.as_slice(),
+            [
+                Instruction::MakeArgs,
+                Instruction::StoreLocal(_),
+                Instruction::PushTypePath(_),
+                Instruction::PushNumber(_),
+                Instruction::PushText(_),
+                Instruction::AllocateDatum { argument_count: 2 },
+                Instruction::StoreLocal(_),
+                Instruction::LoadLocal(_),
+                Instruction::Return,
+            ]
+        ));
+        let mut state = ExecutionState::new();
+        let value = execute_in_state(&program, &[], &mut state).expect("new should execute");
+        let Value::Datum(datum) = value else {
+            panic!("new should return a datum");
+        };
+        assert_eq!(
+            state
+                .heap()
+                .datum(datum)
+                .expect("datum must be live")
+                .type_path(),
+            &TypePath::parse("/datum/example").unwrap()
+        );
+    }
+
+    #[test]
+    fn runtime_new_type_and_proc_ref_macro_expansion_compile() {
+        let syntax = parse(
+            "/proc/build(starting_organ)\n\tvar/item = new starting_organ(src)\n\treturn list((nameof(.proc/on_entered)), item)\n",
+        )
+        .expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("runtime new type and expanded PROC_REF should compile");
+        assert!(program.instructions.iter().any(|instruction| matches!(
+            instruction,
+            Instruction::AllocateDatum { argument_count: 1 }
+        )));
     }
 
     fn manual_program(instructions: Vec<Instruction>, parameter_count: usize) -> Program {
@@ -3330,6 +7206,36 @@ mod tests {
     }
 
     #[test]
+    fn standalone_prefix_and_postfix_increments_are_valid_statements() {
+        let source = "/proc/update()\n\tcount++\n\tvar/debt = 2\n\t--debt\n\treturn count - debt\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure_with_resolver_and_fields(
+            &syntax.definitions[0],
+            &HashMap::new(),
+            &BTreeMap::from([("count".to_owned(), field("count"))]),
+            &BTreeMap::new(),
+        )
+        .expect("increments should compile");
+        let mut state = ExecutionState::new();
+        let src = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/source").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(src, field("count"), Value::number(3.0))
+            .unwrap();
+        assert_eq!(
+            execute_in_context(
+                &program,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(src), Value::Null),
+            ),
+            Ok(Value::number(3.0))
+        );
+    }
+
+    #[test]
     fn src_and_usr_aliases_observe_the_same_datum_write() {
         let source = "/proc/alias()\n\tsrc.value = 7\n\treturn usr.value\n";
         let syntax = parse(source).expect("source should parse");
@@ -3375,6 +7281,103 @@ mod tests {
     }
 
     #[test]
+    fn glob_alias_lowers_and_executes_as_the_global_namespace() {
+        let lowercase =
+            parse("/proc/update()\n\tglobal.counter += 1\n\treturn global.counter\n").unwrap();
+        let uppercase =
+            parse("/proc/update()\n\tGLOB.counter += 1\n\treturn GLOB.counter\n").unwrap();
+        let lowercase_program = compile_procedure(&lowercase.definitions[0]).unwrap();
+        let uppercase_program = compile_procedure(&uppercase.definitions[0]).unwrap();
+
+        assert_eq!(
+            uppercase_program.instructions,
+            lowercase_program.instructions
+        );
+
+        let mut state = ExecutionState::new();
+        state.set_global(field("counter"), Value::number(4.0));
+        assert_eq!(
+            execute_in_state(&uppercase_program, &[], &mut state),
+            Ok(Value::number(5.0))
+        );
+        assert!(
+            state
+                .global(&field("counter"))
+                .unwrap()
+                .semantic_eq(&Value::number(5.0))
+        );
+    }
+
+    #[test]
+    fn assignment_expressions_store_and_yield_the_assigned_value() {
+        let source = parse(
+            "/proc/locals_and_list(items)\n\tvar/local = 1\n\treturn (local = 5) + (items[1] = local)\n/proc/global_assignment()\n\treturn (GLOB.counter = 9)\n",
+        )
+        .unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+        let local_entry = module.procedure_id("/proc/locals_and_list").unwrap();
+        let global_entry = module.procedure_id("/proc/global_assignment").unwrap();
+        let mut state = ExecutionState::new();
+        let list = state.heap.allocate_list();
+        state.heap.list_mut(list).unwrap().add(Value::number(0.0));
+
+        assert_eq!(
+            execute_module_in_state(&module, local_entry, &[Value::List(list)], &mut state),
+            Ok(Value::number(10.0))
+        );
+        assert_eq!(
+            state.heap.list(list).unwrap().positions().next(),
+            Some((1, &Value::number(5.0)))
+        );
+        assert_eq!(
+            execute_module_in_state(&module, global_entry, &[], &mut state),
+            Ok(Value::number(9.0))
+        );
+        assert_eq!(state.global(&field("counter")), Some(&Value::number(9.0)));
+    }
+
+    #[test]
+    fn nameof_procedure_reference_lowers_to_the_procedure_name() {
+        let source = parse(
+            "/proc/main()\n\treturn capture(nameof(.proc/on_signal))\n/proc/capture(value)\n\treturn value\n",
+        )
+        .unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+        let entry = module.procedure_id("/proc/main").unwrap();
+
+        assert_eq!(
+            execute_module(&module, entry, &[]),
+            Ok(Value::text("on_signal"))
+        );
+    }
+
+    #[test]
+    fn nameof_accepts_type_and_static_member_references() {
+        let source = parse(
+            "/proc/main()\n\treturn list(nameof(/datum/example.proc/run), nameof(type::field))\n",
+        )
+        .unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+        let entry = module.procedure_id("/proc/main").unwrap();
+        let mut state = ExecutionState::new();
+
+        let result = execute_module_in_state(&module, entry, &[], &mut state).unwrap();
+        let Value::List(list) = result else {
+            panic!("expected list result");
+        };
+        assert_eq!(
+            state
+                .heap()
+                .list(list)
+                .unwrap()
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>(),
+            vec![Value::text("run"), Value::text("field")]
+        );
+    }
+
+    #[test]
     fn named_and_parent_calls_preserve_object_context() {
         let source =
             parse("/proc/main()\n\treturn helper()\n/proc/helper()\n\treturn usr.value\n").unwrap();
@@ -3401,11 +7404,17 @@ mod tests {
                 path: "/proc/base@0".to_owned(),
                 definition: &parent_source.definitions[0],
                 parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
             },
             ProcedureSpec {
                 path: "/proc/child@1".to_owned(),
                 definition: &parent_source.definitions[1],
                 parent: Some(0),
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
             },
         ])
         .unwrap();
@@ -3436,6 +7445,414 @@ mod tests {
                 &context,
             ),
             Ok(Value::number(8.0))
+        );
+    }
+
+    #[test]
+    fn static_call_statement_executes_and_discards_its_result() {
+        let source = parse(
+            "/proc/entry()\n\thelper()\n\treturn global.calls\n/proc/helper()\n\tglobal.calls += 1\n\treturn 99\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&source.definitions).expect("module should compile");
+        let entry = module
+            .procedure_id("/proc/entry")
+            .expect("entry should exist");
+        let mut state = ExecutionState::new();
+        state.set_global(field("calls"), Value::number(0.0));
+
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                entry,
+                &[],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::number(1.0))
+        );
+    }
+
+    #[test]
+    fn parent_call_statement_executes_and_discards_its_result() {
+        let source = parse(
+            "/proc/base()\n\tglobal.calls += 1\n\treturn 99\n/proc/child()\n\t..()\n\treturn global.calls\n",
+        )
+        .expect("source should parse");
+        let module = compile_module_specs(&[
+            ProcedureSpec {
+                path: "/proc/base@0".to_owned(),
+                definition: &source.definitions[0],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/proc/child@1".to_owned(),
+                definition: &source.definitions[1],
+                parent: Some(0),
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+        ])
+        .expect("resolved parent specs should compile");
+        let child = module.procedure_id_at(1).expect("child should exist");
+        let mut state = ExecutionState::new();
+        state.set_global(field("calls"), Value::number(0.0));
+
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                child,
+                &[],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::number(1.0))
+        );
+        let program = module.procedure(child).expect("child program should exist");
+        assert!(program.instructions.windows(2).any(|instructions| matches!(
+            instructions,
+            [Instruction::CallParent { .. }, Instruction::Pop]
+        )));
+    }
+
+    #[test]
+    fn keyword_style_call_arguments_compile_in_source_order() {
+        let source = parse(
+            "/proc/entry()\n\treturn helper(first = 3, second = 4)\n/proc/helper(first, second)\n\treturn first * 10 + second\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&source.definitions)
+            .expect("keyword-style call arguments should compile");
+        let entry = module
+            .procedure_id("/proc/entry")
+            .expect("entry procedure should resolve");
+
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(34.0)));
+    }
+
+    #[test]
+    fn keyword_style_arguments_in_discarded_calls_do_not_become_assignments() {
+        let source = parse(
+            "/proc/entry()\n\thelper(is_directional = TRUE, is_beam = TRUE)\n\treturn 7\n/proc/helper(first, second)\n\treturn first && second\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&source.definitions)
+            .expect("discarded keyword-style calls should compile");
+        let entry = module
+            .procedure_id("/proc/entry")
+            .expect("entry procedure should resolve");
+
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(7.0)));
+    }
+
+    #[test]
+    fn keyword_style_arguments_in_datum_calls_do_not_become_assignments() {
+        // Lifecycle code commonly invokes inherited datum procedures such as
+        // `AddComponent(...)` rather than a global helper.  The argument
+        // labels are still call syntax in that postfix form: they must not be
+        // parsed as assignments to bare locals on the caller.
+        let source = parse(
+            "/proc/entry(receiver)\n\treceiver.AddComponent(/datum/component/overlay_lighting, is_directional = TRUE, is_beam = TRUE)\n\treturn 7\n",
+        )
+        .expect("source should parse");
+        compile_procedure(&source.definitions[0])
+            .expect("datum calls with keyword-style arguments should compile");
+    }
+
+    #[test]
+    fn keyword_style_arguments_in_bare_datum_calls_do_not_become_assignments() {
+        // An inherited datum call is commonly written without an explicit
+        // receiver in an atom lifecycle hook.  This is the form used by
+        // `/atom/movable/Initialize` in downstream SS13 codebases.
+        let source = parse(
+            "/atom/movable/proc/Initialize()\n\tAddComponent(/datum/component/overlay_lighting, is_directional = TRUE, is_beam = TRUE)\n/atom/proc/AddComponent(first, second, third)\n\treturn\n",
+        )
+        .expect("source should parse");
+        compile_module_specs(&[
+            ProcedureSpec {
+                path: "/atom/movable/proc/Initialize@0".to_owned(),
+                definition: &source.definitions[0],
+                parent: None,
+                static_calls: BTreeMap::from([("AddComponent".to_owned(), 1)]),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/atom/proc/AddComponent@0".to_owned(),
+                definition: &source.definitions[1],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+        ])
+        .expect("bare datum calls with keyword-style arguments should compile");
+    }
+
+    #[test]
+    fn macro_wrapped_named_arguments_become_textual_list_keys() {
+        // Monkestation's `AddComponent` macro expands to this exact shape.
+        // The labels survive only as associative list keys once expansion has
+        // occurred, so they must not be lowered as caller locals.
+        let source = parse(
+            "/proc/entry()\n\t_AddComponent(list(/datum/component/overlay_lighting, is_directional = TRUE, is_beam = TRUE))\n\treturn 7\n/proc/_AddComponent(raw_args)\n\treturn 0\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&source.definitions)
+            .expect("macro-wrapped named arguments should compile");
+        let entry = module
+            .procedure_id("/proc/entry")
+            .expect("entry procedure should resolve");
+
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(7.0)));
+    }
+
+    #[test]
+    fn weighted_pick_style_semicolons_select_a_builtin_candidate() {
+        let source =
+            parse("/proc/entry()\n\treturn pick(10; 3, 1; 4)\n").expect("source should parse");
+        let module =
+            compile_module(&source.definitions).expect("weighted pick syntax should compile");
+        let entry = module
+            .procedure_id("/proc/entry")
+            .expect("entry should exist");
+
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(3.0)));
+        assert!(module.procedure(entry).expect("entry program should exist").instructions.iter().any(
+            |instruction| matches!(instruction, Instruction::Pick { weighted } if weighted == &vec![true, true]),
+        ));
+    }
+
+    #[test]
+    fn random_builtins_are_deterministic_and_respect_their_bounds() {
+        let source =
+            parse("/proc/range()\n\treturn rand(4, 6)\n/proc/chance()\n\treturn prob(100)\n")
+                .expect("source should parse");
+        let module = compile_module(&source.definitions).expect("random builtins should compile");
+        let range = module
+            .procedure_id("/proc/range")
+            .expect("range should exist");
+        let chance = module
+            .procedure_id("/proc/chance")
+            .expect("chance should exist");
+        let first = execute_module(&module, range, &[]).expect("rand should execute");
+        let second =
+            execute_module(&module, range, &[]).expect("fresh states should reproduce rand");
+        assert_eq!(first, second);
+        assert!(matches!(first.as_number(), Some(value) if (4.0..=6.0).contains(&value)));
+        assert_eq!(execute_module(&module, chance, &[]), Ok(Value::number(1.0)));
+    }
+
+    #[test]
+    fn round_builtin_preserves_byond_floor_and_nearest_multiple_forms() {
+        let source = parse(
+            "/proc/floor_form()\n\treturn round(-1.45)\n/proc/nearest()\n\treturn round(1.99, 1)\n/proc/step()\n\treturn round(1.45, 1.5)\n/proc/negative_tie()\n\treturn round(-1.5, 1)\n/proc/zero_multiple()\n\treturn round(-1.45, 0)\n/proc/negative_multiple()\n\treturn round(2.2, -0.5)\n",
+        )
+        .expect("round builtin source should parse");
+        let module = compile_module(&source.definitions).expect("round builtin should compile");
+        for (path, expected) in [
+            ("/proc/floor_form", -2.0),
+            ("/proc/nearest", 2.0),
+            ("/proc/step", 1.5),
+            ("/proc/negative_tie", -1.0),
+            ("/proc/zero_multiple", -2.0),
+            ("/proc/negative_multiple", 2.0),
+        ] {
+            let procedure = module
+                .procedure_id(path)
+                .expect("round procedure should exist");
+            assert_eq!(
+                execute_module(&module, procedure, &[]),
+                Ok(Value::number(expected))
+            );
+        }
+        assert!(module.procedures.iter().any(|program| {
+            program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::Round { .. }))
+        }));
+    }
+
+    #[test]
+    fn calls_accept_a_trailing_argument_separator() {
+        let source = parse(
+            "/proc/entry()\n\treturn helper(3, 4,)\n/proc/helper(first, second)\n\treturn first * 10 + second\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&source.definitions)
+            .expect("a call with a trailing separator should compile");
+        let entry = module
+            .procedure_id("/proc/entry")
+            .expect("entry procedure should resolve");
+
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(34.0)));
+    }
+
+    #[test]
+    fn dynamic_call_dispatches_receiver_methods_from_text_and_type_path_selectors() {
+        let source = parse(
+            "/datum/receiver/proc/entry(selector)\n\treturn call(src, selector)(4)\n/datum/receiver/proc/run(value)\n\treturn src.base + value\n",
+        )
+        .unwrap();
+        let module = compile_module_specs(&[
+            ProcedureSpec {
+                path: "/datum/receiver/proc/entry@0".to_owned(),
+                definition: &source.definitions[0],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/datum/receiver/proc/run@0".to_owned(),
+                definition: &source.definitions[1],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+        ])
+        .unwrap();
+        let entry = module.procedure_id_at(0).unwrap();
+        let mut state = ExecutionState::new();
+        let receiver = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/receiver").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(receiver, field("base"), Value::number(3.0))
+            .unwrap();
+        let context = ExecutionContext::new(Value::Datum(receiver), Value::Null);
+
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                entry,
+                &[Value::Text("run".into())],
+                &mut state,
+                &context,
+            ),
+            Ok(Value::number(7.0))
+        );
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                entry,
+                &[Value::TypePath(
+                    TypePath::parse("/datum/receiver/proc/run").unwrap(),
+                )],
+                &mut state,
+                &context,
+            ),
+            Ok(Value::number(7.0))
+        );
+    }
+
+    #[test]
+    fn dotted_datum_calls_lower_to_dynamic_dispatch() {
+        let source = parse(
+            "/datum/receiver/proc/entry()\n\treturn src.run(4)\n/datum/receiver/proc/run(value)\n\treturn src.base + value\n",
+        )
+        .expect("source should parse");
+        let module = compile_module_specs(&[
+            ProcedureSpec {
+                path: "/datum/receiver/proc/entry@0".to_owned(),
+                definition: &source.definitions[0],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/datum/receiver/proc/run@0".to_owned(),
+                definition: &source.definitions[1],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+        ])
+        .expect("dotted datum call should compile");
+        let entry = module.procedure_id_at(0).expect("entry should exist");
+        let mut state = ExecutionState::new();
+        let receiver = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/receiver").expect("type path"));
+        state
+            .heap_mut()
+            .set_datum_field(receiver, field("base"), Value::number(3.0))
+            .expect("datum should be live");
+
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                entry,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(receiver), Value::Null),
+            ),
+            Ok(Value::number(7.0))
+        );
+    }
+
+    #[test]
+    fn bare_src_field_dotted_call_is_a_valid_side_effect_statement() {
+        let source = parse(
+            "/datum/item/proc/Initialize()\n\tatom_storage.set_holdable(4)\n\treturn 9\n/datum/storage/proc/set_holdable(value)\n\tsrc.value = value\n",
+        )
+        .expect("source should parse");
+        let module = compile_module_specs(&[
+            ProcedureSpec {
+                path: "/datum/item/proc/Initialize@0".to_owned(),
+                definition: &source.definitions[0],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::from([("atom_storage".to_owned(), field("atom_storage"))]),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/datum/storage/proc/set_holdable@0".to_owned(),
+                definition: &source.definitions[1],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+        ])
+        .expect("bare field dotted call should compile");
+        let mut state = ExecutionState::new();
+        let item = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/item").expect("item type"));
+        let storage = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/storage").expect("storage type"));
+        state
+            .heap_mut()
+            .set_datum_field(item, field("atom_storage"), Value::Datum(storage))
+            .expect("item should be live");
+
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                module.procedure_id_at(0).expect("Initialize should exist"),
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(item), Value::Null),
+            ),
+            Ok(Value::number(9.0))
+        );
+        assert!(
+            state
+                .heap()
+                .datum_field(storage, &field("value"))
+                .expect("storage should be live")
+                .semantic_eq(&Value::number(4.0))
         );
     }
 
@@ -3481,6 +7898,31 @@ mod tests {
         );
 
         assert_eq!(execute(&program, &[]), Ok(Value::number(5.0)));
+    }
+
+    #[test]
+    fn datum_type_field_reflects_the_heap_runtime_type() {
+        let program = manual_program(
+            vec![
+                Instruction::LoadSrc,
+                Instruction::LoadField(field("type")),
+                Instruction::Return,
+            ],
+            0,
+        );
+        let mut state = ExecutionState::new();
+        let path = TypePath::parse("/obj/machinery/example").unwrap();
+        let datum = state.heap_mut().allocate_datum(path.clone());
+
+        assert_eq!(
+            execute_in_context(
+                &program,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(datum), Value::Null),
+            ),
+            Ok(Value::TypePath(path))
+        );
     }
 
     #[test]
@@ -3600,7 +8042,9 @@ mod tests {
 
         assert_eq!(result, Value::number(11.0));
         assert_eq!(program.instructions.len(), program.source_spans.len());
-        assert_eq!(program.source_spans[0], syntax.definitions[0].body[0].span);
+        // Every procedure now begins by materializing its implicit `args` list.
+        assert_eq!(program.source_spans[0], syntax.definitions[0].span);
+        assert_eq!(program.source_spans[2], syntax.definitions[0].body[0].span);
     }
 
     #[test]
@@ -3608,6 +8052,170 @@ mod tests {
         let result = execute_source("/proc/probe(input)\n\treturn (input + 3) * 2\n", 4.0);
 
         assert_eq!(result, Value::number(14.0));
+    }
+
+    #[test]
+    fn parenthesized_expression_statements_discard_their_result() {
+        let syntax =
+            parse("/proc/probe(input)\n\tvar/value = 0\n\t((value = input + 1))\n\treturn value\n")
+                .expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("parenthesized expression statement should compile");
+
+        assert_eq!(
+            execute(&program, &[Value::number(41.0)]),
+            Ok(Value::number(42.0))
+        );
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::Pop))
+        );
+    }
+
+    #[test]
+    fn executes_bitwise_operators_with_dm_integer_coercion_and_precedence() {
+        let source = "/proc/probe()\n\treturn (-1 & 6) + (7 ^ 3 | 8) + (9.9 & 3)\n";
+        let syntax = parse(source).expect("source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("bitwise expressions should compile");
+
+        // -1 & 6 = 6, (7 ^ 3) | 8 = 12, and 9.9 truncates to 9 before
+        // bitwise conjunction with 3, giving 1.
+        assert_eq!(execute(&program, &[]), Ok(Value::number(19.0)));
+        assert!(program.instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::BitAnd | Instruction::BitOr | Instruction::BitXor
+            )
+        }));
+    }
+
+    #[test]
+    fn executes_unary_bitwise_complement_with_dm_integer_coercion() {
+        let source = "/proc/probe()\n\treturn ~9.9 + ~0\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("unary bitwise complement should compile");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(-11.0)));
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::BitNot))
+        );
+    }
+
+    #[test]
+    fn bitwise_compound_assignments_update_locals_and_list_indices() {
+        let source = "/proc/probe(items)\n\tvar/value = 14\n\tvalue &= 11\n\tvalue |= 16\n\titems[1] ^= value\n\treturn items[1]\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("bitwise compound assignments should compile");
+        let mut state = ExecutionState::new();
+        let list = state.heap.allocate_list();
+        state.heap.list_mut(list).unwrap().add(Value::number(7.0));
+
+        // ((14 & 11) | 16) = 26; 7 ^ 26 = 29.
+        assert_eq!(
+            execute_in_state(&program, &[Value::List(list)], &mut state),
+            Ok(Value::number(29.0))
+        );
+    }
+
+    #[test]
+    fn shift_operators_and_compound_assignments_use_signed_32_bit_semantics() {
+        let source = "/proc/probe(items)\n\tvar/value = 3 << 2\n\tvalue >>= 1\n\titems[1] <<= value\n\treturn (-8 >> 2) + items[1] + (1 << 33)\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("shift expressions and assignments should compile");
+        let mut state = ExecutionState::new();
+        let list = state.heap.allocate_list();
+        state.heap.list_mut(list).unwrap().add(Value::number(1.0));
+
+        // value is (3 << 2) >> 1 = 6; item becomes 1 << 6 = 64. Right
+        // shifts preserve the sign bit, and a count of 33 masks to one.
+        assert_eq!(
+            execute_in_state(&program, &[Value::List(list)], &mut state),
+            Ok(Value::number(64.0))
+        );
+        assert!(program.instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::ShiftLeft | Instruction::ShiftRight
+            )
+        }));
+    }
+
+    #[test]
+    fn conditional_expressions_associate_right() {
+        let source = "/proc/probe(input)\n\treturn input == 1 ? 10 : input == 2 ? 20 : 30\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("conditional expressions should compile");
+
+        assert_eq!(
+            execute(&program, &[Value::number(1.0)]),
+            Ok(Value::number(10.0))
+        );
+        assert_eq!(
+            execute(&program, &[Value::number(2.0)]),
+            Ok(Value::number(20.0))
+        );
+        assert_eq!(
+            execute(&program, &[Value::number(3.0)]),
+            Ok(Value::number(30.0))
+        );
+
+        let short_circuit = parse("/proc/short_circuit()\n\treturn TRUE ? 7 : 1 in 2\n")
+            .expect("source should parse");
+        let program = compile_procedure(&short_circuit.definitions[0])
+            .expect("conditional expressions should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(7.0)));
+    }
+
+    #[test]
+    fn compiles_in_as_a_relational_list_membership_operator() {
+        let source = "/proc/probe(input)\n\treturn input + 1 in list(2, 4, \"key\" = 9)\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("procedure should compile");
+
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::Contains))
+        );
+        assert_eq!(
+            execute(&program, &[Value::number(1.0)]),
+            Ok(Value::number(1.0))
+        );
+        assert_eq!(
+            execute(&program, &[Value::number(3.0)]),
+            Ok(Value::number(1.0))
+        );
+        assert_eq!(
+            execute(&program, &[Value::number(8.0)]),
+            Ok(Value::number(0.0))
+        );
+    }
+
+    #[test]
+    fn in_checks_associative_keys_but_not_associative_values() {
+        let source = "/proc/probe(input)\n\treturn input in list(\"key\" = 9)\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("procedure should compile");
+
+        assert_eq!(
+            execute(&program, &[Value::text("key")]),
+            Ok(Value::number(1.0))
+        );
+        assert_eq!(
+            execute(&program, &[Value::number(9.0)]),
+            Ok(Value::number(0.0))
+        );
     }
 
     #[test]
@@ -3658,6 +8266,55 @@ mod tests {
         assert_eq!(
             execute_module(&module, entry, &[Value::number(8.0)]),
             Ok(Value::number(11.0))
+        );
+    }
+
+    #[test]
+    fn arglist_expands_inside_static_and_dynamic_call_arguments() {
+        let static_source = parse(
+            "/proc/entry()\n\treturn combine(1, arglist(list(2, 3)), 4)\n/proc/combine(a, b, c, d)\n\treturn a + b + c + d\n",
+        )
+        .expect("static arglist source should parse");
+        let module = compile_module(&static_source.definitions).expect("static arglist should compile");
+        let entry = module.procedure_id("/proc/entry").expect("entry should resolve");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(10.0)));
+
+        let dynamic_source = parse(
+            "/datum/receiver/proc/entry()\n\treturn call(src, \"combine\")(1, arglist(list(2, 3)), 4)\n/datum/receiver/proc/combine(a, b, c, d)\n\treturn a + b + c + d\n",
+        )
+        .expect("dynamic arglist source should parse");
+        let module = compile_module_specs(&[
+            ProcedureSpec {
+                path: "/datum/receiver/proc/entry@0".to_owned(),
+                definition: &dynamic_source.definitions[0],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/datum/receiver/proc/combine@0".to_owned(),
+                definition: &dynamic_source.definitions[1],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+        ])
+        .expect("dynamic arglist should compile");
+        let mut state = ExecutionState::new();
+        let receiver = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/receiver").expect("type path"));
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                module.procedure_id_at(0).expect("entry should resolve"),
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(receiver), Value::Null),
+            ),
+            Ok(Value::number(10.0))
         );
     }
 
@@ -3809,6 +8466,74 @@ mod tests {
     }
 
     #[test]
+    fn do_while_executes_before_testing_and_routes_loop_control_to_condition() {
+        let source = "/proc/count(limit)\n\tvar/result = 0\n\tdo\n\t\tresult = result + 1\n\t\tif(result == 2)\n\t\t\tcontinue\n\t\tif(result > limit)\n\t\t\tbreak\n\twhile(result <= limit)\n\treturn result\n";
+
+        // A post-test loop enters even when the condition will be false.
+        assert_eq!(execute_source(source, 0.0), Value::number(1.0));
+        // `continue` tests the condition, and `break` exits without testing.
+        assert_eq!(execute_source(source, 3.0), Value::number(4.0));
+    }
+
+    #[test]
+    fn switch_matches_values_ranges_and_default_after_evaluating_selector_once() {
+        let source = "/proc/classify(value)\n\tvar/calls = 0\n\tswitch(value + 0)\n\t\tif(1, 3)\n\t\t\treturn 10\n\t\tif(4 to 6)\n\t\t\treturn 20\n\t\telse\n\t\t\treturn 30\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("switch should compile");
+
+        assert_eq!(
+            execute(&program, &[Value::number(1.0)]),
+            Ok(Value::number(10.0))
+        );
+        assert_eq!(
+            execute(&program, &[Value::number(3.0)]),
+            Ok(Value::number(10.0))
+        );
+        assert_eq!(
+            execute(&program, &[Value::number(4.0)]),
+            Ok(Value::number(20.0))
+        );
+        assert_eq!(
+            execute(&program, &[Value::number(6.0)]),
+            Ok(Value::number(20.0))
+        );
+        assert_eq!(
+            execute(&program, &[Value::number(7.0)]),
+            Ok(Value::number(30.0))
+        );
+    }
+
+    #[test]
+    fn switch_rejects_case_after_default() {
+        let source = "/proc/invalid(value)\n\tswitch(value)\n\t\telse\n\t\t\treturn 1\n\t\tif(2)\n\t\t\treturn 2\n";
+        let syntax = parse(source).expect("source should parse");
+        let error = compile_procedure(&syntax.definitions[0])
+            .expect_err("case after default must not compile");
+
+        assert_eq!(error.message, "switch case cannot follow an else default");
+    }
+
+    #[test]
+    fn do_requires_indented_body_and_trailing_while() {
+        for (source, expected) in [
+            (
+                "/proc/invalid()\n\tdo\n",
+                "do statement requires an indented body",
+            ),
+            (
+                "/proc/invalid()\n\tdo\n\t\treturn 1\n",
+                "do statement requires a trailing while condition",
+            ),
+        ] {
+            let syntax = parse(source).expect("source should parse");
+            let error = compile_procedure(&syntax.definitions[0])
+                .expect_err("invalid do loop should not compile");
+
+            assert_eq!(error.message, expected);
+        }
+    }
+
+    #[test]
     fn break_and_continue_work_inside_nested_conditionals() {
         let source = "/proc/filter(limit)\n\tvar/index = 0\n\tvar/total = 0\n\twhile(index < limit)\n\t\tindex = index + 1\n\t\tif(index == 2)\n\t\t\tcontinue\n\t\tif(index > 4)\n\t\t\tbreak\n\t\ttotal = total + index\n\treturn total\n";
         let syntax = parse(source).expect("source should parse");
@@ -3872,13 +8597,13 @@ mod tests {
             entry,
             &[],
             ExecutionLimits {
-                max_steps: 7,
+                max_steps: 8,
                 ..ExecutionLimits::default()
             },
         )
         .expect_err("infinite loop should exhaust its instruction budget");
 
-        assert_eq!(error.message, "instruction budget of 7 exhausted");
+        assert_eq!(error.message, "instruction budget of 8 exhausted");
         assert_eq!(error.source_span, Some(while_span));
         assert_eq!(error.call_stack.len(), 1);
         assert_eq!(error.call_stack[0].procedure, "/proc/spin");
@@ -3934,7 +8659,7 @@ mod tests {
                 entry,
                 &[],
                 ExecutionLimits {
-                    max_steps: 4,
+                    max_steps: 8,
                     ..ExecutionLimits::default()
                 },
             ),
@@ -3945,7 +8670,7 @@ mod tests {
             entry,
             &[],
             ExecutionLimits {
-                max_steps: 2,
+                max_steps: 5,
                 ..ExecutionLimits::default()
             },
         )
@@ -3971,6 +8696,42 @@ mod tests {
         let error = compile_procedure(&escaped.definitions[0])
             .expect_err("for initializer should be scoped to its loop");
         assert_eq!(error.message, "unknown local \"i\"");
+    }
+
+    #[test]
+    fn for_to_range_is_inclusive_and_continue_runs_its_increment() {
+        let source = "/proc/sum(first, last)\n\tvar/total = 0\n\tfor(var/i in first to last)\n\t\tif(i == first)\n\t\t\tcontinue\n\t\ttotal += i\n\treturn total\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("range loop should compile");
+        assert_eq!(
+            execute(&program, &[Value::number(2.0), Value::number(5.0)]),
+            Ok(Value::number(12.0))
+        );
+        assert_eq!(
+            execute(&program, &[Value::number(5.0), Value::number(2.0)]),
+            Ok(Value::number(0.0))
+        );
+    }
+
+    #[test]
+    fn for_to_range_honors_explicit_positive_and_negative_steps() {
+        let source = "/proc/ranges()\n\tvar/total = 0\n\tfor(var/i in 5 to 1 step -2)\n\t\ttotal += i\n\tfor(var/j in 1 to 5 step 2)\n\t\ttotal += j\n\treturn total\n";
+        let syntax = parse(source).expect("source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("stepped range loops should compile");
+
+        // 5 + 3 + 1, then 1 + 3 + 5.
+        assert_eq!(execute(&program, &[]), Ok(Value::number(18.0)));
+    }
+
+    #[test]
+    fn for_to_range_evaluates_its_step_once() {
+        let source = "/proc/step_once()\n\tvar/step = 2\n\tvar/total = 0\n\tfor(var/i in 1 to 5 step step)\n\t\ttotal += i\n\t\tstep = 1\n\treturn total\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("range step expression should compile");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(9.0)));
     }
 
     #[test]
@@ -4040,6 +8801,16 @@ mod tests {
     }
 
     #[test]
+    fn typed_for_in_binding_ignores_as_qualifier() {
+        let source = "/proc/typed_loop()\n\tfor(var/turf/area_turf as anything in list(1))\n\t\tarea_turf = null\n\treturn 7\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("typed for-in binding should use area_turf, not the as qualifier");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(7.0)));
+    }
+
+    #[test]
     fn list_literals_support_bracket_reads_and_writes() {
         let source =
             "/proc/list_access()\n\tvar/items = list(1, 2, 3)\n\titems[2] = 9\n\treturn items[2]\n";
@@ -4074,6 +8845,45 @@ mod tests {
                 .get(1)
                 .unwrap()
                 .semantic_eq(&Value::number(12.0))
+        );
+    }
+
+    #[test]
+    fn compound_list_index_assignment_updates_positional_and_associative_entries() {
+        let source = "/proc/update(items)\n\titems[1] += 4\n\titems[\"score\"] *= 3\n\treturn items[1] + items[\"score\"]\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("compound list-index assignments should compile");
+        let mut state = ExecutionState::new();
+        let list = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(list)
+            .unwrap()
+            .add(Value::number(2.0));
+        state
+            .heap_mut()
+            .list_mut(list)
+            .unwrap()
+            .set_key(Value::text("score"), Value::number(5.0));
+
+        assert!(program.instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::CompoundListIndex(CompoundListIndexOperator::Add)
+            )
+        }));
+        assert_eq!(
+            execute_in_state(&program, &[Value::List(list)], &mut state),
+            Ok(Value::number(21.0))
+        );
+        let values = state.heap().list(list).unwrap();
+        assert!(values.get(1).unwrap().semantic_eq(&Value::number(6.0)));
+        assert!(
+            values
+                .get_key(&Value::text("score"))
+                .unwrap()
+                .semantic_eq(&Value::number(15.0))
         );
     }
 
@@ -4135,6 +8945,111 @@ mod tests {
     }
 
     #[test]
+    fn dm_blend_constants_work_in_defaults_and_expressions() {
+        let source = "/proc/blend(mode = BLEND_MULTIPLY)\n\treturn mode + BLEND_INSET_OVERLAY + BLEND_DEFAULT + BLEND_OVERLAY + BLEND_ADD + BLEND_SUBTRACT\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("BYOND blend constants should compile as numeric literals");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(15.0)));
+        assert_eq!(
+            execute(&program, &[Value::number(2.0)]),
+            Ok(Value::number(13.0))
+        );
+    }
+
+    #[test]
+    fn dm_reset_appearance_constants_are_appearance_flag_bits() {
+        let source =
+            "/proc/appearance_flags()\n\treturn RESET_TRANSFORM | RESET_COLOR | RESET_ALPHA | 1\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("appearance constants should compile as BYOND numeric constants");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(57.0)));
+    }
+
+    #[test]
+    fn dm_appearance_flags_are_the_documented_byond_bit_positions() {
+        let source = "/proc/appearance_flags()\n\treturn KEEP_TOGETHER | KEEP_APART | LONG_GLIDE | RESET_TRANSFORM | RESET_COLOR | RESET_ALPHA | PIXEL_SCALE | TILE_BOUND | INHERIT_ID | NO_CLIENT_COLOR | RESET_CONTENTS | PLANE_MASTER | PASS_MOUSE | TILE_MOVER\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("appearance flags should compile as BYOND numeric constants");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(16_383.0)));
+    }
+
+    #[test]
+    fn replacetext_builtin_family_replaces_text_with_byond_bounds() {
+        let source = "/proc/rewrite()\n\tvar/exact = replacetextEx_char(\"Port Bow / port bow\", \"Port Bow\", \"Northwest\")\n\tvar/insensitive = replacetext_char(exact, \"port bow\", \"Southwest\")\n\treturn replacetextEx(insensitive, \"Northwest\", \"East\", 1, 10)\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("replacetext builtin family should compile");
+
+        assert!(program.instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::ReplaceText {
+                    exact: true,
+                    character_indices: true,
+                    ..
+                }
+            )
+        }));
+        assert_eq!(execute(&program, &[]), Ok(Value::text("East / Southwest")));
+    }
+
+    #[test]
+    fn typed_and_uninitialized_locals_start_as_null() {
+        let source = "/proc/locals()\n\tvar/datum/example/typed\n\tvar/plain\n\tif(typed || plain)\n\t\treturn 0\n\treturn 7\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("typed locals without initializers should compile");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(7.0)));
+    }
+
+    #[test]
+    fn unnamed_varargs_parameter_reserves_its_argument_slot() {
+        let source = "/proc/with_varargs(first, ...)\n\tvar/after = first\n\treturn after\n";
+        let syntax = parse(source).expect("source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("unnamed varargs should compile");
+
+        assert_eq!(program.parameter_count, 2);
+        // Two declared argument positions, one ordinary local, and implicit
+        // per-call `args`.
+        assert_eq!(program.local_count, 4);
+        assert_eq!(
+            execute(&program, &[Value::number(9.0)]),
+            Ok(Value::number(9.0))
+        );
+    }
+
+    #[test]
+    fn implicit_args_is_a_per_call_list_of_all_supplied_values() {
+        let source = "/proc/collect(first)\n\tif(length(args) != 3)\n\t\treturn 0\n\treturn args[3] + first\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("implicit args should compile as a local list");
+
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::MakeArgs))
+        );
+        assert_eq!(
+            execute(
+                &program,
+                &[Value::number(2.0), Value::number(5.0), Value::number(11.0)]
+            ),
+            Ok(Value::number(13.0))
+        );
+        assert_eq!(execute(&program, &[]), Ok(Value::number(0.0)));
+    }
+
+    #[test]
     fn multiple_parameter_defaults_evaluate_in_declaration_order() {
         let source = "/proc/combine(first = 1 + 1, second = 3, third = 4)\n\treturn first + second + third\n";
         let syntax = parse(source).expect("source should parse");
@@ -4180,23 +9095,28 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_parameter_default_forms_have_precise_diagnostics() {
-        let reference = parse("/proc/reference(first = 2, second = first)\n\treturn second\n")
-            .expect("source should parse");
-        let error = compile_procedure(&reference.definitions[0])
-            .expect_err("cross-parameter default needs conformance confirmation");
-        assert_eq!(
-            error.message,
-            "parameter default reference \"first\" requires BYOND conformance confirmation"
-        );
+    fn parameter_defaults_are_general_runtime_expressions() {
+        let source = parse(
+            "/proc/add_one(value)\n\treturn value + 1\n\n/proc/defaulted(first = 2, second = add_one(first), third = second * 10)\n\treturn first + second + third\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&source.definitions)
+            .expect("defaults should support parameter references and procedure calls");
 
-        let call = parse("/proc/call_default(value = helper())\n\treturn value\n")
-            .expect("source should parse");
-        let error = compile_procedure(&call.definitions[0])
-            .expect_err("call defaults should remain outside the supported subset");
+        // Defaults execute at invocation time, in parameter order.  Each
+        // later default observes values supplied or defaulted for its
+        // predecessors, while supplied arguments skip only their own default.
         assert_eq!(
-            error.message,
-            "procedure calls in parameter defaults are not supported"
+            execute_module(&module, module.names["/proc/defaulted"], &[]),
+            Ok(Value::number(35.0))
+        );
+        assert_eq!(
+            execute_module(
+                &module,
+                module.names["/proc/defaulted"],
+                &[Value::number(7.0)],
+            ),
+            Ok(Value::number(95.0))
         );
     }
 
@@ -4206,7 +9126,12 @@ mod tests {
         let program = compile_procedure(&syntax.definitions[0]).expect("procedure should compile");
 
         assert_eq!(execute(&program, &[]), Ok(Value::Null));
-        assert!(matches!(program.instructions[0], Instruction::LoadResult));
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::LoadResult))
+        );
     }
 
     #[test]
@@ -4239,6 +9164,510 @@ mod tests {
     }
 
     #[test]
+    fn type_predicate_builtins_classify_null_numbers_paths_and_subtypes() {
+        for (source, expected) in [
+            ("/proc/test()\n\treturn isnull(null)\n", 1.0),
+            ("/proc/test()\n\treturn isnum(3)\n", 1.0),
+            ("/proc/test()\n\treturn ispath(/datum/example)\n", 1.0),
+            ("/proc/test()\n\treturn islist(list(1))\n", 1.0),
+            ("/proc/test()\n\treturn islist(3)\n", 0.0),
+            ("/proc/test()\n\treturn ismovable(new /atom/movable)\n", 1.0),
+            (
+                "/proc/test()\n\treturn ismovable(new /atom/movable/child)\n",
+                1.0,
+            ),
+            ("/proc/test()\n\treturn ismovable(new /obj/item)\n", 1.0),
+            ("/proc/test()\n\treturn ismovable(new /mob/living)\n", 1.0),
+            ("/proc/test()\n\treturn ismovable(new /atom)\n", 0.0),
+            ("/proc/test()\n\treturn ismovable(/obj/item)\n", 0.0),
+            ("/proc/test()\n\treturn isturf(new /turf)\n", 1.0),
+            ("/proc/test()\n\treturn isturf(new /turf/open/floor)\n", 1.0),
+            ("/proc/test()\n\treturn isturf(new /obj/item)\n", 0.0),
+            ("/proc/test()\n\treturn isturf(/turf/open/floor)\n", 0.0),
+            ("/proc/test()\n\treturn isloc(new /area)\n", 1.0),
+            ("/proc/test()\n\treturn isloc(new /turf/open/floor)\n", 1.0),
+            ("/proc/test()\n\treturn isloc(new /obj/item)\n", 1.0),
+            ("/proc/test()\n\treturn isloc(new /mob/living)\n", 1.0),
+            (
+                "/proc/test()\n\treturn isloc(new /turf, new /obj, new /mob)\n",
+                1.0,
+            ),
+            ("/proc/test()\n\treturn isloc(new /turf, 3)\n", 0.0),
+            ("/proc/test()\n\treturn isloc(/turf)\n", 0.0),
+            (
+                "/proc/test()\n\treturn istype(/datum/example, /datum)\n",
+                1.0,
+            ),
+            (
+                "/proc/test()\n\treturn istype(new /datum/example, /datum)\n",
+                1.0,
+            ),
+            ("/proc/test()\n\treturn istype(3, /datum)\n", 0.0),
+        ] {
+            let syntax = parse(source).expect("source should parse");
+            let program = compile_procedure(&syntax.definitions[0])
+                .expect("type predicate builtin should compile");
+            assert_eq!(execute(&program, &[]), Ok(Value::number(expected)));
+            assert!(
+                program
+                    .instructions
+                    .iter()
+                    .any(|instruction| matches!(instruction, Instruction::TypePredicate { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn waitfor_directives_are_headless_scheduling_metadata() {
+        for value in ["FALSE", "TRUE", "0", "1"] {
+            let syntax = parse(&format!(
+                "/proc/scheduled()\n\tset waitfor = {value}\n\treturn 17\n"
+            ))
+            .expect("source should parse");
+            let program = compile_procedure(&syntax.definitions[0])
+                .expect("waitfor directive should compile");
+
+            assert_eq!(execute(&program, &[]), Ok(Value::number(17.0)));
+        }
+    }
+
+    #[test]
+    fn unsupported_set_directives_remain_diagnostic() {
+        let syntax = parse("/proc/invalid()\n\tset hidden = TRUE\n").expect("source should parse");
+        let error = compile_procedure(&syntax.definitions[0])
+            .expect_err("only the supported scheduling directive should compile");
+
+        assert!(error.message.contains("hidden"));
+    }
+
+    #[test]
+    fn crash_statement_compiles_and_a_false_guard_skips_it() {
+        let syntax =
+            parse("/proc/guarded()\n\tif(FALSE)\n\t\tCRASH(\"should not execute\")\n\treturn 17\n")
+                .expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("CRASH should compile even when its branch is not taken");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(17.0)));
+    }
+
+    #[test]
+    fn crash_statement_returns_a_source_mapped_runtime_error() {
+        let syntax = parse("/proc/fail()\n\tif(TRUE)\n\t\tCRASH(\"loading id is required\")\n")
+            .expect("source should parse");
+        let crash_span = syntax.definitions[0].body[1].span;
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("CRASH statement should compile");
+        let error = execute(&program, &[]).expect_err("taken CRASH must stop execution");
+
+        assert_eq!(error.message, "CRASH: \"loading id is required\"");
+        assert_eq!(error.source_span, Some(crash_span));
+        assert_eq!(error.call_stack.len(), 1);
+        assert_eq!(error.call_stack[0].procedure, "<standalone>");
+        assert_eq!(error.call_stack[0].source_span, Some(crash_span));
+    }
+
+    #[test]
+    fn headless_locate_consumes_arguments_and_returns_null() {
+        let syntax =
+            parse("/proc/find()\n\treturn locate(1, 2, 3)\n").expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("headless locate should compile without a user procedure");
+
+        assert!(
+            program.instructions.iter().any(|instruction| matches!(
+                instruction,
+                Instruction::Locate { argument_count: 3 }
+            ))
+        );
+        assert_eq!(execute(&program, &[]), Ok(Value::Null));
+    }
+
+    #[test]
+    fn regex_builtin_constructs_a_regex_datum_with_pattern_and_flags() {
+        let syntax = parse("/proc/build()\n\treturn regex(@\"[a-z]+\", \"ig\")\n")
+            .expect("regex source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("the built-in regex constructor should compile");
+        assert!(program.instructions.iter().any(|instruction| matches!(
+            instruction,
+            Instruction::MakeRegex { argument_count: 2 }
+        )));
+
+        let mut state = ExecutionState::new();
+        let result =
+            execute_in_state(&program, &[], &mut state).expect("regex constructor should execute");
+        let Value::Datum(regex) = result else {
+            panic!("regex constructor should return a datum");
+        };
+        let datum = state.heap().datum(regex).expect("regex datum should exist");
+        assert_eq!(datum.type_path().to_string(), "/regex");
+        assert_eq!(datum.field(&field("text")), Ok(&Value::text("[a-z]+")));
+        assert_eq!(datum.field(&field("flags")), Ok(&Value::text("ig")));
+    }
+
+    #[test]
+    fn mutable_appearance_builtin_constructs_its_builtin_datum() {
+        let syntax =
+            parse("/proc/build()\n\treturn mutable_appearance('icons/test.dmi', \"state\")\n")
+                .expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("the mutable_appearance constructor should compile");
+        assert!(program.instructions.iter().any(|instruction| matches!(
+            instruction,
+            Instruction::MakeMutableAppearance { argument_count: 2 }
+        )));
+
+        let mut state = ExecutionState::new();
+        let result = execute_in_state(&program, &[], &mut state)
+            .expect("mutable_appearance constructor should execute");
+        let Value::Datum(appearance) = result else {
+            panic!("mutable_appearance constructor should return a datum");
+        };
+        assert_eq!(
+            state
+                .heap()
+                .datum(appearance)
+                .expect("mutable appearance datum should exist")
+                .type_path()
+                .to_string(),
+            "/mutable_appearance"
+        );
+    }
+
+    #[test]
+    fn optional_field_and_index_operators_parse_as_access_expressions() {
+        let fields = parse("/proc/probe(value)\n\treturn value?.name\n")
+            .expect("optional field source should parse");
+        compile_procedure(&fields.definitions[0]).expect("optional field access should compile");
+
+        let index = parse("/proc/probe(value)\n\treturn value?[1]\n")
+            .expect("optional index source should parse");
+        compile_procedure(&index.definitions[0]).expect("optional index access should compile");
+    }
+
+    #[test]
+    fn headless_locate_in_container_is_not_list_membership_and_supports_nesting() {
+        let syntax =
+            parse("/proc/find()\n\treturn locate(locate(1, 2, 3) in null, 4, 5) in null\n")
+                .expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("headless locate in a container should compile");
+
+        assert_eq!(
+            program
+                .instructions
+                .iter()
+                .filter(|instruction| matches!(instruction, Instruction::LocateIn { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(execute(&program, &[]), Ok(Value::Null));
+    }
+
+    #[test]
+    fn length_builtin_counts_text_bytes_and_list_entries() {
+        let source = "/proc/measure()\n\tvar/text_length = length(\"aé\")\n\tvar/list_length = length(list(10, 20, \"key\" = 30))\n\treturn text_length * 10 + list_length\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("length builtin should compile for text and lists");
+
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::Length))
+        );
+        // DM's regular text operations use legacy byte positions, so `é`
+        // contributes two UTF-8 bytes. Associative list entries contribute
+        // one entry, like positional list values.
+        assert_eq!(execute(&program, &[]), Ok(Value::number(33.0)));
+    }
+
+    #[test]
+    fn ref_builtin_returns_stable_byond_style_heap_identity_text() {
+        let syntax = parse(
+            "/proc/list_ref()\n\tvar/item = list()\n\treturn ref(item)\n\n/proc/datum_ref()\n\treturn ref(new /datum/example)\n\n/proc/scalar_ref()\n\treturn ref(42)\n",
+        )
+        .expect("ref source should parse");
+        let list_program =
+            compile_procedure(&syntax.definitions[0]).expect("list ref builtin should compile");
+        let datum_program =
+            compile_procedure(&syntax.definitions[1]).expect("datum ref builtin should compile");
+        let scalar_program =
+            compile_procedure(&syntax.definitions[2]).expect("scalar ref builtin should compile");
+
+        assert!(
+            list_program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::Ref))
+        );
+        let mut state = ExecutionState::new();
+        assert_eq!(
+            execute_in_state(&list_program, &[], &mut state),
+            // The procedure's implicit `args` list occupies the first list
+            // slot, so the explicit list receives the next BYOND list ref.
+            Ok(Value::text("[0xe000002]"))
+        );
+        assert_eq!(
+            execute_in_state(&datum_program, &[], &mut state),
+            Ok(Value::text("[0xd000001]"))
+        );
+        assert_eq!(
+            execute_in_state(&scalar_program, &[], &mut state),
+            Ok(Value::Null)
+        );
+    }
+
+    #[test]
+    fn get_step_finds_cardinal_diagonal_and_same_coordinate_turfs() {
+        let syntax =
+            parse("/proc/step_from(source, direction)\n\treturn get_step(source, direction)\n")
+                .expect("source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("get_step builtin should compile");
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::GetStep))
+        );
+
+        let mut state = ExecutionState::new();
+        let origin = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/turf/open/origin").expect("type path"));
+        let north_east = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/turf/open/north_east").expect("type path"));
+        let west = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/turf/open/west").expect("type path"));
+        for (datum, x, y) in [
+            (origin, 4.0, 9.0),
+            (north_east, 5.0, 10.0),
+            (west, 3.0, 9.0),
+        ] {
+            for (name, value) in [("x", x), ("y", y), ("z", 2.0)] {
+                state
+                    .heap_mut()
+                    .set_datum_field(datum, field(name), Value::number(value))
+                    .expect("coordinate should be set");
+            }
+        }
+
+        assert_eq!(
+            execute_in_state(
+                &program,
+                &[Value::Datum(origin), Value::number(5.0)],
+                &mut state
+            ),
+            Ok(Value::Datum(north_east))
+        );
+        assert_eq!(
+            execute_in_state(
+                &program,
+                &[Value::Datum(origin), Value::number(8.0)],
+                &mut state
+            ),
+            Ok(Value::Datum(west))
+        );
+        assert_eq!(
+            execute_in_state(
+                &program,
+                &[Value::Datum(origin), Value::number(0.0)],
+                &mut state
+            ),
+            Ok(Value::Datum(origin))
+        );
+        assert_eq!(
+            execute_in_state(
+                &program,
+                &[Value::Datum(origin), Value::number(1.0)],
+                &mut state
+            ),
+            Ok(Value::Null)
+        );
+    }
+
+    fn compile_range_programs() -> (Program, Program, Program) {
+        let syntax = parse(
+            "/proc/normal(distance, center)\n\treturn range(distance, center)\n/proc/reversed(center, distance)\n\treturn range(center, distance)\n/proc/implicit(distance)\n\treturn range(distance)\n",
+        )
+        .expect("range source should parse");
+        let normal = compile_procedure(&syntax.definitions[0]).expect("range should compile");
+        let reversed =
+            compile_procedure(&syntax.definitions[1]).expect("reversed range should compile");
+        let implicit =
+            compile_procedure(&syntax.definitions[2]).expect("implicit range should compile");
+        (normal, reversed, implicit)
+    }
+
+    #[test]
+    fn range_returns_all_same_z_atoms_in_a_square_and_accepts_reversed_arguments() {
+        let (normal, reversed, implicit) = compile_range_programs();
+        assert!(
+            normal
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::Range { argument_count: 2 }))
+        );
+        assert!(
+            implicit
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::Range { argument_count: 1 }))
+        );
+
+        let mut state = ExecutionState::new();
+        let center = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/turf/open/center").expect("type path"));
+        let adjacent = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/item/adjacent").expect("type path"));
+        let diagonal = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/mob/living/diagonal").expect("type path"));
+        let far = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/turf/open/far").expect("type path"));
+        let other_z = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/item/other_z").expect("type path"));
+        let area = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/area/test").expect("type path"));
+        for (datum, x, y, z) in [
+            (center, 10.0, 10.0, 1.0),
+            (adjacent, 11.0, 10.0, 1.0),
+            (diagonal, 9.0, 9.0, 1.0),
+            (far, 12.0, 10.0, 1.0),
+            (other_z, 10.0, 10.0, 2.0),
+            (area, 10.0, 10.0, 1.0),
+        ] {
+            for (name, value) in [("x", x), ("y", y), ("z", z)] {
+                state
+                    .heap_mut()
+                    .set_datum_field(datum, field(name), Value::number(value))
+                    .expect("coordinate should be set");
+            }
+        }
+        let values = |value: Value, state: &ExecutionState| {
+            let Value::List(list) = value else {
+                panic!("range should return a list");
+            };
+            state
+                .heap()
+                .list(list)
+                .expect("range list should be live")
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>()
+        };
+        let normal_values = values(
+            execute_in_state(
+                &normal,
+                &[Value::number(1.0), Value::Datum(center)],
+                &mut state,
+            )
+            .expect("normal range should execute"),
+            &state,
+        );
+        assert_eq!(
+            normal_values,
+            vec![
+                Value::Datum(center),
+                Value::Datum(adjacent),
+                Value::Datum(diagonal)
+            ]
+        );
+        let reversed_values = values(
+            execute_in_state(
+                &reversed,
+                &[Value::Datum(center), Value::number(1.0)],
+                &mut state,
+            )
+            .expect("reversed range should execute"),
+            &state,
+        );
+        assert_eq!(reversed_values, normal_values);
+        let context = ExecutionContext::new(Value::Datum(center), Value::Null);
+        let implicit_values = values(
+            execute_in_context(&implicit, &[Value::number(0.0)], &mut state, &context)
+                .expect("implicit range should execute"),
+            &state,
+        );
+        assert_eq!(implicit_values, vec![Value::Datum(center)]);
+    }
+
+    #[test]
+    fn typesof_builtin_includes_the_selector_and_registered_descendants() {
+        let syntax = parse("/proc/types()\n\treturn typesof(/datum)\n")
+            .expect("typesof source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("typesof builtin should compile");
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::TypesOf))
+        );
+
+        let mut state = ExecutionState::new();
+        state.set_type_paths([
+            TypePath::parse("/obj").expect("type path"),
+            TypePath::parse("/datum/child").expect("type path"),
+            TypePath::parse("/datum").expect("type path"),
+            TypePath::parse("/datum/child/grandchild").expect("type path"),
+        ]);
+        let result = execute_in_state(&program, &[], &mut state)
+            .expect("typesof should execute against the catalog");
+        let Value::List(list) = result else {
+            panic!("typesof should return a list");
+        };
+        let values = state
+            .heap()
+            .list(list)
+            .expect("typesof result list should be live")
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                Value::TypePath(TypePath::parse("/datum").expect("type path")),
+                Value::TypePath(TypePath::parse("/datum/child").expect("type path")),
+                Value::TypePath(TypePath::parse("/datum/child/grandchild").expect("type path")),
+            ]
+        );
+    }
+
+    #[test]
+    fn typesof_can_use_a_shared_immutable_catalog() {
+        let catalog = Arc::new(
+            [
+                TypePath::parse("/datum").expect("type path"),
+                TypePath::parse("/datum/child").expect("type path"),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let mut state = ExecutionState::new();
+        state.set_shared_type_paths(Arc::clone(&catalog));
+
+        assert_eq!(Arc::strong_count(&catalog), 2);
+        assert_eq!(
+            state.type_paths().cloned().collect::<Vec<_>>(),
+            vec![
+                TypePath::parse("/datum").expect("type path"),
+                TypePath::parse("/datum/child").expect("type path"),
+            ]
+        );
+    }
+
+    #[test]
     fn special_result_can_receive_resolved_parent_call() {
         let source = "/proc/base(value = 4)\n\t. = value\n/proc/child(value = 4)\n\t. = ..()\n";
         let syntax = parse(source).expect("source should parse");
@@ -4248,11 +9677,17 @@ mod tests {
                 path: "/proc/base@0".to_owned(),
                 definition: &syntax.definitions[0],
                 parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
             },
             ProcedureSpec {
                 path: "/proc/child@1".to_owned(),
                 definition: &syntax.definitions[1],
                 parent: Some(0),
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
             },
         ])
         .expect("resolved parent specs should compile");

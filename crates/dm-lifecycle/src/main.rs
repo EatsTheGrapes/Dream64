@@ -8,7 +8,8 @@ use std::process::ExitCode;
 use dm_compiler::{Compilation, CompilerDatabase};
 use dm_lifecycle::{
     LifecycleIndex, LifecycleKind, LifecycleResolution, build_initialization_plan,
-    execute_initialization_plan,
+    execute_initialization_plan, sweep_lifecycle_compatibility,
+    sweep_lifecycle_compatibility_with_closures,
 };
 use dm_runtime::RuntimeImage;
 use dm_semantics::ProcedureRegistry;
@@ -18,12 +19,15 @@ use dm_world::allocate_world;
 enum Command {
     Plan,
     Boot,
+    Sweep,
+    SweepClosure,
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() -> ExitCode {
     let mut arguments = env::args_os().skip(1);
     let Some(first) = arguments.next() else {
-        eprintln!("usage: dm-lifecycle [plan|boot] <world.dme> [map.dmm]");
+        eprintln!("usage: dm-lifecycle [plan|boot|sweep|sweep-closure] <world.dme> [map.dmm]");
         return ExitCode::from(2);
     };
     let (command, environment) = if first.as_os_str() == OsStr::new("plan") {
@@ -38,12 +42,24 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         };
         (Command::Boot, PathBuf::from(environment))
+    } else if first.as_os_str() == OsStr::new("sweep") {
+        let Some(environment) = arguments.next() else {
+            eprintln!("usage: dm-lifecycle sweep <world.dme> [map.dmm]");
+            return ExitCode::from(2);
+        };
+        (Command::Sweep, PathBuf::from(environment))
+    } else if first.as_os_str() == OsStr::new("sweep-closure") {
+        let Some(environment) = arguments.next() else {
+            eprintln!("usage: dm-lifecycle sweep-closure <world.dme> [map.dmm]");
+            return ExitCode::from(2);
+        };
+        (Command::SweepClosure, PathBuf::from(environment))
     } else {
         (Command::Plan, PathBuf::from(first))
     };
     let requested_map = arguments.next().map(PathBuf::from);
     if arguments.next().is_some() {
-        eprintln!("usage: dm-lifecycle [plan|boot] <world.dme> [map.dmm]");
+        eprintln!("usage: dm-lifecycle [plan|boot|sweep|sweep-closure] <world.dme> [map.dmm]");
         return ExitCode::from(2);
     }
     let compilation = match CompilerDatabase::new().compile(&environment) {
@@ -80,6 +96,22 @@ fn main() -> ExitCode {
     let plan = build_initialization_plan(&runtime, &index, &world, map_path.clone());
 
     print_plan_summary(&map_path, &index, &procedures, &plan);
+    if command == Command::Sweep {
+        print_compatibility_sweep(&sweep_lifecycle_compatibility(
+            &compilation,
+            &procedures,
+            &index,
+            &plan,
+        ));
+    }
+    if command == Command::SweepClosure {
+        print_compatibility_sweep(&sweep_lifecycle_compatibility_with_closures(
+            &compilation,
+            &procedures,
+            &index,
+            &plan,
+        ));
+    }
     if command == Command::Boot {
         let allocation = match allocate_world(&world, &mut runtime) {
             Ok(allocation) => allocation,
@@ -105,6 +137,29 @@ fn main() -> ExitCode {
         print_boot_summary(&allocation, &execution);
     }
     ExitCode::SUCCESS
+}
+
+fn print_compatibility_sweep(sweep: &dm_lifecycle::LifecycleCompatibilitySweep) {
+    println!("sweep_targets={}", sweep.targets);
+    println!("sweep_compatible={}", sweep.compatible);
+    println!("sweep_issue_groups={}", sweep.issues.len());
+    for issue in &sweep.issues {
+        println!(
+            "sweep_issue category={:?} locations={} message={:?}",
+            issue.category,
+            issue.locations.len(),
+            issue.message
+        );
+        for location in &issue.locations {
+            println!(
+                "sweep_location phase={:?} procedure={} source={}:{}",
+                location.kind,
+                location.procedure_path,
+                location.source.path,
+                location.source.span.start
+            );
+        }
+    }
 }
 
 fn print_plan_summary(

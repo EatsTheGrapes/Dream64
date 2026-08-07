@@ -14,8 +14,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dm_compiler::Compilation;
 use dm_core::{FileId, SourceSpan};
+use dm_lexer::TokenKind;
 use dm_object_tree::{CodePath, NodeId, NodeKind};
 use dm_syntax::DefinitionKind;
+use dm_value::FieldName;
 
 /// Tree-local identity of a canonical procedure.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -294,17 +296,79 @@ impl ProcedureRegistry {
         let mut selected: BTreeSet<_> = implementations.into_iter().collect();
         let mut pending: Vec<_> = selected.iter().copied().collect();
         while let Some(implementation) = pending.pop() {
-            let Some(parent) = self
+            if let Some(parent) = self
                 .implementation(implementation)
                 .and_then(|body| body.parent_target)
+                && selected.insert(parent)
+            {
+                pending.push(parent);
+            }
+
+            let Some(body) = self.implementation(implementation) else {
+                continue;
+            };
+            let Some(definition) = compilation
+                .syntax(body.file_id)
+                .and_then(|syntax| syntax.definitions.get(body.definition_index))
             else {
                 continue;
             };
-            if selected.insert(parent) {
-                pending.push(parent);
+            for selector in dynamic_call_literal_selectors(definition) {
+                for procedure in &self.procedures {
+                    if !procedure_matches_dynamic_selector(procedure, &selector) {
+                        continue;
+                    }
+                    if let Some(target) = procedure.effective_target
+                        && selected.insert(target)
+                    {
+                        pending.push(target);
+                    }
+                }
+            }
+            for selector in static_call_selectors(definition) {
+                if let Some(target) =
+                    self.static_call_target(implementation, &selector, compilation)
+                    && selected.insert(target)
+                {
+                    pending.push(target);
+                }
             }
         }
         self.compile_vm_selected(compilation, selected)
+    }
+
+    /// Compiles each requested body independently, without following calls or
+    /// `..()` targets, and retains every lowering result.
+    ///
+    /// This is intended for fast compatibility inventories. Runtime phases
+    /// should use [`Self::compile_vm_implementations`] so their dependency
+    /// closure is present in the generated module.
+    #[must_use]
+    pub fn compile_vm_bodies_independently(
+        &self,
+        compilation: &Compilation,
+        implementations: impl IntoIterator<Item = ProcedureImplementationId>,
+    ) -> Vec<(
+        ProcedureImplementationId,
+        Result<ExecutableProcedures, dm_vm::CompileError>,
+    )> {
+        let direct_fields = direct_instance_fields(compilation);
+        let mut inherited_field_cache = BTreeMap::new();
+        implementations
+            .into_iter()
+            .map(|implementation| {
+                (
+                    implementation,
+                    self.compile_vm_selected_with_fields(
+                        compilation,
+                        [implementation],
+                        &direct_fields,
+                        &mut inherited_field_cache,
+                        false,
+                    ),
+                )
+            })
+            .collect()
     }
 
     fn compile_vm_selected(
@@ -312,7 +376,27 @@ impl ProcedureRegistry {
         compilation: &Compilation,
         selected: impl IntoIterator<Item = ProcedureImplementationId>,
     ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
+        let direct_fields = direct_instance_fields(compilation);
+        let mut inherited_field_cache = BTreeMap::new();
+        self.compile_vm_selected_with_fields(
+            compilation,
+            selected,
+            &direct_fields,
+            &mut inherited_field_cache,
+            true,
+        )
+    }
+
+    fn compile_vm_selected_with_fields(
+        &self,
+        compilation: &Compilation,
+        selected: impl IntoIterator<Item = ProcedureImplementationId>,
+        direct_fields: &BTreeMap<NodeId, BTreeMap<String, FieldName>>,
+        inherited_field_cache: &mut BTreeMap<NodeId, BTreeMap<String, FieldName>>,
+        include_parent_targets: bool,
+    ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
         let selected: BTreeSet<_> = selected.into_iter().collect();
+        let global_fields = declared_global_fields(compilation);
         let mut ordered = Vec::new();
         for procedure in &self.procedures {
             for implementation in &procedure.implementations {
@@ -339,24 +423,48 @@ impl ProcedureRegistry {
         let specs: Vec<_> = ordered
             .iter()
             .map(|(procedure, implementation, definition)| {
-                let parent = implementation
-                    .parent_target
-                    .map(|parent| {
-                        indices
-                            .get(&parent)
-                            .copied()
-                            .ok_or_else(|| dm_vm::CompileError {
-                                message: format!(
-                                    "parent implementation for {} is missing from the VM module",
-                                    procedure.path
-                                ),
-                            })
-                    })
-                    .transpose()?;
+                let parent = if include_parent_targets {
+                    implementation
+                        .parent_target
+                        .map(|parent| {
+                            indices
+                                .get(&parent)
+                                .copied()
+                                .ok_or_else(|| dm_vm::CompileError {
+                                    message: format!(
+                                        "parent implementation for {} is missing from the VM module",
+                                        procedure.path
+                                    ),
+                                })
+                        })
+                        .transpose()?
+                } else {
+                    None
+                };
                 Ok(dm_vm::ProcedureSpec {
                     path: format!("{}@{}", procedure.path, implementation.ordinal),
                     definition,
                     parent,
+                    static_calls: static_call_selectors(definition)
+                        .into_iter()
+                        .filter_map(|selector| {
+                            self.static_call_target(implementation.id, &selector, compilation)
+                                .and_then(|target| indices.get(&target).copied())
+                                .map(|target| (selector, target))
+                        })
+                        .collect(),
+                    src_fields: procedure
+                        .owner_type
+                        .map(|owner| {
+                            inherited_fields(
+                                compilation,
+                                owner,
+                                direct_fields,
+                                inherited_field_cache,
+                            )
+                        })
+                        .unwrap_or_default(),
+                    global_fields: global_fields.clone(),
                 })
             })
             .collect::<Result<_, dm_vm::CompileError>>()?;
@@ -379,6 +487,246 @@ impl ProcedureRegistry {
             module,
             implementations,
         })
+    }
+}
+
+/// Returns bare names for project-wide variables, including globals introduced
+/// by macros such as `SUBSYSTEM_DEF(mapping)`.  A global has no owning type;
+/// static and instance variables remain deliberately excluded.
+fn declared_global_fields(compilation: &Compilation) -> BTreeMap<String, FieldName> {
+    compilation
+        .code_tree()
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == NodeKind::Variable && node.owner_type.is_none())
+        .filter_map(|node| {
+            let name = node.path.segments().last()?;
+            FieldName::parse(name)
+                .ok()
+                .map(|field| (name.clone(), field))
+        })
+        .collect()
+}
+
+impl ProcedureRegistry {
+    fn static_call_target(
+        &self,
+        implementation: ProcedureImplementationId,
+        selector: &str,
+        compilation: &Compilation,
+    ) -> Option<ProcedureImplementationId> {
+        let procedure = self.procedure(implementation.procedure())?;
+        let mut owner = procedure.owner_type;
+        let tree = compilation.code_tree();
+        while let Some(current_owner) = owner {
+            if let Some(candidate) = self.procedures.iter().find(|candidate| {
+                candidate.owner_type == Some(current_owner)
+                    && candidate
+                        .path
+                        .segments()
+                        .last()
+                        .is_some_and(|name| name == selector)
+            }) {
+                return effective_target(&self.procedures, candidate.id);
+            }
+            owner = tree.node(current_owner).and_then(|node| node.parent_type);
+        }
+        self.procedures
+            .iter()
+            .find(|candidate| {
+                candidate.owner_type.is_none()
+                    && candidate
+                        .path
+                        .segments()
+                        .last()
+                        .is_some_and(|name| name == selector)
+            })
+            .and_then(|candidate| effective_target(&self.procedures, candidate.id))
+    }
+}
+
+fn dynamic_call_literal_selectors(definition: &dm_syntax::Definition) -> BTreeSet<String> {
+    let mut selectors = BTreeSet::new();
+    for line in &definition.body {
+        let tokens = &line.tokens;
+        for call_index in 0..tokens.len().saturating_sub(1) {
+            if !matches!(&tokens[call_index].kind, TokenKind::Identifier(name) if name == "call")
+                || !matches!(tokens[call_index + 1].kind, TokenKind::Punctuation('('))
+            {
+                continue;
+            }
+            let mut depth = 1usize;
+            let mut separator = None;
+            for (offset, token) in tokens[call_index + 2..].iter().enumerate() {
+                match &token.kind {
+                    TokenKind::Punctuation('(') => depth += 1,
+                    TokenKind::Punctuation(')') => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    TokenKind::Punctuation(',') if depth == 1 => {
+                        separator = Some(call_index + 2 + offset);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let selector_index = separator.map_or(call_index + 2, |index| index + 1);
+            if let Some(TokenKind::String(selector) | TokenKind::RawString(selector)) =
+                tokens.get(selector_index).map(|token| &token.kind)
+            {
+                selectors.insert(selector.clone());
+            }
+        }
+    }
+    selectors
+}
+
+fn static_call_selectors(definition: &dm_syntax::Definition) -> BTreeSet<String> {
+    definition
+        .body
+        .iter()
+        .flat_map(|line| line.tokens.windows(2))
+        .filter_map(|tokens| match (&tokens[0].kind, &tokens[1].kind) {
+            (TokenKind::Identifier(name), TokenKind::Punctuation('(')) => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn procedure_matches_dynamic_selector(procedure: &Procedure, selector: &str) -> bool {
+    let selector = selector.trim_matches('/');
+    let selector = selector.rsplit('/').next().unwrap_or(selector);
+    procedure
+        .path
+        .segments()
+        .last()
+        .is_some_and(|name| name == selector)
+}
+
+fn direct_instance_fields(
+    compilation: &Compilation,
+) -> BTreeMap<NodeId, BTreeMap<String, FieldName>> {
+    let tree = compilation.code_tree();
+    let mut fields = BTreeMap::<NodeId, BTreeMap<String, FieldName>>::new();
+    for node in tree
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == NodeKind::Variable)
+    {
+        let Some(owner) = node.owner_type else {
+            continue;
+        };
+        let Some(name) = node.path.segments().last() else {
+            continue;
+        };
+        if let Ok(field) = FieldName::parse(name) {
+            fields.entry(owner).or_default().insert(name.clone(), field);
+        }
+    }
+    fields
+}
+
+fn inherited_fields(
+    compilation: &Compilation,
+    owner: NodeId,
+    direct_fields: &BTreeMap<NodeId, BTreeMap<String, FieldName>>,
+    cache: &mut BTreeMap<NodeId, BTreeMap<String, FieldName>>,
+) -> BTreeMap<String, FieldName> {
+    if let Some(fields) = cache.get(&owner) {
+        return fields.clone();
+    }
+    let tree = compilation.code_tree();
+    let mut hierarchy = Vec::new();
+    let mut current = Some(owner);
+    while let Some(node) = current {
+        hierarchy.push(node);
+        current = tree.node(node).and_then(|type_node| type_node.parent_type);
+    }
+    hierarchy.reverse();
+    let mut fields = BTreeMap::new();
+    for node in hierarchy {
+        if let Some(direct) = direct_fields.get(&node) {
+            fields.extend(direct.clone());
+        }
+        standard_instance_fields(tree.node(node).map(|node| &node.path), &mut fields);
+    }
+    cache.insert(owner, fields.clone());
+    fields
+}
+
+/// Adds the fields supplied by BYOND's built-in datum and atom hierarchies.
+///
+/// The object tree deliberately seeds only standard *types*, since their
+/// members have no user source declaration.  VM lowering still needs the
+/// corresponding names, however, so bare reads such as `type`, `loc`, and
+/// `dir` lower exactly like declared `src` fields.  Keep this catalog at the
+/// semantic boundary: atom-only names must not become visible on arbitrary
+/// `/datum`s.
+fn standard_instance_fields(path: Option<&CodePath>, fields: &mut BTreeMap<String, FieldName>) {
+    let Some(path) = path else {
+        return;
+    };
+    let names: &[&str] = match path.to_string().as_str() {
+        // Every datum exposes its canonical runtime type through this
+        // read-only built-in field.  The VM materializes its value from the
+        // datum record rather than from a user-declared default.
+        "/datum" => &["type"],
+        "/atom" => &[
+            "alpha",
+            "appearance_flags",
+            "blend_mode",
+            "color",
+            "density",
+            "desc",
+            "dir",
+            "icon",
+            "icon_state",
+            "invisibility",
+            "layer",
+            "loc",
+            "maptext",
+            "maptext_height",
+            "maptext_width",
+            "mouse_opacity",
+            "name",
+            "opacity",
+            "overlays",
+            "plane",
+            "pixel_w",
+            "pixel_z",
+            "render_source",
+            "render_target",
+            "transform",
+            "underlays",
+            "vis_contents",
+            "vis_flags",
+            "x",
+            "y",
+            "z",
+        ],
+        "/atom/movable" => &[
+            "animate_movement",
+            "bound_height",
+            "bound_width",
+            "bound_x",
+            "bound_y",
+            "glide_size",
+            "pixel_x",
+            "pixel_y",
+            "screen_loc",
+            "step_size",
+        ],
+        _ => return,
+    };
+    for name in names {
+        // All catalog entries are fixed, valid DM identifiers.
+        fields.insert(
+            (*name).to_owned(),
+            FieldName::parse(name).expect("standard field name is valid"),
+        );
     }
 }
 
@@ -416,7 +764,11 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use dm_compiler::{Compilation, CompilerDatabase};
-    use dm_vm::{RuntimeError, Value, execute_module};
+    use dm_value::TypePath;
+    use dm_vm::{
+        ExecutionContext, ExecutionState, Instruction, RuntimeError, Value, execute_module,
+        execute_module_in_context,
+    };
 
     use super::{Procedure, ProcedureImplementationKind, ProcedureRegistry};
 
@@ -579,6 +931,170 @@ mod tests {
         assert_eq!(
             custom.implementations[0].parent_target,
             alternate.effective_target
+        );
+    }
+
+    #[test]
+    fn lowers_bare_inherited_fields_as_src_fields_after_local_resolution() {
+        let compilation = TestProject::compile(
+            "/datum/base\n\tvar/loading_id = 1\n/datum/base/child\n\tproc/run(loading_id)\n\t\tvar/local = loading_id\n\t\tloading_id = local\n\t\treturn src.loading_id\n/datum/base/child\n\tproc/use_field()\n\t\tloading_id += 1\n\t\treturn loading_id\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let procedure = procedure_by_path(&registry, "/datum/base/child/proc/use_field");
+        let executable = registry
+            .compile_vm_implementations(
+                &compilation,
+                procedure.implementations.iter().map(|body| body.id),
+            )
+            .expect("bare inherited field should compile");
+        let entry = executable
+            .implementation(procedure.effective_target.expect("procedure has a body"))
+            .expect("implementation should be present");
+        let program = executable
+            .module()
+            .procedure(entry)
+            .expect("program should exist");
+
+        assert!(program.instructions.windows(3).any(|instructions| matches!(
+            instructions,
+            [Instruction::LoadSrc, Instruction::Duplicate, Instruction::LoadField(field)]
+                if field.as_str() == "loading_id"
+        )));
+        assert!(program.instructions.iter().any(|instruction| matches!(
+            instruction,
+            Instruction::StoreField(field) if field.as_str() == "loading_id"
+        )));
+    }
+
+    #[test]
+    fn lowers_standard_atom_fields_only_for_their_builtin_hierarchy() {
+        let compilation = TestProject::compile(
+            "/obj/example\n\tproc/read()\n\t\tloc = src\n\t\tpixel_x += 1\n\t\talpha -= 1\n\t\treturn list(dir, color, desc, blend_mode, alpha, appearance_flags, layer, plane, transform, overlays, underlays, vis_contents, x, y, z)\n/datum/example\n\tproc/read()\n\t\treturn alpha\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let object = procedure_by_path(&registry, "/obj/example/proc/read");
+        registry
+            .compile_vm_implementations(
+                &compilation,
+                object.implementations.iter().map(|body| body.id),
+            )
+            .expect("standard atom fields should compile as src fields");
+
+        let datum = procedure_by_path(&registry, "/datum/example/proc/read");
+        let error = registry
+            .compile_vm_implementations(
+                &compilation,
+                datum.implementations.iter().map(|body| body.id),
+            )
+            .expect_err("atom fields must not become datum locals");
+        assert_eq!(error.message, "unknown local \"alpha\"");
+    }
+
+    #[test]
+    fn lowers_standard_datum_type_field_for_all_datums() {
+        let compilation = TestProject::compile("/datum/example\n\tproc/read()\n\t\treturn type\n");
+        let registry = ProcedureRegistry::build(&compilation);
+        let datum = procedure_by_path(&registry, "/datum/example/proc/read");
+        registry
+            .compile_vm_implementations(
+                &compilation,
+                datum.implementations.iter().map(|body| body.id),
+            )
+            .expect("datum type should compile as its built-in src field");
+    }
+
+    #[test]
+    fn selected_dynamic_literal_call_includes_matching_method_implementation() {
+        let compilation = TestProject::compile(
+            "/datum/receiver\n\tproc/entry()\n\t\treturn call(src, \"register\")()\n\tproc/register()\n\t\treturn 9\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/datum/receiver/proc/entry");
+        let executable = registry
+            .compile_vm_implementations(
+                &compilation,
+                entry
+                    .implementations
+                    .iter()
+                    .map(|implementation| implementation.id),
+            )
+            .expect("literal dynamic method should be included");
+        let entry = executable
+            .implementation(entry.effective_target.expect("entry has a body"))
+            .expect("entry should be linked");
+        let mut state = ExecutionState::new();
+        let receiver = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/receiver").unwrap());
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                entry,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(receiver), Value::Null),
+            ),
+            Ok(Value::number(9.0))
+        );
+    }
+
+    #[test]
+    fn selected_static_call_uses_object_tree_ancestor_not_lexical_path_ancestor() {
+        let compilation = TestProject::compile(
+            "/datum/proc/RegisterSignals()\n\treturn 42\n/area/centcom/proc/Initialize()\n\treturn RegisterSignals()\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/area/centcom/proc/Initialize");
+        let executable = registry
+            .compile_vm_implementations(
+                &compilation,
+                entry
+                    .implementations
+                    .iter()
+                    .map(|implementation| implementation.id),
+            )
+            .expect("a call inherited from /datum should be linked into the selected module");
+        let entry = executable
+            .implementation(entry.effective_target.expect("entry has a body"))
+            .expect("entry should be linked");
+        assert_eq!(
+            execute_module(executable.module(), entry, &[]),
+            Ok(Value::number(42.0))
+        );
+    }
+
+    #[test]
+    fn selected_method_includes_and_resolves_direct_helper_calls() {
+        let compilation = TestProject::compile(
+            "/datum/receiver\n\tproc/entry()\n\t\treturn helper()\n\tproc/helper()\n\t\treturn 9\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/datum/receiver/proc/entry");
+        let executable = registry
+            .compile_vm_implementations(
+                &compilation,
+                entry
+                    .implementations
+                    .iter()
+                    .map(|implementation| implementation.id),
+            )
+            .expect("direct helper method should be included");
+        let entry = executable
+            .implementation(entry.effective_target.expect("entry has a body"))
+            .expect("entry should be linked");
+        let mut state = ExecutionState::new();
+        let receiver = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/receiver").unwrap());
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                entry,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(receiver), Value::Null),
+            ),
+            Ok(Value::number(9.0))
         );
     }
 

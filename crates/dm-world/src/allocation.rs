@@ -323,6 +323,25 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
     ) -> Result<DatumId, WorldAllocationError> {
         let type_path = TypePath::parse(&initializer.path)?;
         let datum = self.image.allocate_datum(&type_path)?;
+        // BYOND exposes map placement coordinates as built-in atom fields.
+        // They are not map-variable overrides, so materialize them before
+        // applying source-defined overrides and before lifecycle code runs.
+        for (name, value) in [
+            ("x", coordinate.x),
+            ("y", coordinate.y),
+            ("z", coordinate.z),
+        ] {
+            self.image.heap_mut().set_datum_field(
+                datum,
+                FieldName::parse(name).expect("coordinate field name is valid"),
+                dm_value::Value::number(
+                    value
+                        .to_string()
+                        .parse::<f32>()
+                        .expect("world coordinate is representable as a DM number"),
+                ),
+            )?;
+        }
         self.allocation_order.push(datum);
         for assignment in &initializer.variables {
             let Ok(field) = FieldName::parse(&assignment.name) else {

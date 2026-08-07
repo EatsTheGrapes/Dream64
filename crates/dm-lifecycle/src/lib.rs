@@ -80,6 +80,39 @@ pub struct LifecycleTarget {
     pub source: LifecycleSource,
 }
 
+/// One lifecycle entry point affected by a VM compatibility issue.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LifecycleCompatibilityLocation {
+    /// Lifecycle phase which reaches the selected implementation.
+    pub kind: LifecycleKind,
+    /// Canonical procedure path.
+    pub procedure_path: String,
+    /// Source definition selected for dispatch.
+    pub source: LifecycleSource,
+}
+
+/// A group of equivalent VM compilation failures discovered during a sweep.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LifecycleCompatibilityIssue {
+    /// Stable, coarse category derived from the compiler diagnostic.
+    pub category: String,
+    /// Full compiler diagnostic text.
+    pub message: String,
+    /// Lifecycle entry points which produced this diagnostic.
+    pub locations: Vec<LifecycleCompatibilityLocation>,
+}
+
+/// Non-failing compilation audit for every lifecycle-reachable implementation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LifecycleCompatibilitySweep {
+    /// Number of unique lifecycle implementations checked.
+    pub targets: usize,
+    /// Number of implementations whose complete dependency closure compiled.
+    pub compatible: usize,
+    /// Failures grouped by category and diagnostic message.
+    pub issues: Vec<LifecycleCompatibilityIssue>,
+}
+
 /// Structural reason a lifecycle procedure cannot be targeted.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum LifecycleTargetIssueKind {
@@ -608,6 +641,7 @@ impl std::error::Error for InitializationExecutionError {
 ///
 /// Returns a source-aware error when a planned target cannot be compiled,
 /// bound to an allocation, or executed.
+#[allow(clippy::too_many_lines)]
 pub fn execute_initialization_plan(
     compilation: &Compilation,
     procedures: &ProcedureRegistry,
@@ -616,15 +650,22 @@ pub fn execute_initialization_plan(
     allocation: &WorldAllocation,
     runtime: &mut RuntimeImage,
 ) -> Result<InitializationExecution, InitializationExecutionError> {
+    eprintln!("boot-progress: selecting lifecycle targets");
     let bindings = map_datum_bindings(plan, allocation, runtime);
     let targets = plan
         .events
         .iter()
         .filter_map(|event| event_target(*event, index).map(|target| target.implementation))
         .collect::<BTreeSet<_>>();
+    eprintln!(
+        "boot-progress: selected lifecycle targets={}",
+        targets.len()
+    );
+    eprintln!("boot-progress: compiling lifecycle targets");
     let executable = procedures
         .compile_vm_implementations(compilation, targets)
         .map_err(InitializationExecutionError::Compile)?;
+    eprintln!("boot-progress: compiled lifecycle targets");
     let world = if plan.events.iter().any(|event| {
         matches!(
             event,
@@ -647,16 +688,32 @@ pub fn execute_initialization_plan(
 
     let mut state = runtime.take_execution_state();
     let execution = (|| {
+        eprintln!("boot-progress: applying dynamic map overrides");
         apply_dynamic_map_overrides(plan, allocation, &bindings, runtime, &mut state)?;
+        eprintln!("boot-progress: applied dynamic map overrides");
         let mut result = InitializationExecution {
             world,
             ..InitializationExecution::default()
         };
         let mut seen = BTreeSet::new();
+        let total_lifecycle_events = plan
+            .events
+            .iter()
+            .filter(|event| matches!(event, InitializationEvent::Lifecycle { .. }))
+            .count();
+        let mut lifecycle_event = 0usize;
+        eprintln!("boot-progress: executing lifecycle events total={total_lifecycle_events}");
         for event in &plan.events {
             let InitializationEvent::Lifecycle { subject, .. } = *event else {
                 continue;
             };
+            lifecycle_event += 1;
+            if lifecycle_event == 1 || lifecycle_event % 10_000 == 0 {
+                eprintln!(
+                    "boot-progress: lifecycle event {lifecycle_event}/{total_lifecycle_events} phase={:?}",
+                    event_kind(*event),
+                );
+            }
             let datum = match subject {
                 EventSubject::World => {
                     world.ok_or(InitializationExecutionError::MissingWorldDatum)?
@@ -706,10 +763,136 @@ pub fn execute_initialization_plan(
                 result: value,
             });
         }
+        eprintln!("boot-progress: completed lifecycle events");
         Ok(result)
     })();
     runtime.restore_execution_state(state);
     execution
+}
+
+/// Compiles every lifecycle-reachable body independently and retains all
+/// VM-subset failures instead of stopping at the first one.
+///
+/// Unlike boot this fast inventory deliberately does not follow calls or
+/// `..()` targets. Use [`sweep_lifecycle_compatibility_with_closures`] for the
+/// slower boot-equivalent audit.
+#[must_use]
+pub fn sweep_lifecycle_compatibility(
+    compilation: &Compilation,
+    procedures: &ProcedureRegistry,
+    index: &LifecycleIndex,
+    plan: &InitializationPlan,
+) -> LifecycleCompatibilitySweep {
+    sweep_lifecycle_compatibility_inner(compilation, procedures, index, plan, false)
+}
+
+/// Compiles every lifecycle target with its boot-time dependency closure and
+/// retains all VM-subset failures.
+///
+/// This is more complete than [`sweep_lifecycle_compatibility`], but can be
+/// substantially slower for large projects because closures overlap.
+#[must_use]
+pub fn sweep_lifecycle_compatibility_with_closures(
+    compilation: &Compilation,
+    procedures: &ProcedureRegistry,
+    index: &LifecycleIndex,
+    plan: &InitializationPlan,
+) -> LifecycleCompatibilitySweep {
+    sweep_lifecycle_compatibility_inner(compilation, procedures, index, plan, true)
+}
+
+fn sweep_lifecycle_compatibility_inner(
+    compilation: &Compilation,
+    procedures: &ProcedureRegistry,
+    index: &LifecycleIndex,
+    plan: &InitializationPlan,
+    with_closures: bool,
+) -> LifecycleCompatibilitySweep {
+    let mut locations =
+        BTreeMap::<ProcedureImplementationId, Vec<LifecycleCompatibilityLocation>>::new();
+    for event in &plan.events {
+        let Some(target) = event_target(*event, index) else {
+            continue;
+        };
+        let location = LifecycleCompatibilityLocation {
+            kind: event_kind(*event),
+            procedure_path: target.procedure_path.clone(),
+            source: target.source.clone(),
+        };
+        let entry = locations.entry(target.implementation).or_default();
+        if !entry.contains(&location) {
+            entry.push(location);
+        }
+    }
+
+    let targets = locations.len();
+    let mut compatible = 0;
+    let mut grouped = BTreeMap::<(String, String), Vec<LifecycleCompatibilityLocation>>::new();
+    let results = if with_closures {
+        locations
+            .keys()
+            .copied()
+            .map(|implementation| {
+                (
+                    implementation,
+                    procedures.compile_vm_implementations(compilation, [implementation]),
+                )
+            })
+            .collect()
+    } else {
+        procedures.compile_vm_bodies_independently(compilation, locations.keys().copied())
+    };
+    for (implementation, result) in results {
+        let target_locations = locations
+            .remove(&implementation)
+            .expect("sweep result should retain its selected target");
+        match result {
+            Ok(_) => compatible += 1,
+            Err(error) => {
+                let message = error.message;
+                let category = compatibility_category(&message);
+                grouped
+                    .entry((category, message))
+                    .or_default()
+                    .extend(target_locations);
+            }
+        }
+    }
+    let issues = grouped
+        .into_iter()
+        .map(|((category, message), mut locations)| {
+            locations.sort_by(|left, right| {
+                (
+                    left.source.path.as_str(),
+                    left.source.span.start,
+                    left.procedure_path.as_str(),
+                    left.kind,
+                )
+                    .cmp(&(
+                        right.source.path.as_str(),
+                        right.source.span.start,
+                        right.procedure_path.as_str(),
+                        right.kind,
+                    ))
+            });
+            LifecycleCompatibilityIssue {
+                category,
+                message,
+                locations,
+            }
+        })
+        .collect();
+    LifecycleCompatibilitySweep {
+        targets,
+        compatible,
+        issues,
+    }
+}
+
+fn compatibility_category(message: &str) -> String {
+    message
+        .split_once(':')
+        .map_or_else(|| message.to_owned(), |(category, _)| category.to_owned())
 }
 
 fn apply_dynamic_map_overrides(
@@ -1119,7 +1302,7 @@ mod tests {
 
     use super::{
         EventSubject, InitializationEvent, LifecycleIndex, LifecycleKind, LifecycleResolution,
-        build_initialization_plan, execute_initialization_plan,
+        build_initialization_plan, execute_initialization_plan, sweep_lifecycle_compatibility,
     };
 
     static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
@@ -1328,5 +1511,35 @@ mod tests {
                 Ok(&Value::number(111.0))
             );
         }
+    }
+
+    #[test]
+    fn compatibility_sweep_collects_lifecycle_failures_without_hiding_good_targets() {
+        let source = concat!(
+            "/world/New()\n\tspawn(1) return 0\n",
+            "/atom/proc/New()\n\treturn 0\n",
+            "/area/test\n/turf/test\n/obj/test\n",
+        );
+        let (_fixture, compilation, runtime, index) = index(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/obj/test, /turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .expect("map should parse");
+        let world = build_plan(&map, &compilation);
+        let plan = build_initialization_plan(&runtime, &index, &world, "test.dmm");
+
+        let sweep = sweep_lifecycle_compatibility(&compilation, &procedures, &index, &plan);
+
+        assert!(sweep.targets >= 2);
+        assert!(sweep.compatible >= 1);
+        assert_eq!(sweep.issues.len(), 1);
+        assert!(!sweep.issues[0].message.is_empty());
+        assert_eq!(
+            sweep.issues[0].locations[0].procedure_path,
+            "/world/proc/New"
+        );
+        assert_eq!(sweep.issues[0].locations[0].source.path, "types.dm");
     }
 }
