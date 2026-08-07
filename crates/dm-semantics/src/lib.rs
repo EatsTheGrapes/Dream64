@@ -39,7 +39,7 @@ pub struct ProcedureImplementationId {
 }
 
 impl ProcedureImplementationId {
-    /// Returns the canonical procedure containing this implementation.
+    /// Returns this identity's index in [`ProcedureRegistry::procedures`].
     #[must_use]
     pub const fn procedure(self) -> ProcedureId {
         self.procedure
@@ -491,10 +491,12 @@ impl ProcedureRegistry {
 }
 
 /// Returns bare names for project-wide variables, including globals introduced
-/// by macros such as `SUBSYSTEM_DEF(mapping)`.  A global has no owning type;
-/// static and instance variables remain deliberately excluded.
+/// by macros such as `SUBSYSTEM_DEF(mapping)`. A global has no owning type;
+/// static and instance variables remain deliberately excluded. BYOND's built-in
+/// `world` singleton is also available as a bare global even though it has no
+/// source declaration.
 fn declared_global_fields(compilation: &Compilation) -> BTreeMap<String, FieldName> {
-    compilation
+    let mut fields: BTreeMap<String, FieldName> = compilation
         .code_tree()
         .nodes()
         .iter()
@@ -505,7 +507,12 @@ fn declared_global_fields(compilation: &Compilation) -> BTreeMap<String, FieldNa
                 .ok()
                 .map(|field| (name.clone(), field))
         })
-        .collect()
+        .collect();
+    fields.insert(
+        "world".to_owned(),
+        FieldName::parse("world").expect("built-in world global name is valid"),
+    );
+    fields
 }
 
 impl ProcedureRegistry {
@@ -660,9 +667,9 @@ fn inherited_fields(
 /// Adds the fields supplied by BYOND's built-in datum and atom hierarchies.
 ///
 /// The object tree deliberately seeds only standard *types*, since their
-/// members have no user source declaration.  VM lowering still needs the
+/// members have no user source declaration. VM lowering still needs the
 /// corresponding names, however, so bare reads such as `type`, `loc`, and
-/// `dir` lower exactly like declared `src` fields.  Keep this catalog at the
+/// `dir` lower exactly like declared `src` fields. Keep this catalog at the
 /// semantic boundary: atom-only names must not become visible on arbitrary
 /// `/datum`s.
 fn standard_instance_fields(path: Option<&CodePath>, fields: &mut BTreeMap<String, FieldName>) {
@@ -671,7 +678,7 @@ fn standard_instance_fields(path: Option<&CodePath>, fields: &mut BTreeMap<Strin
     };
     let names: &[&str] = match path.to_string().as_str() {
         // Every datum exposes its canonical runtime type through this
-        // read-only built-in field.  The VM materializes its value from the
+        // read-only built-in field. The VM materializes its value from the
         // datum record rather than from a user-declared default.
         "/datum" => &["type"],
         "/atom" => &[
