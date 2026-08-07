@@ -3192,19 +3192,16 @@ fn dm_builtin_numeric_constant(identifier: &str) -> Option<f32> {
         "BLEND_MULTIPLY" | "LONG_GLIDE" | "EAST" => Some(4.0),
         "BLEND_INSET_OVERLAY" | "NORTHEAST" => Some(5.0),
         "SOUTHEAST" => Some(6.0),
-        "WEST" => Some(8.0),
+        "WEST" | "RESET_TRANSFORM" => Some(8.0),
         "NORTHWEST" => Some(9.0),
         "SOUTHWEST" => Some(10.0),
-        "UP" => Some(16.0),
-        "DOWN" => Some(32.0),
+        "UP" | "RESET_COLOR" => Some(16.0),
+        "DOWN" | "RESET_ALPHA" => Some(32.0),
         // Appearance flags are BYOND bitflags. Keep the complete contiguous
         // built-in flag family here rather than teaching project code about
         // individual flags as each one is encountered.
         // These make an overlay/image ignore the corresponding value
         // inherited from its parent.
-        "RESET_TRANSFORM" => Some(8.0),
-        "RESET_COLOR" => Some(16.0),
-        "RESET_ALPHA" => Some(32.0),
         "PIXEL_SCALE" => Some(64.0),
         "TILE_BOUND" => Some(128.0),
         "INHERIT_ID" => Some(256.0),
