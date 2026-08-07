@@ -1,0 +1,56 @@
+name: Run compatibility batch 47 final verification
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    if: github.event.issue.title == 'Verify compatibility batch 47 final'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: compat-batch-47
+          fetch-depth: 0
+      - name: Apply and verify
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          (
+            set -e
+            python3 tools/compat_batch_47_v4.py
+            cargo fmt --all
+            cargo test -p dm-vm -p dm-semantics
+            cargo test
+            cargo clippy --workspace --all-targets -- -D warnings
+          ) 2>&1 | tee compat_batch_47_v4.log
+          status=${PIPESTATUS[0]}
+          git config user.name "Dream64 Compatibility Bot"
+          git config user.email "actions@users.noreply.github.com"
+          if [ "$status" -ne 0 ]; then
+            git add -A
+            git commit -m "Capture compatibility batch 47 v4 failure" || true
+            git push origin HEAD:compat-batch-47
+            exit "$status"
+          fi
+          rm -f tools/compat_batch_47.py tools/compat_batch_47_followup.py tools/compat_batch_47_v3.py tools/compat_batch_47_v4.py
+          rm -f compat_batch_47.log compat_batch_47_v2.log compat_batch_47_v3.log compat_batch_47_v4.log
+          git add -A
+          git commit -m "Batch Monkestation compatibility layer 47"
+          git push origin HEAD:compat-batch-47
+      - name: Remove trigger from main
+        if: always()
+        shell: bash
+        run: |
+          git fetch origin main
+          git switch --force-create cleanup origin/main
+          git rm -f .github/workflows/run-compat-batch-47-v4.yml
+          git config user.name "Dream64 Compatibility Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git commit -m "Remove compatibility batch 47 v4 verifier"
+          git push origin HEAD:main
