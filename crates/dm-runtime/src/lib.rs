@@ -497,6 +497,11 @@ impl RuntimeImage {
     ///
     /// Type-static values are intentionally excluded until their type-qualified
     /// storage identities are represented in the VM global namespace.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an engine-defined built-in field name is internally invalid;
+    /// every such spelling is a fixed canonical DM identifier.
     #[must_use]
     pub fn take_execution_state(&mut self) -> ExecutionState {
         let mut state = ExecutionState::from_heap(std::mem::take(&mut self.heap));
