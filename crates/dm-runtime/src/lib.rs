@@ -512,7 +512,7 @@ impl RuntimeImage {
             let mut hierarchy = Vec::new();
             let mut current = Some(path.clone());
             let mut visited = BTreeSet::new();
-            while let Some(candidate) = current {
+            while let Some(candidate) = current.take() {
                 if !visited.insert(candidate.clone()) {
                     break;
                 }
