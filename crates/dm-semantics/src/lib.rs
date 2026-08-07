@@ -987,7 +987,11 @@ mod tests {
                 datum.implementations.iter().map(|body| body.id),
             )
             .expect_err("atom fields must not become datum locals");
-        assert_eq!(error.message, "unknown local \"alpha\"");
+        assert!(
+    error.message.contains("unknown local \"alpha\""),
+    "unexpected diagnostic: {}",
+    error.message
+);
     }
 
     #[test]

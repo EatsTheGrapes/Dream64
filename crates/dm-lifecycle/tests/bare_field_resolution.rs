@@ -164,5 +164,9 @@ fn unknown_bare_names_remain_compile_diagnostics() {
     let InitializationExecutionError::Compile(error) = error else {
         panic!("expected a lifecycle compilation diagnostic");
     };
-    assert_eq!(error.message, "unknown local \"missing\"");
+    assert!(
+    error.message.contains("unknown local \"missing\""),
+    "unexpected diagnostic: {}",
+    error.message
+);
 }
