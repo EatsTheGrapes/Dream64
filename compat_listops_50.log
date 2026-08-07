@@ -1,6 +1,0 @@
-list operator VM imports: expected one match, found 0
----OLD---
-use builtins::{
-    execute_list_method, execute_standard_builtin, is_subtype, standard_builtin_arity,
-};
-

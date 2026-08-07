@@ -7577,8 +7577,12 @@ fn execute_scalar_compound_assignment(
         CompoundAssignmentOperator::BitAnd => bitwise_binary(left, right, |a, b| a & b),
         CompoundAssignmentOperator::BitOr => bitwise_binary(left, right, |a, b| a | b),
         CompoundAssignmentOperator::BitXor => bitwise_binary(left, right, |a, b| a ^ b),
-        CompoundAssignmentOperator::ShiftLeft => shift_binary(left, right, true),
-        CompoundAssignmentOperator::ShiftRight => shift_binary(left, right, false),
+        CompoundAssignmentOperator::ShiftLeft => {
+            bitwise_shift(left, right, |left, right| left << right)
+        }
+        CompoundAssignmentOperator::ShiftRight => {
+            bitwise_shift(left, right, |left, right| left >> right)
+        }
     };
     Ok(Value::number(value))
 }
