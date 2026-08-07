@@ -1,0 +1,56 @@
+name: Verify compatibility inventory 48 arithmetic
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    if: github.event.issue.title == 'Verify compatibility inventory 48 arithmetic'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: compat-inventory-48
+          fetch-depth: 0
+      - name: Apply arithmetic semantics and verify inventory
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          (
+            set -e
+            python3 tools/compat_inventory_48_followup4.py
+            cargo fmt --all
+            cargo test -p dm-vm -p dm-runtime -p dm-semantics
+            cargo test
+            cargo clippy --workspace --all-targets -- -D warnings
+          ) 2>&1 | tee compat_inventory_48_v5.log
+          status=${PIPESTATUS[0]}
+          git config user.name "Dream64 Compatibility Bot"
+          git config user.email "actions@users.noreply.github.com"
+          if [ "$status" -ne 0 ]; then
+            git add -A
+            git commit -m "Capture compatibility inventory 48 arithmetic failure" || true
+            git push origin HEAD:compat-inventory-48
+            exit "$status"
+          fi
+          rm -f tools/compat_inventory_48.py tools/compat_inventory_48_followup.py tools/compat_inventory_48_followup2.py tools/compat_inventory_48_followup3.py tools/compat_inventory_48_followup4.py
+          rm -f compat_inventory_48.log compat_inventory_48_v2.log compat_inventory_48_v3.log compat_inventory_48_v4.log compat_inventory_48_v5.log
+          git add -A
+          git commit -m "Proactive BYOND semantic compatibility batch 48"
+          git push origin HEAD:compat-inventory-48
+      - name: Remove trigger from main
+        if: always()
+        shell: bash
+        run: |
+          git fetch origin main
+          git switch --force-create cleanup origin/main
+          git rm -f .github/workflows/run-compat-inventory-48-v5.yml
+          git config user.name "Dream64 Compatibility Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git commit -m "Remove compatibility inventory 48 arithmetic verifier"
+          git push origin HEAD:main
