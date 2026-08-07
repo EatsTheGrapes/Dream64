@@ -1,0 +1,55 @@
+name: Retry documented core semantics batch 52
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    if: github.event.issue.title == 'Retry compatibility core 52'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: compat-core-52
+          fetch-depth: 0
+      - name: Apply follow-up and verify documented core semantics
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          (
+            set -e
+            python3 tools/compat_core_52_followup.py
+            cargo fmt --all
+            cargo test -p dm-lexer -p dm-vm
+            cargo test
+            cargo clippy --workspace --all-targets -- -D warnings
+          ) 2>&1 | tee compat_core_52_v2.log
+          status=${PIPESTATUS[0]}
+          git config user.name "Dream64 Compatibility Bot"
+          git config user.email "actions@users.noreply.github.com"
+          if [ "$status" -ne 0 ]; then
+            git add -A
+            git commit -m "Capture compatibility core 52 retry failure" || true
+            git push origin HEAD:compat-core-52
+            exit "$status"
+          fi
+          rm -f tools/compat_core_52.py tools/compat_core_52_followup.py compat_core_52.log compat_core_52_v2.log
+          git add -A
+          git commit -m "Documented core semantics compatibility batch 52"
+          git push origin HEAD:compat-core-52
+      - name: Remove trigger from main
+        if: always()
+        shell: bash
+        run: |
+          git fetch origin main
+          git switch --force-create cleanup origin/main
+          git rm -f .github/workflows/run-compat-core-52-v2.yml
+          git config user.name "Dream64 Compatibility Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git commit -m "Remove compatibility core 52 retry verifier"
+          git push origin HEAD:main
