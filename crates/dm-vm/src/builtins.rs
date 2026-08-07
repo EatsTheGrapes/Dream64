@@ -407,7 +407,7 @@ fn find_match(text: &str, needle: &str, exact: bool, reverse: bool) -> Option<us
                 || tail.to_lowercase().starts_with(&needle.to_lowercase())
         }
     };
-    let offsets = text
+    let mut offsets = text
         .char_indices()
         .map(|(offset, _)| offset)
         .chain(std::iter::once(text.len()));
