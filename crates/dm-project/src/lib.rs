@@ -834,6 +834,7 @@ impl CompilerSourceBuilder {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn append_expanded_source(
         &mut self,
         source: &str,
@@ -864,12 +865,7 @@ impl CompilerSourceBuilder {
                     let replacement = if name == "__FILE__" {
                         format!("{file_macro:?}")
                     } else {
-                        source.as_bytes()[..invocation.start]
-                            .iter()
-                            .filter(|byte| **byte == b'\n')
-                            .count()
-                            .saturating_add(1)
-                            .to_string()
+                        source_line_number(source, invocation.start).to_string()
                     };
                     self.append_replacement(&replacement, invocation);
                     offset = identifier_end;
@@ -905,11 +901,7 @@ impl CompilerSourceBuilder {
                             .expect("arguments were validated above")
                             .0
                     });
-                    let line_macro = source.as_bytes()[..invocation.start]
-                        .iter()
-                        .filter(|byte| **byte == b'\n')
-                        .count()
-                        .saturating_add(1);
+                    let line_macro = source_line_number(source, invocation.start);
                     let replacement = expand_macro(
                         name,
                         arguments.as_deref(),
@@ -987,6 +979,13 @@ impl CompilerSourceBuilder {
             original: invocation,
         });
     }
+}
+
+fn source_line_number(source: &str, offset: usize) -> usize {
+    source[..offset.min(source.len())]
+        .matches('\n')
+        .count()
+        .saturating_add(1)
 }
 
 const MAX_MACRO_EXPANSION_DEPTH: usize = 64;
@@ -1113,6 +1112,7 @@ fn expand_replacement(
     Ok(output)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn substitute_function_macro(
     name: &str,
     definition: &MacroDefinition,
