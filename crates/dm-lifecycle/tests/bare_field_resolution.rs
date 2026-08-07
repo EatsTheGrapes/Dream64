@@ -165,8 +165,8 @@ fn unknown_bare_names_remain_compile_diagnostics() {
         panic!("expected a lifecycle compilation diagnostic");
     };
     assert!(
-    error.message.contains("unknown local \"missing\""),
-    "unexpected diagnostic: {}",
-    error.message
-);
+        error.message.contains("unknown local \"missing\""),
+        "unexpected diagnostic: {}",
+        error.message
+    );
 }

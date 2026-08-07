@@ -3514,7 +3514,9 @@ impl<'a> ExpressionParser<'a> {
                             arguments.len()
                         )));
                     }
-                    Ok(Expression::ArgList(Box::new(arguments.pop().expect("argument count was validated"))))
+                    Ok(Expression::ArgList(Box::new(
+                        arguments.pop().expect("argument count was validated"),
+                    )))
                 } else if let Some(kind) = type_predicate_kind(identifier) {
                     let arguments = self.parse_call_arguments()?;
                     let valid_count = match kind {
@@ -4163,7 +4165,9 @@ fn emit_expression(
         }
         Expression::Result => instructions.push(Instruction::LoadResult),
         Expression::ArgList(_) => {
-            return Err(compile_error("arglist may only appear in a call or constructor argument list"));
+            return Err(compile_error(
+                "arglist may only appear in a call or constructor argument list",
+            ));
         }
         Expression::Call {
             procedure,
@@ -4201,7 +4205,12 @@ fn emit_expression(
         }
         Expression::CurrentCall { arguments } => {
             let argument_count = if let Some(arguments) = arguments {
-                Some(emit_call_arguments(arguments, locals, instructions, procedures)?)
+                Some(emit_call_arguments(
+                    arguments,
+                    locals,
+                    instructions,
+                    procedures,
+                )?)
             } else {
                 None
             };
@@ -4209,7 +4218,12 @@ fn emit_expression(
         }
         Expression::ParentCall { arguments } => {
             let argument_count = if let Some(arguments) = arguments {
-                Some(emit_call_arguments(arguments, locals, instructions, procedures)?)
+                Some(emit_call_arguments(
+                    arguments,
+                    locals,
+                    instructions,
+                    procedures,
+                )?)
             } else {
                 None
             };
@@ -5003,24 +5017,31 @@ fn run_frames(
                                 "arglist requires a list value",
                             ));
                         };
-                        let list = state.heap.list(list).map_err(|error| {
-                            execution_error(module, &frames, error.to_string())
-                        })?;
+                        let list = state
+                            .heap
+                            .list(list)
+                            .map_err(|error| execution_error(module, &frames, error.to_string()))?;
                         expanded.extend(list.positions().map(|(_, value)| value.clone()));
                     } else {
                         expanded.push(value);
                     }
                 }
                 let expanded_count = u16::try_from(expanded.len()).map_err(|_| {
-                    execution_error(module, &frames, "expanded call has more than 65535 arguments")
+                    execution_error(
+                        module,
+                        &frames,
+                        "expanded call has more than 65535 arguments",
+                    )
                 })?;
                 let stack = &mut frames[frame_index].stack;
                 stack.extend(expanded);
                 stack.push(Value::number(f32::from(expanded_count)));
             }
             Instruction::AllocateDatum { argument_count } => {
-                let count_result = runtime_argument_count(&mut frames[frame_index].stack, argument_count);
-                let count = count_result.map_err(|message| execution_error(module, &frames, message))?;
+                let count_result =
+                    runtime_argument_count(&mut frames[frame_index].stack, argument_count);
+                let count =
+                    count_result.map_err(|message| execution_error(module, &frames, message))?;
                 let stack = &mut frames[frame_index].stack;
                 if stack.len() < count + 1 {
                     return Err(execution_error(module, &frames, "bytecode stack underflow"));
@@ -5834,8 +5855,9 @@ fn run_frames(
                     ));
                 }
                 let arguments = if let Some(argument_count) = argument_count {
-                    let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
-                        .map_err(|message| execution_error(module, &frames, message))?;
+                    let count =
+                        runtime_argument_count(&mut frames[frame_index].stack, argument_count)
+                            .map_err(|message| execution_error(module, &frames, message))?;
                     let stack_length = frames[frame_index].stack.len();
                     if count > stack_length {
                         return Err(execution_error(module, &frames, "bytecode stack underflow"));
@@ -5867,8 +5889,9 @@ fn run_frames(
                     ));
                 };
                 let arguments = if let Some(argument_count) = argument_count {
-                    let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
-                        .map_err(|message| execution_error(module, &frames, message))?;
+                    let count =
+                        runtime_argument_count(&mut frames[frame_index].stack, argument_count)
+                            .map_err(|message| execution_error(module, &frames, message))?;
                     let stack_length = frames[frame_index].stack.len();
                     if count > stack_length {
                         return Err(execution_error(module, &frames, "bytecode stack underflow"));
@@ -6817,11 +6840,7 @@ fn runtime_argument_count(stack: &mut Vec<Value>, encoded: u16) -> Result<usize,
         return Err("expanded call argument count is not numeric".to_owned());
     };
     let count = number.to_f32();
-    if !count.is_finite()
-        || count < 0.0
-        || count > f32::from(u16::MAX)
-        || count.fract() != 0.0
-    {
+    if !count.is_finite() || count < 0.0 || count > f32::from(u16::MAX) || count.fract() != 0.0 {
         return Err("expanded call argument count is invalid".to_owned());
     }
     Ok(count as usize)
@@ -8275,8 +8294,11 @@ mod tests {
             "/proc/entry()\n\treturn combine(1, arglist(list(2, 3)), 4)\n/proc/combine(a, b, c, d)\n\treturn a + b + c + d\n",
         )
         .expect("static arglist source should parse");
-        let module = compile_module(&static_source.definitions).expect("static arglist should compile");
-        let entry = module.procedure_id("/proc/entry").expect("entry should resolve");
+        let module =
+            compile_module(&static_source.definitions).expect("static arglist should compile");
+        let entry = module
+            .procedure_id("/proc/entry")
+            .expect("entry should resolve");
         assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(10.0)));
 
         let dynamic_source = parse(

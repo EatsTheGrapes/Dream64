@@ -13,6 +13,7 @@ use dm_lifecycle::{
 use dm_runtime::RuntimeImage;
 use dm_semantics::{ProcedureImplementationId, ProcedureRegistry};
 
+#[allow(clippy::too_many_lines)]
 fn main() -> ExitCode {
     let mut arguments = env::args_os().skip(1);
     let Some(environment) = arguments.next() else {

@@ -637,6 +637,11 @@ impl std::error::Error for InitializationExecutionError {
 /// `src`, execute in plan order, and share one mutable VM heap. Repeated map
 /// placements referring to one shared area datum run each hook once.
 ///
+/// # Panics
+///
+/// Panics only if Dream64's hard-coded `world` built-in identifier stops being
+/// a valid DM field name, which would violate an internal engine invariant.
+///
 /// # Errors
 ///
 /// Returns a source-aware error when a planned target cannot be compiled,
