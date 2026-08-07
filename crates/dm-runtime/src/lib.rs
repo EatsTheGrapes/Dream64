@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dm_compiler::{Compilation, CompilerDatabase, CompilerError};
@@ -165,6 +165,99 @@ fn materialize_builtin_atom_defaults(
     Ok(())
 }
 
+fn materialize_builtin_world_defaults(
+    heap: &mut ValueHeap,
+    datum: DatumId,
+    type_path: &TypePath,
+) -> Result<(), ValueError> {
+    if type_path.as_str() != "/world" {
+        return Ok(());
+    }
+    let system_type = if cfg!(windows) { "MS Windows" } else { "UNIX" };
+    let defaults: &[(&str, Value)] = &[
+        ("system_type", Value::text(system_type)),
+        ("icon_size", Value::number(32.0)),
+        ("tick_lag", Value::number(1.0)),
+        ("fps", Value::number(10.0)),
+        ("timezone", Value::number(0.0)),
+        ("cpu", Value::number(0.0)),
+        ("time", Value::number(0.0)),
+        ("timeofday", Value::number(0.0)),
+        ("realtime", Value::number(0.0)),
+    ];
+    for (name, value) in defaults {
+        let name = FieldName::parse(name).expect("built-in world field is valid");
+        if heap.datum_field(datum, &name).is_err() {
+            heap.set_datum_field(datum, name, value.clone())?;
+        }
+    }
+    Ok(())
+}
+
+fn builtin_initial_fields(path: &TypePath) -> BTreeMap<FieldName, Value> {
+    let mut fields = BTreeMap::new();
+    let mut insert = |name: &str, value: Value| {
+        fields.insert(
+            FieldName::parse(name).expect("built-in initial field name is valid"),
+            value,
+        );
+    };
+    match path.as_str() {
+        "/datum" => insert("tag", Value::Null),
+        "/atom" => {
+            for (name, value) in [
+                ("alpha", Value::number(255.0)),
+                ("appearance_flags", Value::number(0.0)),
+                ("blend_mode", Value::number(0.0)),
+                ("color", Value::Null),
+                ("density", Value::number(0.0)),
+                ("dir", Value::number(2.0)),
+                ("icon", Value::Null),
+                ("icon_state", Value::Null),
+                ("invisibility", Value::number(0.0)),
+                ("layer", Value::number(1.0)),
+                ("loc", Value::Null),
+                ("opacity", Value::number(0.0)),
+                ("overlays", Value::Null),
+                ("plane", Value::number(0.0)),
+                ("underlays", Value::Null),
+                ("x", Value::number(0.0)),
+                ("y", Value::number(0.0)),
+                ("z", Value::number(0.0)),
+            ] {
+                insert(name, value);
+            }
+        }
+        "/atom/movable" => {
+            for (name, value) in [
+                ("animate_movement", Value::number(0.0)),
+                ("bound_height", Value::number(32.0)),
+                ("bound_width", Value::number(32.0)),
+                ("bound_x", Value::number(0.0)),
+                ("bound_y", Value::number(0.0)),
+                ("glide_size", Value::number(0.0)),
+                ("pixel_x", Value::number(0.0)),
+                ("pixel_y", Value::number(0.0)),
+                ("screen_loc", Value::Null),
+                ("step_size", Value::number(32.0)),
+            ] {
+                insert(name, value);
+            }
+        }
+        "/world" => {
+            insert(
+                "system_type",
+                Value::text(if cfg!(windows) { "MS Windows" } else { "UNIX" }),
+            );
+            insert("icon_size", Value::number(32.0));
+            insert("tick_lag", Value::number(1.0));
+            insert("fps", Value::number(10.0));
+        }
+        _ => {}
+    }
+    fields
+}
+
 impl RuntimeType {
     /// Returns the canonical type path.
     #[must_use]
@@ -218,6 +311,7 @@ pub struct RuntimeImage {
     type_paths: Arc<BTreeSet<TypePath>>,
     binding_index: RuntimeBindingIndex,
     diagnostics: Vec<RuntimeInitializerDiagnostic>,
+    project_root: PathBuf,
     stats: RuntimeImageStats,
 }
 
@@ -289,6 +383,7 @@ impl RuntimeImage {
             type_paths,
             binding_index,
             diagnostics: Vec::new(),
+            project_root: compilation.project().root_directory.clone(),
             stats: RuntimeImageStats {
                 variables: registry.entries().len(),
                 initializer_steps: plans.global_steps.len()
@@ -402,10 +497,64 @@ impl RuntimeImage {
     ///
     /// Type-static values are intentionally excluded until their type-qualified
     /// storage identities are represented in the VM global namespace.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an engine-defined built-in field name is internally invalid;
+    /// every such spelling is a fixed canonical DM identifier.
     #[must_use]
     pub fn take_execution_state(&mut self) -> ExecutionState {
         let mut state = ExecutionState::from_heap(std::mem::take(&mut self.heap));
         state.set_shared_type_paths(Arc::clone(&self.type_paths));
+        state.set_type_parents(
+            self.types
+                .iter()
+                .map(|(path, runtime_type)| (path.clone(), runtime_type.parent.clone()))
+                .collect(),
+        );
+        let mut initial_values = BTreeMap::new();
+        for path in self.types.keys() {
+            let mut hierarchy = Vec::new();
+            let mut current = Some(path.clone());
+            let mut visited = BTreeSet::new();
+            while let Some(candidate) = current.take() {
+                if !visited.insert(candidate.clone()) {
+                    break;
+                }
+                let Some(runtime_type) = self.types.get(&candidate) else {
+                    break;
+                };
+                hierarchy.push(candidate.clone());
+                current.clone_from(&runtime_type.parent);
+            }
+            hierarchy.reverse();
+            let mut values = BTreeMap::new();
+            for ancestor in hierarchy {
+                values.extend(builtin_initial_fields(&ancestor));
+                if let Some(runtime_type) = self.types.get(&ancestor) {
+                    values.extend(
+                        runtime_type
+                            .defaults
+                            .fields()
+                            .map(|(field, value)| (field.clone(), value.clone())),
+                    );
+                }
+            }
+            values.insert(
+                FieldName::parse("type").expect("built-in type field is valid"),
+                Value::TypePath(path.clone()),
+            );
+            values.insert(
+                FieldName::parse("parent_type").expect("built-in parent_type field is valid"),
+                self.types
+                    .get(path)
+                    .and_then(|runtime_type| runtime_type.parent.clone())
+                    .map_or(Value::Null, Value::TypePath),
+            );
+            initial_values.insert(path.clone(), values);
+        }
+        state.set_initial_values(initial_values);
+        state.set_project_root(self.project_root.clone());
         for field in self.binding_index.globals.values() {
             state.set_global(field.clone(), Value::Null);
         }
@@ -475,6 +624,7 @@ impl RuntimeImage {
             .heap
             .allocate_datum_with_defaults(type_path.clone(), &chain);
         materialize_builtin_atom_defaults(&mut self.heap, datum, is_atom, is_movable)?;
+        materialize_builtin_world_defaults(&mut self.heap, datum, type_path)?;
         self.stats.datums_allocated += 1;
         Ok(datum)
     }
@@ -1483,6 +1633,25 @@ mod tests {
             RuntimeImageError::ExpressionExecution(ref error)
                 if error.source_span.is_some() && !error.call_stack.is_empty()
         ));
+    }
+
+    #[test]
+    fn execution_state_carries_initial_parent_and_project_metadata() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/datum/base\n\tvar/value = 7\n/datum/base/child\n",
+        );
+        let mut image = fixture.image();
+        let state = image.take_execution_state();
+        let child = type_path("/datum/base/child");
+        assert_eq!(state.type_parent(&child), Some(&type_path("/datum/base")));
+        assert_eq!(
+            state.initial_value(&child, &field("value")),
+            Some(&Value::number(7.0))
+        );
+        assert_eq!(state.project_root(), Some(fixture.0.as_path()));
     }
 
     #[test]

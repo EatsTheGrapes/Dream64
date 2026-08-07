@@ -786,7 +786,21 @@ fn standard_instance_fields(path: Option<&CodePath>, fields: &mut BTreeMap<Strin
         // Every datum exposes its canonical runtime type through this
         // read-only built-in field. The VM materializes its value from the
         // datum record rather than from a user-declared default.
-        "/datum" => &["tag", "type"],
+        "/datum" => &["tag", "type", "parent_type"],
+        "/world" => &[
+            "system_type",
+            "icon_size",
+            "tick_lag",
+            "fps",
+            "timezone",
+            "cpu",
+            "time",
+            "timeofday",
+            "realtime",
+            "maxx",
+            "maxy",
+            "maxz",
+        ],
         "/atom" => &[
             "alpha",
             "appearance_flags",
@@ -1263,9 +1277,11 @@ mod tests {
             execute_effective(&compilation, "/datum/base/child/proc/run", &[]),
             Ok(Value::number(13.0))
         );
-        let error = execute_effective(&compilation, "/datum/base/child/proc/run", &[Value::Null])
-            .expect_err("explicit null should be reused rather than defaulted");
-        assert_eq!(error.message, "numeric operation received null");
+        assert_eq!(
+            execute_effective(&compilation, "/datum/base/child/proc/run", &[Value::Null]),
+            Ok(Value::number(11.0)),
+            "explicit null is reused and BYOND arithmetic treats it as numeric zero",
+        );
     }
 
     #[test]
