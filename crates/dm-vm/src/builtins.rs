@@ -16,7 +16,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use dm_value::{FieldName, TypePath, Value};
+use dm_value::{FieldName, ListId, TypePath, Value};
 
 use super::ExecutionState;
 
@@ -731,6 +731,419 @@ fn ckey(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
             .flat_map(char::to_lowercase)
             .collect::<String>(),
     ))
+}
+
+pub(super) fn execute_list_method(
+    name: &str,
+    list: ListId,
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Option<Result<Value, String>> {
+    Some(match name {
+        "Add" => list_add(list, arguments, state),
+        "Copy" => list_copy(list, arguments, state),
+        "Cut" => list_cut(list, arguments, state),
+        "Find" => list_find(list, arguments, state),
+        "Insert" => list_insert(list, arguments, state),
+        "Join" => list_join(list, arguments, state),
+        "Remove" => list_remove(list, arguments, state, false),
+        "RemoveAll" => list_remove(list, arguments, state, true),
+        "Splice" => list_splice(list, arguments, state),
+        "Swap" => list_swap(list, arguments, state),
+        _ => return None,
+    })
+}
+
+fn list_integer(value: Option<&Value>, default: i64, context: &str) -> Result<i64, String> {
+    match value {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Number(number)) if number.to_f32().is_finite() => {
+            Ok(number.to_f32().trunc() as i64)
+        }
+        Some(value) => Err(format!(
+            "{context} requires a numeric index, received {value}"
+        )),
+    }
+}
+
+fn list_boundary(value: i64, len: usize, zero_is_end: bool) -> Result<usize, String> {
+    let limit = i64::try_from(len).unwrap_or(i64::MAX - 1).saturating_add(1);
+    let value = if value == 0 {
+        if zero_is_end { limit } else { 1 }
+    } else {
+        value
+    };
+    if value < 1 || value > limit {
+        return Err(format!("list index {value} is outside 1 through {limit}"));
+    }
+    usize::try_from(value).map_err(|error| format!("list index is not representable: {error}"))
+}
+
+fn splice_boundary(value: i64, len: usize, zero_is_end: bool) -> usize {
+    let limit = i64::try_from(len).unwrap_or(i64::MAX - 1).saturating_add(1);
+    let value = if value == 0 && zero_is_end {
+        limit
+    } else if value < 0 {
+        limit.saturating_add(value)
+    } else {
+        value
+    };
+    usize::try_from(value.clamp(1, limit)).unwrap_or(usize::MAX)
+}
+
+fn flattened_list_arguments(
+    arguments: &[Value],
+    state: &ExecutionState,
+) -> Result<Vec<Value>, String> {
+    let mut values = Vec::new();
+    for argument in arguments {
+        if let Value::List(list) = argument {
+            let snapshot = state
+                .heap
+                .list(*list)
+                .map_err(|error| error.to_string())?
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>();
+            values.extend(snapshot);
+        } else {
+            values.push(argument.clone());
+        }
+    }
+    Ok(values)
+}
+
+fn list_add(
+    list: ListId,
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    if arguments.is_empty() {
+        return Err("list.Add requires at least one item".to_owned());
+    }
+    let values = flattened_list_arguments(arguments, state)?;
+    let target = state
+        .heap
+        .list_mut(list)
+        .map_err(|error| error.to_string())?;
+    for value in values {
+        target.add(value);
+    }
+    Ok(Value::Null)
+}
+
+fn list_copy(
+    list: ListId,
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    if arguments.len() > 2 {
+        return Err("list.Copy accepts Start and End only".to_owned());
+    }
+    let source = state.heap.list(list).map_err(|error| error.to_string())?;
+    let len = source.len();
+    let start = list_boundary(
+        list_integer(arguments.first(), 1, "list.Copy Start")?,
+        len,
+        false,
+    )?;
+    let end = list_boundary(
+        list_integer(arguments.get(1), 0, "list.Copy End")?,
+        len,
+        true,
+    )?;
+    let copy = source
+        .copy_range(start, end)
+        .map_err(|error| error.to_string())?;
+    let result = state.heap.allocate_list();
+    *state
+        .heap
+        .list_mut(result)
+        .map_err(|error| error.to_string())? = copy;
+    Ok(Value::List(result))
+}
+
+fn list_cut(
+    list: ListId,
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    if arguments.len() > 2 {
+        return Err("list.Cut accepts Start and End only".to_owned());
+    }
+    let len = state
+        .heap
+        .list(list)
+        .map_err(|error| error.to_string())?
+        .len();
+    let raw_start = list_integer(arguments.first(), 1, "list.Cut Start")?;
+    if raw_start < 0 {
+        return Err("list.Cut Start cannot be negative".to_owned());
+    }
+    let start = list_boundary(
+        raw_start.min(i64::try_from(len + 1).unwrap_or(i64::MAX)),
+        len,
+        false,
+    )?;
+    let raw_end = list_integer(arguments.get(1), 0, "list.Cut End")?;
+    if raw_end < 0 {
+        return Err("list.Cut End cannot be negative".to_owned());
+    }
+    let end = if raw_end == 0 || raw_end > i64::try_from(len + 1).unwrap_or(i64::MAX) {
+        len + 1
+    } else {
+        list_boundary(raw_end, len, true)?
+    };
+    state
+        .heap
+        .list_mut(list)
+        .map_err(|error| error.to_string())?
+        .cut_range(start, end)
+        .map_err(|error| error.to_string())?;
+    Ok(Value::Null)
+}
+
+fn list_find(list: ListId, arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
+    if arguments.is_empty() || arguments.len() > 3 {
+        return Err("list.Find requires Elem and optional Start/End".to_owned());
+    }
+    let source = state.heap.list(list).map_err(|error| error.to_string())?;
+    let len = source.len();
+    let raw_start = list_integer(arguments.get(1), 1, "list.Find Start")
+        .unwrap_or(1)
+        .max(1);
+    let start = usize::try_from(raw_start)
+        .unwrap_or(usize::MAX)
+        .min(len.saturating_add(1));
+    let raw_end = list_integer(arguments.get(2), 0, "list.Find End").unwrap_or(0);
+    let end = if raw_end <= 0 || raw_end > i64::try_from(len + 1).unwrap_or(i64::MAX) {
+        len + 1
+    } else {
+        usize::try_from(raw_end).unwrap_or(len + 1)
+    };
+    let found = source
+        .find_position(&arguments[0], start.max(1), end.max(1))
+        .map_err(|error| error.to_string())?;
+    Ok(Value::number(found as f32))
+}
+
+fn list_insert(
+    list: ListId,
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    if arguments.len() < 2 {
+        return Err("list.Insert requires Index and at least one item".to_owned());
+    }
+    let len = state
+        .heap
+        .list(list)
+        .map_err(|error| error.to_string())?
+        .len();
+    let raw = list_integer(arguments.first(), 0, "list.Insert Index")?;
+    let mut index = if raw <= 0 {
+        len + 1
+    } else {
+        usize::try_from(raw).map_err(|error| format!("list.Insert index is invalid: {error}"))?
+    };
+    if index > len + 1 {
+        return Err(format!("list.Insert index {index} exceeds {}", len + 1));
+    }
+    let values = flattened_list_arguments(&arguments[1..], state)?;
+    let target = state
+        .heap
+        .list_mut(list)
+        .map_err(|error| error.to_string())?;
+    for value in values {
+        target
+            .insert(index, value)
+            .map_err(|error| error.to_string())?;
+        index += 1;
+    }
+    Ok(Value::number(index as f32))
+}
+
+fn list_join(list: ListId, arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
+    if arguments.is_empty() || arguments.len() > 3 {
+        return Err("list.Join requires Glue and optional Start/End".to_owned());
+    }
+    let glue = runtime_text(&arguments[0], state, "list.Join Glue")?;
+    let source = state.heap.list(list).map_err(|error| error.to_string())?;
+    let len = source.len();
+    let limit = i64::try_from(len).unwrap_or(i64::MAX - 1).saturating_add(1);
+    let mut start = list_integer(arguments.get(1), 1, "list.Join Start").unwrap_or(1);
+    let mut end = list_integer(arguments.get(2), 0, "list.Join End").unwrap_or(0);
+    if end <= 0 {
+        end = end.saturating_add(limit);
+    }
+    if start < 0 {
+        start = start.saturating_add(limit);
+    }
+    if start == 0 || start >= end {
+        return Ok(Value::text(""));
+    }
+    let start = usize::try_from(start.max(1))
+        .unwrap_or(usize::MAX)
+        .min(len + 1);
+    let end = usize::try_from(end.max(1))
+        .unwrap_or(usize::MAX)
+        .min(len + 1);
+    let mut values = Vec::new();
+    for index in start..end {
+        values.push(runtime_text(
+            source.get(index).map_err(|error| error.to_string())?,
+            state,
+            "list.Join item",
+        )?);
+    }
+    Ok(Value::text(values.join(&glue)))
+}
+
+fn list_remove_once(
+    list: ListId,
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Result<usize, String> {
+    let mut removed = 0usize;
+    for argument in arguments {
+        if matches!(argument, Value::List(candidate) if *candidate == list) {
+            let len = state
+                .heap
+                .list(list)
+                .map_err(|error| error.to_string())?
+                .len();
+            state
+                .heap
+                .list_mut(list)
+                .map_err(|error| error.to_string())?
+                .resize(0)
+                .map_err(|error| error.to_string())?;
+            removed += len;
+            break;
+        }
+        let values = flattened_list_arguments(std::slice::from_ref(argument), state)?;
+        for value in values {
+            if state
+                .heap
+                .list_mut(list)
+                .map_err(|error| error.to_string())?
+                .remove_last(&value)
+                .is_some()
+            {
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn list_remove(
+    list: ListId,
+    arguments: &[Value],
+    state: &mut ExecutionState,
+    all: bool,
+) -> Result<Value, String> {
+    if arguments.is_empty() {
+        return Err(if all {
+            "list.RemoveAll requires at least one item"
+        } else {
+            "list.Remove requires at least one item"
+        }
+        .to_owned());
+    }
+    if all {
+        let mut total = 0usize;
+        loop {
+            let removed = list_remove_once(list, arguments, state)?;
+            total += removed;
+            if removed == 0 {
+                break;
+            }
+        }
+        Ok(Value::number(total as f32))
+    } else {
+        Ok(Value::number(f32::from(
+            list_remove_once(list, arguments, state)? > 0,
+        )))
+    }
+}
+
+fn list_splice(
+    list: ListId,
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    if arguments.len() > 2 && arguments.len() < 3 {
+        return Err("invalid list.Splice arguments".to_owned());
+    }
+    let len = state
+        .heap
+        .list(list)
+        .map_err(|error| error.to_string())?
+        .len();
+    let mut start = splice_boundary(
+        list_integer(arguments.first(), 1, "list.Splice Start")?,
+        len,
+        false,
+    );
+    let mut end = splice_boundary(
+        list_integer(arguments.get(1), 0, "list.Splice End")?,
+        len,
+        true,
+    );
+    if end < start {
+        std::mem::swap(&mut start, &mut end);
+    }
+    state
+        .heap
+        .list_mut(list)
+        .map_err(|error| error.to_string())?
+        .cut_range(start, end)
+        .map_err(|error| error.to_string())?;
+    if arguments.len() <= 2 {
+        return Ok(Value::Null);
+    }
+    let values = flattened_list_arguments(&arguments[2..], state)?;
+    let mut index = start.min(
+        state
+            .heap
+            .list(list)
+            .map_err(|error| error.to_string())?
+            .len()
+            + 1,
+    );
+    let target = state
+        .heap
+        .list_mut(list)
+        .map_err(|error| error.to_string())?;
+    for value in values {
+        target
+            .insert(index, value)
+            .map_err(|error| error.to_string())?;
+        index += 1;
+    }
+    Ok(Value::Null)
+}
+
+fn list_swap(
+    list: ListId,
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    if arguments.len() != 2 {
+        return Err("list.Swap requires exactly two indices".to_owned());
+    }
+    let first = list_integer(arguments.first(), 0, "list.Swap Index1")?;
+    let second = list_integer(arguments.get(1), 0, "list.Swap Index2")?;
+    let first = usize::try_from(first).map_err(|_| "list.Swap Index1 is invalid".to_owned())?;
+    let second = usize::try_from(second).map_err(|_| "list.Swap Index2 is invalid".to_owned())?;
+    state
+        .heap
+        .list_mut(list)
+        .map_err(|error| error.to_string())?
+        .swap(first, second)
+        .map_err(|error| error.to_string())?;
+    Ok(Value::Null)
 }
 
 fn resolved_file_path(

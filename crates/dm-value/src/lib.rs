@@ -437,6 +437,134 @@ impl DmList {
         self.remove(index + 1).ok()
     }
 
+    /// Inserts a positional value at a 1-based boundary and returns that index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an index error when `index` is zero or greater than `len + 1`.
+    pub fn insert(&mut self, index: usize, value: Value) -> Result<usize, ValueError> {
+        checked_boundary(index, self.order.len())?;
+        let position = self.positional.len();
+        self.positional.push(value);
+        self.order
+            .insert(index - 1, ListOrder::Positional(position));
+        Ok(index)
+    }
+
+    /// Creates a shallow copy of the half-open 1-based range `[start, end)`.
+    ///
+    /// Associative values remain associated with copied keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns an index error for boundaries outside `1..=len + 1`, or
+    /// [`ValueError::CorruptListStorage`] if an associative order entry lost
+    /// its value.
+    pub fn copy_range(&self, start: usize, end: usize) -> Result<Self, ValueError> {
+        checked_boundary(start, self.order.len())?;
+        checked_boundary(end, self.order.len())?;
+        let mut copy = Self::default();
+        if end <= start {
+            return Ok(copy);
+        }
+        for entry in &self.order[start - 1..end - 1] {
+            match entry {
+                ListOrder::Positional(position) => {
+                    copy.add(self.positional[*position].clone());
+                }
+                ListOrder::Associative(key) => {
+                    copy.set_key(key.clone(), self.get_key(key)?.clone());
+                }
+            }
+        }
+        Ok(copy)
+    }
+
+    /// Removes the half-open 1-based range `[start, end)` and returns the
+    /// number of removed iteration entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an index error for boundaries outside `1..=len + 1`.
+    pub fn cut_range(&mut self, start: usize, end: usize) -> Result<usize, ValueError> {
+        checked_boundary(start, self.order.len())?;
+        checked_boundary(end, self.order.len())?;
+        if end <= start {
+            return Ok(0);
+        }
+        let count = end - start;
+        for _ in 0..count {
+            self.remove(start)?;
+        }
+        Ok(count)
+    }
+
+    /// Finds the first iteration position semantically equal to `value` in
+    /// the half-open 1-based range `[start, end)`, returning zero when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an index error for boundaries outside `1..=len + 1`.
+    pub fn find_position(
+        &self,
+        value: &Value,
+        start: usize,
+        end: usize,
+    ) -> Result<usize, ValueError> {
+        checked_boundary(start, self.order.len())?;
+        checked_boundary(end, self.order.len())?;
+        if end <= start {
+            return Ok(0);
+        }
+        for index in start..end {
+            if self.get(index)?.semantic_eq(value) {
+                return Ok(index);
+            }
+        }
+        Ok(0)
+    }
+
+    /// Removes the last occurrence equal to `value`, matching BYOND list
+    /// subtraction/`Remove()` ordering.
+    pub fn remove_last(&mut self, value: &Value) -> Option<Value> {
+        let index = (1..=self.len()).rev().find(|index| {
+            self.get(*index)
+                .is_ok_and(|candidate| candidate.semantic_eq(value))
+        })?;
+        self.remove(index).ok()
+    }
+
+    /// Swaps two 1-based iteration positions while keeping associative values
+    /// attached to their keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns an index error when either position is outside the list.
+    pub fn swap(&mut self, first: usize, second: usize) -> Result<(), ValueError> {
+        let first = checked_index(first, self.order.len())?;
+        let second = checked_index(second, self.order.len())?;
+        self.order.swap(first, second);
+        Ok(())
+    }
+
+    /// Resizes the list, appending positional `null` values when growing and
+    /// cutting the tail when shrinking.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error only if an existing associative entry is
+    /// internally inconsistent while shrinking.
+    pub fn resize(&mut self, new_len: usize) -> Result<(), ValueError> {
+        while self.len() < new_len {
+            self.add(Value::Null);
+        }
+        if self.len() > new_len {
+            let end = self.len() + 1;
+            self.cut_range(new_len + 1, end)?;
+        }
+        Ok(())
+    }
+
     /// Reads an associative value by semantic key equality.
     ///
     /// # Errors
@@ -562,6 +690,16 @@ impl fmt::Display for ValueError {
 }
 
 impl std::error::Error for ValueError {}
+
+fn checked_boundary(index: usize, len: usize) -> Result<usize, ValueError> {
+    if index == 0 {
+        return Err(ValueError::IndexZero);
+    }
+    if index > len.saturating_add(1) {
+        return Err(ValueError::IndexOutOfBounds { index, len });
+    }
+    Ok(index - 1)
+}
 
 fn checked_index(index: usize, len: usize) -> Result<usize, ValueError> {
     if index == 0 {
@@ -1049,6 +1187,35 @@ mod tests {
         assert!(list.remove_first(&Value::number(0.0)).is_some());
         assert_eq!(list.len(), 1);
         assert!(list.get(1).unwrap().semantic_eq(&Value::number(0.0)));
+    }
+
+    #[test]
+    fn range_insert_swap_and_resize_preserve_order_and_associations() {
+        let mut list = DmList::default();
+        list.add(text("a"));
+        list.set_key(text("key"), Value::number(9.0));
+        list.add(text("b"));
+
+        let copy = list.copy_range(2, 4).unwrap();
+        assert_eq!(copy.len(), 2);
+        assert!(copy.get(1).unwrap().semantic_eq(&text("key")));
+        assert!(
+            copy.get_key(&text("key"))
+                .unwrap()
+                .semantic_eq(&Value::number(9.0))
+        );
+
+        list.insert(2, text("x")).unwrap();
+        assert_eq!(list.find_position(&text("b"), 1, list.len() + 1), Ok(4));
+        list.swap(1, 4).unwrap();
+        assert!(list.get(1).unwrap().semantic_eq(&text("b")));
+        assert!(list.get(4).unwrap().semantic_eq(&text("a")));
+        assert!(list.remove_last(&text("x")).is_some());
+        list.resize(5).unwrap();
+        assert_eq!(list.len(), 5);
+        assert!(list.get(5).unwrap().semantic_eq(&Value::Null));
+        list.resize(2).unwrap();
+        assert_eq!(list.len(), 2);
     }
 
     #[test]
