@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use dm_core::{FileId, SourceSpan};
-use dm_lexer::{SpannedToken, TokenKind};
+use dm_lexer::{SpannedToken, TokenKind, lex};
 use dm_syntax::{Definition, DefinitionKind, DefinitionPath, SyntaxFile};
 
 /// A parsed file paired with its stable project-local identity.
@@ -284,11 +284,129 @@ impl CodeTree {
         self.paths.get(&CodePath::from_definition(path)).copied()
     }
 
+    /// Resolves DM's upward-search path operator from an absolute anchor.
+    ///
+    /// The suffix is first appended to the complete anchor. If that path does
+    /// not exist, one anchor segment is removed at a time until a matching
+    /// canonical node is found. An empty suffix resolves the anchor itself.
+    #[must_use]
+    pub fn resolve_upward_path(
+        &self,
+        anchor: &DefinitionPath,
+        suffix: &[String],
+    ) -> Option<NodeId> {
+        let anchor = anchor.segments();
+        for length in (1..=anchor.len()).rev() {
+            let mut candidate = anchor[..length].to_vec();
+            candidate.extend_from_slice(suffix);
+            if let Some(node) = self.paths.get(&CodePath(candidate)) {
+                return Some(*node);
+            }
+        }
+        None
+    }
+
+    /// Rewrites resolvable upward-search expressions to absolute path tokens.
+    ///
+    /// Unresolved input is retained, and replacements preserve the original
+    /// complete expression span for diagnostics.
+    #[must_use]
+    pub fn normalize_upward_paths(
+        &self,
+        contextual_anchor: Option<&DefinitionPath>,
+        tokens: &[SpannedToken],
+    ) -> Vec<SpannedToken> {
+        let mut output = Vec::with_capacity(tokens.len());
+        let mut index = 0;
+        while index < tokens.len() {
+            let Some((end, anchor, suffix)) = upward_path_at(tokens, index, contextual_anchor)
+            else {
+                output.push(tokens[index].clone());
+                index += 1;
+                continue;
+            };
+            let Some(node) = self.resolve_upward_path(&anchor, &suffix) else {
+                output.push(tokens[index].clone());
+                index += 1;
+                continue;
+            };
+            let path = self
+                .node(node)
+                .expect("resolved node should exist")
+                .path
+                .to_string();
+            let span = SourceSpan::new(tokens[index].span.start, tokens[end - 1].span.end);
+            let replacement = lex(&path).expect("canonical paths should lex");
+            output.extend(
+                replacement
+                    .into_iter()
+                    .filter(|token| {
+                        !matches!(token.kind, TokenKind::LineStart { .. } | TokenKind::Newline)
+                    })
+                    .map(|mut token| {
+                        token.span = span;
+                        token
+                    }),
+            );
+            index = end;
+        }
+        output
+    }
+
     /// Returns errors from resolving final constant `parent_type` assignments.
     #[must_use]
     pub fn inheritance_diagnostics(&self) -> &[InheritanceDiagnostic] {
         &self.inheritance_diagnostics
     }
+}
+
+fn upward_path_at(
+    tokens: &[SpannedToken],
+    start: usize,
+    contextual_anchor: Option<&DefinitionPath>,
+) -> Option<(usize, DefinitionPath, Vec<String>)> {
+    let mut index = start;
+    let anchor = if matches!(tokens.get(index).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "/")
+    {
+        let mut segments = Vec::new();
+        while matches!(tokens.get(index).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "/")
+        {
+            let Some(TokenKind::Identifier(segment)) =
+                tokens.get(index + 1).map(|token| &token.kind)
+            else {
+                return None;
+            };
+            segments.push(segment.clone());
+            index += 2;
+        }
+        if !matches!(tokens.get(index).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == ".")
+        {
+            return None;
+        }
+        DefinitionPath::new(segments)
+    } else if matches!(tokens.get(index).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == ".")
+    {
+        contextual_anchor?.clone()
+    } else {
+        return None;
+    };
+    index += 1;
+    if matches!(tokens.get(index).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "/")
+    {
+        index += 1;
+    }
+    let mut suffix = Vec::new();
+    while let Some(TokenKind::Identifier(segment)) = tokens.get(index).map(|token| &token.kind) {
+        suffix.push(segment.clone());
+        index += 1;
+        if matches!(tokens.get(index).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "/")
+        {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    Some((index, anchor, suffix))
 }
 
 /// Result of project-wide code-tree construction.
@@ -1138,6 +1256,55 @@ mod tests {
                 "parent of {path}"
             );
         }
+    }
+
+    #[test]
+    fn resolves_upward_search_paths_against_the_completed_tree() {
+        let syntax = parse("/datum/foo\n/datum/d\n/datum/a/b/c\n/atom/proc/fn()\n\treturn\n")
+            .expect("upward-search fixture should parse");
+        let output = build(&[SyntaxUnit {
+            file_id: FileId::from_index(0),
+            syntax: &syntax,
+        }]);
+        let path = |segments: &[&str]| {
+            dm_syntax::DefinitionPath::new(
+                segments
+                    .iter()
+                    .map(|segment| (*segment).to_owned())
+                    .collect(),
+            )
+        };
+        let suffix = |segments: &[&str]| {
+            segments
+                .iter()
+                .map(|segment| (*segment).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let resolved = |anchor: &[&str], tail: &[&str]| {
+            output
+                .tree
+                .resolve_upward_path(&path(anchor), &suffix(tail))
+                .and_then(|node| output.tree.node(node))
+                .map(|node| node.path.to_string())
+        };
+
+        assert_eq!(
+            resolved(&["datum", "bar"], &["foo"]).as_deref(),
+            Some("/datum/foo")
+        );
+        assert_eq!(
+            resolved(&["datum", "a", "b", "c"], &["d"]).as_deref(),
+            Some("/datum/d")
+        );
+        assert_eq!(
+            resolved(&["atom"], &["proc", "fn"]).as_deref(),
+            Some("/atom/proc/fn")
+        );
+        assert_eq!(
+            resolved(&["datum", "foo"], &[]).as_deref(),
+            Some("/datum/foo")
+        );
+        assert_eq!(resolved(&["datum", "foo"], &["missing"]), None);
     }
 
     #[test]

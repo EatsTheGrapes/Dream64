@@ -489,6 +489,8 @@ impl ProcedureRegistry {
                     procedure.owner_type,
                     compilation,
                     &const_bindings,
+                    self,
+                    implementation.id,
                 )?;
                 ordered.push((procedure, implementation, definition));
             }
@@ -497,6 +499,12 @@ impl ProcedureRegistry {
             .iter()
             .enumerate()
             .map(|(index, (_, implementation, _))| (implementation.id, index))
+            .collect();
+        let normalized_definitions: Vec<_> = ordered
+            .iter()
+            .map(|(procedure, _, definition)| {
+                normalize_upward_paths(compilation, procedure.owner_type, definition)
+            })
             .collect();
         let builtin_syntax =
             dm_syntax::parse(STANDARD_BUILTINS).map_err(|error| dm_vm::CompileError {
@@ -523,7 +531,9 @@ impl ProcedureRegistry {
             .collect();
         let mut specs: Vec<_> = ordered
             .iter()
-            .map(|(procedure, implementation, definition)| {
+            .enumerate()
+            .map(|(ordered_index, (procedure, implementation, _))| {
+                let definition = &normalized_definitions[ordered_index];
                 let parent = if include_parent_targets {
                     implementation
                         .parent_target
@@ -612,31 +622,128 @@ impl ProcedureRegistry {
     }
 }
 
+fn normalize_upward_paths(
+    compilation: &Compilation,
+    owner: Option<NodeId>,
+    definition: &dm_syntax::Definition,
+) -> dm_syntax::Definition {
+    let mut normalized = definition.clone();
+    let contextual_anchor = owner
+        .and_then(|node| compilation.code_tree().node(node))
+        .map(|node| dm_syntax::DefinitionPath::new(node.path.segments().to_vec()));
+    for line in &mut normalized.body {
+        line.tokens = compilation
+            .code_tree()
+            .normalize_upward_paths(contextual_anchor.as_ref(), &line.tokens);
+        if matches!(line.tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(name)) if name == "var")
+            && let Some(annotation) = line.tokens.iter().position(
+                |token| matches!(&token.kind, TokenKind::Identifier(name) if name == "as"),
+            )
+        {
+            let assignment = line.tokens.iter().position(
+                |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
+            );
+            if let Some(assignment) = assignment
+                && annotation < assignment
+            {
+                line.tokens.drain(annotation..assignment);
+            } else {
+                line.tokens.drain(annotation..);
+            }
+        }
+    }
+    for parameter in &mut normalized.parameters {
+        let assignment = parameter.tokens.iter().position(
+            |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
+        );
+        let annotation = parameter
+            .tokens
+            .iter()
+            .position(|token| matches!(&token.kind, TokenKind::Identifier(name) if name == "as"));
+        if let Some(annotation) = annotation
+            && assignment.is_none_or(|assignment| annotation < assignment)
+        {
+            let end = assignment.unwrap_or(parameter.tokens.len());
+            parameter.tokens.drain(annotation..end);
+        } else if let (Some(annotation), Some(assignment)) = (annotation, assignment)
+            && annotation > assignment
+        {
+            parameter.tokens.drain(annotation..);
+        }
+    }
+    normalized
+}
+
 #[derive(Default)]
 struct ConstBindings {
     globals: BTreeSet<String>,
     fields: BTreeMap<NodeId, BTreeSet<String>>,
+    field_types: BTreeMap<NodeId, BTreeMap<String, NodeId>>,
+    scalar_field_types: BTreeMap<NodeId, ScalarConstraint>,
+    scalar_field_conflicts: Vec<String>,
 }
 
 impl ConstBindings {
     fn build(compilation: &Compilation) -> Self {
         let mut bindings = Self::default();
-        for entry in VariableRegistry::build(compilation)
-            .entries()
-            .iter()
-            .filter(|entry| entry.modifiers.constant)
-        {
+        let registry = VariableRegistry::build(compilation);
+        for entry in registry.entries() {
             let Some(name) = entry.path.rsplit('/').next() else {
                 continue;
             };
-            if let Some(owner) = &entry.owner {
+            if entry.modifiers.constant {
+                if let Some(owner) = &entry.owner {
+                    bindings
+                        .fields
+                        .entry(owner.node)
+                        .or_default()
+                        .insert(name.to_owned());
+                } else {
+                    bindings.globals.insert(name.to_owned());
+                }
+            }
+            let Some(owner) = &entry.owner else {
+                continue;
+            };
+            let Some(definition) = compilation
+                .syntax(entry.file_id)
+                .and_then(|syntax| syntax.definitions.get(entry.definition_index))
+            else {
+                continue;
+            };
+            if entry.assignment == dm_globals::AssignmentKind::Declaration
+                && let Some(constraint) = scalar_constraint(&definition.header)
+            {
+                bindings.scalar_field_types.insert(entry.node, constraint);
+            }
+            if let Some(type_node) = declared_type_node(compilation, &definition.header, name) {
                 bindings
-                    .fields
+                    .field_types
                     .entry(owner.node)
                     .or_default()
-                    .insert(name.to_owned());
-            } else {
-                bindings.globals.insert(name.to_owned());
+                    .entry(name.to_owned())
+                    .or_insert(type_node);
+            }
+        }
+        for entry in registry
+            .entries()
+            .iter()
+            .filter(|entry| entry.assignment == dm_globals::AssignmentKind::Override)
+        {
+            let Some(initializer) = &entry.initializer else {
+                continue;
+            };
+            let Some(actual) = proven_literal_scalar_type(&initializer.tokens) else {
+                continue;
+            };
+            let Some(expected) = bindings.effective_scalar_field(compilation, entry.node) else {
+                continue;
+            };
+            if actual != expected.kind && !(actual == ScalarType::Null && expected.allows_null) {
+                bindings.scalar_field_conflicts.push(format!(
+                    "cannot assign {actual:?} to field override {} declared as {:?}",
+                    entry.path, expected.kind
+                ));
             }
         }
         bindings
@@ -663,6 +770,41 @@ impl ConstBindings {
         }
         false
     }
+
+    fn field_type(
+        &self,
+        compilation: &Compilation,
+        mut owner: Option<NodeId>,
+        name: &str,
+    ) -> Option<NodeId> {
+        while let Some(node) = owner {
+            if let Some(field_type) = self
+                .field_types
+                .get(&node)
+                .and_then(|fields| fields.get(name))
+            {
+                return Some(*field_type);
+            }
+            owner = compilation
+                .code_tree()
+                .node(node)
+                .and_then(|type_node| type_node.parent_type);
+        }
+        None
+    }
+
+    fn effective_scalar_field(
+        &self,
+        compilation: &Compilation,
+        mut node: NodeId,
+    ) -> Option<ScalarConstraint> {
+        loop {
+            if let Some(constraint) = self.scalar_field_types.get(&node) {
+                return Some(*constraint);
+            }
+            node = compilation.code_tree().node(node)?.inherited_member?;
+        }
+    }
 }
 
 fn validate_const_assignments(
@@ -670,9 +812,51 @@ fn validate_const_assignments(
     owner: Option<NodeId>,
     compilation: &Compilation,
     bindings: &ConstBindings,
+    registry: &ProcedureRegistry,
+    implementation: ProcedureImplementationId,
 ) -> Result<(), dm_vm::CompileError> {
+    if let Some(message) = bindings.scalar_field_conflicts.first() {
+        return Err(dm_vm::CompileError {
+            message: message.clone(),
+        });
+    }
     let mut locals = BTreeSet::new();
     let mut const_locals = BTreeSet::new();
+    let mut local_types = BTreeMap::new();
+    let mut scalar_types = BTreeMap::new();
+    let procedure_node = registry
+        .procedure(implementation.procedure())
+        .map(|procedure| procedure.node);
+    if let Some(node) = procedure_node {
+        validate_override_return_signature(compilation, node)?;
+    }
+    let return_type = procedure_node.and_then(|node| effective_datum_return(compilation, node));
+    let scalar_return = procedure_node.and_then(|node| effective_scalar_return(compilation, node));
+
+    for parameter in &definition.parameters {
+        let identifiers: Vec<_> = parameter
+            .tokens
+            .iter()
+            .filter_map(|token| match &token.kind {
+                TokenKind::Identifier(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let name_end = identifiers
+            .iter()
+            .position(|name| *name == "as")
+            .unwrap_or(identifiers.len());
+        let Some(name) = identifiers[..name_end].last().copied() else {
+            continue;
+        };
+        locals.insert(name.to_owned());
+        if let Some(type_node) = declared_type_node(compilation, &parameter.tokens, name) {
+            local_types.insert(name.to_owned(), type_node);
+        }
+        if let Some(constraint) = scalar_constraint(&parameter.tokens) {
+            scalar_types.insert(name.to_owned(), constraint);
+        }
+    }
 
     for line in &definition.body {
         let tokens = &line.tokens;
@@ -695,24 +879,135 @@ fn validate_const_assignments(
                 .unwrap_or(identifiers.len());
             if let Some(name) = identifiers[..name_index].last().copied() {
                 locals.insert(name.to_owned());
+                if let Some(type_node) = declared_type_node(compilation, tokens, name) {
+                    local_types.insert(name.to_owned(), type_node);
+                }
+                if let Some(constraint) = scalar_constraint(tokens) {
+                    if let Some(assignment) = assignment
+                        && let Some(actual) = proven_scalar_type(
+                            compilation,
+                            registry,
+                            implementation,
+                            &tokens[assignment + 1..],
+                            &scalar_types,
+                            &local_types,
+                            owner,
+                            bindings,
+                        )
+                    {
+                        validate_scalar_assignment(name, constraint, actual)?;
+                    }
+                    scalar_types.insert(name.to_owned(), constraint);
+                } else if let Some(assignment) = assignment
+                    && let Some(actual) = proven_scalar_type(
+                        compilation,
+                        registry,
+                        implementation,
+                        &tokens[assignment + 1..],
+                        &scalar_types,
+                        &local_types,
+                        owner,
+                        bindings,
+                    )
+                {
+                    scalar_types.insert(name.to_owned(), ScalarConstraint::exact(actual));
+                }
                 if identifiers.contains(&"const") {
                     const_locals.insert(name.to_owned());
+                }
+                if let (Some(expected), Some(actual)) = (
+                    local_types.get(name).copied(),
+                    assignment.and_then(|assignment| {
+                        proven_datum_expression_type(
+                            compilation,
+                            &tokens[assignment + 1..],
+                            &local_types,
+                            owner,
+                            bindings,
+                            registry,
+                            implementation,
+                        )
+                    }),
+                ) {
+                    validate_type_assignment(compilation, name, expected, actual)?;
                 }
             }
             continue;
         }
 
         let Some(assignment_index) = assignment else {
+            if matches!(tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(keyword)) if keyword == "return")
+                && let (Some(expected), Some(actual)) = (
+                    return_type,
+                    proven_datum_expression_type(
+                        compilation,
+                        &tokens[1..],
+                        &local_types,
+                        owner,
+                        bindings,
+                        registry,
+                        implementation,
+                    ),
+                )
+            {
+                validate_type_assignment(compilation, "return", expected, actual)?;
+            }
+            if matches!(tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(keyword)) if keyword == "return")
+                && let (Some(expected), Some(actual)) = (
+                    scalar_return,
+                    proven_scalar_type(
+                        compilation,
+                        registry,
+                        implementation,
+                        &tokens[1..],
+                        &scalar_types,
+                        &local_types,
+                        owner,
+                        bindings,
+                    ),
+                )
+            {
+                validate_scalar_assignment("return", expected, actual)?;
+            }
             continue;
         };
         let assigned = &tokens[..assignment_index];
-        let bare_name = match assigned {
+        let mut bare_name = match assigned {
             [token] => match &token.kind {
                 TokenKind::Identifier(name) => Some(name.as_str()),
                 _ => None,
             },
             _ => None,
         };
+        if bare_name.is_none()
+            && assignment_index == 0
+            && matches!(
+                tokens.first().map(|token| &token.kind),
+                Some(TokenKind::Operator(operator)) if operator == "++" || operator == "--"
+            )
+        {
+            bare_name = match tokens.get(1).map(|token| &token.kind) {
+                Some(TokenKind::Identifier(name)) => Some(name.as_str()),
+                _ => None,
+            };
+        }
+        if let Some((receiver, name)) = assigned_receiver_field(assigned) {
+            let receiver_type = if receiver == "src" {
+                owner
+            } else {
+                local_types
+                    .get(receiver)
+                    .copied()
+                    .or_else(|| bindings.field_type(compilation, owner, receiver))
+            };
+            if receiver_type.is_some() && bindings.field_is_const(compilation, receiver_type, name)
+            {
+                return Err(dm_vm::CompileError {
+                    message: format!("cannot assign to const variable `{name}`"),
+                });
+            }
+            continue;
+        }
         let Some(name) = bare_name else {
             continue;
         };
@@ -727,8 +1022,749 @@ fn validate_const_assignments(
                 message: format!("cannot assign to const variable `{name}`"),
             });
         }
+        if let (Some(expected), Some(actual)) = (
+            local_types.get(name).copied(),
+            proven_datum_expression_type(
+                compilation,
+                &tokens[assignment_index + 1..],
+                &local_types,
+                owner,
+                bindings,
+                registry,
+                implementation,
+            ),
+        ) {
+            validate_type_assignment(compilation, name, expected, actual)?;
+        }
+        if let (Some(expected), Some(actual)) = (
+            scalar_types.get(name).copied(),
+            proven_scalar_type(
+                compilation,
+                registry,
+                implementation,
+                &tokens[assignment_index + 1..],
+                &scalar_types,
+                &local_types,
+                owner,
+                bindings,
+            ),
+        ) {
+            validate_scalar_assignment(name, expected, actual)?;
+        }
     }
     Ok(())
+}
+
+fn validate_override_return_signature(
+    compilation: &Compilation,
+    node: NodeId,
+) -> Result<(), dm_vm::CompileError> {
+    let tree_node = compilation
+        .code_tree()
+        .node(node)
+        .expect("procedure node should exist");
+    let Some(parent) = tree_node.inherited_member else {
+        return Ok(());
+    };
+    let direct_scalar = tree_node.declarations.iter().rev().find_map(|declaration| {
+        let declaration = compilation.code_tree().declaration(*declaration)?;
+        let definition = compilation
+            .syntax(declaration.file_id)?
+            .definitions
+            .get(declaration.definition_index)?;
+        procedure_scalar_return(&definition.header)
+    });
+    if let (Some(child), Some(parent)) =
+        (direct_scalar, effective_scalar_return(compilation, parent))
+        && (child.kind != parent.kind || child.allows_null != parent.allows_null)
+    {
+        return Err(dm_vm::CompileError {
+            message: "procedure override changes its inherited scalar return type".to_owned(),
+        });
+    }
+    let direct_datum = tree_node.declarations.iter().rev().find_map(|declaration| {
+        let declaration = compilation.code_tree().declaration(*declaration)?;
+        let definition = compilation
+            .syntax(declaration.file_id)?
+            .definitions
+            .get(declaration.definition_index)?;
+        procedure_return_type_node(compilation, &definition.header)
+    });
+    if let (Some(child), Some(parent)) = (direct_datum, effective_datum_return(compilation, parent))
+    {
+        validate_type_assignment(compilation, "return", parent, child)?;
+    }
+    Ok(())
+}
+
+fn validate_type_assignment(
+    compilation: &Compilation,
+    name: &str,
+    expected: NodeId,
+    actual: NodeId,
+) -> Result<(), dm_vm::CompileError> {
+    let tree = compilation.code_tree();
+    let mut current = Some(actual);
+    while let Some(node) = current {
+        if node == expected {
+            return Ok(());
+        }
+        current = tree.node(node).and_then(|node| node.parent_type);
+    }
+    let expected = tree
+        .node(expected)
+        .map(|node| node.path.to_string())
+        .unwrap_or_else(|| "<unknown>".to_owned());
+    let actual = tree
+        .node(actual)
+        .map(|node| node.path.to_string())
+        .unwrap_or_else(|| "<unknown>".to_owned());
+    Err(dm_vm::CompileError {
+        message: format!(
+            "cannot assign {actual} to typed variable `{name}` declared as {expected}"
+        ),
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScalarType {
+    Number,
+    Text,
+    Null,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScalarConstraint {
+    kind: ScalarType,
+    allows_null: bool,
+}
+
+impl ScalarConstraint {
+    const fn exact(kind: ScalarType) -> Self {
+        Self {
+            kind,
+            allows_null: matches!(kind, ScalarType::Null),
+        }
+    }
+}
+
+fn scalar_constraint(tokens: &[dm_lexer::SpannedToken]) -> Option<ScalarConstraint> {
+    let annotation = tokens
+        .iter()
+        .position(|token| matches!(&token.kind, TokenKind::Identifier(name) if name == "as"))?;
+    let identifiers: BTreeSet<_> = tokens[annotation + 1..]
+        .iter()
+        .filter_map(|token| match &token.kind {
+            TokenKind::Identifier(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let kind = if identifiers.contains("num") {
+        ScalarType::Number
+    } else if identifiers.contains("text") {
+        ScalarType::Text
+    } else {
+        return None;
+    };
+    Some(ScalarConstraint {
+        kind,
+        allows_null: identifiers.contains("null"),
+    })
+}
+
+fn procedure_scalar_return(tokens: &[dm_lexer::SpannedToken]) -> Option<ScalarConstraint> {
+    let closing = tokens
+        .iter()
+        .rposition(|token| token.kind == TokenKind::Punctuation(')'))?;
+    scalar_constraint(&tokens[closing + 1..])
+}
+
+fn effective_scalar_return(compilation: &Compilation, node: NodeId) -> Option<ScalarConstraint> {
+    let tree_node = compilation.code_tree().node(node)?;
+    for declaration in tree_node.declarations.iter().rev() {
+        let declaration = compilation.code_tree().declaration(*declaration)?;
+        let definition = compilation
+            .syntax(declaration.file_id)
+            .and_then(|syntax| syntax.definitions.get(declaration.definition_index))?;
+        if let Some(constraint) = procedure_scalar_return(&definition.header) {
+            return Some(constraint);
+        }
+    }
+    tree_node
+        .inherited_member
+        .and_then(|parent| effective_scalar_return(compilation, parent))
+}
+
+fn effective_datum_return(compilation: &Compilation, node: NodeId) -> Option<NodeId> {
+    let tree_node = compilation.code_tree().node(node)?;
+    for declaration in tree_node.declarations.iter().rev() {
+        let declaration = compilation.code_tree().declaration(*declaration)?;
+        let definition = compilation
+            .syntax(declaration.file_id)
+            .and_then(|syntax| syntax.definitions.get(declaration.definition_index))?;
+        if let Some(return_type) = procedure_return_type_node(compilation, &definition.header) {
+            return Some(return_type);
+        }
+    }
+    tree_node
+        .inherited_member
+        .and_then(|parent| effective_datum_return(compilation, parent))
+}
+
+fn statically_called_procedure(
+    registry: &ProcedureRegistry,
+    implementation: ProcedureImplementationId,
+    compilation: &Compilation,
+    tokens: &[dm_lexer::SpannedToken],
+) -> Option<NodeId> {
+    let TokenKind::Identifier(selector) = &tokens.first()?.kind else {
+        return None;
+    };
+    if !matches!(
+        tokens.get(1).map(|token| &token.kind),
+        Some(TokenKind::Punctuation('('))
+    ) || !matches!(
+        tokens.last().map(|token| &token.kind),
+        Some(TokenKind::Punctuation(')'))
+    ) {
+        return None;
+    }
+    let target = registry.static_call_target(implementation, selector, compilation)?;
+    registry
+        .procedure(target.procedure())
+        .map(|procedure| procedure.node)
+}
+
+fn proven_scalar_type(
+    compilation: &Compilation,
+    registry: &ProcedureRegistry,
+    implementation: ProcedureImplementationId,
+    tokens: &[dm_lexer::SpannedToken],
+    locals: &BTreeMap<String, ScalarConstraint>,
+    datum_locals: &BTreeMap<String, NodeId>,
+    owner: Option<NodeId>,
+    bindings: &ConstBindings,
+) -> Option<ScalarType> {
+    if let Some(inferred) = infer_scalar_composite(
+        compilation,
+        registry,
+        implementation,
+        tokens,
+        locals,
+        datum_locals,
+        owner,
+        bindings,
+    ) {
+        return Some(inferred);
+    }
+    let direct = match tokens {
+        [token] => match &token.kind {
+            TokenKind::Identifier(name) => locals.get(name).map(|constraint| constraint.kind),
+            _ => proven_literal_scalar_type(tokens),
+        },
+        _ => proven_literal_scalar_type(tokens),
+    };
+    direct
+        .or_else(|| {
+            statically_called_procedure(registry, implementation, compilation, tokens)
+                .and_then(|node| effective_scalar_return(compilation, node))
+                .map(|constraint| constraint.kind)
+        })
+        .or_else(|| {
+            let (receiver, member, call) = receiver_member_expression(tokens)?;
+            let receiver_type =
+                proven_receiver_type(compilation, receiver, datum_locals, owner, bindings)?;
+            if call {
+                find_member_node(compilation, receiver_type, "proc", member)
+                    .and_then(|node| effective_scalar_return(compilation, node))
+                    .map(|constraint| constraint.kind)
+            } else {
+                find_member_node(compilation, receiver_type, "var", member)
+                    .and_then(|node| bindings.effective_scalar_field(compilation, node))
+                    .map(|constraint| constraint.kind)
+            }
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn infer_scalar_composite(
+    compilation: &Compilation,
+    registry: &ProcedureRegistry,
+    implementation: ProcedureImplementationId,
+    tokens: &[dm_lexer::SpannedToken],
+    locals: &BTreeMap<String, ScalarConstraint>,
+    datum_locals: &BTreeMap<String, NodeId>,
+    owner: Option<NodeId>,
+    bindings: &ConstBindings,
+) -> Option<ScalarType> {
+    if matches!(
+        tokens.first().map(|token| &token.kind),
+        Some(TokenKind::Punctuation('('))
+    ) && matches!(
+        tokens.last().map(|token| &token.kind),
+        Some(TokenKind::Punctuation(')'))
+    ) && matching_closing(tokens, 0, '(', ')') == Some(tokens.len() - 1)
+    {
+        return proven_scalar_type(
+            compilation,
+            registry,
+            implementation,
+            &tokens[1..tokens.len() - 1],
+            locals,
+            datum_locals,
+            owner,
+            bindings,
+        );
+    }
+    if matches!(tokens.first().map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "..")
+        && tokens.len() == 3
+        && matches!(
+            tokens.get(1).map(|token| &token.kind),
+            Some(TokenKind::Punctuation('('))
+        )
+        && matches!(
+            tokens.get(2).map(|token| &token.kind),
+            Some(TokenKind::Punctuation(')'))
+        )
+    {
+        let parent = registry.implementation(implementation)?.parent_target?;
+        let node = registry.procedure(parent.procedure())?.node;
+        return effective_scalar_return(compilation, node).map(|constraint| constraint.kind);
+    }
+    if let Some((question, colon)) = top_level_ternary(tokens) {
+        let left = proven_scalar_type(
+            compilation,
+            registry,
+            implementation,
+            &tokens[question + 1..colon],
+            locals,
+            datum_locals,
+            owner,
+            bindings,
+        )?;
+        let right = proven_scalar_type(
+            compilation,
+            registry,
+            implementation,
+            &tokens[colon + 1..],
+            locals,
+            datum_locals,
+            owner,
+            bindings,
+        )?;
+        return (left == right).then_some(left);
+    }
+    if let Some((index, operator)) = top_level_binary(tokens) {
+        let left = proven_scalar_type(
+            compilation,
+            registry,
+            implementation,
+            &tokens[..index],
+            locals,
+            datum_locals,
+            owner,
+            bindings,
+        )?;
+        let right = proven_scalar_type(
+            compilation,
+            registry,
+            implementation,
+            &tokens[index + 1..],
+            locals,
+            datum_locals,
+            owner,
+            bindings,
+        )?;
+        return match operator {
+            "+" if left == right && matches!(left, ScalarType::Number | ScalarType::Text) => {
+                Some(left)
+            }
+            "-" | "*" | "/" | "%" if left == ScalarType::Number && right == ScalarType::Number => {
+                Some(ScalarType::Number)
+            }
+            _ => None,
+        };
+    }
+    inline_list_index_scalar(
+        compilation,
+        registry,
+        implementation,
+        tokens,
+        locals,
+        datum_locals,
+        owner,
+        bindings,
+    )
+}
+
+fn receiver_member_expression(tokens: &[dm_lexer::SpannedToken]) -> Option<(&str, &str, bool)> {
+    let [receiver, dot, member, rest @ ..] = tokens else {
+        return None;
+    };
+    let TokenKind::Identifier(receiver) = &receiver.kind else {
+        return None;
+    };
+    if !matches!(&dot.kind, TokenKind::Operator(operator) if operator == ".") {
+        return None;
+    }
+    let TokenKind::Identifier(member) = &member.kind else {
+        return None;
+    };
+    let call = !rest.is_empty()
+        && matches!(
+            rest.first().map(|token| &token.kind),
+            Some(TokenKind::Punctuation('('))
+        )
+        && matches!(
+            rest.last().map(|token| &token.kind),
+            Some(TokenKind::Punctuation(')'))
+        );
+    if !rest.is_empty() && !call {
+        return None;
+    }
+    Some((receiver, member, call))
+}
+
+fn proven_receiver_type(
+    compilation: &Compilation,
+    receiver: &str,
+    datum_locals: &BTreeMap<String, NodeId>,
+    owner: Option<NodeId>,
+    bindings: &ConstBindings,
+) -> Option<NodeId> {
+    if receiver == "src" {
+        owner
+    } else {
+        datum_locals
+            .get(receiver)
+            .copied()
+            .or_else(|| bindings.field_type(compilation, owner, receiver))
+    }
+}
+
+fn find_member_node(
+    compilation: &Compilation,
+    mut owner: NodeId,
+    namespace: &str,
+    member: &str,
+) -> Option<NodeId> {
+    loop {
+        let owner_node = compilation.code_tree().node(owner)?;
+        let mut segments = owner_node.path.segments().to_vec();
+        segments.push(namespace.to_owned());
+        segments.push(member.to_owned());
+        let path = dm_syntax::DefinitionPath::new(segments);
+        if let Some(node) = compilation.code_tree().find(&path) {
+            return Some(node);
+        }
+        owner = owner_node.parent_type?;
+    }
+}
+
+fn proven_literal_scalar_type(tokens: &[dm_lexer::SpannedToken]) -> Option<ScalarType> {
+    match tokens {
+        [token] => match &token.kind {
+            TokenKind::Number(_) => Some(ScalarType::Number),
+            TokenKind::String(_) | TokenKind::RawString(_) => Some(ScalarType::Text),
+            TokenKind::Identifier(name) if name == "null" => Some(ScalarType::Null),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn matching_closing(
+    tokens: &[dm_lexer::SpannedToken],
+    opening: usize,
+    open: char,
+    close: char,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(opening) {
+        match token.kind {
+            TokenKind::Punctuation(value) if value == open => depth += 1,
+            TokenKind::Punctuation(value) if value == close => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn top_level_ternary(tokens: &[dm_lexer::SpannedToken]) -> Option<(usize, usize)> {
+    let mut depth = 0usize;
+    let mut question = None;
+    for (index, token) in tokens.iter().enumerate() {
+        match &token.kind {
+            TokenKind::Punctuation('(' | '[') => depth += 1,
+            TokenKind::Punctuation(')' | ']') => depth = depth.saturating_sub(1),
+            TokenKind::Operator(operator) if depth == 0 && operator == "?" => {
+                question = Some(index)
+            }
+            TokenKind::Operator(operator) if depth == 0 && operator == ":" => {
+                if let Some(question) = question {
+                    return Some((question, index));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn top_level_binary(tokens: &[dm_lexer::SpannedToken]) -> Option<(usize, &str)> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().rev() {
+        match &token.kind {
+            TokenKind::Punctuation(')' | ']') => depth += 1,
+            TokenKind::Punctuation('(' | '[') => depth = depth.saturating_sub(1),
+            TokenKind::Operator(operator)
+                if depth == 0 && matches!(operator.as_str(), "+" | "-" | "*" | "/" | "%") =>
+            {
+                return Some((index, operator));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inline_list_index_scalar(
+    compilation: &Compilation,
+    registry: &ProcedureRegistry,
+    implementation: ProcedureImplementationId,
+    tokens: &[dm_lexer::SpannedToken],
+    locals: &BTreeMap<String, ScalarConstraint>,
+    datum_locals: &BTreeMap<String, NodeId>,
+    owner: Option<NodeId>,
+    bindings: &ConstBindings,
+) -> Option<ScalarType> {
+    if !matches!(tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(name)) if name == "list")
+        || !matches!(
+            tokens.get(1).map(|token| &token.kind),
+            Some(TokenKind::Punctuation('('))
+        )
+    {
+        return None;
+    }
+    let close = matching_closing(tokens, 1, '(', ')')?;
+    if !matches!(
+        tokens.get(close + 1).map(|token| &token.kind),
+        Some(TokenKind::Punctuation('['))
+    ) || matching_closing(tokens, close + 1, '[', ']') != Some(tokens.len() - 1)
+    {
+        return None;
+    }
+    let mut entry_start = 2usize;
+    let mut depth = 0usize;
+    let mut inferred = None;
+    for index in 2..=close {
+        let separator = index == close
+            || (depth == 0 && matches!(tokens[index].kind, TokenKind::Punctuation(',')));
+        if separator {
+            let entry = proven_scalar_type(
+                compilation,
+                registry,
+                implementation,
+                &tokens[entry_start..index],
+                locals,
+                datum_locals,
+                owner,
+                bindings,
+            )?;
+            if inferred.is_some_and(|previous| previous != entry) {
+                return None;
+            }
+            inferred = Some(entry);
+            entry_start = index + 1;
+            continue;
+        }
+        match tokens[index].kind {
+            TokenKind::Punctuation('(' | '[') => depth += 1,
+            TokenKind::Punctuation(')' | ']') => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    inferred
+}
+
+fn validate_scalar_assignment(
+    name: &str,
+    expected: ScalarConstraint,
+    actual: ScalarType,
+) -> Result<(), dm_vm::CompileError> {
+    if actual == expected.kind || (actual == ScalarType::Null && expected.allows_null) {
+        return Ok(());
+    }
+    Err(dm_vm::CompileError {
+        message: format!(
+            "cannot assign {actual:?} to typed variable `{name}` declared as {:?}",
+            expected.kind
+        ),
+    })
+}
+
+fn proven_datum_expression_type(
+    compilation: &Compilation,
+    tokens: &[dm_lexer::SpannedToken],
+    local_types: &BTreeMap<String, NodeId>,
+    owner: Option<NodeId>,
+    bindings: &ConstBindings,
+    registry: &ProcedureRegistry,
+    implementation: ProcedureImplementationId,
+) -> Option<NodeId> {
+    if let Some((question, colon)) = top_level_ternary(tokens) {
+        let left = proven_datum_expression_type(
+            compilation,
+            &tokens[question + 1..colon],
+            local_types,
+            owner,
+            bindings,
+            registry,
+            implementation,
+        )?;
+        let right = proven_datum_expression_type(
+            compilation,
+            &tokens[colon + 1..],
+            local_types,
+            owner,
+            bindings,
+            registry,
+            implementation,
+        )?;
+        return (left == right).then_some(left);
+    }
+    if let [token] = tokens
+        && let TokenKind::Identifier(name) = &token.kind
+    {
+        return local_types
+            .get(name)
+            .copied()
+            .or_else(|| bindings.field_type(compilation, owner, name));
+    }
+    if let Some(node) = statically_called_procedure(registry, implementation, compilation, tokens) {
+        return effective_datum_return(compilation, node);
+    }
+    if let Some((receiver, member, call)) = receiver_member_expression(tokens) {
+        let receiver_type =
+            proven_receiver_type(compilation, receiver, local_types, owner, bindings)?;
+        if call {
+            return find_member_node(compilation, receiver_type, "proc", member)
+                .and_then(|node| effective_datum_return(compilation, node));
+        }
+        return bindings.field_type(compilation, Some(receiver_type), member);
+    }
+    let mut index = usize::from(
+        matches!(tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(name)) if name == "new"),
+    );
+    if !matches!(tokens.get(index).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "/")
+    {
+        return None;
+    }
+    let mut segments = Vec::new();
+    while matches!(tokens.get(index).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "/")
+    {
+        let Some(TokenKind::Identifier(segment)) = tokens.get(index + 1).map(|token| &token.kind)
+        else {
+            return None;
+        };
+        segments.push(segment.clone());
+        index += 2;
+    }
+    compilation
+        .code_tree()
+        .find(&dm_syntax::DefinitionPath::new(segments))
+}
+
+fn assigned_receiver_field(tokens: &[dm_lexer::SpannedToken]) -> Option<(&str, &str)> {
+    match tokens {
+        [receiver, dot, field] if matches!(&dot.kind, TokenKind::Operator(operator) if operator == ".") =>
+        {
+            let TokenKind::Identifier(receiver) = &receiver.kind else {
+                return None;
+            };
+            let TokenKind::Identifier(field) = &field.kind else {
+                return None;
+            };
+            Some((receiver, field))
+        }
+        _ => None,
+    }
+}
+
+fn declared_type_node(
+    compilation: &Compilation,
+    tokens: &[dm_lexer::SpannedToken],
+    variable_name: &str,
+) -> Option<NodeId> {
+    let assignment = tokens
+        .iter()
+        .position(|token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="))
+        .unwrap_or(tokens.len());
+    let header = &tokens[..assignment];
+    let identifiers: Vec<_> = header
+        .iter()
+        .filter_map(|token| match &token.kind {
+            TokenKind::Identifier(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let segments: Vec<String> =
+        if let Some(as_index) = identifiers.iter().position(|name| *name == "as") {
+            identifiers[as_index + 1..]
+                .iter()
+                .take_while(|name| !matches!(**name, "null" | "num" | "text"))
+                .map(|name| (**name).to_owned())
+                .collect()
+        } else {
+            let var_index = identifiers.iter().position(|name| *name == "var")?;
+            let name_index = identifiers
+                .iter()
+                .rposition(|name| *name == variable_name)?;
+            identifiers[var_index + 1..name_index]
+                .iter()
+                .filter(|name| !matches!(**name, "global" | "static" | "tmp" | "const"))
+                .map(|name| (**name).to_owned())
+                .collect()
+        };
+    if segments.is_empty() {
+        return None;
+    }
+    compilation
+        .code_tree()
+        .find(&dm_syntax::DefinitionPath::new(segments))
+}
+
+fn procedure_return_type_node(
+    compilation: &Compilation,
+    tokens: &[dm_lexer::SpannedToken],
+) -> Option<NodeId> {
+    let closing = tokens
+        .iter()
+        .rposition(|token| token.kind == TokenKind::Punctuation(')'))?;
+    let annotation = tokens[closing + 1..]
+        .iter()
+        .position(|token| matches!(&token.kind, TokenKind::Identifier(name) if name == "as"))?
+        + closing
+        + 1;
+    let segments = tokens[annotation + 1..]
+        .iter()
+        .filter_map(|token| match &token.kind {
+            TokenKind::Identifier(segment) => Some(segment.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return None;
+    }
+    compilation
+        .code_tree()
+        .find(&dm_syntax::DefinitionPath::new(segments))
 }
 
 fn is_assignment_operator(operator: &str) -> bool {
@@ -1146,6 +2182,21 @@ mod tests {
                 "/datum/base\n\tvar/const/answer = 42\n/datum/base/child\n\tproc/change()\n\t\tanswer = 7\n",
                 "answer",
             ),
+            (
+                "prefix mutation",
+                "/proc/RunTest()\n\tvar/const/answer = 42\n\t++answer\n",
+                "answer",
+            ),
+            (
+                "typed local receiver",
+                "/obj\n\tvar/const/answer = 42\n/proc/RunTest()\n\tvar/obj/o = new\n\to.answer = 7\n",
+                "answer",
+            ),
+            (
+                "typed field receiver",
+                "/obj\n\tvar/const/answer = 42\n/datum/holder\n\tvar/obj/item\n\tproc/change()\n\t\titem.answer = 7\n",
+                "answer",
+            ),
         ];
 
         for (label, source, name) in cases {
@@ -1169,6 +2220,280 @@ mod tests {
         ProcedureRegistry::build(&compilation)
             .compile_vm(&compilation)
             .expect("mutable local should shadow the const field");
+    }
+
+    #[test]
+    fn typed_receiver_const_check_does_not_guess_from_the_field_name() {
+        let compilation = TestProject::compile(
+            "/obj\n\tvar/const/answer = 42\n/datum/other\n\tvar/answer = 1\n/proc/RunTest()\n\tvar/datum/other/o = new\n\to.answer = 7\n",
+        );
+        ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("the proven receiver field is mutable despite a same-name const elsewhere");
+    }
+
+    #[test]
+    fn validates_proven_new_paths_against_typed_parameters_and_locals() {
+        let incompatible = TestProject::compile(
+            "/proc/replace(turf/bar as turf)\n\tbar = new /obj(null)\n/proc/RunTest()\n\treturn\n",
+        );
+        let error = ProcedureRegistry::build(&incompatible)
+            .compile_vm(&incompatible)
+            .expect_err("an obj cannot be assigned to a turf variable");
+        assert!(
+            error.message.contains("cannot assign /obj"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("declared as /turf"),
+            "{}",
+            error.message
+        );
+
+        let compatible = TestProject::compile(
+            "/obj/item\n/proc/replace(obj/bar as obj)\n\tbar = new /obj/item(null)\n/proc/local()\n\tvar/obj/bar = new /obj/item\n\treturn bar\n",
+        );
+        ProcedureRegistry::build(&compatible)
+            .compile_vm(&compatible)
+            .expect("subtype construction should satisfy the declared type");
+    }
+
+    #[test]
+    fn validates_typed_sources_and_proven_datum_return_paths() {
+        let incompatible_assignment = TestProject::compile(
+            "/datum/base\n/datum/base/child\n/obj/item\n/proc/copy()\n\tvar/datum/base/target\n\tvar/obj/item/source\n\ttarget = source\n",
+        );
+        let error = ProcedureRegistry::build(&incompatible_assignment)
+            .compile_vm(&incompatible_assignment)
+            .expect_err("an obj source cannot flow into a datum/base variable");
+        assert!(error.message.contains("cannot assign /obj/item"));
+
+        let incompatible_return = TestProject::compile(
+            "/datum/base\n/obj/item\n/proc/build() as /datum/base\n\treturn /obj/item\n",
+        );
+        let error = ProcedureRegistry::build(&incompatible_return)
+            .compile_vm(&incompatible_return)
+            .expect_err("an obj path cannot satisfy a datum/base return type");
+        assert!(error.message.contains("typed variable `return`"));
+
+        let compatible = TestProject::compile(
+            "/datum/base\n/datum/base/child\n/proc/copy() as /datum/base\n\tvar/datum/base/target\n\tvar/datum/base/child/source\n\ttarget = source\n\treturn /datum/base/child\n",
+        );
+        ProcedureRegistry::build(&compatible)
+            .compile_vm(&compatible)
+            .expect("subtype sources and return paths should satisfy base constraints");
+    }
+
+    #[test]
+    fn validates_proven_scalar_annotations_without_rejecting_null_unions() {
+        let bad_local = TestProject::compile(
+            "/proc/value() as num\n\tvar/const/result = \"wrong\"\n\treturn result\n",
+        );
+        assert!(
+            ProcedureRegistry::build(&bad_local)
+                .compile_vm(&bad_local)
+                .expect_err("text cannot satisfy a numeric return")
+                .message
+                .contains("typed variable `return`")
+        );
+
+        let bad_parameter = TestProject::compile(
+            "/proc/value(var/input = \"text\" as text) as num\n\treturn input\n",
+        );
+        assert!(
+            ProcedureRegistry::build(&bad_parameter)
+                .compile_vm(&bad_parameter)
+                .expect_err("a text parameter cannot satisfy a numeric return")
+                .message
+                .contains("typed variable `return`")
+        );
+
+        let compatible = TestProject::compile(
+            "/proc/number() as num\n\tvar/value = 5 as num|null\n\tvalue = null\n\tvalue = 7\n\treturn value\n/proc/text_value(var/input = \"ok\" as text) as text\n\treturn input\n",
+        );
+        ProcedureRegistry::build(&compatible)
+            .compile_vm(&compatible)
+            .expect("matching scalar annotations and nullable assignments should compile");
+    }
+
+    #[test]
+    fn inherits_override_return_constraints_and_propagates_static_call_types() {
+        let inherited_mismatch = TestProject::compile(
+            "/datum/proc/value() as num\n\treturn 5\n/datum/child/value()\n\treturn \"wrong\"\n",
+        );
+        assert!(
+            ProcedureRegistry::build(&inherited_mismatch)
+                .compile_vm(&inherited_mismatch)
+                .expect_err("unannotated override should inherit numeric return")
+                .message
+                .contains("typed variable `return`")
+        );
+
+        let changed_signature = TestProject::compile(
+            "/datum/proc/value() as num\n\treturn 5\n/datum/child/value() as text\n\treturn \"wrong\"\n",
+        );
+        assert!(
+            ProcedureRegistry::build(&changed_signature)
+                .compile_vm(&changed_signature)
+                .expect_err("override cannot replace numeric return with text")
+                .message
+                .contains("changes its inherited scalar return type")
+        );
+
+        let call_mismatch = TestProject::compile(
+            "/proc/text_value() as text\n\treturn \"text\"\n/proc/number_value() as num\n\treturn text_value()\n",
+        );
+        assert!(
+            ProcedureRegistry::build(&call_mismatch)
+                .compile_vm(&call_mismatch)
+                .expect_err("static text call cannot satisfy numeric return")
+                .message
+                .contains("typed variable `return`")
+        );
+
+        let compatible = TestProject::compile(
+            "/datum/base\n/datum/base/child\n/proc/build_child() as /datum/base/child\n\treturn /datum/base/child\n/proc/build() as /datum/base\n\treturn build_child()\n",
+        );
+        ProcedureRegistry::build(&compatible)
+            .compile_vm(&compatible)
+            .expect("statically called subtype return should satisfy base return");
+    }
+
+    #[test]
+    fn validates_scalar_field_overrides_against_late_inherited_declarations() {
+        let incompatible = TestProject::compile(
+            "/datum/base/child\n\tvalue = \"wrong\"\n/datum/base\n\tvar/value = 5 as num\n/proc/RunTest()\n\treturn\n",
+        );
+        assert!(
+            ProcedureRegistry::build(&incompatible)
+                .compile_vm(&incompatible)
+                .expect_err("text override cannot satisfy inherited numeric field")
+                .message
+                .contains("field override /datum/base/child/var/value")
+        );
+
+        let compatible = TestProject::compile(
+            "/datum/base/child\n\tvalue = null\n/datum/base\n\tvar/value = 5 as num|null\n/proc/RunTest()\n\treturn\n",
+        );
+        ProcedureRegistry::build(&compatible)
+            .compile_vm(&compatible)
+            .expect("nullable inherited field should accept null subtype default");
+    }
+
+    #[test]
+    fn infers_returns_from_proven_receiver_fields_and_methods() {
+        let field_mismatch = TestProject::compile(
+            "/datum/value_holder\n\tvar/bar = 5 as num\n\tproc/read() as text\n\t\tvar/datum/value_holder/D = new\n\t\treturn D.bar\n",
+        );
+        assert!(
+            ProcedureRegistry::build(&field_mismatch)
+                .compile_vm(&field_mismatch)
+                .expect_err("numeric typed member cannot satisfy text return")
+                .message
+                .contains("typed variable `return`")
+        );
+
+        let method_mismatch = TestProject::compile(
+            "/datum/producer/proc/value() as text\n\treturn \"text\"\n/proc/read() as num\n\tvar/datum/producer/P = new\n\treturn P.value()\n",
+        );
+        assert!(
+            ProcedureRegistry::build(&method_mismatch)
+                .compile_vm(&method_mismatch)
+                .expect_err("typed receiver method return should propagate")
+                .message
+                .contains("typed variable `return`")
+        );
+
+        let compatible = TestProject::compile(
+            "/datum/base\n/datum/base/child\n/datum/producer/proc/value() as /datum/base/child\n\treturn /datum/base/child\n/proc/read() as /datum/base\n\tvar/datum/producer/P = new\n\treturn P.value()\n",
+        );
+        ProcedureRegistry::build(&compatible)
+            .compile_vm(&compatible)
+            .expect("typed receiver method subtype should satisfy base return");
+    }
+
+    #[test]
+    fn late_base_signature_constrains_early_override_chain() {
+        let compilation = TestProject::compile(
+            "/datum/do/re/mi/fa/so/f()\n\treturn 5\n/datum/do/re/f()\n\treturn ..() + \" re\"\n/datum/do/re/mi/fa/f()\n\treturn ..() + \" fa\"\n/datum/do/re/mi/f()\n\treturn ..() + \" mi\"\n/datum/do/proc/f() as text\n\treturn \"do\"\n",
+        );
+        assert!(
+            ProcedureRegistry::build(&compilation)
+                .compile_vm(&compilation)
+                .expect_err("early numeric override must inherit late text signature")
+                .message
+                .contains("typed variable `return`")
+        );
+    }
+
+    #[test]
+    fn infers_only_proven_scalar_composite_results() {
+        let incompatible =
+            TestProject::compile("/proc/ternary_value() as text\n\treturn 1 ? 2 : 3\n");
+        assert!(
+            ProcedureRegistry::build(&incompatible)
+                .compile_vm(&incompatible)
+                .expect_err("numeric ternary cannot satisfy text return")
+                .message
+                .contains("typed variable `return`")
+        );
+
+        let list_mismatch =
+            TestProject::compile("/proc/list_value() as text\n\treturn list(1, 2, 3)[1]\n");
+        assert!(
+            ProcedureRegistry::build(&list_mismatch)
+                .compile_vm(&list_mismatch)
+                .expect_err("homogeneous numeric list index cannot satisfy text return")
+                .message
+                .contains("typed variable `return`")
+        );
+
+        let compatible = TestProject::compile(
+            "/datum/proc/value() as text\n\treturn \"base\"\n/datum/child/value()\n\treturn ..() + \" child\"\n/proc/number() as num\n\treturn (1 ? 2 : 3) + list(4, 5)[1]\n",
+        );
+        ProcedureRegistry::build(&compatible)
+            .compile_vm(&compatible)
+            .expect("matching proven composites should compile");
+    }
+
+    #[test]
+    fn resolves_upward_search_path_expressions_before_vm_lowering() {
+        let cases = [
+            (
+                "deep search",
+                "/datum/a/b/c\n/datum/d\n/proc/RunTest()\n\treturn /datum/a/b/c.d\n",
+                "/proc/RunTest",
+                "/datum/d",
+            ),
+            (
+                "procedure namespace",
+                "/atom/proc/fn()\n\treturn\n/proc/RunTest()\n\treturn /atom./proc/fn\n",
+                "/proc/RunTest",
+                "/atom/proc/fn",
+            ),
+            (
+                "contextual search",
+                "/datum/foo\n/datum/bar/proc/find()\n\treturn .foo\n",
+                "/datum/bar/proc/find",
+                "/datum/foo",
+            ),
+            (
+                "empty suffix",
+                "/datum/foo\n/proc/RunTest()\n\treturn /datum/foo.\n",
+                "/proc/RunTest",
+                "/datum/foo",
+            ),
+        ];
+
+        for (label, source, procedure, expected) in cases {
+            let compilation = TestProject::compile(source);
+            assert_eq!(
+                execute_effective(&compilation, procedure, &[]),
+                Ok(Value::TypePath(TypePath::parse(expected).unwrap())),
+                "{label}"
+            );
+        }
     }
 
     #[test]

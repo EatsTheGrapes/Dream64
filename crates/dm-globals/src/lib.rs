@@ -8,7 +8,7 @@ use dm_compiler::Compilation;
 use dm_core::{FileId, SourceSpan};
 use dm_lexer::{SpannedToken, TokenKind};
 use dm_object_tree::NodeId;
-use dm_syntax::{Definition, DefinitionKind};
+use dm_syntax::{Definition, DefinitionKind, DefinitionPath};
 
 mod constant;
 
@@ -212,6 +212,10 @@ impl VariableRegistry {
                             path: node.path.to_string(),
                         })
                 });
+                let initializer =
+                    initializer(compilation, declaration.file_id, definition).map(|initializer| {
+                        normalize_initializer_paths(compilation, owner.as_ref(), initializer)
+                    });
                 Some(VariableEntry {
                     ordinal: declaration.ordinal,
                     node: declaration.node,
@@ -232,7 +236,7 @@ impl VariableRegistry {
                     file_id: declaration.file_id,
                     definition_index: declaration.definition_index,
                     span: declaration.span,
-                    initializer: initializer(compilation, declaration.file_id, definition),
+                    initializer,
                 })
             })
             .collect();
@@ -351,6 +355,30 @@ impl VariableRegistry {
             type_defaults,
         }
     }
+}
+
+fn normalize_initializer_paths(
+    compilation: &Compilation,
+    owner: Option<&VariableOwner>,
+    mut initializer: InitializerSyntax,
+) -> InitializerSyntax {
+    let anchor = owner.map(|owner| {
+        DefinitionPath::new(
+            owner
+                .path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        )
+    });
+    initializer.tokens = compilation
+        .code_tree()
+        .normalize_upward_paths(anchor.as_ref(), &initializer.tokens);
+    initializer.evaluation = evaluate_constant(&initializer.tokens);
+    initializer.class = classify_evaluation(&initializer.evaluation);
+    initializer.dependencies = initializer_dependencies(&initializer.tokens);
+    initializer
 }
 
 fn declared_storage(compilation: &Compilation) -> HashMap<NodeId, StorageClass> {

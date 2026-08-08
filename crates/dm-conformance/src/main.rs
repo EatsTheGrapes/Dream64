@@ -58,8 +58,9 @@ fn run_fixture_audit(arguments: &[OsString]) -> Result<(), String> {
     }
 
     let audit = fixture_audit(&fixture_root)?;
-    println!("format=dm-conformance-fixture-audit-v1");
-    println!("audit_stage=parse+vm-compile");
+    println!("format=dm-conformance-fixture-audit-v2");
+    println!("audit_stage=preprocess+parse+vm-compile");
+    println!("runtime_execution=none");
     println!("assert_handling=synthetic-procedure");
     println!("caught_panic_stderr=unsuppressed-process-global-hook");
     println!("fixtures_total={}", audit.total);
@@ -183,28 +184,8 @@ fn fixture_audit(root: &Path) -> Result<FixtureAudit, String> {
                     }
                 }
             })
-            .and_then(|source| {
-                dm_syntax::parse(&source).map_err(|error| {
-                    let message = error.to_string();
-                    AuditFailure {
-                        category: format!("parse: {}", compile_error_category(&message)),
-                        message,
-                    }
-                })
-            })
-            .and_then(|syntax| {
-                let mut definitions: Vec<_> = syntax
-                    .definitions
-                    .into_iter()
-                    .filter(|definition| {
-                        matches!(
-                            definition.kind,
-                            dm_syntax::DefinitionKind::Procedure
-                                | dm_syntax::DefinitionKind::ProcedureOverride
-                                | dm_syntax::DefinitionKind::Verb
-                        )
-                    })
-                    .collect();
+            .and_then(|_| preprocess_fixture(&path))
+            .and_then(|mut definitions| {
                 if source_uses_assert(&definitions)
                     && !definitions
                         .iter()
@@ -227,7 +208,8 @@ fn fixture_audit(root: &Path) -> Result<FixtureAudit, String> {
         let outcome = if expects_compile_error {
             match outcome {
                 Err(failure)
-                    if failure.category.starts_with("parse:")
+                    if failure.category.starts_with("project:")
+                        || failure.category.starts_with("parse:")
                         || failure.category.starts_with("compile:") =>
                 {
                     audit.expected_compile_errors_matched += 1;
@@ -264,6 +246,75 @@ fn fixture_audit(root: &Path) -> Result<FixtureAudit, String> {
         }
     }
     Ok(audit)
+}
+
+fn preprocess_fixture(path: &Path) -> Result<Vec<dm_syntax::Definition>, AuditFailure> {
+    let compilation = dm_compiler::CompilerDatabase::new()
+        .compile(path)
+        .map_err(|error| match error {
+            dm_compiler::CompilerError::Project(error) => project_audit_failure(error),
+        })?;
+    if let Some(diagnostic) = compilation
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.severity == dm_compiler::DiagnosticSeverity::Error)
+    {
+        return Err(AuditFailure {
+            category: format!("compile: frontend {:?}", diagnostic.kind),
+            message: diagnostic.message.clone(),
+        });
+    }
+    let mut definitions = Vec::new();
+    for file in &compilation.project().files {
+        if !matches!(
+            file.kind,
+            dm_project::FileKind::Environment | dm_project::FileKind::Source
+        ) {
+            continue;
+        }
+        let Some(syntax) = compilation.syntax(file.id) else {
+            continue;
+        };
+        definitions.extend(
+            syntax
+                .definitions
+                .iter()
+                .filter(|definition| {
+                    matches!(
+                        definition.kind,
+                        dm_syntax::DefinitionKind::Procedure
+                            | dm_syntax::DefinitionKind::ProcedureOverride
+                            | dm_syntax::DefinitionKind::Verb
+                    )
+                })
+                .cloned(),
+        );
+    }
+    Ok(definitions)
+}
+
+fn project_audit_failure(error: dm_project::ProjectError) -> AuditFailure {
+    let category = match &error {
+        dm_project::ProjectError::Io { source, .. } => {
+            format!("project: io {:?}", source.kind())
+        }
+        dm_project::ProjectError::InvalidUtf8 { .. } => "project: invalid utf-8".to_owned(),
+        dm_project::ProjectError::MissingInclude { .. } => "project: missing include".to_owned(),
+        dm_project::ProjectError::OutsideProject { .. } => "project: outside project".to_owned(),
+        dm_project::ProjectError::Preprocessor { message, .. } => {
+            format!("project: preprocessor {}", compile_error_category(message))
+        }
+        dm_project::ProjectError::MacroExpansion { message, .. } => {
+            format!(
+                "project: macro expansion {}",
+                compile_error_category(message)
+            )
+        }
+    };
+    AuditFailure {
+        category,
+        message: error.to_string(),
+    }
 }
 
 fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
@@ -965,5 +1016,170 @@ mod tests {
         assert_eq!(audit.expected_compile_errors, 2);
         assert_eq!(audit.expected_compile_errors_matched, 1);
         assert_eq!(audit.failures["expected compile error: accepted"].count, 1);
+    }
+
+    #[test]
+    fn fixture_audit_preprocesses_macros_and_conditional_branches() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::create_dir_all(scratch.path().join("Preprocessor")).expect("preprocessor directory");
+        fs::write(
+            scratch.path().join("Preprocessor/pass.dm"),
+            concat!(
+                "#define EXPECTED 7\n",
+                "#if 0\n",
+                "/proc/hidden()\n",
+                "\treturn missing_local\n",
+                "#else\n",
+                "/proc/RunTest()\n",
+                "\tASSERT(EXPECTED == 7)\n",
+                "#endif\n",
+            ),
+        )
+        .expect("preprocessor fixture");
+
+        let audit = fixture_audit(scratch.path()).expect("audit");
+
+        assert_eq!(audit.total, 1);
+        assert_eq!(audit.passed, 1);
+        assert_eq!(audit.families["Preprocessor"].passed, 1);
+        assert!(audit.failures.is_empty());
+    }
+
+    #[test]
+    fn fixture_audit_groups_project_preprocessor_failures() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::write(
+            scratch.path().join("missing.dm"),
+            "#include \"not-present.dm\"\n",
+        )
+        .expect("missing-include fixture");
+
+        let audit = fixture_audit(scratch.path()).expect("audit");
+        let failure = &audit.failures["project: missing include"];
+
+        assert_eq!(failure.count, 1);
+        assert_eq!(failure.examples[0].path, "missing.dm");
+        assert!(failure.examples[0].message.contains("not-present.dm"));
+    }
+
+    #[test]
+    fn fixture_audit_matches_pragma_promoted_matrix_lint() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::create_dir_all(scratch.path().join("Builtins")).expect("builtins directory");
+        fs::write(
+            scratch.path().join("Builtins/MatrixLint.dm"),
+            concat!(
+                "// COMPILE ERROR OD2207\n",
+                "#pragma SuspiciousMatrixCall error\n",
+                "/proc/RunTest()\n",
+                "\tvar/matrix/value = matrix(\"x\", \"y\", \"bad\")\n",
+            ),
+        )
+        .expect("matrix fixture");
+
+        let audit = fixture_audit(scratch.path()).expect("audit");
+
+        assert_eq!(audit.total, 1);
+        assert_eq!(audit.passed, 1);
+        assert_eq!(audit.expected_compile_errors_matched, 1);
+        assert!(audit.failures.is_empty());
+    }
+
+    #[test]
+    fn fixture_audit_matches_proc_argument_global_lint() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::create_dir_all(scratch.path().join("Arg")).expect("argument directory");
+        fs::write(
+            scratch.path().join("Arg/ProcArgumentGlobal_lint.dm"),
+            concat!(
+                "// COMPILE ERROR OD2211\n",
+                "#pragma ProcArgumentGlobal error\n",
+                "/proc/bad(/var/value)\n",
+                "\treturn value\n",
+            ),
+        )
+        .expect("argument fixture");
+
+        let audit = fixture_audit(scratch.path()).expect("audit");
+
+        assert_eq!(audit.passed, 1);
+        assert_eq!(audit.expected_compile_errors_matched, 1);
+        assert!(audit.failures.is_empty());
+    }
+
+    #[test]
+    fn fixture_audit_matches_numeric_builtin_constant_diagnostics() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::create_dir_all(scratch.path().join("Builtins")).expect("builtins directory");
+        fs::write(
+            scratch.path().join("Builtins/fallback.dm"),
+            "// COMPILE ERROR OD2208\n#pragma FallbackBuiltinArgument error\n/proc/RunTest()\n\treturn abs(\"bad\")\n",
+        )
+        .expect("fallback fixture");
+        fs::write(
+            scratch.path().join("Builtins/domain.dm"),
+            "// COMPILE ERROR OD0100\n/proc/RunTest()\n\treturn arccos(2)\n",
+        )
+        .expect("domain fixture");
+
+        let audit = fixture_audit(scratch.path()).expect("audit");
+
+        assert_eq!(audit.total, 2);
+        assert_eq!(audit.passed, 2);
+        assert_eq!(audit.expected_compile_errors_matched, 2);
+        assert!(audit.failures.is_empty());
+    }
+
+    #[test]
+    fn fixture_audit_matches_builtin_arity_and_global_rgb_diagnostics() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::create_dir_all(scratch.path().join("Builtins")).expect("builtins directory");
+        fs::write(
+            scratch.path().join("Builtins/image.dm"),
+            "// COMPILE ERROR OD0013\n/proc/RunTest()\n\treturn image()\n",
+        )
+        .expect("image fixture");
+        fs::write(
+            scratch.path().join("Builtins/addtext.dm"),
+            "// COMPILE ERROR OD0013\n/proc/RunTest()\n\treturn addtext()\n",
+        )
+        .expect("addtext fixture");
+        fs::write(
+            scratch.path().join("Builtins/rgb.dm"),
+            "// COMPILE ERROR OD2208\n#pragma FallbackBuiltinArgument error\n/datum/example/var/color = rgb(1, 2, null)\n",
+        )
+        .expect("rgb fixture");
+
+        let audit = fixture_audit(scratch.path()).expect("audit");
+
+        assert_eq!(audit.total, 3);
+        assert_eq!(audit.passed, 3);
+        assert_eq!(audit.expected_compile_errors_matched, 3);
+        assert!(audit.failures.is_empty());
+    }
+
+    #[test]
+    fn fixture_audit_matches_malformed_string_interpolation_family() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::create_dir_all(scratch.path().join("Text")).expect("text directory");
+        for (name, expression) in [
+            ("empty.dm", "\"[;]\""),
+            ("adjacent.dm", "\"[\"a\"\"b\"]\""),
+            ("nested.dm", "\"[\"[\"a\"\"b\"]\"]\""),
+            ("macro.dm", "\"Example \\proper\""),
+        ] {
+            fs::write(
+                scratch.path().join("Text").join(name),
+                format!("// COMPILE ERROR OD0011\n/proc/RunTest()\n\treturn {expression}\n"),
+            )
+            .expect("text fixture");
+        }
+
+        let audit = fixture_audit(scratch.path()).expect("audit");
+
+        assert_eq!(audit.total, 4);
+        assert_eq!(audit.passed, 4);
+        assert_eq!(audit.expected_compile_errors_matched, 4);
+        assert!(audit.failures.is_empty());
     }
 }

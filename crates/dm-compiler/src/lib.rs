@@ -11,11 +11,12 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use dm_core::{FileId, SourceSpan};
+use dm_lexer::{SpannedToken, TokenKind};
 use dm_object_tree::{
     BuildOutput, CodeTree, DefinitionUnit, DiagnosticKind as TreeDiagnosticKind,
     DiagnosticSeverity as TreeDiagnosticSeverity, NodeId, TreeDiagnostic,
 };
-use dm_project::{FileKind, Project, ProjectError};
+use dm_project::{FileKind, PragmaSeverity, Project, ProjectError};
 use dm_syntax::{SyntaxError, SyntaxFile};
 
 /// Reusable entry point for deterministic project compilations.
@@ -177,6 +178,20 @@ pub enum DiagnosticKind {
     ConflictingNodeKind,
     /// A procedure, verb, or variable path had no valid owning type.
     MalformedMemberPath,
+    /// A native `matrix()` constructor has arguments that imply an invalid signature.
+    SuspiciousMatrixCall,
+    /// A procedure parameter incorrectly uses a global `/var/...` path.
+    ProcArgumentGlobal,
+    /// A numeric builtin will substitute zero for a constant non-numeric argument.
+    FallbackBuiltinArgument,
+    /// A constant builtin argument is outside the builtin's valid numeric domain.
+    BadArgument,
+    /// A builtin call supplies too few or too many arguments.
+    InvalidArgumentCount,
+    /// A quoted string contains a malformed embedded expression or text macro.
+    InvalidStringInterpolation,
+    /// An assignment attempts to modify a compile-time readonly member such as `type`.
+    ReadOnlyAssignment,
 }
 
 /// A source location with both stable identity and display path.
@@ -255,6 +270,7 @@ fn compile_project(project: Project) -> Compilation {
                 let compiler_span = match &error {
                     SyntaxError::Lex(error) => error.span,
                     SyntaxError::UnclosedDelimiter(span) => *span,
+                    SyntaxError::InfixNewline { span, .. } => *span,
                 };
                 diagnostics.push(syntax_diagnostic(
                     file.id,
@@ -291,6 +307,36 @@ fn compile_project(project: Project) -> Compilation {
             .iter()
             .map(|diagnostic| map_tree_diagnostic(&project, &tree, diagnostic)),
     );
+    for (index, syntax) in syntax_files.iter().enumerate() {
+        let Some(syntax) = syntax else { continue };
+        let file = &project.files[index];
+        diagnostics.extend(matrix_lint_diagnostics(file, syntax));
+        diagnostics.extend(proc_argument_diagnostics(file, syntax));
+        diagnostics.extend(numeric_builtin_diagnostics(file, syntax));
+        diagnostics.extend(builtin_arity_diagnostics(file, syntax));
+        diagnostics.extend(string_interpolation_diagnostics(file, syntax));
+        diagnostics.extend(readonly_member_diagnostics(file, syntax));
+    }
+    diagnostics.retain_mut(|diagnostic| {
+        let Some(severity) = project.diagnostic_severity(diagnostic_pragma_name(diagnostic)) else {
+            return true;
+        };
+        match severity {
+            PragmaSeverity::Disabled => false,
+            PragmaSeverity::Notice => {
+                diagnostic.severity = DiagnosticSeverity::Note;
+                true
+            }
+            PragmaSeverity::Warning => {
+                diagnostic.severity = DiagnosticSeverity::Warning;
+                true
+            }
+            PragmaSeverity::Error => {
+                diagnostic.severity = DiagnosticSeverity::Error;
+                true
+            }
+        }
+    });
 
     let mut stats = CompilationStats {
         project_files: project.files.len(),
@@ -320,6 +366,530 @@ fn compile_project(project: Project) -> Compilation {
         declarations,
         diagnostics,
         stats,
+    }
+}
+
+fn diagnostic_pragma_name(diagnostic: &Diagnostic) -> &'static str {
+    match diagnostic.kind {
+        DiagnosticKind::Syntax => "BadToken",
+        DiagnosticKind::DuplicateFileUnit => "FileAlreadyIncluded",
+        DiagnosticKind::DuplicateDeclaration if diagnostic.message.contains("/var/") => {
+            "DuplicateVariable"
+        }
+        DiagnosticKind::DuplicateDeclaration => "DuplicateProcDefinition",
+        DiagnosticKind::ConflictingNodeKind => "InvalidOverride",
+        DiagnosticKind::MalformedMemberPath => "DanglingVarType",
+        DiagnosticKind::SuspiciousMatrixCall => "SuspiciousMatrixCall",
+        DiagnosticKind::ProcArgumentGlobal => "ProcArgumentGlobal",
+        DiagnosticKind::FallbackBuiltinArgument => "FallbackBuiltinArgument",
+        DiagnosticKind::BadArgument => "BadArgument",
+        DiagnosticKind::InvalidArgumentCount => "InvalidArgumentCount",
+        DiagnosticKind::InvalidStringInterpolation => "BadExpression",
+        DiagnosticKind::ReadOnlyAssignment => "InvalidReference",
+    }
+}
+
+fn readonly_member_diagnostics(
+    file: &dm_project::ProjectFile,
+    syntax: &SyntaxFile,
+) -> Vec<Diagnostic> {
+    const ASSIGNMENTS: &[&str] = &[
+        "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "&&=",
+        "||=", "%%=", "**=",
+    ];
+    let mut diagnostics = Vec::new();
+    for definition in &syntax.definitions {
+        for line in &definition.body {
+            for window in line.tokens.windows(3) {
+                let member_access = matches!(&window[0].kind, TokenKind::Operator(operator) if matches!(operator.as_str(), "." | "?." | ":" | "?:"));
+                let readonly = matches!(&window[1].kind, TokenKind::Identifier(name) if name == "type");
+                let assignment = matches!(&window[2].kind, TokenKind::Operator(operator) if ASSIGNMENTS.contains(&operator.as_str()));
+                if !(member_access && readonly && assignment) {
+                    continue;
+                }
+                diagnostics.push(Diagnostic {
+                    kind: DiagnosticKind::ReadOnlyAssignment,
+                    severity: DiagnosticSeverity::Error,
+                    message: "the type member is compile-time readonly".to_owned(),
+                    location: Some(DiagnosticLocation {
+                        file_id: file.id,
+                        path: file.path.clone(),
+                        span: Some(file.original_span(SourceSpan::new(
+                            window[0].span.start,
+                            window[2].span.end,
+                        ))),
+                    }),
+                    related: None,
+                });
+            }
+        }
+    }
+    diagnostics
+}
+
+fn string_interpolation_diagnostics(
+    file: &dm_project::ProjectFile,
+    syntax: &SyntaxFile,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for definition in &syntax.definitions {
+        lint_string_tokens(file, &definition.header, &mut diagnostics);
+        for line in &definition.body {
+            lint_string_tokens(file, &line.tokens, &mut diagnostics);
+        }
+    }
+    diagnostics
+}
+
+fn lint_string_tokens(
+    file: &dm_project::ProjectFile,
+    tokens: &[SpannedToken],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for (index, token) in tokens.iter().enumerate() {
+        let TokenKind::String(content) = &token.kind else {
+            continue;
+        };
+        let is_text_template = index >= 2
+            && tokens[index - 1].kind == TokenKind::Punctuation('(')
+            && matches!(&tokens[index - 2].kind, TokenKind::Identifier(name) if name == "text")
+            && (index < 3
+                || !matches!(&tokens[index - 3].kind, TokenKind::Operator(operator) if matches!(operator.as_str(), "." | ":" | "::" | "?." | "?:")));
+        if is_text_template {
+            continue;
+        }
+        let trimmed = content.trim_end();
+        let empty_expression = interpolation_contents(content)
+            .any(|expression| expression.trim().is_empty() || expression.trim() == ";");
+        let adjacent_expressions =
+            interpolation_contents(content).any(|expression| expression.contains("\"\""));
+        let dangling_text_macro = trimmed.ends_with("\\proper") || trimmed.ends_with("\\improper");
+        let message = if empty_expression {
+            Some("expected an expression inside string interpolation")
+        } else if adjacent_expressions {
+            Some("expected the end of the embedded expression")
+        } else if dangling_text_macro {
+            Some("text macro requires a following interpolated expression or text")
+        } else {
+            None
+        };
+        let Some(message) = message else { continue };
+        diagnostics.push(Diagnostic {
+            kind: DiagnosticKind::InvalidStringInterpolation,
+            severity: DiagnosticSeverity::Error,
+            message: message.to_owned(),
+            location: Some(DiagnosticLocation {
+                file_id: file.id,
+                path: file.path.clone(),
+                span: Some(file.original_span(token.span)),
+            }),
+            related: None,
+        });
+    }
+}
+
+fn interpolation_contents(content: &str) -> impl Iterator<Item = &str> {
+    let mut expressions = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut escaped = false;
+    for (offset, character) in content.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        match character {
+            '[' => {
+                if depth == 0 {
+                    start = offset + 1;
+                }
+                depth += 1;
+            }
+            ']' if depth != 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    expressions.push(&content[start..offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    expressions.into_iter()
+}
+
+fn numeric_builtin_diagnostics(
+    file: &dm_project::ProjectFile,
+    syntax: &SyntaxFile,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for definition in &syntax.definitions {
+        lint_numeric_builtin_calls(file, &definition.header, &mut diagnostics);
+        for line in &definition.body {
+            lint_numeric_builtin_calls(file, &line.tokens, &mut diagnostics);
+        }
+    }
+    diagnostics
+}
+
+fn lint_numeric_builtin_calls(
+    file: &dm_project::ProjectFile,
+    tokens: &[SpannedToken],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    const NUMERIC_BUILTINS: &[&str] = &[
+        "abs", "sin", "cos", "tan", "arcsin", "arccos", "arctan", "sqrt", "log", "rgb",
+    ];
+    let mut index = 0usize;
+    while index + 1 < tokens.len() {
+        let TokenKind::Identifier(name) = &tokens[index].kind else {
+            index += 1;
+            continue;
+        };
+        let is_member = index != 0
+            && matches!(&tokens[index - 1].kind, TokenKind::Operator(operator) if matches!(operator.as_str(), "." | ":" | "::" | "?." | "?:"));
+        if is_member
+            || !NUMERIC_BUILTINS.contains(&name.as_str())
+            || tokens[index + 1].kind != TokenKind::Punctuation('(')
+        {
+            index += 1;
+            continue;
+        }
+        let Some((close, arguments)) = call_arguments(tokens, index + 1) else {
+            index += 1;
+            continue;
+        };
+        if (name == "log" || name == "arctan") && !matches!(arguments.len(), 1 | 2) {
+            index = close + 1;
+            continue;
+        }
+        if name == "rgb" && !(3..=5).contains(&arguments.len()) {
+            index = close + 1;
+            continue;
+        }
+        if name != "log" && name != "arctan" && name != "rgb" && arguments.len() != 1 {
+            index = close + 1;
+            continue;
+        }
+        for argument in &arguments {
+            if constant_non_number(argument) {
+                push_builtin_diagnostic(
+                    file,
+                    argument,
+                    DiagnosticKind::FallbackBuiltinArgument,
+                    DiagnosticSeverity::Warning,
+                    format!("constant non-numeric argument to {name}() is treated as 0"),
+                    diagnostics,
+                );
+            }
+        }
+        for (argument_index, argument) in arguments.iter().enumerate() {
+            let Some(number) = constant_number(argument) else {
+                continue;
+            };
+            let invalid = match name.as_str() {
+                "arcsin" | "arccos" => !(-1.0..=1.0).contains(&number),
+                "sqrt" => number < 0.0,
+                "log" => number < 0.0 && argument_index < 2,
+                _ => false,
+            };
+            if invalid {
+                push_builtin_diagnostic(
+                    file,
+                    argument,
+                    DiagnosticKind::BadArgument,
+                    DiagnosticSeverity::Error,
+                    format!("constant argument {number} is outside the domain of {name}()"),
+                    diagnostics,
+                );
+            }
+        }
+        index = close + 1;
+    }
+}
+
+fn builtin_arity_diagnostics(
+    file: &dm_project::ProjectFile,
+    syntax: &SyntaxFile,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for definition in &syntax.definitions {
+        lint_builtin_arities(file, &definition.header, &mut diagnostics);
+        for line in &definition.body {
+            lint_builtin_arities(file, &line.tokens, &mut diagnostics);
+        }
+    }
+    diagnostics
+}
+
+fn lint_builtin_arities(
+    file: &dm_project::ProjectFile,
+    tokens: &[SpannedToken],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut index = 0usize;
+    while index + 1 < tokens.len() {
+        let TokenKind::Identifier(name) = &tokens[index].kind else {
+            index += 1;
+            continue;
+        };
+        let is_member = index != 0
+            && matches!(&tokens[index - 1].kind, TokenKind::Operator(operator) if matches!(operator.as_str(), "." | ":" | "::" | "?." | "?:"));
+        if is_member || tokens[index + 1].kind != TokenKind::Punctuation('(') {
+            index += 1;
+            continue;
+        }
+        let Some((close, arguments)) = call_arguments(tokens, index + 1) else {
+            index += 1;
+            continue;
+        };
+        let valid = match name.as_str() {
+            "image" => !arguments.is_empty(),
+            "addtext" => arguments.len() >= 2,
+            "rgb" => (3..=5).contains(&arguments.len()),
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        if !valid {
+            let compiler_span = SourceSpan::new(tokens[index].span.start, tokens[close].span.end);
+            diagnostics.push(Diagnostic {
+                kind: DiagnosticKind::InvalidArgumentCount,
+                severity: DiagnosticSeverity::Error,
+                message: format!("invalid argument count {} for {name}()", arguments.len()),
+                location: Some(DiagnosticLocation {
+                    file_id: file.id,
+                    path: file.path.clone(),
+                    span: Some(file.original_span(compiler_span)),
+                }),
+                related: None,
+            });
+        }
+        index = close + 1;
+    }
+}
+
+fn push_builtin_diagnostic(
+    file: &dm_project::ProjectFile,
+    argument: &[SpannedToken],
+    kind: DiagnosticKind,
+    severity: DiagnosticSeverity,
+    message: String,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some((first, last)) = argument.first().zip(argument.last()) else {
+        return;
+    };
+    diagnostics.push(Diagnostic {
+        kind,
+        severity,
+        message,
+        location: Some(DiagnosticLocation {
+            file_id: file.id,
+            path: file.path.clone(),
+            span: Some(file.original_span(SourceSpan::new(first.span.start, last.span.end))),
+        }),
+        related: None,
+    });
+}
+
+fn constant_non_number(tokens: &[SpannedToken]) -> bool {
+    matches!(
+        tokens,
+        [SpannedToken {
+            kind: TokenKind::String(_)
+                | TokenKind::RawString(_)
+                | TokenKind::TextBlock(_)
+                | TokenKind::Resource(_),
+            ..
+        }]
+    ) || matches!(tokens, [SpannedToken { kind: TokenKind::Identifier(name), .. }] if name == "null")
+}
+
+fn constant_number(tokens: &[SpannedToken]) -> Option<f32> {
+    match tokens {
+        [
+            SpannedToken {
+                kind: TokenKind::Number(number),
+                ..
+            },
+        ] => number.parse().ok(),
+        [
+            SpannedToken {
+                kind: TokenKind::Operator(operator),
+                ..
+            },
+            SpannedToken {
+                kind: TokenKind::Number(number),
+                ..
+            },
+        ] if operator == "-" => number.parse::<f32>().ok().map(|number| -number),
+        _ => None,
+    }
+}
+
+fn proc_argument_diagnostics(
+    file: &dm_project::ProjectFile,
+    syntax: &SyntaxFile,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for definition in &syntax.definitions {
+        for parameter in &definition.parameters {
+            if !matches!(parameter.tokens.as_slice(), [
+                SpannedToken { kind: TokenKind::Operator(slash), .. },
+                SpannedToken { kind: TokenKind::Identifier(var), .. },
+                ..
+            ] if slash == "/" && var == "var")
+            {
+                continue;
+            }
+            diagnostics.push(Diagnostic {
+                kind: DiagnosticKind::ProcArgumentGlobal,
+                severity: DiagnosticSeverity::Warning,
+                message: "procedure arguments cannot use the global /var path".to_owned(),
+                location: Some(DiagnosticLocation {
+                    file_id: file.id,
+                    path: file.path.clone(),
+                    span: Some(file.original_span(parameter.span)),
+                }),
+                related: None,
+            });
+        }
+    }
+    diagnostics
+}
+
+fn matrix_lint_diagnostics(file: &dm_project::ProjectFile, syntax: &SyntaxFile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for definition in &syntax.definitions {
+        for line in &definition.body {
+            lint_matrix_calls(file, &line.tokens, &mut diagnostics);
+        }
+    }
+    diagnostics
+}
+
+fn lint_matrix_calls(
+    file: &dm_project::ProjectFile,
+    tokens: &[SpannedToken],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut index = 0usize;
+    while index + 1 < tokens.len() {
+        let is_matrix =
+            matches!(&tokens[index].kind, TokenKind::Identifier(name) if name == "matrix");
+        let is_member = index != 0
+            && matches!(&tokens[index - 1].kind, TokenKind::Operator(operator) if matches!(operator.as_str(), "." | ":" | "::" | "?." | "?:"));
+        if !is_matrix || is_member || tokens[index + 1].kind != TokenKind::Punctuation('(') {
+            index += 1;
+            continue;
+        }
+        let Some((close, arguments)) = call_arguments(tokens, index + 1) else {
+            index += 1;
+            continue;
+        };
+        let suspicious = match arguments.len() {
+            2..=4 => arguments
+                .last()
+                .and_then(|argument| constant_matrix_opcode(argument))
+                .is_some_and(|valid| !valid),
+            5 => true,
+            _ => false,
+        };
+        if suspicious {
+            let compiler_span =
+                SourceSpan::new(tokens[index + 1].span.start, tokens[close].span.end);
+            diagnostics.push(Diagnostic {
+                kind: DiagnosticKind::SuspiciousMatrixCall,
+                severity: DiagnosticSeverity::Warning,
+                message: if arguments.len() == 5 {
+                    "calling matrix() with 5 arguments will always error at runtime".to_owned()
+                } else {
+                    "matrix() arguments have an invalid opcode or insufficient arguments".to_owned()
+                },
+                location: Some(DiagnosticLocation {
+                    file_id: file.id,
+                    path: file.path.clone(),
+                    span: Some(file.original_span(compiler_span)),
+                }),
+                related: None,
+            });
+        }
+        index = close + 1;
+    }
+}
+
+fn call_arguments(tokens: &[SpannedToken], open: usize) -> Option<(usize, Vec<&[SpannedToken]>)> {
+    let mut depth = 1usize;
+    let mut start = open + 1;
+    let mut arguments = Vec::new();
+    for index in open + 1..tokens.len() {
+        match tokens[index].kind {
+            TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+            TokenKind::Punctuation(')' | ']' | '}') => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    if index != start || !arguments.is_empty() {
+                        arguments.push(&tokens[start..index]);
+                    }
+                    return Some((index, arguments));
+                }
+            }
+            TokenKind::Punctuation(',') if depth == 1 => {
+                arguments.push(&tokens[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn constant_matrix_opcode(tokens: &[SpannedToken]) -> Option<bool> {
+    match tokens {
+        [
+            SpannedToken {
+                kind: TokenKind::Number(number),
+                ..
+            },
+        ] => {
+            let opcode = number.parse::<i32>().ok()?;
+            Some((0..=8).contains(&(opcode & !128)))
+        }
+        [
+            SpannedToken {
+                kind: TokenKind::Operator(operator),
+                ..
+            },
+            SpannedToken {
+                kind: TokenKind::Number(number),
+                ..
+            },
+        ] if operator == "-" => {
+            let opcode = -number.parse::<i32>().ok()?;
+            Some((0..=8).contains(&(opcode & !128)))
+        }
+        [
+            SpannedToken {
+                kind:
+                    TokenKind::String(_)
+                    | TokenKind::RawString(_)
+                    | TokenKind::TextBlock(_)
+                    | TokenKind::Resource(_),
+                ..
+            },
+        ] => Some(false),
+        [
+            SpannedToken {
+                kind: TokenKind::Identifier(name),
+                ..
+            },
+        ] if matches!(name.as_str(), "null" | "TRUE" | "FALSE") => Some(false),
+        _ => None,
     }
 }
 
@@ -792,6 +1362,307 @@ mod tests {
         );
         assert_eq!(compilation.stats().errors, 1);
         assert_eq!(compilation.stats().notes, 1);
+    }
+
+    #[test]
+    fn applies_project_pragma_severity_to_frontend_diagnostics() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            concat!(
+                "#pragma DuplicateProcDefinition error\n",
+                "#include \"duplicate.dm\"\n",
+            ),
+        );
+        fixture.write(
+            "duplicate.dm",
+            "/datum/example/proc/run()\n\treturn 1\n/datum/example/proc/run()\n\treturn 2\n",
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("pragma-controlled diagnostics should compile recoverably");
+        let duplicate = compilation
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.kind == DiagnosticKind::DuplicateDeclaration)
+            .expect("duplicate procedure should emit a diagnostic");
+
+        assert_eq!(duplicate.severity, super::DiagnosticSeverity::Error);
+        assert_eq!(compilation.stats().errors, 1);
+    }
+
+    #[test]
+    fn emits_and_controls_suspicious_matrix_constructor_diagnostics() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            concat!(
+                "#pragma SuspiciousMatrixCall error\n",
+                "/proc/run()\n",
+                "\tvar/bad = matrix(\"x\", \"y\", \"not an opcode\")\n",
+                "\tvar/five = matrix(1, 2, 3, 4, 5)\n",
+                "\tvar/good_copy = matrix(1, 0)\n",
+                "\tvar/good_modify = matrix(1, 129)\n",
+                "\tvar/dynamic = matrix(1, opcode)\n",
+                "\tvar/member = holder.matrix(1, \"bad\")\n",
+                "\tvar/normal = matrix(1, 0, 0, 1, 0, 0)\n",
+            ),
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("matrix linting should be recoverable");
+        let matrix_diagnostics: Vec<_> = compilation
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.kind == DiagnosticKind::SuspiciousMatrixCall)
+            .collect();
+
+        assert_eq!(matrix_diagnostics.len(), 2);
+        assert!(
+            matrix_diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity == super::DiagnosticSeverity::Error)
+        );
+        assert!(matrix_diagnostics.iter().all(|diagnostic| {
+            diagnostic
+                .location
+                .as_ref()
+                .and_then(|item| item.span)
+                .is_some()
+        }));
+    }
+
+    #[test]
+    fn disables_suspicious_matrix_diagnostics_via_pragma() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            "#pragma SuspiciousMatrixCall disabled\n/proc/run()\n\treturn matrix(1, 2, 3, 4, 5)\n",
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("disabled matrix lint should compile");
+
+        assert!(
+            compilation
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.kind != DiagnosticKind::SuspiciousMatrixCall)
+        );
+    }
+
+    #[test]
+    fn diagnoses_global_var_paths_only_in_procedure_parameters() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            concat!(
+                "#pragma ProcArgumentGlobal error\n",
+                "/var/global_value\n",
+                "/proc/bad(/var/value)\n",
+                "\treturn value\n",
+                "/proc/good(var/value, datum/typed)\n",
+                "\treturn value\n",
+            ),
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("argument lint should be recoverable");
+        let diagnostics: Vec<_> = compilation
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.kind == DiagnosticKind::ProcArgumentGlobal)
+            .collect();
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, super::DiagnosticSeverity::Error);
+        assert!(
+            diagnostics[0]
+                .location
+                .as_ref()
+                .and_then(|item| item.span)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn distinguishes_duplicate_variable_and_procedure_pragma_names() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            concat!(
+                "#pragma DuplicateVariable disabled\n",
+                "#pragma DuplicateProcDefinition error\n",
+                "/datum/example/var/value\n",
+                "/datum/example/var/value\n",
+                "/datum/example/proc/run()\n",
+                "\treturn 1\n",
+                "/datum/example/proc/run()\n",
+                "\treturn 2\n",
+            ),
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("duplicate declarations should be recoverable");
+        let duplicates: Vec<_> = compilation
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.kind == DiagnosticKind::DuplicateDeclaration)
+            .collect();
+
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(duplicates[0].severity, super::DiagnosticSeverity::Error);
+        assert!(duplicates[0].message.contains("/proc/"));
+    }
+
+    #[test]
+    fn validates_constant_numeric_builtin_arguments_without_flagging_dynamic_values() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            concat!(
+                "#pragma FallbackBuiltinArgument error\n",
+                "/proc/run(dynamic)\n",
+                "\tvar/fallback = sin(\"bad\")\n",
+                "\tvar/domain = sqrt(-1)\n",
+                "\tvar/good = arcsin(1) + log(2, 4)\n",
+                "\tvar/unknown = cos(dynamic)\n",
+                "\tvar/member = holder.sin(\"bad\")\n",
+            ),
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("builtin diagnostics should be recoverable");
+        let fallback: Vec<_> = compilation
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.kind == DiagnosticKind::FallbackBuiltinArgument)
+            .collect();
+        let bad_argument: Vec<_> = compilation
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.kind == DiagnosticKind::BadArgument)
+            .collect();
+
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].severity, super::DiagnosticSeverity::Error);
+        assert_eq!(bad_argument.len(), 1);
+        assert_eq!(bad_argument[0].severity, super::DiagnosticSeverity::Error);
+    }
+
+    #[test]
+    fn validates_builtin_arities_and_global_rgb_constant_arguments() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            concat!(
+                "#pragma FallbackBuiltinArgument error\n",
+                "/datum/example/var/color = rgb(1, 2, null)\n",
+                "/proc/run(dynamic)\n",
+                "\timage()\n",
+                "\taddtext(\"only one\")\n",
+                "\trgb(1, 2)\n",
+                "\timage(dynamic)\n",
+                "\taddtext(\"a\", dynamic)\n",
+                "\trgb(1, 2, 3)\n",
+                "\tholder.image()\n",
+            ),
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("arity diagnostics should be recoverable");
+
+        assert_eq!(
+            compilation
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.kind == DiagnosticKind::InvalidArgumentCount)
+                .count(),
+            3
+        );
+        assert_eq!(
+            compilation
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.kind == DiagnosticKind::FallbackBuiltinArgument)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn rejects_type_member_writes_without_rejecting_reads_or_mutable_members() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            concat!(
+                "/proc/run(list/value)\n",
+                "\tvalue.type = /list\n",
+                "\tvalue.type += 1\n",
+                "\tvar/read_type = value.type\n",
+                "\tvalue.len = 2\n",
+                "\tvalue.dynamic = 3\n",
+            ),
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("readonly diagnostics should be recoverable");
+        let diagnostics: Vec<_> = compilation
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.kind == DiagnosticKind::ReadOnlyAssignment)
+            .collect();
+
+        assert_eq!(diagnostics.len(), 2);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.location.as_ref().and_then(|item| item.span).is_some())
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_string_interpolations_and_accepts_valid_nested_text() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            concat!(
+                "/proc/run(value)\n",
+                "\tvar/empty = \"[;]\"\n",
+                "\tvar/adjacent = \"[\"a\"\"b\"]\"\n",
+                "\tvar/dangling = \"Example \\proper\"\n",
+                "\tvar/good = \"prefix [value] suffix\"\n",
+                "\tvar/nested = \"[format(\"nested [value]\")]\"\n",
+                "\tvar/proper_name = \"\\proper thing\"\n",
+                "\tvar/template = text(\"[] [ ]\", value, value)\n",
+            ),
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("string diagnostics should be recoverable");
+        let diagnostics: Vec<_> = compilation
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.kind == DiagnosticKind::InvalidStringInterpolation)
+            .collect();
+
+        assert_eq!(diagnostics.len(), 3);
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic
+                .location
+                .as_ref()
+                .and_then(|item| item.span)
+                .is_some()
+        }));
     }
 
     #[test]

@@ -23,6 +23,8 @@ pub struct Project {
     pub files: Vec<ProjectFile>,
     /// Include operations in source encounter order.
     pub includes: Vec<IncludeEdge>,
+    /// Active compiler diagnostic policies in source encounter order.
+    pub diagnostic_pragmas: Vec<DiagnosticPragma>,
 }
 
 impl Project {
@@ -46,6 +48,16 @@ impl Project {
     #[must_use]
     pub fn file(&self, id: FileId) -> Option<&ProjectFile> {
         self.files.get(id.index())
+    }
+
+    /// Returns the last configured severity for a named compiler diagnostic.
+    #[must_use]
+    pub fn diagnostic_severity(&self, name: &str) -> Option<PragmaSeverity> {
+        self.diagnostic_pragmas
+            .iter()
+            .rev()
+            .find(|pragma| pragma.name == name)
+            .map(|pragma| pragma.severity)
     }
 
     /// Returns the project source stream after quoted includes are spliced in.
@@ -110,6 +122,32 @@ impl Project {
         }
         segments
     }
+}
+
+/// Severity selected by a Dream Maker `#pragma` diagnostic policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PragmaSeverity {
+    /// Do not emit the diagnostic.
+    Disabled,
+    /// Emit an informational diagnostic.
+    Notice,
+    /// Emit a warning.
+    Warning,
+    /// Emit a compilation error.
+    Error,
+}
+
+/// One source-ordered `#pragma DiagnosticName severity` policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticPragma {
+    /// OpenDream/Dream Maker diagnostic name.
+    pub name: String,
+    /// Configured severity.
+    pub severity: PragmaSeverity,
+    /// File containing the directive.
+    pub source: FileId,
+    /// Complete directive range.
+    pub span: SourceSpan,
 }
 
 /// A contiguous part of one file in the fully expanded project source stream.
@@ -415,6 +453,7 @@ struct Loader {
     next_include_ordinal: usize,
     warning_directive_is_error: bool,
     duplicate_include_is_error: bool,
+    diagnostic_pragmas: Vec<DiagnosticPragma>,
 }
 
 impl Loader {
@@ -444,6 +483,7 @@ impl Loader {
             next_include_ordinal: 0,
             warning_directive_is_error: false,
             duplicate_include_is_error: false,
+            diagnostic_pragmas: Vec::new(),
         })
     }
 
@@ -455,6 +495,7 @@ impl Loader {
             root_directory: self.root_directory,
             files: self.files,
             includes: self.includes.into_iter().map(|(_, edge)| edge).collect(),
+            diagnostic_pragmas: self.diagnostic_pragmas,
         })
     }
 
@@ -685,6 +726,16 @@ impl Loader {
                 value,
                 parameters,
             } if active => {
+                if parameters
+                    .as_ref()
+                    .is_some_and(|parameters| !parameters.valid)
+                {
+                    return Err(preprocessor_error(
+                        path,
+                        offset,
+                        "variadic macro parameter must be last",
+                    ));
+                }
                 self.macros.insert(
                     name,
                     MacroDefinition {
@@ -717,7 +768,7 @@ impl Loader {
                 ));
             }
             DirectiveKind::Pragma(value) if active => {
-                self.apply_pragma(&value);
+                self.apply_pragma(source, directive.span, &value);
             }
             DirectiveKind::Warning(_)
             | DirectiveKind::Pragma(_)
@@ -732,9 +783,11 @@ impl Loader {
         Ok(())
     }
 
-    fn apply_pragma(&mut self, value: &str) {
+    fn apply_pragma(&mut self, source: FileId, span: SourceSpan, value: &str) {
         let mut words = value.split_whitespace();
-        match (words.next(), words.next()) {
+        let name = words.next();
+        let severity = words.next();
+        match (name, severity) {
             (Some("WarningDirective"), Some("error")) => {
                 self.warning_directive_is_error = true;
             }
@@ -748,6 +801,21 @@ impl Loader {
                 self.duplicate_include_is_error = false;
             }
             _ => {}
+        }
+        let severity = match severity {
+            Some("disabled") => Some(PragmaSeverity::Disabled),
+            Some("notice" | "info") => Some(PragmaSeverity::Notice),
+            Some("warning" | "warn") => Some(PragmaSeverity::Warning),
+            Some("error") => Some(PragmaSeverity::Error),
+            _ => None,
+        };
+        if let (Some(name), Some(severity)) = (name, severity) {
+            self.diagnostic_pragmas.push(DiagnosticPragma {
+                name: name.to_owned(),
+                severity,
+                source,
+                span,
+            });
         }
     }
 
@@ -883,6 +951,7 @@ struct MacroDefinition {
 struct MacroParameters {
     fixed: Vec<String>,
     variadic: Option<String>,
+    valid: bool,
 }
 
 impl MacroDefinition {
@@ -1681,11 +1750,15 @@ fn complete_define(
 fn parse_macro_parameters(source: &str) -> MacroParameters {
     let mut fixed = Vec::new();
     let mut variadic = None;
+    let mut valid = true;
     for parameter in source
         .split(',')
         .map(str::trim)
         .filter(|item| !item.is_empty())
     {
+        if variadic.is_some() {
+            valid = false;
+        }
         if parameter == "..." {
             variadic = Some("__VA_ARGS__".to_owned());
         } else if let Some(name) = parameter.strip_suffix("...") {
@@ -1694,7 +1767,11 @@ fn parse_macro_parameters(source: &str) -> MacroParameters {
             fixed.push(parameter.to_owned());
         }
     }
-    MacroParameters { fixed, variadic }
+    MacroParameters {
+        fixed,
+        variadic,
+        valid,
+    }
 }
 
 fn splice_continuations(source: &str) -> String {
@@ -1858,6 +1935,7 @@ fn parse_directive_line(line: &str) -> Option<DirectiveKind> {
                 parameters: value[name_end..].starts_with('(').then(|| MacroParameters {
                     fixed: Vec::new(),
                     variadic: None,
+                    valid: true,
                 }),
             })
         }
@@ -2219,7 +2297,7 @@ mod tests {
 
     use dm_core::SourceSpan;
 
-    use super::{IncludeTarget, Project, ProjectError};
+    use super::{IncludeTarget, PragmaSeverity, Project, ProjectError};
 
     struct ScratchDirectory(PathBuf);
 
@@ -2887,6 +2965,33 @@ mod tests {
     }
 
     #[test]
+    fn preserves_generic_diagnostic_pragma_metadata_in_source_order() {
+        let scratch = ScratchDirectory::new();
+        fs::write(
+            scratch.path().join("world.dme"),
+            concat!(
+                "#pragma SuspiciousMatrixCall warning\n",
+                "#pragma SuspiciousMatrixCall error\n",
+                "#pragma EmptyProc disabled\n",
+            ),
+        )
+        .expect("pragma fixture should be written");
+
+        let project = Project::load(scratch.path().join("world.dme"))
+            .expect("diagnostic pragmas should load");
+
+        assert_eq!(project.diagnostic_pragmas.len(), 3);
+        assert_eq!(
+            project.diagnostic_severity("SuspiciousMatrixCall"),
+            Some(PragmaSeverity::Error)
+        );
+        assert_eq!(
+            project.diagnostic_severity("EmptyProc"),
+            Some(PragmaSeverity::Disabled)
+        );
+    }
+
+    #[test]
     fn ignores_directives_in_block_comments_and_accepts_comments_as_whitespace() {
         let scratch = ScratchDirectory::new();
         fs::write(
@@ -2930,6 +3035,14 @@ mod tests {
 
         let (_, multiple_names) = preprocessor_error_for("#ifdef FIRST SECOND\n#endif\n");
         assert_eq!(multiple_names, "#ifdef accepts exactly one macro name");
+    }
+
+    #[test]
+    fn rejects_variadic_macro_parameters_before_the_final_position() {
+        let (_, message) =
+            preprocessor_error_for("#define INVALID(first..., second..., third...) list(first)\n");
+
+        assert_eq!(message, "variadic macro parameter must be last");
     }
 
     #[test]

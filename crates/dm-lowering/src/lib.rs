@@ -491,7 +491,7 @@ mod tests {
             "#include \"supported.dm\"\n#include \"unsupported.dm\"\n",
             &[
                 ("supported.dm", "/proc/ready()\n\treturn 42\n"),
-                ("unsupported.dm", "/proc/later()\n\tspawn()\n"),
+                ("unsupported.dm", "/proc/later()\n\treturn arglist(1)\n"),
             ],
         );
         let compilation = CompilerDatabase::new()

@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 dm-core = { path = "../dm-core" }
+dm-lexer = { path = "../dm-lexer" }
 dm-object-tree = { path = "../dm-object-tree" }
 dm-project = { path = "../dm-project" }
 dm-syntax = { path = "../dm-syntax" }

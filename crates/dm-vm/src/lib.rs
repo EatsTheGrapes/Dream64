@@ -18,7 +18,7 @@ use dm_core::{DmNumberBits, SourceSpan};
 use dm_lexer::{SpannedToken, TokenKind};
 use dm_syntax::{Definition, DefinitionKind, SourceLine};
 pub use dm_value::Value;
-use dm_value::{FieldName, ListId, TypePath, ValueError, ValueHeap};
+use dm_value::{DatumId, FieldName, ListId, TypePath, ValueError, ValueHeap};
 
 /// One instruction in the portable reference bytecode.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,6 +60,11 @@ pub enum Instruction {
     MakeMutableAppearance {
         /// Number of already-evaluated constructor arguments to discard.
         argument_count: u16,
+    },
+    /// Constructs BYOND's built-in affine `/matrix` datum.
+    MakeMatrix {
+        /// Number of constructor arguments.
+        argument_count: u8,
     },
     /// Replaces every matching text fragment in a bounded 1-based region.
     ///
@@ -143,6 +148,8 @@ pub enum Instruction {
     /// to provide the complete object tree without coupling bytecode to its
     /// materialization implementation.
     TypesOf,
+    /// Returns a snapshot list of live datums matching a type and descendants.
+    TypeInstances(TypePath),
     /// Classifies a value using BYOND's simple predicate builtins.
     ///
     /// `istype` additionally accepts an optional target type path and treats
@@ -1438,18 +1445,30 @@ fn compile_block_inner(
             }
             TokenKind::Identifier(keyword) if keyword == "spawn" => {
                 let first_instruction = instructions.len();
-                let mut spawn = ExpressionParser::new(&line.tokens[1..]);
-                let arguments = spawn.parse_call_arguments()?;
-                if arguments.is_empty() {
-                    return Err(compile_error("spawn requires a delay argument"));
-                }
-                if arguments.len() != 1 {
-                    return Err(compile_error(
-                        "spawn accepts exactly one delay argument before the spawned expression",
-                    ));
-                }
-                let rest = &line.tokens[1 + spawn.index..];
-                emit_expression(&arguments[0], locals, instructions, procedures)?;
+                let after_keyword = &line.tokens[1..];
+                let rest = if matches!(
+                    after_keyword.first().map(|token| &token.kind),
+                    Some(TokenKind::Punctuation('('))
+                ) {
+                    let mut spawn = ExpressionParser::new(after_keyword);
+                    let arguments = spawn.parse_call_arguments()?;
+                    if arguments.len() > 1 {
+                        return Err(compile_error(
+                            "spawn accepts at most one delay argument before the spawned expression",
+                        ));
+                    }
+                    if let Some(delay) = arguments.first() {
+                        emit_expression(delay, locals, instructions, procedures)?;
+                    } else {
+                        instructions.push(Instruction::PushNumber(DmNumberBits::from_f32(0.0)));
+                    }
+                    &line.tokens[1 + spawn.index..]
+                } else {
+                    // BYOND's `spawn statement` and `spawn { ... }` forms are
+                    // exactly `spawn(0)` with the parentheses omitted.
+                    instructions.push(Instruction::PushNumber(DmNumberBits::from_f32(0.0)));
+                    after_keyword
+                };
                 let spawn_instruction = instructions.len();
                 instructions.push(Instruction::Spawn { entry: usize::MAX });
                 let skip_spawned_body = instructions.len();
@@ -2059,7 +2078,41 @@ fn compile_for(
     loops: &mut Vec<LoopContext>,
 ) -> Result<usize, CompileError> {
     let line = &lines[line_index];
-    if let Some((local_name, declared, start, end, step)) = for_to_parts(&line.tokens)? {
+    if let Some((local_name, type_path)) = for_type_parts(&line.tokens)? {
+        return compile_for_in(
+            lines,
+            line_index,
+            block_indentation,
+            locals,
+            instructions,
+            source_spans,
+            procedures,
+            loops,
+            &local_name,
+            true,
+            &[],
+            Some(&type_path),
+        );
+    }
+    if let Some((first, second, iterable, declared)) = for_assoc_parts(&line.tokens)? {
+        return compile_for_assoc(
+            lines,
+            line_index,
+            block_indentation,
+            locals,
+            instructions,
+            source_spans,
+            procedures,
+            loops,
+            first,
+            second,
+            iterable,
+            declared,
+        );
+    }
+    if !for_header_uses_c_style(&line.tokens)
+        && let Some((local_name, declared, start, end, step)) = for_to_parts(&line.tokens)?
+    {
         return compile_for_to(
             lines,
             line_index,
@@ -2089,6 +2142,7 @@ fn compile_for(
             &local_name,
             declared,
             iterable,
+            None,
         );
     }
     let [initializer, condition, increment] = for_clauses(&line.tokens)?;
@@ -2118,28 +2172,26 @@ fn compile_for(
     );
 
     let child_index = line_index + 1;
-    let child = lines
-        .get(child_index)
-        .ok_or_else(|| compile_error("for statement requires an indented body"))?;
-    let child_indentation = indentation(child);
-    if child_indentation <= block_indentation {
-        return Err(compile_error("for statement requires an indented body"));
-    }
+    let child_indentation = lines.get(child_index).map(indentation);
     loops.push(LoopContext {
         continue_target: None,
         continue_jumps: Vec::new(),
         break_jumps: Vec::new(),
     });
-    let body = compile_block(
-        lines,
-        child_index,
-        child_indentation,
-        locals,
-        instructions,
-        source_spans,
-        procedures,
-        loops,
-    );
+    let body = if child_indentation.is_some_and(|indent| indent > block_indentation) {
+        compile_block(
+            lines,
+            child_index,
+            child_indentation.expect("checked"),
+            locals,
+            instructions,
+            source_spans,
+            procedures,
+            loops,
+        )
+    } else {
+        Ok((child_index, true))
+    };
     let loop_context = loops.pop().expect("the active for context was pushed");
     let (after_body, _) = body?;
 
@@ -2170,6 +2222,32 @@ fn compile_for(
     Ok(after_body)
 }
 
+fn for_header_uses_c_style(tokens: &[SpannedToken]) -> bool {
+    let mut depth = 0usize;
+    let separators = tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(index, token)| match token.kind {
+            TokenKind::Punctuation('(' | '[') => {
+                depth += 1;
+                None
+            }
+            TokenKind::Punctuation(')' | ']') => {
+                depth = depth.saturating_sub(1);
+                None
+            }
+            TokenKind::Punctuation(';' | ',') if depth == 1 => Some(index),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    separators.len() >= 2
+        || separators.first().is_some_and(|separator| {
+            tokens[*separator + 1..tokens.len().saturating_sub(1)]
+                .iter()
+                .any(|_| true)
+        })
+}
+
 /// Compiles DM's inclusive numeric range loop, `for(var/i in first to last)`.
 /// The end expression is evaluated once, matching the normal DM range-loop
 /// header semantics and avoiding re-evaluating a mutable field on each turn.
@@ -2190,12 +2268,17 @@ fn compile_for_to(
     step: Option<&[SpannedToken]>,
 ) -> Result<usize, CompileError> {
     let line = &lines[line_index];
+    let field_target = (!declared)
+        .then(|| locals.src_field(local_name).cloned())
+        .flatten();
     let item_slot = if declared {
         locals.declare(local_name.to_owned())?
+    } else if let Some(slot) = locals.get(local_name) {
+        slot
+    } else if field_target.is_some() {
+        locals.declare_hidden()?
     } else {
-        locals
-            .get(local_name)
-            .ok_or_else(|| compile_error(format!("unknown local {local_name:?}")))?
+        return Err(compile_error(format!("unknown local {local_name:?}")));
     };
     let current_slot = locals.declare_hidden()?;
     let end_slot = locals.declare_hidden()?;
@@ -2248,7 +2331,6 @@ fn compile_for_to(
         Instruction::JumpIfFalse(usize::MAX),
         line.span,
     );
-
     // BYOND does not assign an existing iterator when the range is empty.
     // Keep the candidate in a hidden slot until the entry condition succeeds.
     push_instruction(
@@ -2263,7 +2345,15 @@ fn compile_for_to(
         Instruction::StoreLocal(item_slot),
         line.span,
     );
-
+    if let Some(field) = &field_target {
+        for instruction in [
+            Instruction::LoadSrc,
+            Instruction::LoadLocal(item_slot),
+            Instruction::StoreField(field.clone()),
+        ] {
+            push_instruction(instructions, source_spans, instruction, line.span);
+        }
+    }
     let child_index = line_index + 1;
     let child = lines
         .get(child_index)
@@ -2294,8 +2384,23 @@ fn compile_for_to(
     for continue_jump in loop_context.continue_jumps {
         patch_jump(instructions, continue_jump, increment_target)?;
     }
+    if let Some(field) = &field_target {
+        push_instruction(instructions, source_spans, Instruction::LoadSrc, line.span);
+        push_instruction(
+            instructions,
+            source_spans,
+            Instruction::LoadField(field.clone()),
+            line.span,
+        );
+    } else {
+        push_instruction(
+            instructions,
+            source_spans,
+            Instruction::LoadLocal(item_slot),
+            line.span,
+        );
+    }
     for instruction in [
-        Instruction::LoadLocal(item_slot),
         Instruction::LoadLocal(step_slot),
         Instruction::Add,
         Instruction::StoreLocal(current_slot),
@@ -2327,9 +2432,13 @@ fn compile_for_in(
     local_name: &str,
     declared: bool,
     iterable: &[SpannedToken],
+    type_instances: Option<&TypePath>,
 ) -> Result<usize, CompileError> {
     let line = &lines[line_index];
-    let item_slot = if declared {
+    let result_target = !declared && local_name == ".";
+    let item_slot = if result_target {
+        locals.declare_hidden()?
+    } else if declared {
         locals.declare(local_name.to_owned())?
     } else {
         locals
@@ -2340,7 +2449,11 @@ fn compile_for_in(
     let index_slot = locals.declare_hidden()?;
 
     let initialization_start = instructions.len();
-    compile_expression(iterable, locals, instructions, procedures)?;
+    if let Some(type_path) = type_instances {
+        instructions.push(Instruction::TypeInstances(type_path.clone()));
+    } else {
+        compile_expression(iterable, locals, instructions, procedures)?;
+    }
     instructions.push(Instruction::StoreLocal(list_slot));
     instructions.push(Instruction::PushNumber(DmNumberBits::from_f32(1.0)));
     instructions.push(Instruction::StoreLocal(index_slot));
@@ -2406,6 +2519,20 @@ fn compile_for_in(
         Instruction::StoreLocal(item_slot),
         line.span,
     );
+    if result_target {
+        push_instruction(
+            instructions,
+            source_spans,
+            Instruction::LoadLocal(item_slot),
+            line.span,
+        );
+        push_instruction(
+            instructions,
+            source_spans,
+            Instruction::StoreResult,
+            line.span,
+        );
+    }
 
     let child_index = line_index + 1;
     let child = lines
@@ -2457,6 +2584,270 @@ fn compile_for_in(
     Ok(after_body)
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn compile_for_assoc(
+    lines: &[SourceLine],
+    line_index: usize,
+    block_indentation: usize,
+    locals: &mut LocalTable,
+    instructions: &mut Vec<Instruction>,
+    source_spans: &mut Vec<SourceSpan>,
+    procedures: &HashMap<String, ProcedureId>,
+    loops: &mut Vec<LoopContext>,
+    first: &[SpannedToken],
+    second: &[SpannedToken],
+    iterable: &[SpannedToken],
+    declared: bool,
+) -> Result<usize, CompileError> {
+    let line = &lines[line_index];
+    let (first_target, first_name) = parse_for_target(first, declared, locals)?;
+    let (second_target, second_name) = parse_for_target(second, declared, locals)?;
+    let list_slot = locals.declare_hidden()?;
+    let index_slot = locals.declare_hidden()?;
+    let key_slot = locals.declare_hidden()?;
+    let value_slot = locals.declare_hidden()?;
+    let start = instructions.len();
+    compile_expression(iterable, locals, instructions, procedures)?;
+    instructions.push(Instruction::StoreLocal(list_slot));
+    instructions.push(Instruction::PushNumber(DmNumberBits::from_f32(1.0)));
+    instructions.push(Instruction::StoreLocal(index_slot));
+    source_spans.extend(std::iter::repeat_n(line.span, instructions.len() - start));
+    let condition = instructions.len();
+    for instruction in [
+        Instruction::LoadLocal(index_slot),
+        Instruction::LoadLocal(list_slot),
+        Instruction::ListLength,
+        Instruction::LessEqual,
+    ] {
+        push_instruction(instructions, source_spans, instruction, line.span);
+    }
+    let false_jump = instructions.len();
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::JumpIfFalse(usize::MAX),
+        line.span,
+    );
+    for instruction in [
+        Instruction::LoadLocal(list_slot),
+        Instruction::LoadLocal(index_slot),
+        Instruction::IndexList,
+        Instruction::StoreLocal(key_slot),
+        Instruction::LoadLocal(list_slot),
+        Instruction::LoadLocal(key_slot),
+        Instruction::IndexList,
+        Instruction::StoreLocal(value_slot),
+    ] {
+        push_instruction(instructions, source_spans, instruction, line.span);
+    }
+    emit_for_target_store(&first_target, key_slot, locals, instructions, procedures)?;
+    emit_for_target_store(&second_target, value_slot, locals, instructions, procedures)?;
+    source_spans.extend(std::iter::repeat_n(
+        line.span,
+        instructions.len() - source_spans.len(),
+    ));
+    let child_index = line_index + 1;
+    let child = lines
+        .get(child_index)
+        .ok_or_else(|| compile_error("for-in statement requires an indented body"))?;
+    let child_indent = indentation(child);
+    if child_indent <= block_indentation {
+        return Err(compile_error("for-in statement requires an indented body"));
+    }
+    loops.push(LoopContext {
+        continue_target: None,
+        continue_jumps: Vec::new(),
+        break_jumps: Vec::new(),
+    });
+    let body = compile_block(
+        lines,
+        child_index,
+        child_indent,
+        locals,
+        instructions,
+        source_spans,
+        procedures,
+        loops,
+    );
+    let context = loops.pop().expect("assoc loop context pushed");
+    let (after_body, _) = body?;
+    let increment = instructions.len();
+    for jump in context.continue_jumps {
+        patch_jump(instructions, jump, increment)?;
+    }
+    for instruction in [
+        Instruction::LoadLocal(index_slot),
+        Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+        Instruction::Add,
+        Instruction::StoreLocal(index_slot),
+        Instruction::Jump(condition),
+    ] {
+        push_instruction(instructions, source_spans, instruction, line.span);
+    }
+    let end = instructions.len();
+    patch_jump(instructions, false_jump, end)?;
+    for jump in context.break_jumps {
+        patch_jump(instructions, jump, end)?;
+    }
+    if let Some(name) = first_name {
+        locals.remove(&name);
+    }
+    if let Some(name) = second_name {
+        locals.remove(&name);
+    }
+    Ok(after_body)
+}
+
+fn parse_for_target(
+    tokens: &[SpannedToken],
+    declared: bool,
+    locals: &mut LocalTable,
+) -> Result<(Expression, Option<String>), CompileError> {
+    if declared {
+        let name = tokens
+            .iter()
+            .rev()
+            .find_map(|token| match &token.kind {
+                TokenKind::Identifier(name) if name != "var" => Some(name.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| compile_error("associative loop declaration has no name"))?;
+        locals.declare(name.clone())?;
+        return Ok((Expression::Local(name.clone()), Some(name)));
+    }
+    Ok((ExpressionParser::new(tokens).parse()?, None))
+}
+
+fn emit_for_target_store(
+    target: &Expression,
+    slot: u16,
+    locals: &LocalTable,
+    instructions: &mut Vec<Instruction>,
+    procedures: &HashMap<String, ProcedureId>,
+) -> Result<(), CompileError> {
+    match target {
+        Expression::Local(name) => {
+            let target = locals
+                .get(name)
+                .ok_or_else(|| compile_error(format!("unknown local {name:?}")))?;
+            instructions.push(Instruction::LoadLocal(slot));
+            instructions.push(Instruction::StoreLocal(target));
+        }
+        Expression::Index { list, index } => {
+            emit_expression(list, locals, instructions, procedures)?;
+            emit_expression(index, locals, instructions, procedures)?;
+            instructions.push(Instruction::LoadLocal(slot));
+            instructions.push(Instruction::SetListIndex);
+        }
+        Expression::SafeIndex { list, index } => {
+            emit_expression(list, locals, instructions, procedures)?;
+            instructions.push(Instruction::Duplicate);
+            let null_jump = instructions.len();
+            instructions.push(Instruction::JumpIfNull(usize::MAX));
+            emit_expression(index, locals, instructions, procedures)?;
+            instructions.push(Instruction::LoadLocal(slot));
+            instructions.push(Instruction::SetListIndex);
+            let end_jump = instructions.len();
+            instructions.push(Instruction::Jump(usize::MAX));
+            let null_target = instructions.len();
+            instructions.push(Instruction::Pop);
+            let end = instructions.len();
+            instructions[null_jump] = Instruction::JumpIfNull(null_target);
+            instructions[end_jump] = Instruction::Jump(end);
+        }
+        _ => return Err(compile_error("associative loop target is not writable")),
+    }
+    Ok(())
+}
+
+fn for_type_parts(tokens: &[SpannedToken]) -> Result<Option<(String, TypePath)>, CompileError> {
+    let header = &tokens[1..];
+    if !matches!(
+        header.first().map(|token| &token.kind),
+        Some(TokenKind::Punctuation('('))
+    ) || !matches!(
+        header.last().map(|token| &token.kind),
+        Some(TokenKind::Punctuation(')'))
+    ) {
+        return Ok(None);
+    }
+    let inner = &header[1..header.len() - 1];
+    if !matches!(inner.first().map(|token| &token.kind), Some(TokenKind::Identifier(name)) if name == "var")
+        || inner.iter().any(|token| {
+            matches!(&token.kind,
+            TokenKind::Identifier(name) if matches!(name.as_str(), "in" | "to"))
+                || matches!(token.kind, TokenKind::Punctuation(',' | ';'))
+        })
+    {
+        return Ok(None);
+    }
+    let names = inner
+        .iter()
+        .filter_map(|token| match &token.kind {
+            TokenKind::Identifier(name) if name != "var" => Some(name.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if names.len() < 2 {
+        return Ok(None);
+    }
+    let local = names.last().expect("length checked").clone();
+    let path = format!("/{}", names[..names.len() - 1].join("/"));
+    let path = TypePath::parse(&path).map_err(|error| compile_error(error.to_string()))?;
+    Ok(Some((local, path)))
+}
+
+#[allow(clippy::type_complexity)]
+fn for_assoc_parts(
+    tokens: &[SpannedToken],
+) -> Result<Option<(&[SpannedToken], &[SpannedToken], &[SpannedToken], bool)>, CompileError> {
+    let header = &tokens[1..];
+    if !matches!(
+        header.first().map(|t| &t.kind),
+        Some(TokenKind::Punctuation('('))
+    ) || !matches!(
+        header.last().map(|t| &t.kind),
+        Some(TokenKind::Punctuation(')'))
+    ) {
+        return Ok(None);
+    }
+    let inner = &header[1..header.len() - 1];
+    let Some(in_pos) = inner
+        .iter()
+        .position(|t| matches!(&t.kind, TokenKind::Identifier(n) if n == "in"))
+    else {
+        return Ok(None);
+    };
+    let targets = &inner[..in_pos];
+    let iterable = &inner[in_pos + 1..];
+    let mut depth = 0usize;
+    let mut comma = None;
+    for (index, token) in targets.iter().enumerate() {
+        match token.kind {
+            TokenKind::Punctuation('(' | '[') => depth += 1,
+            TokenKind::Punctuation(')' | ']') => depth = depth.saturating_sub(1),
+            TokenKind::Punctuation(',') if depth == 0 => comma = Some(index),
+            _ => {}
+        }
+    }
+    let Some(comma) = comma else {
+        return Ok(None);
+    };
+    if iterable.is_empty() || targets[..comma].is_empty() || targets[comma + 1..].is_empty() {
+        return Err(compile_error(
+            "associative for-in requires two targets and an iterable",
+        ));
+    }
+    let declared =
+        matches!(targets.first().map(|t| &t.kind), Some(TokenKind::Identifier(n)) if n == "var");
+    Ok(Some((
+        &targets[..comma],
+        &targets[comma + 1..],
+        iterable,
+        declared,
+    )))
+}
+
 fn for_in_parts(
     tokens: &[SpannedToken],
 ) -> Result<Option<(String, bool, &[SpannedToken])>, CompileError> {
@@ -2471,15 +2862,29 @@ fn for_in_parts(
         return Ok(None);
     }
     let clauses = &header[1..header.len() - 1];
-    if clauses
+    let clauses = if matches!(
+        clauses.last().map(|token| &token.kind),
+        Some(TokenKind::Punctuation(';'))
+    ) && clauses[..clauses.len().saturating_sub(1)]
+        .iter()
+        .all(|token| token.kind != TokenKind::Punctuation(';'))
+    {
+        &clauses[..clauses.len() - 1]
+    } else if clauses
         .iter()
         .any(|token| token.kind == TokenKind::Punctuation(';'))
     {
         return Ok(None);
+    } else {
+        clauses
+    };
+    let separators = top_level_keyword_positions(clauses, "in");
+    if separators.len() > 1 {
+        return Err(compile_error(
+            "for-in header contains multiple 'in' keywords",
+        ));
     }
-    let Some(separator) = clauses.iter().position(
-        |token| matches!(&token.kind, TokenKind::Identifier(identifier) if identifier == "in"),
-    ) else {
+    let Some(separator) = separators.first().copied() else {
         return Ok(None);
     };
     let declaration = &clauses[..separator];
@@ -2503,14 +2908,15 @@ fn for_in_parts(
             |token| matches!(&token.kind, TokenKind::Identifier(identifier) if identifier == "as"),
         )
         .unwrap_or(declaration.len());
-    let local_name = declaration[..declaration_end]
+    let local_name = if matches!(declaration, [SpannedToken { kind: TokenKind::Operator(operator), .. }] if operator == ".") {
+        Some(".".to_owned())
+    } else { declaration[..declaration_end]
         .iter()
         .rev()
         .find_map(|token| match &token.kind {
             TokenKind::Identifier(identifier) if identifier != "var" => Some(identifier.clone()),
             _ => None,
-        })
-        .ok_or_else(|| compile_error("for-in variable declaration has no name"))?;
+        }) } .ok_or_else(|| compile_error("for-in variable declaration has no name"))?;
     Ok(Some((local_name, declared, iterable)))
 }
 
@@ -2579,6 +2985,10 @@ fn for_to_parts(
     };
     let start = &iterable[..*separator];
     let after_to = &iterable[*separator + 1..];
+    let after_to = after_to
+        .iter()
+        .position(|token| token.kind == TokenKind::Punctuation(';'))
+        .map_or(after_to, |end| &after_to[..end]);
     // The first top-level `step` begins the increment expression. Subsequent
     // occurrences are ordinary identifiers inside that expression (for
     // example, `step step` when the increment is held in a local named
@@ -2687,6 +3097,42 @@ fn compile_for_clause(
             return Err(compile_error(
                 "for increment clause cannot declare a local variable",
             ));
+        }
+        // In C-style headers BYOND accepts a declaration followed by an
+        // `in range` type-filter-looking suffix. It does not iterate that
+        // range; the suffix qualifies the initializer and the declared value
+        // remains the ordinary left-hand initializer.
+        let tokens = top_level_keyword_positions(tokens, "in")
+            .first()
+            .map_or(tokens, |separator| &tokens[..*separator]);
+        let separators = tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(index, token)| {
+                matches!(&token.kind, TokenKind::Operator(operator) if operator == "&&")
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if !separators.is_empty() {
+            let mut start = 0usize;
+            let mut last = None;
+            for end in separators.into_iter().chain(std::iter::once(tokens.len())) {
+                let declaration = &tokens[start..end];
+                if !matches!(declaration.first().map(|token| &token.kind), Some(TokenKind::Identifier(name)) if name == "var")
+                {
+                    return Err(compile_error(
+                        "combined for initializer must contain variable declarations",
+                    ));
+                }
+                last = Some(compile_local(
+                    declaration,
+                    locals,
+                    instructions,
+                    procedures,
+                )?);
+                start = end + 1;
+            }
+            return Ok(last);
         }
         return compile_local(tokens, locals, instructions, procedures).map(Some);
     }
@@ -3569,6 +4015,9 @@ enum Expression {
     MutableAppearance {
         arguments: Vec<Self>,
     },
+    Matrix {
+        arguments: Vec<Self>,
+    },
     ReplaceText {
         arguments: Vec<Self>,
         exact: bool,
@@ -3721,13 +4170,14 @@ fn dm_builtin_text_constant(identifier: &str) -> Option<&'static str> {
 
 fn dm_builtin_numeric_constant(identifier: &str) -> Option<f32> {
     match identifier {
-        "FALSE" | "BLEND_DEFAULT" => Some(0.0),
+        "FALSE" | "BLEND_DEFAULT" | "MATRIX_COPY" => Some(0.0),
         "TRUE" | "BLEND_OVERLAY" | "KEEP_TOGETHER" | "NORTH" => Some(1.0),
         "BLEND_ADD" | "KEEP_APART" | "SOUTH" => Some(2.0),
         "BLEND_SUBTRACT" => Some(3.0),
-        "BLEND_MULTIPLY" | "LONG_GLIDE" | "EAST" => Some(4.0),
-        "BLEND_INSET_OVERLAY" | "NORTHEAST" => Some(5.0),
-        "SOUTHEAST" => Some(6.0),
+        "BLEND_MULTIPLY" | "LONG_GLIDE" | "EAST" | "MATRIX_INVERT" => Some(4.0),
+        "BLEND_INSET_OVERLAY" | "NORTHEAST" | "MATRIX_ROTATE" => Some(5.0),
+        "SOUTHEAST" | "MATRIX_SCALE" => Some(6.0),
+        "MATRIX_TRANSLATE" => Some(7.0),
         "WEST" | "RESET_TRANSFORM" => Some(8.0),
         "NORTHWEST" => Some(9.0),
         "SOUTHWEST" => Some(10.0),
@@ -3739,7 +4189,7 @@ fn dm_builtin_numeric_constant(identifier: &str) -> Option<f32> {
         // These make an overlay/image ignore the corresponding value
         // inherited from its parent.
         "PIXEL_SCALE" => Some(64.0),
-        "TILE_BOUND" => Some(128.0),
+        "TILE_BOUND" | "MATRIX_MODIFY" => Some(128.0),
         "INHERIT_ID" => Some(256.0),
         "NO_CLIENT_COLOR" => Some(512.0),
         "RESET_CONTENTS" => Some(1024.0),
@@ -3978,7 +4428,16 @@ impl<'a> ExpressionParser<'a> {
                 }
                 continue;
             }
-            if matches!(self.current_operator(), Some("." | "?." | "?:")) {
+            if matches!(self.current_operator(), Some("." | "?." | "?:"))
+                || (matches!(self.current_operator(), Some(":"))
+                    && !self.tokens[..self.index].iter().any(
+                        |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "?")
+                    )
+                    && matches!(
+                        self.tokens.get(self.index + 1).map(|token| &token.kind),
+                        Some(TokenKind::Identifier(_))
+                    ))
+            {
                 let safe_member = matches!(self.current_operator(), Some("?." | "?:"));
                 self.index += 1;
                 let Some(TokenKind::Identifier(name)) =
@@ -4369,6 +4828,12 @@ impl<'a> ExpressionParser<'a> {
                     Ok(Expression::MutableAppearance {
                         arguments: self.parse_call_arguments()?,
                     })
+                } else if identifier == "matrix" {
+                    let arguments = self.parse_call_arguments()?;
+                    if arguments.len() > 6 {
+                        return Err(compile_error("matrix accepts at most six arguments"));
+                    }
+                    Ok(Expression::Matrix { arguments })
                 } else if let Some((exact, character_indices)) = replacetext_kind(identifier) {
                     let arguments = self.parse_call_arguments()?;
                     if !(3..=5).contains(&arguments.len()) {
@@ -4601,10 +5066,12 @@ impl<'a> ExpressionParser<'a> {
     }
 
     fn parse_call_arguments(&mut self) -> Result<Vec<Expression>, CompileError> {
-        debug_assert!(matches!(
+        if !matches!(
             self.tokens.get(self.index).map(|token| &token.kind),
             Some(TokenKind::Punctuation('('))
-        ));
+        ) {
+            return Err(compile_error("expected '(' before call arguments"));
+        }
         self.index += 1;
         let mut arguments = Vec::new();
         if !matches!(
@@ -4922,6 +5389,15 @@ fn emit_expression(
                 argument_count: u16::try_from(arguments.len()).map_err(|_| {
                     compile_error("mutable_appearance has more than 65535 constructor arguments")
                 })?,
+            });
+        }
+        Expression::Matrix { arguments } => {
+            for argument in arguments {
+                emit_expression(argument, locals, instructions, procedures)?;
+            }
+            instructions.push(Instruction::MakeMatrix {
+                argument_count: u8::try_from(arguments.len())
+                    .expect("matrix argument count was validated"),
             });
         }
         Expression::ReplaceText {
@@ -5535,6 +6011,7 @@ fn bind_initializer_expression(
         | Expression::StandardBuiltin { arguments, .. }
         | Expression::Regex { arguments }
         | Expression::MutableAppearance { arguments }
+        | Expression::Matrix { arguments }
         | Expression::ReplaceText { arguments, .. }
         | Expression::CopyText { arguments, .. }
         | Expression::Block { arguments }
@@ -6284,9 +6761,15 @@ fn run_frames(
                         ));
                     }
                 };
+                let arguments = stack[arguments_start..].to_vec();
                 stack.truncate(type_path_index);
-                let datum = state.heap.allocate_datum(type_path);
-                stack.push(Value::Datum(datum));
+                let datum = if type_path.as_str() == "/matrix" {
+                    construct_matrix(&arguments, &mut state.heap)
+                        .map_err(|message| execution_error(module, &frames, message))?
+                } else {
+                    state.heap.allocate_datum(type_path)
+                };
+                frames[frame_index].stack.push(Value::Datum(datum));
             }
             Instruction::AllocateCurrentDatum { argument_count } => {
                 let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
@@ -6362,6 +6845,23 @@ fn run_frames(
                     .expect("the built-in mutable_appearance type path is valid");
                 let datum = state.heap.allocate_datum(type_path);
                 stack.push(Value::Datum(datum));
+            }
+            Instruction::MakeMatrix { argument_count } => {
+                let count = usize::from(argument_count);
+                if frames[frame_index].stack.len() < count {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "invalid matrix constructor stack",
+                    ));
+                }
+                let arguments = {
+                    let stack = &mut frames[frame_index].stack;
+                    stack.split_off(stack.len() - count)
+                };
+                let datum = construct_matrix(&arguments, &mut state.heap)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].stack.push(Value::Datum(datum));
             }
             Instruction::ReplaceText {
                 argument_count,
@@ -6512,6 +7012,23 @@ fn run_frames(
                         .list_mut(list)
                         .expect("a newly allocated list handle must be live")
                         .add(Value::TypePath(path));
+                }
+                frames[frame_index].stack.push(Value::List(list));
+            }
+            Instruction::TypeInstances(target) => {
+                let matches = state
+                    .heap
+                    .datums()
+                    .filter(|(_, datum)| is_subtype(state, datum.type_path(), &target))
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>();
+                let list = state.heap.allocate_list();
+                for datum in matches {
+                    state
+                        .heap
+                        .list_mut(list)
+                        .expect("new type-instance list is live")
+                        .add(Value::Datum(datum));
                 }
                 frames[frame_index].stack.push(Value::List(list));
             }
@@ -7292,7 +7809,12 @@ fn run_frames(
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let left = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
-                let value = if let Value::List(list) = left {
+                let value = if let Value::Datum(datum) = left
+                    && is_matrix_datum(datum, &state.heap)
+                {
+                    execute_matrix_compound(operator, datum, &right, &mut state.heap)
+                        .map_err(|message| execution_error(module, &frames, message))?
+                } else if let Value::List(list) = left {
                     execute_list_compound_operator(operator, list, &right, state)
                         .map_err(|message| execution_error(module, &frames, message))?
                 } else {
@@ -7306,7 +7828,21 @@ fn run_frames(
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let left = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
-                let value = if let Value::List(list) = left {
+                let value = if let (Value::Datum(left), Value::Datum(right)) = (&left, &right)
+                    && is_matrix_datum(*left, &state.heap)
+                    && is_matrix_datum(*right, &state.heap)
+                {
+                    let left_values = matrix_components(*left, &state.heap)
+                        .map_err(|message| execution_error(module, &frames, message))?;
+                    let right_values = matrix_components(*right, &state.heap)
+                        .map_err(|message| execution_error(module, &frames, message))?;
+                    let datum = allocate_matrix(
+                        std::array::from_fn(|index| left_values[index] + right_values[index]),
+                        &mut state.heap,
+                    )
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                    Value::Datum(datum)
+                } else if let Value::List(list) = left {
                     execute_list_binary_operator("+", list, &right, state)
                         .map_err(|message| execution_error(module, &frames, message))?
                 } else {
@@ -7330,7 +7866,22 @@ fn run_frames(
                     Instruction::BitXor => "^",
                     _ => unreachable!(),
                 };
-                let value = if let Value::List(list) = left {
+                let value = if matches!(instruction, Instruction::Subtract)
+                    && let (Value::Datum(left), Value::Datum(right)) = (&left, &right)
+                    && is_matrix_datum(*left, &state.heap)
+                    && is_matrix_datum(*right, &state.heap)
+                {
+                    let left_values = matrix_components(*left, &state.heap)
+                        .map_err(|message| execution_error(module, &frames, message))?;
+                    let right_values = matrix_components(*right, &state.heap)
+                        .map_err(|message| execution_error(module, &frames, message))?;
+                    let datum = allocate_matrix(
+                        std::array::from_fn(|index| left_values[index] - right_values[index]),
+                        &mut state.heap,
+                    )
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                    Value::Datum(datum)
+                } else if let Value::List(list) = left {
                     execute_list_binary_operator(operator, list, &right, state)
                         .map_err(|message| execution_error(module, &frames, message))?
                 } else {
@@ -7647,6 +8198,12 @@ fn run_frames(
                     let result =
                         result.map_err(|message| execution_error(module, &frames, message))?;
                     frames[frame_index].stack.push(result);
+                } else if let (Value::Datum(datum), Value::Text(method)) = (&receiver, &selector)
+                    && is_matrix_datum(*datum, &state.heap)
+                {
+                    let result = execute_matrix_method(*datum, method, &arguments, &mut state.heap)
+                        .map_err(|message| execution_error(module, &frames, message))?;
+                    frames[frame_index].stack.push(result);
                 } else {
                     if frames.len() >= limits.max_call_depth {
                         return Err(execution_error(
@@ -7905,6 +8462,12 @@ fn compare_values(left: &Value, right: &Value) -> Result<Option<std::cmp::Orderi
 }
 
 fn values_equivalent(left: &Value, right: &Value, heap: &ValueHeap) -> Result<bool, String> {
+    if let (Value::Datum(left), Value::Datum(right)) = (left, right)
+        && is_matrix_datum(*left, heap)
+        && is_matrix_datum(*right, heap)
+    {
+        return Ok(matrix_components(*left, heap)? == matrix_components(*right, heap)?);
+    }
     let (Value::List(left_id), Value::List(right_id)) = (left, right) else {
         return Ok(left.semantic_eq(right));
     };
@@ -7926,6 +8489,261 @@ fn values_equivalent(left: &Value, right: &Value, heap: &ValueHeap) -> Result<bo
         }
     }
     Ok(true)
+}
+
+const MATRIX_FIELDS: [&str; 6] = ["a", "b", "c", "d", "e", "f"];
+
+fn matrix_numeric(value: &Value) -> f32 {
+    value.as_number().unwrap_or(0.0)
+}
+
+fn is_matrix_datum(datum: DatumId, heap: &ValueHeap) -> bool {
+    heap.datum(datum)
+        .is_ok_and(|datum| datum.type_path().as_str() == "/matrix")
+}
+
+fn matrix_components(datum: DatumId, heap: &ValueHeap) -> Result<[f32; 6], String> {
+    if !is_matrix_datum(datum, heap) {
+        return Err("matrix operation requires a /matrix datum".to_owned());
+    }
+    let mut values = [0.0; 6];
+    for (index, name) in MATRIX_FIELDS.iter().enumerate() {
+        let field = FieldName::parse(name).expect("matrix field is valid");
+        values[index] = matrix_numeric(heap.datum_field(datum, &field).map_err(|e| e.to_string())?);
+    }
+    Ok(values)
+}
+
+fn write_matrix(datum: DatumId, values: [f32; 6], heap: &mut ValueHeap) -> Result<(), String> {
+    for (name, value) in MATRIX_FIELDS.into_iter().zip(values) {
+        heap.set_datum_field(
+            datum,
+            FieldName::parse(name).expect("matrix field is valid"),
+            Value::number(value),
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn allocate_matrix(values: [f32; 6], heap: &mut ValueHeap) -> Result<DatumId, String> {
+    let datum = heap.allocate_datum(TypePath::parse("/matrix").expect("matrix path is valid"));
+    write_matrix(datum, values, heap)?;
+    Ok(datum)
+}
+
+fn construct_matrix(arguments: &[Value], heap: &mut ValueHeap) -> Result<DatumId, String> {
+    match arguments {
+        [] => return allocate_matrix([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], heap),
+        [Value::Datum(source)] if is_matrix_datum(*source, heap) => {
+            return allocate_matrix(matrix_components(*source, heap)?, heap);
+        }
+        [a, b, c, d, e, f] => {
+            return allocate_matrix([a, b, c, d, e, f].map(matrix_numeric), heap);
+        }
+        _ => {}
+    }
+    let mode_value = arguments
+        .last()
+        .and_then(Value::as_number)
+        .ok_or_else(|| "matrix operation mode must be numeric".to_owned())?
+        as i32;
+    let mode = mode_value & 127;
+    let modify = mode_value & 128 != 0;
+    let source = arguments.first().and_then(|value| match value {
+        Value::Datum(datum) if is_matrix_datum(*datum, heap) => Some(*datum),
+        _ => None,
+    });
+    let mut values = source.map_or(Ok([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]), |datum| {
+        matrix_components(datum, heap)
+    })?;
+    match mode {
+        0 => {
+            let source = source.ok_or_else(|| "MATRIX_COPY requires a matrix".to_owned())?;
+            values = matrix_components(source, heap)?;
+        }
+        4 => {
+            let determinant = values[0] * values[4] - values[1] * values[3];
+            if determinant == 0.0 {
+                return Err("cannot invert a singular matrix".to_owned());
+            }
+            values = [
+                values[4] / determinant,
+                -values[1] / determinant,
+                (values[1] * values[5] - values[4] * values[2]) / determinant,
+                -values[3] / determinant,
+                values[0] / determinant,
+                (values[3] * values[2] - values[0] * values[5]) / determinant,
+            ];
+        }
+        5 => {
+            let offset = usize::from(source.is_some());
+            let radians = matrix_numeric(&arguments[offset]).to_radians();
+            let mut cosine = radians.cos();
+            let mut sine = radians.sin();
+            if cosine.abs() < 1.0e-6 {
+                cosine = 0.0;
+            }
+            if sine.abs() < 1.0e-6 {
+                sine = 0.0;
+            }
+            values = matrix_product(values, [cosine, sine, 0.0, -sine, cosine, 0.0]);
+        }
+        6 => {
+            let offset = usize::from(source.is_some());
+            let x = matrix_numeric(&arguments[offset]);
+            let y = if arguments.len() - offset >= 3 {
+                matrix_numeric(&arguments[offset + 1])
+            } else {
+                x
+            };
+            values = matrix_product(values, [x, 0.0, 0.0, 0.0, y, 0.0]);
+        }
+        7 => {
+            let offset = usize::from(source.is_some());
+            let x = matrix_numeric(&arguments[offset]);
+            let y = if arguments.len() - offset >= 3 {
+                matrix_numeric(&arguments[offset + 1])
+            } else {
+                x
+            };
+            values[2] += x;
+            values[5] += y;
+        }
+        _ => return Err(format!("unknown matrix operation mode {mode}")),
+    }
+    if modify {
+        let datum = source.ok_or_else(|| "MATRIX_MODIFY requires a matrix".to_owned())?;
+        write_matrix(datum, values, heap)?;
+        Ok(datum)
+    } else {
+        allocate_matrix(values, heap)
+    }
+}
+
+fn execute_matrix_method(
+    datum: DatumId,
+    method: &str,
+    arguments: &[Value],
+    heap: &mut ValueHeap,
+) -> Result<Value, String> {
+    let current = matrix_components(datum, heap)?;
+    let updated = match method.to_ascii_lowercase().as_str() {
+        "add" | "subtract" => {
+            let Value::Datum(other) = arguments.first().unwrap_or(&Value::Null) else {
+                return Err(format!("matrix.{method} requires a matrix"));
+            };
+            let other = matrix_components(*other, heap)?;
+            let sign = if method.eq_ignore_ascii_case("add") {
+                1.0
+            } else {
+                -1.0
+            };
+            std::array::from_fn(|index| current[index] + sign * other[index])
+        }
+        "multiply" => match arguments.first().unwrap_or(&Value::Null) {
+            Value::Null => current,
+            Value::Datum(other) if is_matrix_datum(*other, heap) => {
+                matrix_product(current, matrix_components(*other, heap)?)
+            }
+            value => current.map(|component| component * matrix_numeric(value)),
+        },
+        "scale" => {
+            let factor = arguments.first().map_or(0.0, matrix_numeric);
+            current.map(|component| component * factor)
+        }
+        "translate" => {
+            let Some(x) = arguments.first().and_then(Value::as_number) else {
+                return Ok(Value::Datum(datum));
+            };
+            let y = arguments.get(1).and_then(Value::as_number).unwrap_or(x);
+            [
+                current[0],
+                current[1],
+                current[2] + x,
+                current[3],
+                current[4],
+                current[5] + y,
+            ]
+        }
+        "turn" => {
+            let degrees = arguments.first().map_or(0.0, matrix_numeric).to_radians();
+            let mut cosine = degrees.cos();
+            let mut sine = degrees.sin();
+            if cosine.abs() < 1.0e-6 {
+                cosine = 0.0;
+            }
+            if sine.abs() < 1.0e-6 {
+                sine = 0.0;
+            }
+            let rotation = [cosine, sine, 0.0, -sine, cosine, 0.0];
+            matrix_product(current, rotation)
+        }
+        "invert" => {
+            let determinant = current[0] * current[4] - current[1] * current[3];
+            if determinant == 0.0 {
+                return Err("cannot invert a singular matrix".to_owned());
+            }
+            [
+                current[4] / determinant,
+                -current[1] / determinant,
+                (current[1] * current[5] - current[4] * current[2]) / determinant,
+                -current[3] / determinant,
+                current[0] / determinant,
+                (current[3] * current[2] - current[0] * current[5]) / determinant,
+            ]
+        }
+        _ => return Err(format!("unknown /matrix procedure {method:?}")),
+    };
+    write_matrix(datum, updated, heap)?;
+    Ok(Value::Datum(datum))
+}
+
+fn matrix_product(left: [f32; 6], right: [f32; 6]) -> [f32; 6] {
+    [
+        left[0] * right[0] + left[3] * right[1],
+        left[1] * right[0] + left[4] * right[1],
+        left[2] * right[0] + left[5] * right[1] + right[2],
+        left[0] * right[3] + left[3] * right[4],
+        left[1] * right[3] + left[4] * right[4],
+        left[2] * right[3] + left[5] * right[4] + right[5],
+    ]
+}
+
+fn execute_matrix_compound(
+    operator: CompoundAssignmentOperator,
+    datum: DatumId,
+    right: &Value,
+    heap: &mut ValueHeap,
+) -> Result<Value, String> {
+    let left = matrix_components(datum, heap)?;
+    let updated = match operator {
+        CompoundAssignmentOperator::Add | CompoundAssignmentOperator::Subtract => {
+            let Value::Datum(other) = right else {
+                return Err("matrix addition/subtraction requires another matrix".to_owned());
+            };
+            let other = matrix_components(*other, heap)?;
+            let sign = if matches!(operator, CompoundAssignmentOperator::Add) {
+                1.0
+            } else {
+                -1.0
+            };
+            std::array::from_fn(|index| left[index] + sign * other[index])
+        }
+        CompoundAssignmentOperator::Multiply => match right {
+            Value::Datum(other) if is_matrix_datum(*other, heap) => {
+                matrix_product(left, matrix_components(*other, heap)?)
+            }
+            value => left.map(|component| component * matrix_numeric(value)),
+        },
+        CompoundAssignmentOperator::Divide => {
+            let divisor = matrix_numeric(right);
+            left.map(|component| component / divisor)
+        }
+        _ => return Err("unsupported compound matrix operator".to_owned()),
+    };
+    write_matrix(datum, updated, heap)?;
+    Ok(Value::Datum(datum))
 }
 
 fn validate_jump(target: usize, instruction_count: usize) -> Result<(), String> {
@@ -9868,6 +10686,28 @@ mod tests {
     }
 
     #[test]
+    fn spawn_without_parentheses_defaults_to_zero_delay_for_inline_and_block_bodies() {
+        for source in [
+            "/proc/entry()\n\tspawn helper()\n\treturn 1\n/proc/helper()\n\treturn 2\n",
+            "/proc/entry()\n\tspawn {\n\t\thelper()\n\t}\n\treturn 1\n/proc/helper()\n\treturn 2\n",
+        ] {
+            let syntax = parse(source).expect("source should parse");
+            let module =
+                compile_module(&syntax.definitions).expect("parenthesis-free spawn should compile");
+            let entry = module.procedure_id("/proc/entry").expect("entry");
+            let mut state = ExecutionState::new();
+            assert_eq!(
+                execute_module_in_state(&module, entry, &[], &mut state),
+                Ok(Value::number(1.0))
+            );
+            assert_eq!(
+                advance_scheduler(&module, 0, ExecutionLimits::default(), &mut state),
+                Ok(vec![Value::Null])
+            );
+        }
+    }
+
+    #[test]
     fn sleep_yields_and_resumes_the_full_procedure_frame() {
         let source = parse("/proc/entry()\n\tvar/value = sleep(1)\n\treturn value + 11\n")
             .expect("source should parse");
@@ -11615,6 +12455,99 @@ mod tests {
     }
 
     #[test]
+    fn type_for_loop_enumerates_only_live_matching_datums() {
+        let syntax = parse(
+            "/proc/count()\n\tvar/total = 0\n\tfor(var/datum/a/item)\n\t\ttotal++\n\treturn total\n",
+        )
+        .expect("type loop should parse");
+        let module = compile_module(&syntax.definitions).expect("type loop should compile");
+        let mut state = ExecutionState::new();
+        let datum = TypePath::parse("/datum").unwrap();
+        let a = TypePath::parse("/datum/a").unwrap();
+        let child = TypePath::parse("/datum/a/child").unwrap();
+        let b = TypePath::parse("/datum/b").unwrap();
+        state.set_type_parents(BTreeMap::from([
+            (datum.clone(), None),
+            (a.clone(), Some(datum.clone())),
+            (child.clone(), Some(a.clone())),
+            (b.clone(), Some(datum)),
+        ]));
+        state.heap_mut().allocate_datum(a);
+        state.heap_mut().allocate_datum(child);
+        state.heap_mut().allocate_datum(b);
+        let entry = module.procedure_id("/proc/count").expect("entry");
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::number(2.0))
+        );
+    }
+
+    #[test]
+    fn associative_for_loop_binds_keys_values_and_writable_targets() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/list/items = list(\"a\", \"b\" = 5)\n\tvar/total = 0\n\tfor(var/key, value in items)\n\t\ttotal += (key == \"a\") + value\n\tvar/existing_key\n\tvar/existing_value\n\tfor(existing_key, existing_value in items)\n\t\ttotal += 0\n\tvar/list/out = list(null, null)\n\tfor(out[1], out[2] in items)\n\t\ttotal += 0\n\treturn total + (existing_key == \"b\") + (existing_value == 5) + (out[1] == \"b\") + (out[2] == 5)\n",
+        )
+        .expect("associative loop should parse");
+        let module = compile_module(&syntax.definitions).expect("associative loop should compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(10.0)));
+    }
+
+    #[test]
+    fn exotic_c_style_for_headers_follow_byond_declaration_and_range_fakeouts() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/out1 = 0\n\tfor(var/x = 2 in 1 to 20; x < 6; x++)\n\t\tout1 += x\n\tvar/out2 = 0\n\tfor(var/y in 1 to 5;)\n\t\tout2 += y\n\tvar/out3 = 0\n\tfor(var/z = 5 in 1 to 20; z < 10)\n\t\tout3 += z\n\t\tout3++\n\t\tif(out3 > 10)\n\t\t\tbreak\n\tvar/out4 = 0\n\tfor(var/a && var/b, a < b + 4, a += 2)\n\t\tout4++\n\treturn out1 * 1000 + out2 * 100 + out3 * 10 + out4\n",
+        )
+        .expect("exotic loops should parse");
+        let module = compile_module(&syntax.definitions).expect("exotic loops should compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(
+            execute_module(&module, entry, &[]),
+            Ok(Value::number(15_622.0))
+        );
+    }
+
+    #[test]
+    fn range_for_can_reuse_bare_and_explicit_src_field_iterators() {
+        for iterator in ["idx", "src.idx"] {
+            let source = format!(
+                "/datum/example/proc/run()\n\tfor({iterator} in 1 to 5)\n\t\tc += idx\n\treturn c\n"
+            );
+            let syntax = parse(&source).expect("field range loop should parse");
+            let fields = BTreeMap::from([
+                ("idx".to_owned(), field("idx")),
+                ("c".to_owned(), field("c")),
+            ]);
+            let program = compile_procedure_with_resolver_and_fields(
+                &syntax.definitions[0],
+                &HashMap::new(),
+                &fields,
+                &BTreeMap::new(),
+            )
+            .expect("field range loop should compile");
+            let mut state = ExecutionState::new();
+            let src = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/datum/example").unwrap());
+            state
+                .heap_mut()
+                .set_datum_field(src, field("idx"), Value::number(0.0))
+                .unwrap();
+            state
+                .heap_mut()
+                .set_datum_field(src, field("c"), Value::number(0.0))
+                .unwrap();
+            let result = execute_in_context(
+                &program,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(src), Value::Null),
+            );
+            assert_eq!(result, Ok(Value::number(15.0)));
+        }
+    }
+
+    #[test]
     fn typed_for_in_binding_ignores_as_qualifier() {
         let source = "/proc/typed_loop()\n\tfor(var/turf/area_turf as anything in list(1))\n\t\tarea_turf = null\n\treturn 7\n";
         let syntax = parse(source).expect("source should parse");
@@ -12148,6 +13081,28 @@ mod tests {
                 .to_string(),
             "/mutable_appearance"
         );
+    }
+
+    #[test]
+    fn matrix_constructor_methods_and_equivalence_use_affine_components() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/matrix/value = matrix(1, 2, 3, 4, 5, 6)\n\tvalue.Add(matrix(7, 8, 9, 10, 11, 12))\n\tvalue.Subtract(matrix(7, 8, 9, 10, 11, 12))\n\tvalue.Multiply(matrix(7, 8, 9, 10, 11, 12))\n\treturn value ~= matrix(39, 54, 78, 54, 75, 108)\n",
+        )
+        .expect("matrix source should parse");
+        let module = compile_module(&syntax.definitions).expect("matrix source should compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(1.0)));
+    }
+
+    #[test]
+    fn matrix_transform_methods_mutate_the_six_public_fields() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/matrix/value = matrix(1, 2, 3, 4, 5, 6)\n\tvalue.Translate(2)\n\tvalue.Turn(90)\n\treturn value ~= matrix(4, 5, 8, -1, -2, -5)\n",
+        )
+        .expect("matrix source should parse");
+        let module = compile_module(&syntax.definitions).expect("matrix source should compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(1.0)));
     }
 
     #[test]

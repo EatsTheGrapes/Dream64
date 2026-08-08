@@ -1319,6 +1319,22 @@ mod tests {
     }
 
     #[test]
+    fn materializes_contextual_upward_path_type_defaults() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write("types.dm", "/datum/foo\n/datum/bar\n\tvar/meep = .foo\n");
+        let mut image = fixture.image();
+        let datum = image
+            .allocate_datum(&type_path("/datum/bar"))
+            .expect("bar should allocate");
+
+        assert_eq!(
+            image.heap().datum_field(datum, &field("meep")),
+            Ok(&Value::TypePath(type_path("/datum/foo")))
+        );
+    }
+
+    #[test]
     fn materializes_builtin_atom_appearance_defaults_without_overriding_source() {
         let fixture = Fixture::new();
         fixture.write("world.dme", "#include \"types.dm\"\n");

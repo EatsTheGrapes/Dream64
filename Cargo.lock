@@ -7,6 +7,7 @@ name = "dm-compiler"
 version = "0.1.0"
 dependencies = [
  "dm-core",
+ "dm-lexer",
  "dm-object-tree",
  "dm-project",
  "dm-syntax",

@@ -100,6 +100,7 @@ impl<'source> Lexer<'source> {
                 '/' if self.remaining().starts_with("//") => self.skip_line_comment(),
                 '/' if self.remaining().starts_with("/*") => self.skip_block_comment()?,
                 'a'..='z' | 'A'..='Z' | '_' => self.lex_identifier(),
+                '\\' => self.lex_escaped_identifier()?,
                 '0'..='9' => self.lex_number(),
                 '@' if self.remaining().starts_with("@@") => self.lex_at_raw_string()?,
                 '@' if self.remaining().starts_with("@{") => self.lex_braced_string(true)?,
@@ -218,11 +219,53 @@ impl<'source> Lexer<'source> {
 
     fn lex_identifier(&mut self) {
         let start = self.offset;
-        self.advance_while(|character| character.is_ascii_alphanumeric() || character == '_');
-        self.push_range(
-            start,
-            TokenKind::Identifier(self.source[start..self.offset].to_owned()),
-        );
+        let mut spelling = String::new();
+        while let Some(character) = self.current_char() {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                spelling.push(character);
+                self.advance_char();
+            } else if character == '\\' && !self.has_line_continuation() {
+                self.advance_char();
+                let Some(escaped) = self.current_char() else {
+                    break;
+                };
+                spelling.push(escaped);
+                self.advance_char();
+            } else {
+                break;
+            }
+        }
+        self.push_range(start, TokenKind::Identifier(spelling));
+    }
+
+    fn lex_escaped_identifier(&mut self) -> Result<(), LexError> {
+        let start = self.offset;
+        self.advance_char();
+        let Some(escaped) = self.current_char() else {
+            return Err(LexError {
+                message: "escaped identifier is missing a character".to_owned(),
+                span: SourceSpan::new(start, self.offset),
+            });
+        };
+        self.advance_char();
+        let mut spelling = escaped.to_string();
+        while let Some(character) = self.current_char() {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                spelling.push(character);
+                self.advance_char();
+            } else if character == '\\' && !self.has_line_continuation() {
+                self.advance_char();
+                let Some(escaped) = self.current_char() else {
+                    break;
+                };
+                spelling.push(escaped);
+                self.advance_char();
+            } else {
+                break;
+            }
+        }
+        self.push_range(start, TokenKind::Identifier(spelling));
+        Ok(())
     }
 
     fn lex_number(&mut self) {
@@ -531,6 +574,26 @@ mod tests {
                 .filter(|token| token.kind == TokenKind::Newline)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn merges_escaped_identifier_components_without_changing_line_splices() {
+        let tokens =
+            lex("ES\\KE \\+suffix\\-part\nnext\\\nline\n").expect("escaped identifiers should lex");
+        let identifiers: Vec<_> = tokens
+            .iter()
+            .filter_map(|token| match &token.kind {
+                TokenKind::Identifier(identifier) => Some(identifier.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(identifiers, ["ESKE", "+suffix-part", "next", "line"]);
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind == TokenKind::LineContinuation)
         );
     }
 

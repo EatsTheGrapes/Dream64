@@ -152,6 +152,13 @@ pub enum SyntaxError {
     Lex(LexError),
     /// A logical line ended with unmatched opening punctuation.
     UnclosedDelimiter(SourceSpan),
+    /// A physical newline interrupted an infix expression inside delimiters.
+    InfixNewline {
+        /// Infix operator immediately before the newline.
+        operator: String,
+        /// Physical newline range.
+        span: SourceSpan,
+    },
 }
 
 impl fmt::Display for SyntaxError {
@@ -169,6 +176,11 @@ impl fmt::Display for SyntaxError {
                     span.start, span.end
                 )
             }
+            Self::InfixNewline { operator, span } => write!(
+                formatter,
+                "physical newline after infix operator {operator:?} at {}..{}",
+                span.start, span.end
+            ),
         }
     }
 }
@@ -824,7 +836,18 @@ fn build_logical_lines(tokens: Vec<SpannedToken>) -> Result<Vec<SourceLine>, Syn
                 indentation = Indentation::default();
                 line_start = None;
             }
-            TokenKind::Newline | TokenKind::LineContinuation | TokenKind::LineStart { .. } => {}
+            TokenKind::Newline => {
+                if let Some(TokenKind::Operator(operator)) =
+                    line_tokens.last().map(|token| &token.kind)
+                    && infix_operator_requires_rhs(operator)
+                {
+                    return Err(SyntaxError::InfixNewline {
+                        operator: operator.clone(),
+                        span: token.span,
+                    });
+                }
+            }
+            TokenKind::LineContinuation | TokenKind::LineStart { .. } => {}
             TokenKind::Punctuation('(' | '[' | '{') => {
                 delimiter_stack.push(token.span);
                 line_tokens.push(token);
@@ -857,9 +880,51 @@ fn build_logical_lines(tokens: Vec<SpannedToken>) -> Result<Vec<SourceLine>, Syn
     Ok(lines)
 }
 
+fn infix_operator_requires_rhs(operator: &str) -> bool {
+    matches!(
+        operator,
+        "=" | "+="
+            | "-="
+            | "*="
+            | "/="
+            | "%="
+            | "&="
+            | "|="
+            | "^="
+            | "&&="
+            | "||="
+            | "<<="
+            | ">>="
+            | "%%="
+            | "**="
+            | "+"
+            | "-"
+            | "*"
+            | "/"
+            | "%"
+            | "&"
+            | "|"
+            | "^"
+            | "&&"
+            | "||"
+            | "<<"
+            | ">>"
+            | "%%"
+            | "**"
+            | "=="
+            | "!="
+            | "<>"
+            | "<"
+            | ">"
+            | "<="
+            | ">="
+            | "<=>"
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DefinitionKind, parse};
+    use super::{DefinitionKind, SourceSpan, SyntaxError, parse};
 
     fn paths(source: &str) -> Vec<(String, DefinitionKind, Option<usize>)> {
         parse(source)
@@ -1193,5 +1258,38 @@ var/global/global_call = build_global()
         assert_eq!(syntax.definitions.len(), 1);
         assert_eq!(syntax.definitions[0].path.to_string(), "/proc/run");
         assert_eq!(syntax.definitions[0].body.len(), 3);
+    }
+
+    #[test]
+    fn rejects_physical_newlines_after_infix_operators_inside_calls() {
+        let source = "/proc/run()\n\treturn test(1, 2+\n\t\t2)\n";
+        let newline_start = source.find("+\n").expect("fixture contains newline") + 1;
+
+        let error = parse(source).expect_err("an infix expression cannot cross a raw newline");
+
+        assert_eq!(
+            error,
+            SyntaxError::InfixNewline {
+                operator: "+".to_owned(),
+                span: SourceSpan::new(newline_start, newline_start + 1),
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_argument_newlines_and_explicit_expression_continuations() {
+        let source = concat!(
+            "/proc/run()\n",
+            "\tvar/values = list(\n",
+            "\t\t1,\n",
+            "\t\t2\n",
+            "\t)\n",
+            "\treturn test(1, 2 + \\\n",
+            "\t\t2)\n",
+        );
+
+        let syntax = parse(source).expect("valid multiline forms should parse");
+
+        assert_eq!(syntax.definitions[0].body.len(), 2);
     }
 }
