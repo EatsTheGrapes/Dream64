@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dm_compiler::Compilation;
 use dm_core::{FileId, SourceSpan};
+use dm_globals::VariableRegistry;
 use dm_lexer::TokenKind;
 use dm_object_tree::{CodePath, NodeId, NodeKind};
 use dm_syntax::DefinitionKind;
@@ -467,6 +468,7 @@ impl ProcedureRegistry {
     ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
         let selected: BTreeSet<_> = selected.into_iter().collect();
         let global_fields = declared_global_fields(compilation);
+        let const_bindings = ConstBindings::build(compilation);
         let mut ordered = Vec::new();
         for procedure in &self.procedures {
             for implementation in &procedure.implementations {
@@ -482,6 +484,12 @@ impl ProcedureRegistry {
                             procedure.path
                         ),
                     })?;
+                validate_const_assignments(
+                    definition,
+                    procedure.owner_type,
+                    compilation,
+                    &const_bindings,
+                )?;
                 ordered.push((procedure, implementation, definition));
             }
         }
@@ -602,6 +610,132 @@ impl ProcedureRegistry {
             implementations,
         })
     }
+}
+
+#[derive(Default)]
+struct ConstBindings {
+    globals: BTreeSet<String>,
+    fields: BTreeMap<NodeId, BTreeSet<String>>,
+}
+
+impl ConstBindings {
+    fn build(compilation: &Compilation) -> Self {
+        let mut bindings = Self::default();
+        for entry in VariableRegistry::build(compilation)
+            .entries()
+            .iter()
+            .filter(|entry| entry.modifiers.constant)
+        {
+            let Some(name) = entry.path.rsplit('/').next() else {
+                continue;
+            };
+            if let Some(owner) = &entry.owner {
+                bindings
+                    .fields
+                    .entry(owner.node)
+                    .or_default()
+                    .insert(name.to_owned());
+            } else {
+                bindings.globals.insert(name.to_owned());
+            }
+        }
+        bindings
+    }
+
+    fn field_is_const(
+        &self,
+        compilation: &Compilation,
+        mut owner: Option<NodeId>,
+        name: &str,
+    ) -> bool {
+        while let Some(node) = owner {
+            if self
+                .fields
+                .get(&node)
+                .is_some_and(|fields| fields.contains(name))
+            {
+                return true;
+            }
+            owner = compilation
+                .code_tree()
+                .node(node)
+                .and_then(|type_node| type_node.parent_type);
+        }
+        false
+    }
+}
+
+fn validate_const_assignments(
+    definition: &dm_syntax::Definition,
+    owner: Option<NodeId>,
+    compilation: &Compilation,
+    bindings: &ConstBindings,
+) -> Result<(), dm_vm::CompileError> {
+    let mut locals = BTreeSet::new();
+    let mut const_locals = BTreeSet::new();
+
+    for line in &definition.body {
+        let tokens = &line.tokens;
+        let assignment = tokens.iter().position(|token| {
+            matches!(&token.kind, TokenKind::Operator(operator) if is_assignment_operator(operator))
+        });
+        let identifiers: Vec<_> = tokens
+            .iter()
+            .take(assignment.unwrap_or(tokens.len()))
+            .filter_map(|token| match &token.kind {
+                TokenKind::Identifier(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        if identifiers.first() == Some(&"var") {
+            let name_index = identifiers
+                .iter()
+                .position(|name| *name == "as")
+                .unwrap_or(identifiers.len());
+            if let Some(name) = identifiers[..name_index].last().copied() {
+                locals.insert(name.to_owned());
+                if identifiers.contains(&"const") {
+                    const_locals.insert(name.to_owned());
+                }
+            }
+            continue;
+        }
+
+        let Some(assignment_index) = assignment else {
+            continue;
+        };
+        let assigned = &tokens[..assignment_index];
+        let bare_name = match assigned {
+            [token] => match &token.kind {
+                TokenKind::Identifier(name) => Some(name.as_str()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(name) = bare_name else {
+            continue;
+        };
+
+        let forbidden = if locals.contains(name) {
+            const_locals.contains(name)
+        } else {
+            bindings.field_is_const(compilation, owner, name) || bindings.globals.contains(name)
+        };
+        if forbidden {
+            return Err(dm_vm::CompileError {
+                message: format!("cannot assign to const variable `{name}`"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn is_assignment_operator(operator: &str) -> bool {
+    matches!(
+        operator,
+        "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>=" | "++" | "--"
+    )
 }
 
 /// Returns bare names for project-wide variables, including globals introduced
@@ -992,6 +1126,49 @@ mod tests {
             procedure.effective_target,
             Some(procedure.implementations[0].id)
         );
+    }
+
+    #[test]
+    fn rejects_writes_to_global_local_and_inherited_const_variables() {
+        let cases = [
+            (
+                "global",
+                "var/const/answer = 42\n/proc/RunTest()\n\tanswer = 7\n",
+                "answer",
+            ),
+            (
+                "local",
+                "/proc/RunTest()\n\tvar/const/answer = 42\n\tanswer += 1\n",
+                "answer",
+            ),
+            (
+                "inherited",
+                "/datum/base\n\tvar/const/answer = 42\n/datum/base/child\n\tproc/change()\n\t\tanswer = 7\n",
+                "answer",
+            ),
+        ];
+
+        for (label, source, name) in cases {
+            let compilation = TestProject::compile(source);
+            let error = ProcedureRegistry::build(&compilation)
+                .compile_vm(&compilation)
+                .expect_err("const assignment should fail compilation");
+            assert!(
+                error.message.contains(&format!("const variable `{name}`")),
+                "{label}: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn mutable_local_shadowing_a_const_field_remains_assignable() {
+        let compilation = TestProject::compile(
+            "/datum/base\n\tvar/const/answer = 42\n\tproc/read()\n\t\tvar/answer = 1\n\t\tanswer = 2\n\t\treturn answer\n",
+        );
+        ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("mutable local should shadow the const field");
     }
 
     #[test]

@@ -506,6 +506,7 @@ impl Loader {
         Ok(id)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn process_directives(
         &mut self,
         source: FileId,
@@ -524,7 +525,7 @@ impl Loader {
             if conditional_active(&conditionals) {
                 if let Some((start, mut deferred)) = deferred_expansion.take() {
                     deferred.push_str(&original_text[ordinary_span.start..ordinary_span.end]);
-                    match compiler_source.append_deferred_source(
+                    match CompilerSourceBuilder::expand_deferred_source(
                         &deferred,
                         &mut self.macros,
                         path,
@@ -587,17 +588,16 @@ impl Loader {
         if conditional_active(&conditionals) {
             if let Some((start, mut deferred)) = deferred_expansion.take() {
                 deferred.push_str(&original_text[tail.start..tail.end]);
-                let contents = compiler_source
-                    .append_deferred_source(
-                        &deferred,
-                        &mut self.macros,
-                        path,
-                    )?
-                    .ok_or_else(|| ProjectError::MacroExpansion {
-                        path: path.to_path_buf(),
-                        offset: start,
-                        message: "unterminated function macro invocation".to_owned(),
-                    })?;
+                let contents = CompilerSourceBuilder::expand_deferred_source(
+                    &deferred,
+                    &mut self.macros,
+                    path,
+                )?
+                .ok_or_else(|| ProjectError::MacroExpansion {
+                    path: path.to_path_buf(),
+                    offset: start,
+                    message: "unterminated function macro invocation".to_owned(),
+                })?;
                 compiler_source.append_replacement(&contents, SourceSpan::new(start, tail.end));
             } else {
                 compiler_source.append_expanded_source(
@@ -964,8 +964,7 @@ impl CompilerSourceBuilder {
         self.mappings.truncate(checkpoint.1);
     }
 
-    fn append_deferred_source(
-        &self,
+    fn expand_deferred_source(
         source: &str,
         macros: &mut HashMap<String, MacroDefinition>,
         path: &Path,
@@ -2606,6 +2605,35 @@ mod tests {
         assert!(expanded.contains("var/kept = 4;"));
         assert!(expanded.contains("return 1 + 2 + 3 + 4 + 5 + 6"));
         assert!(!expanded.contains("#define"));
+    }
+
+    #[test]
+    fn preserves_multiline_macro_invocations_across_conditional_directives() {
+        let scratch = ScratchDirectory::new();
+        let source = concat!(
+            "#define MAKE_LIST(values...) list(values)\n",
+            "/proc/check()\n",
+            "\tvar/first = MAKE_LIST(\n",
+            "\t\t1,\n",
+            "\t\t#ifdef OMIT_MIDDLE\n",
+            "\t\t2,\n",
+            "\t\t#endif\n",
+            "\t\t3\n",
+            "\t)\n",
+        );
+        fs::write(scratch.path().join("world.dme"), source)
+            .expect("embedded-directive fixture should be written");
+
+        let project = Project::load(scratch.path().join("world.dme"))
+            .expect("directives inside macro arguments should preprocess");
+        let expanded = project.files[0]
+            .compiler_text()
+            .expect("expanded source should remain UTF-8");
+
+        assert!(expanded.contains("list(1,"));
+        assert!(expanded.contains('3'));
+        assert!(!expanded.contains("OMIT_MIDDLE"));
+        assert!(!expanded.contains("\n\t\t2,"));
     }
 
     #[test]

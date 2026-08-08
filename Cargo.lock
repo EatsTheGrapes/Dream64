@@ -119,6 +119,7 @@ version = "0.1.0"
 dependencies = [
  "dm-compiler",
  "dm-core",
+ "dm-globals",
  "dm-lexer",
  "dm-object-tree",
  "dm-syntax",

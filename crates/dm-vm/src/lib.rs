@@ -2841,13 +2841,17 @@ fn compile_try(
     };
 
     let catch_child_index = catch_index + 1;
-    let catch_child = lines
-        .get(catch_child_index)
-        .ok_or_else(|| compile_error("catch statement requires an indented body"))?;
-    let catch_indentation = indentation(catch_child);
-    if catch_indentation <= block_indentation {
-        return Err(compile_error("catch statement requires an indented body"));
+    let catch_indentation = lines.get(catch_child_index).map(indentation);
+    // An empty catch is legal (`catch` followed by the next sibling
+    // statement) and simply consumes the thrown value. A try itself may not
+    // be empty, which also preserves BYOND's OD0015 diagnostic for an empty
+    // try/catch pair.
+    if catch_indentation.is_none_or(|indentation| indentation <= block_indentation) {
+        let end_target = instructions.len();
+        patch_jump(instructions, end_jump, end_target)?;
+        return Ok((catch_child_index, true));
     }
+    let catch_indentation = catch_indentation.expect("indentation was checked");
     let saved_names = locals.names.clone();
     if let (Some(name), Some(slot)) = (catch_local_name, catch_local) {
         locals.names.insert(name, slot);
