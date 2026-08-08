@@ -436,13 +436,22 @@ fn starts_with_slash(tokens: &[SpannedToken]) -> bool {
 }
 
 fn path_segments(tokens: &[SpannedToken]) -> Vec<String> {
-    tokens
+    let mut segments: Vec<_> = tokens
         .iter()
         .filter_map(|token| match &token.kind {
             TokenKind::Identifier(identifier) => Some(identifier.clone()),
             _ => None,
         })
-        .collect()
+        .collect();
+    if segments.last().is_some_and(|segment| segment == "operator")
+        && let Some(suffix) = operator_procedure_suffix(tokens.last().map(|token| &token.kind))
+    {
+        segments
+            .last_mut()
+            .expect("operator segment was checked")
+            .push_str(suffix);
+    }
+    segments
 }
 
 fn namespace_kind_from_segments(segments: &[String]) -> Option<NamespaceKind> {
@@ -465,10 +474,22 @@ fn is_preprocessor_line(tokens: &[SpannedToken]) -> bool {
 }
 
 fn is_path_spelling(tokens: &[SpannedToken]) -> bool {
-    tokens.iter().all(|token| {
+    tokens.iter().enumerate().all(|(index, token)| {
         matches!(token.kind, TokenKind::Identifier(_))
             || matches!(&token.kind, TokenKind::Operator(operator) if operator == "/")
+            || (index + 1 == tokens.len()
+                && index != 0
+                && matches!(&tokens[index - 1].kind, TokenKind::Identifier(identifier) if identifier == "operator")
+                && operator_procedure_suffix(Some(&token.kind)).is_some())
     })
+}
+
+fn operator_procedure_suffix(kind: Option<&TokenKind>) -> Option<&str> {
+    match kind? {
+        TokenKind::Operator(operator) if operator != "/" && operator != "=" => Some(operator),
+        TokenKind::String(value) if value.is_empty() => Some("\"\""),
+        _ => None,
+    }
 }
 
 fn canonicalize_path(base: Option<&[String]>, candidate: &Candidate) -> DefinitionPath {
@@ -1142,5 +1163,35 @@ var/global/global_call = build_global()
                 .iter()
                 .all(|definition| definition.parameters.len() == 1 && definition.body.len() == 1)
         );
+    }
+
+    #[test]
+    fn retains_operator_overload_bodies_as_procedure_bodies() {
+        let source = "/datum/armor/proc/operator~=(datum/armor/other)\n\tif(ispath(other, /datum/armor))\n\t\treturn FALSE\n\tfor(var/rating in ratings)\n\t\treturn rating\n\n/datum/timedevent/proc/operator\"\"()\n\tif(!length(timer_info))\n\t\treturn null\n";
+        let syntax = parse(source).expect("operator overloads should parse");
+
+        assert_eq!(syntax.definitions.len(), 2);
+        assert_eq!(
+            syntax.definitions[0].path.to_string(),
+            "/datum/armor/proc/operator~="
+        );
+        assert_eq!(syntax.definitions[0].kind, DefinitionKind::Procedure);
+        assert_eq!(syntax.definitions[0].body.len(), 4);
+        assert_eq!(
+            syntax.definitions[1].path.to_string(),
+            "/datum/timedevent/proc/operator\"\""
+        );
+        assert_eq!(syntax.definitions[1].kind, DefinitionKind::Procedure);
+        assert_eq!(syntax.definitions[1].body.len(), 2);
+    }
+
+    #[test]
+    fn block_comment_closer_preserves_indentation_for_trailing_code() {
+        let source = "/proc/run(parent_atom)\n\t/*\n\tcommented_out()\n\t*/.\n\tif(parent_atom)\n\t\treturn TRUE\n";
+        let syntax = parse(source).expect("comment-closing line should parse");
+
+        assert_eq!(syntax.definitions.len(), 1);
+        assert_eq!(syntax.definitions[0].path.to_string(), "/proc/run");
+        assert_eq!(syntax.definitions[0].body.len(), 3);
     }
 }

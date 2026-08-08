@@ -5,6 +5,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, ExitCode, Stdio};
 use std::thread;
@@ -34,12 +35,352 @@ fn run(arguments: &[OsString]) -> Result<(), String> {
         "compile-check" => run_project_compile_check(&arguments[1..]),
         "execute" => run_procedure(&arguments[1..]),
         "frontend" => run_frontend(&arguments[1..]),
+        "fixture-audit" => run_fixture_audit(&arguments[1..]),
+        "inventory" => run_fixture_inventory(&arguments[1..]),
         "lex" => run_lexer(&arguments[1..]),
         "probe" => run_compiler_probe(&arguments[1..]),
         "project" => run_project(&arguments[1..]),
         "syntax" => run_syntax(&arguments[1..]),
         _ => Err(usage()),
     }
+}
+
+fn run_fixture_audit(arguments: &[OsString]) -> Result<(), String> {
+    let [fixture_root] = arguments else {
+        return Err("usage: dm-conformance fixture-audit <fixture-root>".to_owned());
+    };
+    let fixture_root = PathBuf::from(fixture_root);
+    if !fixture_root.is_dir() {
+        return Err(format!(
+            "fixture root is not a directory: {}",
+            fixture_root.display()
+        ));
+    }
+
+    let audit = fixture_audit(&fixture_root)?;
+    println!("format=dm-conformance-fixture-audit-v1");
+    println!("audit_stage=parse+vm-compile");
+    println!("assert_handling=synthetic-procedure");
+    println!("caught_panic_stderr=unsuppressed-process-global-hook");
+    println!("fixtures_total={}", audit.total);
+    println!("fixtures_passed={}", audit.passed);
+    println!("fixtures_failed={}", audit.total - audit.passed);
+    println!("expected_compile_errors={}", audit.expected_compile_errors);
+    println!(
+        "expected_compile_errors_matched={}",
+        audit.expected_compile_errors_matched
+    );
+    println!(
+        "positive_fixtures={}",
+        audit.total - audit.expected_compile_errors
+    );
+    println!(
+        "positive_fixtures_compiled={}",
+        audit.passed - audit.expected_compile_errors_matched
+    );
+    for (family, result) in audit.families {
+        println!(
+            "family={}\ttotal={}\tpassed={}\tfailed={}",
+            escape_inventory_field(&family),
+            result.total,
+            result.passed,
+            result.total - result.passed
+        );
+    }
+    for (category, failure) in audit.failures {
+        println!(
+            "failure={}\t{}",
+            escape_inventory_field(&category),
+            failure.count
+        );
+        for example in failure.examples {
+            println!(
+                "failure_example={}\t{}\t{}",
+                escape_inventory_field(&category),
+                escape_inventory_field(&example.path),
+                escape_inventory_field(&example.message)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct FamilyAudit {
+    total: usize,
+    passed: usize,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct FixtureAudit {
+    total: usize,
+    passed: usize,
+    expected_compile_errors: usize,
+    expected_compile_errors_matched: usize,
+    families: BTreeMap<String, FamilyAudit>,
+    failures: BTreeMap<String, FailureAudit>,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct FailureAudit {
+    count: usize,
+    examples: Vec<FailureExample>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct FailureExample {
+    path: String,
+    message: String,
+}
+
+#[derive(Debug)]
+struct AuditFailure {
+    category: String,
+    message: String,
+}
+
+fn fixture_audit(root: &Path) -> Result<FixtureAudit, String> {
+    let mut files = Vec::new();
+    collect_dm_fixtures(root, &mut files)?;
+    files.sort();
+
+    let assert_definition = dm_syntax::parse("/proc/ASSERT(value)\n\treturn value\n")
+        .expect("the audit ASSERT shim is valid DM")
+        .definitions
+        .into_iter()
+        .next()
+        .expect("the audit ASSERT shim declares one procedure");
+    let mut audit = FixtureAudit::default();
+    for path in files {
+        let relative = path
+            .strip_prefix(root)
+            .expect("recursively collected fixtures remain beneath their root");
+        let family = fixture_family(relative);
+        audit.total += 1;
+        audit.families.entry(family).or_default().total += 1;
+
+        let source_result = fs::read_to_string(&path);
+        let expects_compile_error = source_result.as_ref().is_ok_and(|source| {
+            source
+                .lines()
+                .take(4)
+                .any(|line| line.contains("COMPILE ERROR"))
+        });
+        if expects_compile_error {
+            audit.expected_compile_errors += 1;
+        }
+        let outcome = source_result
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::InvalidData {
+                    AuditFailure {
+                        category: "read: invalid utf-8".to_owned(),
+                        message: error.to_string(),
+                    }
+                } else {
+                    AuditFailure {
+                        category: format!("read: {:?}", error.kind()),
+                        message: error.to_string(),
+                    }
+                }
+            })
+            .and_then(|source| {
+                dm_syntax::parse(&source).map_err(|error| {
+                    let message = error.to_string();
+                    AuditFailure {
+                        category: format!("parse: {}", compile_error_category(&message)),
+                        message,
+                    }
+                })
+            })
+            .and_then(|syntax| {
+                let mut definitions: Vec<_> = syntax
+                    .definitions
+                    .into_iter()
+                    .filter(|definition| {
+                        matches!(
+                            definition.kind,
+                            dm_syntax::DefinitionKind::Procedure
+                                | dm_syntax::DefinitionKind::ProcedureOverride
+                                | dm_syntax::DefinitionKind::Verb
+                        )
+                    })
+                    .collect();
+                if source_uses_assert(&definitions)
+                    && !definitions
+                        .iter()
+                        .any(|definition| definition.path.to_string() == "/proc/ASSERT")
+                {
+                    definitions.push(assert_definition.clone());
+                }
+                match catch_unwind(AssertUnwindSafe(|| dm_vm::compile_module(&definitions))) {
+                    Ok(Ok(_)) => Ok(()),
+                    Ok(Err(error)) => Err(AuditFailure {
+                        category: format!("compile: {}", compile_error_category(&error.message)),
+                        message: error.message,
+                    }),
+                    Err(payload) => Err(AuditFailure {
+                        category: "compile: internal panic".to_owned(),
+                        message: panic_payload_message(&payload),
+                    }),
+                }
+            });
+        let outcome = if expects_compile_error {
+            match outcome {
+                Err(failure)
+                    if failure.category.starts_with("parse:")
+                        || failure.category.starts_with("compile:") =>
+                {
+                    audit.expected_compile_errors_matched += 1;
+                    Ok(())
+                }
+                Ok(()) => Err(AuditFailure {
+                    category: "expected compile error: accepted".to_owned(),
+                    message: "fixture declares COMPILE ERROR but Dream64 accepted it".to_owned(),
+                }),
+                Err(failure) => Err(failure),
+            }
+        } else {
+            outcome
+        };
+        match outcome {
+            Ok(()) => {
+                audit.passed += 1;
+                audit
+                    .families
+                    .get_mut(&fixture_family(relative))
+                    .expect("family was inserted")
+                    .passed += 1;
+            }
+            Err(failure) => {
+                let summary = audit.failures.entry(failure.category).or_default();
+                summary.count += 1;
+                if summary.examples.len() < 3 {
+                    summary.examples.push(FailureExample {
+                        path: relative.to_string_lossy().replace('\\', "/"),
+                        message: failure.message,
+                    });
+                }
+            }
+        }
+    }
+    Ok(audit)
+}
+
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+        })
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
+}
+
+fn fixture_family(relative: &Path) -> String {
+    relative
+        .components()
+        .next()
+        .and_then(|component| {
+            let component = Path::new(component.as_os_str());
+            (relative.components().count() > 1).then(|| component.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "__root__".to_owned())
+}
+
+fn source_uses_assert(definitions: &[dm_syntax::Definition]) -> bool {
+    definitions.iter().any(|definition| {
+        definition.body.iter().any(|line| {
+            line.tokens.iter().any(|token| {
+                matches!(&token.kind, dm_lexer::TokenKind::Identifier(name) if name == "ASSERT")
+            })
+        })
+    })
+}
+
+fn run_fixture_inventory(arguments: &[OsString]) -> Result<(), String> {
+    let [fixture_root] = arguments else {
+        return Err("usage: dm-conformance inventory <fixture-root>".to_owned());
+    };
+    let fixture_root = PathBuf::from(fixture_root);
+    if !fixture_root.is_dir() {
+        return Err(format!(
+            "fixture root is not a directory: {}",
+            fixture_root.display()
+        ));
+    }
+
+    let inventory = fixture_inventory(&fixture_root)?;
+    println!("format=dm-conformance-inventory-v1");
+    println!("fixtures_total={}", inventory.total);
+    println!("families_total={}", inventory.families.len());
+    for (family, count) in inventory.families {
+        println!("family={}\t{}", escape_inventory_field(&family), count);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct FixtureInventory {
+    total: usize,
+    families: BTreeMap<String, usize>,
+}
+
+fn fixture_inventory(root: &Path) -> Result<FixtureInventory, String> {
+    let mut files = Vec::new();
+    collect_dm_fixtures(root, &mut files)?;
+    files.sort();
+
+    let mut families = BTreeMap::new();
+    for path in &files {
+        let relative = path
+            .strip_prefix(root)
+            .expect("recursively collected fixtures remain beneath their root");
+        let family = fixture_family(relative);
+        *families.entry(family).or_insert(0) += 1;
+    }
+    Ok(FixtureInventory {
+        total: files.len(),
+        families,
+    })
+}
+
+fn collect_dm_fixtures(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    let mut entries: Vec<_> = fs::read_dir(directory)
+        .map_err(|error| format!("failed to read {}: {error}", directory.display()))?
+        .collect::<Result<_, _>>()
+        .map_err(|error| {
+            format!(
+                "failed to read an entry in {}: {error}",
+                directory.display()
+            )
+        })?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        if file_type.is_dir() {
+            collect_dm_fixtures(&path, files)?;
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("dm"))
+        {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn escape_inventory_field(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
 }
 
 fn run_frontend(arguments: &[OsString]) -> Result<(), String> {
@@ -137,11 +478,14 @@ fn run_project_compile_check(arguments: &[OsString]) -> Result<(), String> {
 fn compile_error_category(message: &str) -> String {
     for prefix in [
         "unknown local",
+        "unknown procedure",
         "unexpected token",
+        "unsupported statement beginning",
         "unsupported binary operator",
         "unsupported unary operator",
         "expected an expression",
         "unexpected indentation",
+        "duplicate procedure path",
     ] {
         if message.starts_with(prefix) {
             return prefix.to_owned();
@@ -533,10 +877,93 @@ fn print_stream(name: &str, bytes: &[u8]) {
 }
 
 fn usage() -> String {
-    "usage: dm-conformance <check|compile-check|execute|frontend|lex|probe|project|syntax> ..."
+    "usage: dm-conformance <check|compile-check|execute|fixture-audit|frontend|inventory|lex|probe|project|syntax> ..."
         .to_owned()
 }
 
 fn probe_usage() -> String {
     "usage: dm-conformance probe --compiler <dm.exe> --project <world.dme>".to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixture_inventory_groups_dm_files_by_top_level_directory() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::create_dir_all(scratch.path().join("Operators/nested")).expect("operator directory");
+        fs::create_dir_all(scratch.path().join("Lists")).expect("list directory");
+        fs::write(scratch.path().join("Operators/a.dm"), "").expect("fixture");
+        fs::write(scratch.path().join("Operators/nested/b.DM"), "").expect("fixture");
+        fs::write(scratch.path().join("Lists/list.dm"), "").expect("fixture");
+        fs::write(scratch.path().join("root.dm"), "").expect("fixture");
+        fs::write(scratch.path().join("Operators/readme.txt"), "").expect("non-fixture");
+
+        let inventory = fixture_inventory(scratch.path()).expect("inventory");
+        assert_eq!(inventory.total, 4);
+        assert_eq!(
+            inventory.families,
+            BTreeMap::from([
+                ("Lists".to_owned(), 1),
+                ("Operators".to_owned(), 2),
+                ("__root__".to_owned(), 1),
+            ])
+        );
+    }
+
+    #[test]
+    fn inventory_fields_are_single_line_and_unambiguous() {
+        assert_eq!(escape_inventory_field("a\\b\tc\nd"), "a\\\\b\\tc\\nd");
+    }
+
+    #[test]
+    fn fixture_audit_compiles_assert_fixtures_and_groups_failures() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::create_dir_all(scratch.path().join("Operators")).expect("operator directory");
+        fs::create_dir_all(scratch.path().join("Lists")).expect("list directory");
+        fs::write(
+            scratch.path().join("Operators/pass.dm"),
+            "/proc/RunTest()\n\tASSERT(1 + 1 == 2)\n",
+        )
+        .expect("passing fixture");
+        fs::write(
+            scratch.path().join("Lists/fail.dm"),
+            "/proc/RunTest()\n\treturn missing_local\n",
+        )
+        .expect("failing fixture");
+
+        let audit = fixture_audit(scratch.path()).expect("audit");
+        assert_eq!(audit.total, 2);
+        assert_eq!(audit.passed, 1);
+        assert_eq!(audit.families["Operators"].passed, 1);
+        assert_eq!(audit.families["Lists"].passed, 0);
+        let failure = &audit.failures["compile: unknown local"];
+        assert_eq!(failure.count, 1);
+        assert_eq!(failure.examples.len(), 1);
+        assert_eq!(failure.examples[0].path, "Lists/fail.dm");
+        assert!(failure.examples[0].message.contains("missing_local"));
+    }
+
+    #[test]
+    fn fixture_audit_scores_expected_compile_errors_by_rejection() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::write(
+            scratch.path().join("rejected.dm"),
+            "// COMPILE ERROR OD0001\n/proc/RunTest()\n\treturn missing_local\n",
+        )
+        .expect("negative fixture");
+        fs::write(
+            scratch.path().join("accepted.dm"),
+            "// COMPILE ERROR OD0002\n/proc/RunTest()\n\treturn 1\n",
+        )
+        .expect("incorrectly accepted negative fixture");
+
+        let audit = fixture_audit(scratch.path()).expect("audit");
+        assert_eq!(audit.total, 2);
+        assert_eq!(audit.passed, 1);
+        assert_eq!(audit.expected_compile_errors, 2);
+        assert_eq!(audit.expected_compile_errors_matched, 1);
+        assert_eq!(audit.failures["expected compile error: accepted"].count, 1);
+    }
 }

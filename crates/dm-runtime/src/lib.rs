@@ -1651,7 +1651,13 @@ mod tests {
             state.initial_value(&child, &field("value")),
             Some(&Value::number(7.0))
         );
-        assert_eq!(state.project_root(), Some(fixture.0.as_path()));
+        let project_root = state
+            .project_root()
+            .expect("image should retain its project root");
+        assert_eq!(
+            std::fs::canonicalize(project_root).expect("project root should exist"),
+            std::fs::canonicalize(&fixture.0).expect("fixture root should exist")
+        );
     }
 
     #[test]

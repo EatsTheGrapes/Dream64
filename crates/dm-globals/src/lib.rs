@@ -37,6 +37,18 @@ pub enum AssignmentKind {
     Override,
 }
 
+/// Semantic modifiers retained from a variable's introducing declaration.
+///
+/// Overrides inherit these flags from the original declaration. This mirrors
+/// DM's rule that assigning a subtype default does not redeclare the field.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct VariableModifiers {
+    /// The field cannot be assigned after its constant initializer is resolved.
+    pub constant: bool,
+    /// The field is excluded from savefile persistence.
+    pub temporary: bool,
+}
+
 /// Conservative initialization classification.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum InitializerClass {
@@ -109,6 +121,8 @@ pub struct VariableEntry {
     pub storage: StorageClass,
     /// Declaration versus override assignment.
     pub assignment: AssignmentKind,
+    /// Effective declaration modifiers, inherited by override entries.
+    pub modifiers: VariableModifiers,
     /// Owning type, absent for global variables.
     pub owner: Option<VariableOwner>,
     /// Physical source file.
@@ -169,6 +183,7 @@ impl VariableRegistry {
     #[must_use]
     pub fn build(compilation: &Compilation) -> Self {
         let declared_storage = declared_storage(compilation);
+        let declared_modifiers = declared_modifiers(compilation);
         let entries = compilation
             .declarations()
             .iter()
@@ -207,6 +222,12 @@ impl VariableRegistry {
                     } else {
                         AssignmentKind::Declaration
                     },
+                    modifiers: effective_modifiers(
+                        compilation,
+                        &declared_modifiers,
+                        declaration.node,
+                    )
+                    .unwrap_or_else(|| classify_modifiers(definition)),
                     owner,
                     file_id: declaration.file_id,
                     definition_index: declaration.definition_index,
@@ -353,6 +374,56 @@ fn declared_storage(compilation: &Compilation) -> HashMap<NodeId, StorageClass> 
             .or_insert_with(|| classify_storage(definition, global_owner));
     }
     storage
+}
+
+fn declared_modifiers(compilation: &Compilation) -> HashMap<NodeId, VariableModifiers> {
+    let mut modifiers = HashMap::new();
+    for declaration in compilation.declarations() {
+        let Some(definition) = compilation
+            .syntax(declaration.file_id)
+            .and_then(|syntax| syntax.definitions.get(declaration.definition_index))
+        else {
+            continue;
+        };
+        if definition.kind != DefinitionKind::Variable {
+            continue;
+        }
+        modifiers
+            .entry(declaration.node)
+            .or_insert_with(|| classify_modifiers(definition));
+    }
+    modifiers
+}
+
+fn effective_modifiers(
+    compilation: &Compilation,
+    declared: &HashMap<NodeId, VariableModifiers>,
+    mut node: NodeId,
+) -> Option<VariableModifiers> {
+    loop {
+        if let Some(modifiers) = declared.get(&node) {
+            return Some(*modifiers);
+        }
+        node = compilation.code_tree().node(node)?.inherited_member?;
+    }
+}
+
+fn classify_modifiers(definition: &Definition) -> VariableModifiers {
+    let identifiers: BTreeSet<_> = definition
+        .header
+        .iter()
+        .take_while(
+            |token| !matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
+        )
+        .filter_map(|token| match &token.kind {
+            TokenKind::Identifier(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    VariableModifiers {
+        constant: identifiers.contains("const"),
+        temporary: identifiers.contains("tmp"),
+    }
 }
 
 fn classify_storage(definition: &Definition, has_no_owner: bool) -> StorageClass {
@@ -554,6 +625,32 @@ mod tests {
             entries[4].initializer.as_ref().unwrap().dependencies[0].name,
             "dependency"
         );
+    }
+
+    #[test]
+    fn retains_const_and_tmp_modifiers_across_subtype_overrides() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"vars.dm\"\n");
+        fixture.write(
+            "vars.dm",
+            "/datum/base\n\tvar/const/answer = 42\n\tvar/tmp/transient = 1\n/datum/base/child\n\tanswer = 42\n\ttransient = 2\n\tvar/plain = global.answer\n",
+        );
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.0.join("world.dme"))
+            .expect("fixture should compile");
+        let registry = VariableRegistry::build(&compilation);
+        let entries = registry.entries();
+
+        assert_eq!(entries.len(), 5);
+        assert!(entries[0].modifiers.constant);
+        assert!(!entries[0].modifiers.temporary);
+        assert!(!entries[1].modifiers.constant);
+        assert!(entries[1].modifiers.temporary);
+        assert_eq!(entries[2].assignment, AssignmentKind::Override);
+        assert!(entries[2].modifiers.constant);
+        assert_eq!(entries[3].assignment, AssignmentKind::Override);
+        assert!(entries[3].modifiers.temporary);
+        assert_eq!(entries[4].modifiers, Default::default());
     }
 
     #[test]

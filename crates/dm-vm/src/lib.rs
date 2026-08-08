@@ -194,6 +194,47 @@ pub enum Instruction {
     LoadGlobal(FieldName),
     /// Pops and stores one persistent runtime global.
     StoreGlobal(FieldName),
+    /// Mutates a local by one and pushes either its old or new value.
+    MutateLocal {
+        /// Local slot to update.
+        slot: u16,
+        /// `1` for increment and `-1` for decrement.
+        delta: i8,
+        /// Whether the expression yields the updated value.
+        prefix: bool,
+    },
+    /// Pops a receiver, mutates one field by one, and pushes the expression value.
+    MutateField {
+        /// Field to update.
+        name: FieldName,
+        /// `1` for increment and `-1` for decrement.
+        delta: i8,
+        /// Whether the expression yields the updated value.
+        prefix: bool,
+    },
+    /// Mutates a persistent global by one and pushes the expression value.
+    MutateGlobal {
+        /// Global field to update.
+        name: FieldName,
+        /// `1` for increment and `-1` for decrement.
+        delta: i8,
+        /// Whether the expression yields the updated value.
+        prefix: bool,
+    },
+    /// Pops a list key and list, mutates the entry, and pushes the expression value.
+    MutateListIndex {
+        /// `1` for increment and `-1` for decrement.
+        delta: i8,
+        /// Whether the expression yields the updated value.
+        prefix: bool,
+    },
+    /// Mutates the current procedure's special result by one.
+    MutateResult {
+        /// `1` for increment and `-1` for decrement.
+        delta: i8,
+        /// Whether the expression yields the updated value.
+        prefix: bool,
+    },
     /// Clones the top stack value.
     Duplicate,
     /// Pushes the current procedure's special `.` return value.
@@ -204,6 +245,19 @@ pub enum Instruction {
     Pop,
     /// Pops a diagnostic value and terminates execution with a runtime error.
     Crash,
+    /// Installs an exception handler for the current frame.
+    BeginTry {
+        /// First instruction of the corresponding catch body.
+        catch: usize,
+        /// First instruction after the protected try body.
+        end: usize,
+        /// Optional local receiving the thrown DM value.
+        local: Option<u16>,
+    },
+    /// Removes the innermost exception handler after normal completion.
+    EndTry,
+    /// Pops and throws an arbitrary DM value to the nearest active handler.
+    Throw,
     /// Discards `locate` arguments and yields null when no world locator is
     /// available to the headless interpreter.
     Locate {
@@ -334,6 +388,14 @@ pub enum Instruction {
     },
     /// Returns the top stack value.
     Return,
+    /// Defers execution from an instruction in a cloned caller frame until a
+    /// future scheduler tick. The delay value is consumed from the stack.
+    Spawn {
+        /// First instruction of the detached spawned body.
+        entry: usize,
+    },
+    /// Suspends the complete current call chain for a scheduler delay.
+    Sleep,
 }
 
 /// Calculate-and-assign operator used by [`Instruction::CompoundAssignment`].
@@ -1223,6 +1285,24 @@ fn compile_block_inner(
                 line_index = next_line;
                 continue;
             }
+            TokenKind::Identifier(keyword) if keyword == "try" => {
+                let (next_line, statement_falls_through) = compile_try(
+                    lines,
+                    line_index,
+                    block_indentation,
+                    locals,
+                    instructions,
+                    source_spans,
+                    procedures,
+                    loops,
+                )?;
+                falls_through &= statement_falls_through;
+                line_index = next_line;
+                continue;
+            }
+            TokenKind::Identifier(keyword) if keyword == "catch" => {
+                return Err(compile_error("catch without a matching try"));
+            }
             TokenKind::Identifier(keyword) if keyword == "else" => {
                 return Err(compile_error("else without a matching if"));
             }
@@ -1286,6 +1366,19 @@ fn compile_block_inner(
                 ));
                 falls_through = false;
             }
+            TokenKind::Identifier(keyword) if keyword == "throw" => {
+                if line.tokens.len() == 1 {
+                    return Err(compile_error("throw requires an expression"));
+                }
+                let first_instruction = instructions.len();
+                compile_expression(&line.tokens[1..], locals, instructions, procedures)?;
+                instructions.push(Instruction::Throw);
+                source_spans.extend(std::iter::repeat_n(
+                    line.span,
+                    instructions.len() - first_instruction,
+                ));
+                falls_through = false;
+            }
             // `waitfor` controls BYOND's cooperative scheduling of a procedure.
             // Dream64's current headless executor is synchronous and has no
             // sleeping instructions, so the declaration is intentionally a
@@ -1342,6 +1435,73 @@ fn compile_block_inner(
                     line.span,
                     instructions.len() - first_instruction,
                 ));
+            }
+            TokenKind::Identifier(keyword) if keyword == "spawn" => {
+                let first_instruction = instructions.len();
+                let mut spawn = ExpressionParser::new(&line.tokens[1..]);
+                let arguments = spawn.parse_call_arguments()?;
+                if arguments.is_empty() {
+                    return Err(compile_error("spawn requires a delay argument"));
+                }
+                if arguments.len() != 1 {
+                    return Err(compile_error(
+                        "spawn accepts exactly one delay argument before the spawned expression",
+                    ));
+                }
+                let rest = &line.tokens[1 + spawn.index..];
+                emit_expression(&arguments[0], locals, instructions, procedures)?;
+                let spawn_instruction = instructions.len();
+                instructions.push(Instruction::Spawn { entry: usize::MAX });
+                let skip_spawned_body = instructions.len();
+                instructions.push(Instruction::Jump(usize::MAX));
+                let spawned_entry = instructions.len();
+                if rest.is_empty() {
+                    source_spans.extend(std::iter::repeat_n(
+                        line.span,
+                        instructions.len() - first_instruction,
+                    ));
+                    let Some(first_body_line) = lines.get(line_index + 1) else {
+                        return Err(compile_error("spawn requires a spawned statement"));
+                    };
+                    let body_indentation = indentation(first_body_line);
+                    if body_indentation <= block_indentation {
+                        return Err(compile_error(
+                            "spawn requires an indented spawned statement",
+                        ));
+                    }
+                    let (next_line, _) = compile_block(
+                        lines,
+                        line_index + 1,
+                        body_indentation,
+                        locals,
+                        instructions,
+                        source_spans,
+                        procedures,
+                        loops,
+                    )?;
+                    line_index = next_line;
+                } else {
+                    compile_expression(rest, locals, instructions, procedures)?;
+                    instructions.push(Instruction::Pop);
+                }
+                instructions.push(Instruction::PushNull);
+                instructions.push(Instruction::Return);
+                let after_spawned_body = instructions.len();
+                instructions[spawn_instruction] = Instruction::Spawn {
+                    entry: spawned_entry,
+                };
+                instructions[skip_spawned_body] = Instruction::Jump(after_spawned_body);
+                if rest.is_empty() {
+                    source_spans.extend(std::iter::repeat_n(line.span, 2));
+                } else {
+                    source_spans.extend(std::iter::repeat_n(
+                        line.span,
+                        instructions.len() - first_instruction,
+                    ));
+                }
+                if rest.is_empty() {
+                    continue;
+                }
             }
             // `new /type(...)` is also commonly written as a pure
             // side-effect statement, especially for controller singletons.
@@ -1899,7 +2059,7 @@ fn compile_for(
     loops: &mut Vec<LoopContext>,
 ) -> Result<usize, CompileError> {
     let line = &lines[line_index];
-    if let Some((local_name, start, end, step)) = for_to_parts(&line.tokens)? {
+    if let Some((local_name, declared, start, end, step)) = for_to_parts(&line.tokens)? {
         return compile_for_to(
             lines,
             line_index,
@@ -1910,12 +2070,13 @@ fn compile_for(
             procedures,
             loops,
             &local_name,
+            declared,
             start,
             end,
             step,
         );
     }
-    if let Some((local_name, iterable)) = for_in_parts(&line.tokens)? {
+    if let Some((local_name, declared, iterable)) = for_in_parts(&line.tokens)? {
         return compile_for_in(
             lines,
             line_index,
@@ -1926,6 +2087,7 @@ fn compile_for(
             procedures,
             loops,
             &local_name,
+            declared,
             iterable,
         );
     }
@@ -2022,18 +2184,26 @@ fn compile_for_to(
     procedures: &HashMap<String, ProcedureId>,
     loops: &mut Vec<LoopContext>,
     local_name: &str,
+    declared: bool,
     start: &[SpannedToken],
     end: &[SpannedToken],
     step: Option<&[SpannedToken]>,
 ) -> Result<usize, CompileError> {
     let line = &lines[line_index];
-    let item_slot = locals.declare(local_name.to_owned())?;
+    let item_slot = if declared {
+        locals.declare(local_name.to_owned())?
+    } else {
+        locals
+            .get(local_name)
+            .ok_or_else(|| compile_error(format!("unknown local {local_name:?}")))?
+    };
+    let current_slot = locals.declare_hidden()?;
     let end_slot = locals.declare_hidden()?;
     let step_slot = locals.declare_hidden()?;
 
     let initialization_start = instructions.len();
     compile_expression(start, locals, instructions, procedures)?;
-    instructions.push(Instruction::StoreLocal(item_slot));
+    instructions.push(Instruction::StoreLocal(current_slot));
     compile_expression(end, locals, instructions, procedures)?;
     instructions.push(Instruction::StoreLocal(end_slot));
     if let Some(step) = step {
@@ -2056,14 +2226,14 @@ fn compile_for_to(
         Instruction::LoadLocal(step_slot),
         Instruction::PushNumber(DmNumberBits::from_f32(0.0)),
         Instruction::GreaterEqual,
-        Instruction::LoadLocal(item_slot),
+        Instruction::LoadLocal(current_slot),
         Instruction::LoadLocal(end_slot),
         Instruction::LessEqual,
         Instruction::And,
         Instruction::LoadLocal(step_slot),
         Instruction::PushNumber(DmNumberBits::from_f32(0.0)),
         Instruction::Less,
-        Instruction::LoadLocal(item_slot),
+        Instruction::LoadLocal(current_slot),
         Instruction::LoadLocal(end_slot),
         Instruction::GreaterEqual,
         Instruction::And,
@@ -2076,6 +2246,21 @@ fn compile_for_to(
         instructions,
         source_spans,
         Instruction::JumpIfFalse(usize::MAX),
+        line.span,
+    );
+
+    // BYOND does not assign an existing iterator when the range is empty.
+    // Keep the candidate in a hidden slot until the entry condition succeeds.
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::LoadLocal(current_slot),
+        line.span,
+    );
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::StoreLocal(item_slot),
         line.span,
     );
 
@@ -2113,7 +2298,7 @@ fn compile_for_to(
         Instruction::LoadLocal(item_slot),
         Instruction::LoadLocal(step_slot),
         Instruction::Add,
-        Instruction::StoreLocal(item_slot),
+        Instruction::StoreLocal(current_slot),
         Instruction::Jump(condition_target),
     ] {
         push_instruction(instructions, source_spans, instruction, line.span);
@@ -2123,7 +2308,9 @@ fn compile_for_to(
     for break_jump in loop_context.break_jumps {
         patch_jump(instructions, break_jump, end_target)?;
     }
-    locals.remove(local_name);
+    if declared {
+        locals.remove(local_name);
+    }
     Ok(after_body)
 }
 
@@ -2138,10 +2325,17 @@ fn compile_for_in(
     procedures: &HashMap<String, ProcedureId>,
     loops: &mut Vec<LoopContext>,
     local_name: &str,
+    declared: bool,
     iterable: &[SpannedToken],
 ) -> Result<usize, CompileError> {
     let line = &lines[line_index];
-    let item_slot = locals.declare(local_name.to_owned())?;
+    let item_slot = if declared {
+        locals.declare(local_name.to_owned())?
+    } else {
+        locals
+            .get(local_name)
+            .ok_or_else(|| compile_error(format!("unknown local {local_name:?}")))?
+    };
     let list_slot = locals.declare_hidden()?;
     let index_slot = locals.declare_hidden()?;
 
@@ -2257,13 +2451,15 @@ fn compile_for_in(
     for break_jump in loop_context.break_jumps {
         patch_jump(instructions, break_jump, end_target)?;
     }
-    locals.remove(local_name);
+    if declared {
+        locals.remove(local_name);
+    }
     Ok(after_body)
 }
 
 fn for_in_parts(
     tokens: &[SpannedToken],
-) -> Result<Option<(String, &[SpannedToken])>, CompileError> {
+) -> Result<Option<(String, bool, &[SpannedToken])>, CompileError> {
     let header = &tokens[1..];
     if !matches!(
         header.first().map(|token| &token.kind),
@@ -2291,12 +2487,10 @@ fn for_in_parts(
     if iterable.is_empty() {
         return Err(compile_error("for-in requires an iterable expression"));
     }
-    if !matches!(
+    let declared = matches!(
         declaration.first().map(|token| &token.kind),
         Some(TokenKind::Identifier(identifier)) if identifier == "var"
-    ) {
-        return Err(compile_error("for-in currently requires a declared var"));
-    }
+    );
     // A typed loop declaration may carry a cast qualifier after the local,
     // e.g. `var/turf/area_turf as anything`.  The qualifier describes the
     // iteration mode, not a second local name.  Restrict the name search to
@@ -2317,7 +2511,7 @@ fn for_in_parts(
             _ => None,
         })
         .ok_or_else(|| compile_error("for-in variable declaration has no name"))?;
-    Ok(Some((local_name, iterable)))
+    Ok(Some((local_name, declared, iterable)))
 }
 
 /// Recognizes `for(var/name in first to last [step increment])`, rather than treating the
@@ -2328,14 +2522,56 @@ fn for_to_parts(
 ) -> Result<
     Option<(
         String,
+        bool,
         &[SpannedToken],
         &[SpannedToken],
         Option<&[SpannedToken]>,
     )>,
     CompileError,
 > {
-    let Some((local_name, iterable)) = for_in_parts(tokens)? else {
-        return Ok(None);
+    let (local_name, declared, iterable) = if let Some(parts) = for_in_parts(tokens)? {
+        parts
+    } else {
+        let header = &tokens[1..];
+        if !matches!(
+            header.first().map(|token| &token.kind),
+            Some(TokenKind::Punctuation('('))
+        ) || !matches!(
+            header.last().map(|token| &token.kind),
+            Some(TokenKind::Punctuation(')'))
+        ) {
+            return Ok(None);
+        }
+        let clauses = &header[1..header.len() - 1];
+        let separators = top_level_keyword_positions(clauses, "to");
+        let [to_separator] = separators.as_slice() else {
+            return Ok(None);
+        };
+        let before_to = &clauses[..*to_separator];
+        let Some(assignment) = before_to.iter().rposition(
+            |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
+        ) else {
+            return Ok(None);
+        };
+        let declaration = &before_to[..assignment];
+        let declared = matches!(
+            declaration.first().map(|token| &token.kind),
+            Some(TokenKind::Identifier(identifier)) if identifier == "var"
+        );
+        let local_name = declaration
+            .iter()
+            .rev()
+            .find_map(|token| match &token.kind {
+                TokenKind::Identifier(identifier) if identifier != "var" => {
+                    Some(identifier.clone())
+                }
+                _ => None,
+            })
+            .ok_or_else(|| compile_error("for-to variable declaration has no name"))?;
+        let start = &before_to[assignment + 1..];
+        let iterable = &clauses[assignment + 1..];
+        debug_assert!(iterable.starts_with(start));
+        (local_name, declared, iterable)
     };
     let separators = top_level_keyword_positions(iterable, "to");
     let [separator] = separators.as_slice() else {
@@ -2360,7 +2596,7 @@ fn for_to_parts(
     if step.is_some_and(<[SpannedToken]>::is_empty) {
         return Err(compile_error("for-to range step requires an increment"));
     }
-    Ok(Some((local_name, start, end, step)))
+    Ok(Some((local_name, declared, start, end, step)))
 }
 
 /// Finds DM header keywords outside nested calls, indexes, and list literals.
@@ -2401,9 +2637,20 @@ fn for_clauses(tokens: &[SpannedToken]) -> Result<[&[SpannedToken]; 3], CompileE
         match token.kind {
             TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
             TokenKind::Punctuation(')' | ']' | '}') => depth = depth.saturating_sub(1),
-            TokenKind::Punctuation(';') if depth == 0 => separators.push(index),
+            TokenKind::Punctuation(';' | ',') if depth == 0 => separators.push(index),
             _ => {}
         }
+    }
+    if separators.is_empty() && clauses.is_empty() {
+        return Ok([clauses, clauses, clauses]);
+    }
+    if separators.len() == 1 {
+        let separator = separators[0];
+        return Ok([
+            &clauses[..separator],
+            &clauses[separator + 1..],
+            &clauses[0..0],
+        ]);
     }
     if separators.len() != 2 {
         if clauses.iter().any(
@@ -2412,7 +2659,7 @@ fn for_clauses(tokens: &[SpannedToken]) -> Result<[&[SpannedToken]; 3], CompileE
             return Err(compile_error("for-in list iteration is not implemented"));
         }
         return Err(compile_error(
-            "C-style for requires initializer, condition, and increment clauses separated by ';'",
+            "C-style for requires initializer, condition, and increment clauses separated by ';' or ','",
         ));
     }
     Ok([
@@ -2512,6 +2759,141 @@ fn local_increment(tokens: &[SpannedToken]) -> Option<(&str, bool)> {
         }
         _ => None,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_try(
+    lines: &[SourceLine],
+    line_index: usize,
+    block_indentation: usize,
+    locals: &mut LocalTable,
+    instructions: &mut Vec<Instruction>,
+    source_spans: &mut Vec<SourceSpan>,
+    procedures: &HashMap<String, ProcedureId>,
+    loops: &mut Vec<LoopContext>,
+) -> Result<(usize, bool), CompileError> {
+    let try_line = &lines[line_index];
+    if try_line.tokens.len() != 1 {
+        return Err(compile_error("try does not accept an expression"));
+    }
+    let child_index = line_index + 1;
+    let child = lines
+        .get(child_index)
+        .ok_or_else(|| compile_error("try statement requires an indented body"))?;
+    let child_indentation = indentation(child);
+    if child_indentation <= block_indentation {
+        return Err(compile_error("try statement requires an indented body"));
+    }
+
+    let handler_instruction = instructions.len();
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::BeginTry {
+            catch: usize::MAX,
+            end: usize::MAX,
+            local: None,
+        },
+        try_line.span,
+    );
+    let (catch_index, try_falls_through) = compile_block(
+        lines,
+        child_index,
+        child_indentation,
+        locals,
+        instructions,
+        source_spans,
+        procedures,
+        loops,
+    )?;
+    let catch_line = lines
+        .get(catch_index)
+        .filter(|line| {
+            indentation(line) == block_indentation
+                && matches!(line.tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(keyword)) if keyword == "catch")
+        })
+        .ok_or_else(|| compile_error("try requires a matching catch"))?;
+    let catch_local_name = parse_catch_local(&catch_line.tokens)?;
+    let catch_local = catch_local_name
+        .as_ref()
+        .map(|_| locals.declare_hidden())
+        .transpose()?;
+
+    let protected_end = instructions.len();
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::EndTry,
+        catch_line.span,
+    );
+    let end_jump = instructions.len();
+    push_instruction(
+        instructions,
+        source_spans,
+        Instruction::Jump(usize::MAX),
+        catch_line.span,
+    );
+    let catch_target = instructions.len();
+    instructions[handler_instruction] = Instruction::BeginTry {
+        catch: catch_target,
+        end: protected_end,
+        local: catch_local,
+    };
+
+    let catch_child_index = catch_index + 1;
+    let catch_child = lines
+        .get(catch_child_index)
+        .ok_or_else(|| compile_error("catch statement requires an indented body"))?;
+    let catch_indentation = indentation(catch_child);
+    if catch_indentation <= block_indentation {
+        return Err(compile_error("catch statement requires an indented body"));
+    }
+    let saved_names = locals.names.clone();
+    if let (Some(name), Some(slot)) = (catch_local_name, catch_local) {
+        locals.names.insert(name, slot);
+    }
+    let (next_line, catch_falls_through) = compile_block(
+        lines,
+        catch_child_index,
+        catch_indentation,
+        locals,
+        instructions,
+        source_spans,
+        procedures,
+        loops,
+    )?;
+    locals.names = saved_names;
+    let end_target = instructions.len();
+    patch_jump(instructions, end_jump, end_target)?;
+    Ok((next_line, try_falls_through || catch_falls_through))
+}
+
+fn parse_catch_local(tokens: &[SpannedToken]) -> Result<Option<String>, CompileError> {
+    if tokens.len() == 1 {
+        return Ok(None);
+    }
+    if !matches!(
+        tokens.get(1).map(|token| &token.kind),
+        Some(TokenKind::Punctuation('('))
+    ) || !matches!(
+        tokens.last().map(|token| &token.kind),
+        Some(TokenKind::Punctuation(')'))
+    ) {
+        return Err(compile_error("catch variable requires parentheses"));
+    }
+    let inner = &tokens[2..tokens.len() - 1];
+    if !matches!(inner.first().map(|token| &token.kind), Some(TokenKind::Identifier(keyword)) if keyword == "var")
+    {
+        return Err(compile_error(
+            "catch binding must be a variable declaration",
+        ));
+    }
+    let name = inner.iter().rev().find_map(|token| match &token.kind {
+        TokenKind::Identifier(name) if name != "var" => Some(name.clone()),
+        _ => None,
+    });
+    name.map(Some)
+        .ok_or_else(|| compile_error("catch variable declaration requires a name"))
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -3196,6 +3578,7 @@ enum Expression {
         name: String,
         arguments: Vec<Self>,
     },
+    Sleep(Box<Self>),
     Initial(Box<Self>),
     Block {
         arguments: Vec<Self>,
@@ -3233,6 +3616,7 @@ enum Expression {
     Local(String),
     Src,
     Usr,
+    World,
     GlobalNamespace,
     Field {
         receiver: Box<Self>,
@@ -3286,6 +3670,11 @@ enum Expression {
     Unary {
         operator: String,
         operand: Box<Self>,
+    },
+    Mutation {
+        target: Box<Self>,
+        delta: i8,
+        prefix: bool,
     },
     Binary {
         operator: String,
@@ -3506,6 +3895,20 @@ impl<'a> ExpressionParser<'a> {
     }
 
     fn parse_unary(&mut self) -> Result<Expression, CompileError> {
+        // Prefix mutation is an expression in DM, not merely a statement:
+        // `values[++i]` first updates i, then uses the new value. Reuse the
+        // assignment lowering so every assignable target retains its normal
+        // single-evaluation behavior.
+        if let Some(operator @ ("++" | "--")) = self.current_operator() {
+            let operator = operator.to_owned();
+            self.index += 1;
+            let target = self.parse_unary()?;
+            return Ok(Expression::Mutation {
+                target: Box::new(target),
+                delta: if operator == "++" { 1 } else { -1 },
+                prefix: true,
+            });
+        }
         if let Some(operator @ ("!" | "+" | "-" | "~")) = self.current_operator() {
             let operator = operator.to_owned();
             self.index += 1;
@@ -3542,6 +3945,33 @@ impl<'a> ExpressionParser<'a> {
                         index: Box::new(index),
                     }
                 };
+                continue;
+            }
+            if matches!(self.current_operator(), Some("::")) {
+                self.index += 1;
+                let Some(TokenKind::Identifier(qualified)) =
+                    self.tokens.get(self.index).map(|token| &token.kind)
+                else {
+                    return Err(compile_error("expected identifier after '::'"));
+                };
+                let qualified = qualified.clone();
+                self.index += 1;
+                if matches!(
+                    self.tokens.get(self.index).map(|token| &token.kind),
+                    Some(TokenKind::Punctuation('('))
+                ) {
+                    expression = Expression::Call {
+                        procedure: qualified,
+                        arguments: self.parse_call_arguments()?,
+                    };
+                } else {
+                    let name = FieldName::parse(&qualified)
+                        .map_err(|error| compile_error(error.to_string()))?;
+                    expression = Expression::Initial(Box::new(Expression::Field {
+                        receiver: Box::new(expression),
+                        name,
+                    }));
+                }
                 continue;
             }
             if matches!(self.current_operator(), Some("." | "?." | "?:")) {
@@ -3601,6 +4031,16 @@ impl<'a> ExpressionParser<'a> {
                         expression = other;
                         break;
                     }
+                };
+                continue;
+            }
+            if let Some(operator @ ("++" | "--")) = self.current_operator() {
+                let delta = if operator == "++" { 1 } else { -1 };
+                self.index += 1;
+                expression = Expression::Mutation {
+                    target: Box::new(expression),
+                    delta,
+                    prefix: false,
                 };
                 continue;
             }
@@ -3695,14 +4135,91 @@ impl<'a> ExpressionParser<'a> {
             {
                 Ok(Expression::Text(value.to_owned()))
             }
+            TokenKind::Operator(operator) if operator == "::" => {
+                let Some(TokenKind::Identifier(name)) =
+                    self.tokens.get(self.index).map(|token| &token.kind)
+                else {
+                    return Err(compile_error("expected global identifier after '::'"));
+                };
+                let name = name.clone();
+                self.index += 1;
+                if matches!(
+                    self.tokens.get(self.index).map(|token| &token.kind),
+                    Some(TokenKind::Punctuation('('))
+                ) {
+                    Ok(Expression::Call {
+                        procedure: name,
+                        arguments: self.parse_call_arguments()?,
+                    })
+                } else {
+                    FieldName::parse(&name)
+                        .map(Expression::GlobalField)
+                        .map_err(|error| compile_error(error.to_string()))
+                }
+            }
             TokenKind::Identifier(identifier) if identifier == "src" => Ok(Expression::Src),
             TokenKind::Identifier(identifier) if identifier == "usr" => Ok(Expression::Usr),
+            TokenKind::Identifier(identifier) if identifier == "world" => Ok(Expression::World),
+            TokenKind::Identifier(identifier) if identifier == "locs" => Ok(Expression::Field {
+                receiver: Box::new(Expression::Src),
+                name: FieldName::parse("locs").expect("built-in locs field name is valid"),
+            }),
+            TokenKind::Identifier(identifier) if identifier == "vars" => Ok(Expression::Field {
+                receiver: Box::new(Expression::Src),
+                name: FieldName::parse("vars").expect("built-in vars field name is valid"),
+            }),
             // `GLOB` is the conventional SS13 alias for DM's built-in
             // `global` namespace. It is not a local datum and must lower to
             // the same persistent-global operations as the spelling BYOND
             // exposes directly.
             TokenKind::Identifier(identifier) if identifier == "global" || identifier == "GLOB" => {
                 Ok(Expression::GlobalNamespace)
+            }
+            TokenKind::Identifier(identifier) if matches!(self.tokens.get(self.index).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "::") =>
+            {
+                let mut qualifiers = Vec::new();
+                let mut next_token = self.tokens.get(self.index).map(|token| &token.kind);
+                while let Some(TokenKind::Operator(operator)) = next_token {
+                    if operator != "::" {
+                        break;
+                    }
+                    self.index += 1;
+                    let token = self
+                        .tokens
+                        .get(self.index)
+                        .ok_or_else(|| compile_error("expected namespace qualifier after '::'"))?;
+                    let TokenKind::Identifier(qualified) = &token.kind else {
+                        return Err(compile_error("expected identifier after '::'"));
+                    };
+                    qualifiers.push(qualified.clone());
+                    self.index += 1;
+                    next_token = self.tokens.get(self.index).map(|token| &token.kind);
+                }
+
+                if matches!(
+                    self.tokens.get(self.index).map(|token| &token.kind),
+                    Some(TokenKind::Punctuation('('))
+                ) {
+                    let arguments = self.parse_call_arguments()?;
+                    Ok(Expression::Call {
+                        procedure: qualifiers
+                            .last()
+                            .expect("namespace chain has a qualifier")
+                            .clone(),
+                        arguments,
+                    })
+                } else {
+                    let mut receiver = Expression::Local(identifier.clone());
+                    for qualifier in qualifiers {
+                        let name = FieldName::parse(&qualifier)
+                            .map_err(|error| compile_error(error.to_string()))?;
+                        receiver = Expression::Initial(Box::new(Expression::Field {
+                            receiver: Box::new(receiver),
+                            name,
+                        }));
+                    }
+                    Ok(receiver)
+                }
             }
             TokenKind::Identifier(identifier) if identifier == "new" => {
                 // `new /path(args)` is the common explicit form.  An
@@ -3981,6 +4498,17 @@ impl<'a> ExpressionParser<'a> {
                         )));
                     }
                     Ok(Expression::Round { arguments })
+                } else if identifier == "sleep" {
+                    let mut arguments = self.parse_call_arguments()?;
+                    if arguments.len() != 1 {
+                        return Err(compile_error(format!(
+                            "sleep requires exactly one delay, received {} arguments",
+                            arguments.len()
+                        )));
+                    }
+                    Ok(Expression::Sleep(Box::new(
+                        arguments.pop().expect("sleep argument count was validated"),
+                    )))
                 } else if identifier == "locate" {
                     Ok(Expression::Locate {
                         arguments: self.parse_call_arguments()?,
@@ -4512,6 +5040,9 @@ fn emit_expression(
         }
         Expression::Src => instructions.push(Instruction::LoadSrc),
         Expression::Usr => instructions.push(Instruction::LoadUsr),
+        Expression::World => instructions.push(Instruction::LoadGlobal(
+            FieldName::parse("world").expect("built-in world global name is valid"),
+        )),
         Expression::GlobalNamespace => {
             return Err(compile_error("global namespace requires a field name"));
         }
@@ -4547,6 +5078,10 @@ fn emit_expression(
                 name: name.clone(),
                 argument_count,
             });
+        }
+        Expression::Sleep(delay) => {
+            emit_expression(delay, locals, instructions, procedures)?;
+            instructions.push(Instruction::Sleep);
         }
         Expression::Initial(reference) => match reference.as_ref() {
             Expression::Field { receiver, name } => {
@@ -4696,6 +5231,11 @@ fn emit_expression(
                 }
             }
         }
+        Expression::Mutation {
+            target,
+            delta,
+            prefix,
+        } => emit_mutation_expression(target, *delta, *prefix, locals, instructions, procedures)?,
         Expression::Binary {
             operator,
             left,
@@ -4779,6 +5319,63 @@ fn emit_expression(
             operator,
             value,
         } => emit_assignment_expression(target, operator, value, locals, instructions, procedures)?,
+    }
+    Ok(())
+}
+
+fn emit_mutation_expression(
+    target: &Expression,
+    delta: i8,
+    prefix: bool,
+    locals: &LocalTable,
+    instructions: &mut Vec<Instruction>,
+    procedures: &HashMap<String, ProcedureId>,
+) -> Result<(), CompileError> {
+    match target {
+        Expression::Local(name) => {
+            if let Some(slot) = locals.get(name) {
+                instructions.push(Instruction::MutateLocal {
+                    slot,
+                    delta,
+                    prefix,
+                });
+            } else if let Some(field) = locals.src_field(name) {
+                instructions.push(Instruction::LoadSrc);
+                instructions.push(Instruction::MutateField {
+                    name: field.clone(),
+                    delta,
+                    prefix,
+                });
+            } else if let Some(global) = locals.global_field(name) {
+                instructions.push(Instruction::MutateGlobal {
+                    name: global.clone(),
+                    delta,
+                    prefix,
+                });
+            } else {
+                return Err(compile_error(format!("unknown local {name:?}")));
+            }
+        }
+        Expression::GlobalField(name) => instructions.push(Instruction::MutateGlobal {
+            name: name.clone(),
+            delta,
+            prefix,
+        }),
+        Expression::Field { receiver, name } => {
+            emit_expression(receiver, locals, instructions, procedures)?;
+            instructions.push(Instruction::MutateField {
+                name: name.clone(),
+                delta,
+                prefix,
+            });
+        }
+        Expression::Index { list, index } => {
+            emit_expression(list, locals, instructions, procedures)?;
+            emit_expression(index, locals, instructions, procedures)?;
+            instructions.push(Instruction::MutateListIndex { delta, prefix });
+        }
+        Expression::Result => instructions.push(Instruction::MutateResult { delta, prefix }),
+        _ => return Err(compile_error("increment/decrement target is not writable")),
     }
     Ok(())
 }
@@ -4914,6 +5511,7 @@ fn bind_initializer_expression(
     bindings: &BTreeMap<String, InitializerBinding>,
 ) -> Result<(), CompileError> {
     match expression {
+        Expression::World => {}
         Expression::Local(name) => {
             let binding = bindings
                 .get(name)
@@ -4948,7 +5546,8 @@ fn bind_initializer_expression(
         Expression::Length { value }
         | Expression::Ref { value }
         | Expression::TypesOf { value }
-        | Expression::Initial(value) => {
+        | Expression::Initial(value)
+        | Expression::Sleep(value) => {
             bind_initializer_expression(value, bindings)?;
         }
         Expression::ArgList(value) => bind_initializer_expression(value, bindings)?,
@@ -5018,7 +5617,10 @@ fn bind_initializer_expression(
             bind_initializer_expression(list, bindings)?;
             bind_initializer_expression(index, bindings)?;
         }
-        Expression::Unary { operand, .. } => {
+        Expression::Unary { operand, .. }
+        | Expression::Mutation {
+            target: operand, ..
+        } => {
             bind_initializer_expression(operand, bindings)?;
         }
         Expression::Binary { left, right, .. } => {
@@ -5092,6 +5694,9 @@ pub struct ExecutionState {
     initial_values: Arc<BTreeMap<TypePath, BTreeMap<FieldName, Value>>>,
     project_root: Option<Arc<PathBuf>>,
     random_state: u64,
+    scheduler_tick: u64,
+    scheduler_sequence: u64,
+    scheduled_spawns: Vec<ScheduledSpawn>,
 }
 
 impl ExecutionState {
@@ -5112,6 +5717,9 @@ impl ExecutionState {
             initial_values: Arc::new(BTreeMap::new()),
             project_root: None,
             random_state: 0,
+            scheduler_tick: 0,
+            scheduler_sequence: 0,
+            scheduled_spawns: Vec::new(),
         }
     }
 
@@ -5207,6 +5815,12 @@ impl ExecutionState {
     pub fn globals(&self) -> impl Iterator<Item = (&FieldName, &Value)> {
         self.globals.iter()
     }
+
+    /// Returns the current deterministic scheduler tick.
+    #[must_use]
+    pub const fn scheduler_tick(&self) -> u64 {
+        self.scheduler_tick
+    }
 }
 
 /// Entry-frame object context retained across a procedure call chain.
@@ -5245,7 +5859,7 @@ impl Default for ExecutionContext {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct CallFrame {
     procedure: ProcedureId,
     instruction: usize,
@@ -5257,6 +5871,28 @@ struct CallFrame {
     // Retain all supplied values for the future DM `args` list, including
     // extras beyond the declared parameter slots.
     arguments: Vec<Value>,
+    exception_handlers: Vec<ExceptionHandler>,
+}
+
+#[derive(Clone, Debug)]
+struct ExceptionHandler {
+    start: usize,
+    end: usize,
+    catch: usize,
+    local: Option<u16>,
+    stack_depth: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ScheduledSpawn {
+    due_tick: u64,
+    sequence: u64,
+    frames: Vec<CallFrame>,
+}
+
+enum FrameRunOutcome {
+    Complete(Value),
+    Yielded { frames: Vec<CallFrame>, delay: u64 },
 }
 
 /// Executes one standalone program to completion on the reference interpreter.
@@ -5475,7 +6111,65 @@ pub fn execute_module_with_limits_in_context(
     }
 
     let frames = vec![make_frame(entry, program, arguments, context)];
-    run_frames(module, frames, limits, state)
+    finish_frame_run(module, run_frames(module, frames, limits, state)?, state)
+}
+
+fn finish_frame_run(
+    module: &Module,
+    outcome: FrameRunOutcome,
+    state: &mut ExecutionState,
+) -> Result<Value, RuntimeError> {
+    match outcome {
+        FrameRunOutcome::Complete(value) => Ok(value),
+        FrameRunOutcome::Yielded { frames, delay } => {
+            schedule_frames(state, frames, delay);
+            let _ = module;
+            Ok(Value::Null)
+        }
+    }
+}
+
+/// Advances the deterministic scheduler and runs every spawned body whose
+/// delay has elapsed. Tasks with the same deadline retain source order.
+///
+/// # Errors
+///
+/// Returns a runtime error when a due spawned body fails.
+pub fn advance_scheduler(
+    module: &Module,
+    ticks: u64,
+    limits: ExecutionLimits,
+    state: &mut ExecutionState,
+) -> Result<Vec<Value>, RuntimeError> {
+    state.scheduler_tick = state.scheduler_tick.saturating_add(ticks);
+    state
+        .scheduled_spawns
+        .sort_by_key(|spawn| (spawn.due_tick, spawn.sequence));
+    let due_count = state
+        .scheduled_spawns
+        .partition_point(|spawn| spawn.due_tick <= state.scheduler_tick);
+    let due = state
+        .scheduled_spawns
+        .drain(..due_count)
+        .collect::<Vec<_>>();
+    let mut completed = Vec::new();
+    for spawn in due {
+        match run_frames(module, spawn.frames, limits, state)? {
+            FrameRunOutcome::Complete(value) => completed.push(value),
+            FrameRunOutcome::Yielded { frames, delay } => schedule_frames(state, frames, delay),
+        }
+    }
+    Ok(completed)
+}
+
+fn schedule_frames(state: &mut ExecutionState, frames: Vec<CallFrame>, delay: u64) {
+    let sequence = state.scheduler_sequence;
+    state.scheduler_sequence = state.scheduler_sequence.saturating_add(1);
+    state.scheduled_spawns.push(ScheduledSpawn {
+        due_tick: state.scheduler_tick.saturating_add(delay),
+        sequence,
+        frames,
+    });
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5484,7 +6178,7 @@ fn run_frames(
     mut frames: Vec<CallFrame>,
     limits: ExecutionLimits,
     state: &mut ExecutionState,
-) -> Result<Value, RuntimeError> {
+) -> Result<FrameRunOutcome, RuntimeError> {
     let mut remaining_steps = limits.max_steps;
     loop {
         let frame_index = frames.len() - 1;
@@ -5721,6 +6415,25 @@ fn run_frames(
                 let value = execute_standard_builtin(&name, &arguments, state)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 frames[frame_index].stack.push(value);
+            }
+            Instruction::Sleep => {
+                let delay = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let delay = delay.as_number().ok_or_else(|| {
+                    execution_error(
+                        module,
+                        &frames,
+                        format!("sleep delay must be numeric, received {delay}"),
+                    )
+                })?;
+                let delay = if delay.is_finite() && delay > 0.0 {
+                    (delay.floor() as u64).max(1)
+                } else {
+                    0
+                };
+                frames[frame_index].stack.push(Value::Null);
+                frames[frame_index].instruction += 1;
+                return Ok(FrameRunOutcome::Yielded { frames, delay });
             }
             Instruction::Length => {
                 let value = match pop(&mut frames[frame_index].stack) {
@@ -6283,6 +6996,117 @@ fn run_frames(
                 };
                 state.set_global(name, value);
             }
+            Instruction::MutateLocal {
+                slot,
+                delta,
+                prefix,
+            } => {
+                let Some(current) = frames[frame_index].locals.get(usize::from(slot)).cloned()
+                else {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        format!("invalid local slot {slot}"),
+                    ));
+                };
+                let (result, updated) = mutate_scalar_value(current, delta, prefix)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].locals[usize::from(slot)] = updated;
+                frames[frame_index].stack.push(result);
+            }
+            Instruction::MutateGlobal {
+                name,
+                delta,
+                prefix,
+            } => {
+                let current = state.global(&name).cloned().unwrap_or(Value::Null);
+                let (result, updated) = mutate_scalar_value(current, delta, prefix)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                state.set_global(name, updated);
+                frames[frame_index].stack.push(result);
+            }
+            Instruction::MutateResult { delta, prefix } => {
+                let current = frames[frame_index].result.clone();
+                let (result, updated) = mutate_scalar_value(current, delta, prefix)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].result = updated;
+                frames[frame_index].stack.push(result);
+            }
+            Instruction::MutateField {
+                name,
+                delta,
+                prefix,
+            } => {
+                let receiver = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let current = match &receiver {
+                    Value::Datum(datum) => state
+                        .heap
+                        .datum_field(*datum, &name)
+                        .map_err(|error| execution_error(module, &frames, error.to_string()))?
+                        .clone(),
+                    Value::List(list) if name.as_str() == "len" => {
+                        let len = state
+                            .heap
+                            .list(*list)
+                            .map_err(|error| execution_error(module, &frames, error.to_string()))?
+                            .len();
+                        Value::number(len as f32)
+                    }
+                    value => {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!(
+                                "increment/decrement field requires a datum or list.len, received {value}"
+                            ),
+                        ));
+                    }
+                };
+                let (result, updated) = mutate_scalar_value(current, delta, prefix)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                match receiver {
+                    Value::Datum(datum) => {
+                        state
+                            .heap
+                            .set_datum_field(datum, name, updated)
+                            .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                    }
+                    Value::List(list) => {
+                        let new_len = updated.as_number().unwrap_or(0.0).trunc().max(0.0) as usize;
+                        state
+                            .heap
+                            .list_mut(list)
+                            .and_then(|values| values.resize(new_len))
+                            .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                    }
+                    _ => unreachable!("receiver was validated above"),
+                }
+                frames[frame_index].stack.push(result);
+            }
+            Instruction::MutateListIndex { delta, prefix } => {
+                let key = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let list = match pop(&mut frames[frame_index].stack) {
+                    Ok(Value::List(list)) => list,
+                    Ok(value) => {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("list mutation requires a list, received {value}"),
+                        ));
+                    }
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let current = read_list_value(&state.heap, list, &key)
+                    .map_err(|error| execution_error(module, &frames, error.to_string()))?
+                    .clone();
+                let (result, updated) = mutate_scalar_value(current, delta, prefix)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                write_list_value(&mut state.heap, list, key, updated)
+                    .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                frames[frame_index].stack.push(result);
+            }
             Instruction::Duplicate => {
                 let Some(value) = frames[frame_index].stack.last().cloned() else {
                     return Err(execution_error(module, &frames, "bytecode stack underflow"));
@@ -6339,6 +7163,78 @@ fn run_frames(
                     &frames,
                     format!("CRASH: {message}"),
                 ));
+            }
+            Instruction::BeginTry { catch, end, local } => {
+                if catch >= program.instructions.len() || end >= program.instructions.len() {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "exception handler target is outside the procedure",
+                    ));
+                }
+                let stack_depth = frames[frame_index].stack.len();
+                frames[frame_index]
+                    .exception_handlers
+                    .push(ExceptionHandler {
+                        start: instruction_index + 1,
+                        end,
+                        catch,
+                        local,
+                        stack_depth,
+                    });
+            }
+            Instruction::EndTry => {
+                if frames[frame_index].exception_handlers.pop().is_none() {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "EndTry without an active exception handler",
+                    ));
+                }
+            }
+            Instruction::Throw => {
+                let thrown = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let mut handler = None;
+                for candidate_frame in (0..frames.len()).rev() {
+                    let current = frames[candidate_frame].instruction;
+                    if let Some(position) = frames[candidate_frame]
+                        .exception_handlers
+                        .iter()
+                        .rposition(|handler| handler.start <= current && current <= handler.end)
+                    {
+                        handler = Some((candidate_frame, position));
+                        break;
+                    }
+                }
+                let Some((handler_frame, handler_position)) = handler else {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        format!("uncaught exception: {thrown}"),
+                    ));
+                };
+                frames.truncate(handler_frame + 1);
+                let handler = frames[handler_frame]
+                    .exception_handlers
+                    .remove(handler_position);
+                frames[handler_frame]
+                    .exception_handlers
+                    .truncate(handler_position);
+                frames[handler_frame].stack.truncate(handler.stack_depth);
+                if let Some(slot) = handler.local {
+                    let Some(local) = frames[handler_frame].locals.get_mut(usize::from(slot))
+                    else {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("invalid catch local {slot}"),
+                        ));
+                    };
+                    *local = thrown;
+                }
+                frames[handler_frame].instruction = handler.catch;
+                continue;
             }
             Instruction::Locate { argument_count } => {
                 let count = usize::from(argument_count);
@@ -6770,6 +7666,35 @@ fn run_frames(
                     continue;
                 }
             }
+            Instruction::Spawn { entry } => {
+                let delay = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let delay = delay.as_number().ok_or_else(|| {
+                    execution_error(
+                        module,
+                        &frames,
+                        format!("spawn delay must be numeric, received {delay}"),
+                    )
+                })?;
+                let mut spawned = frames[frame_index].clone();
+                spawned.instruction = entry;
+                spawned.stack.clear();
+                if delay.is_sign_negative() {
+                    match run_frames(module, vec![spawned], limits, state)? {
+                        FrameRunOutcome::Complete(_) => {}
+                        FrameRunOutcome::Yielded { frames, delay } => {
+                            schedule_frames(state, frames, delay);
+                        }
+                    }
+                    continue;
+                }
+                let delay = if delay.is_finite() && delay > 0.0 {
+                    (delay.floor() as u64).max(1)
+                } else {
+                    0
+                };
+                schedule_frames(state, vec![spawned], delay);
+            }
             Instruction::Return => {
                 let result = match pop(&mut frames[frame_index].stack) {
                     Ok(value) => value,
@@ -6777,7 +7702,7 @@ fn run_frames(
                 };
                 frames.pop();
                 let Some(caller) = frames.last_mut() else {
-                    return Ok(result);
+                    return Ok(FrameRunOutcome::Complete(result));
                 };
                 caller.stack.push(result);
                 caller.instruction += 1;
@@ -6809,6 +7734,7 @@ fn make_frame(
         src: context.src.clone(),
         usr: context.usr.clone(),
         arguments: arguments.to_vec(),
+        exception_handlers: Vec::new(),
     }
 }
 
@@ -7863,6 +8789,22 @@ fn scalar_number_string(value: Value) -> Result<f32, String> {
     }
 }
 
+fn mutate_scalar_value(value: Value, delta: i8, prefix: bool) -> Result<(Value, Value), String> {
+    let old_result = value.clone();
+    let old_number = match value {
+        Value::Null | Value::Text(_) => 0.0,
+        Value::Number(number) => number.to_f32(),
+        value => {
+            return Err(format!(
+                "increment/decrement requires a scalar value, received {value}"
+            ));
+        }
+    };
+    let updated = Value::number(old_number + f32::from(delta));
+    let result = if prefix { updated.clone() } else { old_result };
+    Ok((result, updated))
+}
+
 fn execute_scalar_add(left: Value, right: Value) -> Result<Value, String> {
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => {
@@ -7951,8 +8893,8 @@ mod tests {
 
     use super::{
         CompoundListIndexOperator, ExecutionContext, ExecutionLimits, ExecutionState,
-        InitializerBinding, Instruction, ProcedureSpec, Program, Value, compile_initializer,
-        compile_module, compile_module_specs, compile_procedure,
+        InitializerBinding, Instruction, ProcedureSpec, Program, Value, advance_scheduler,
+        compile_initializer, compile_module, compile_module_specs, compile_procedure,
         compile_procedure_with_resolver_and_fields, condition_tokens, execute, execute_in_context,
         execute_in_state, execute_module, execute_module_in_context, execute_module_in_state,
         execute_module_with_limits, execute_with_limits, execute_with_limits_in_state,
@@ -7970,6 +8912,51 @@ mod tests {
             .expect("condition source should lex");
         let condition = condition_tokens(&tokens[1..], "if").expect("condition should compile");
         assert!(matches!(condition[0].kind, TokenKind::Operator(ref op) if op == "!"));
+    }
+
+    #[test]
+    fn try_catch_binds_arbitrary_thrown_values_and_skips_catch_normally() {
+        let syntax = parse(
+            "/proc/run(should_throw)\n\tvar/result = 1\n\ttry\n\t\tif (should_throw)\n\t\t\tthrow 5\n\t\tresult = 2\n\tcatch(var/error)\n\t\tresult = error + 10\n\treturn result\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("try/catch should compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(
+            execute_module(&module, entry, &[Value::number(0.0)]),
+            Ok(Value::number(2.0))
+        );
+        assert_eq!(
+            execute_module(&module, entry, &[Value::number(1.0)]),
+            Ok(Value::number(15.0))
+        );
+    }
+
+    #[test]
+    fn thrown_values_unwind_calls_and_nested_handlers_choose_the_nearest_catch() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/result\n\ttry\n\t\ttry\n\t\t\thelper()\n\t\tcatch(var/inner)\n\t\t\tresult = inner + 1\n\t\t\tthrow 10\n\tcatch(var/outer)\n\t\tresult += outer\n\treturn result\n/proc/helper()\n\tthrow 5\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("nested try/catch should compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(16.0)));
+    }
+
+    #[test]
+    fn catch_without_binding_consumes_the_exception_and_uncaught_throw_errors() {
+        let caught = parse("/proc/run()\n\ttry\n\t\tthrow \"test\"\n\tcatch\n\t\treturn 7\n")
+            .expect("source should parse");
+        let caught = compile_module(&caught.definitions).expect("catch should compile");
+        let entry = caught.procedure_id("/proc/run").expect("entry");
+        assert_eq!(execute_module(&caught, entry, &[]), Ok(Value::number(7.0)));
+
+        let uncaught = parse("/proc/run()\n\tthrow \"test\"\n").expect("source should parse");
+        let uncaught = compile_module(&uncaught.definitions).expect("throw should compile");
+        let entry = uncaught.procedure_id("/proc/run").expect("entry");
+        let error = execute_module(&uncaught, entry, &[]).expect_err("throw should escape");
+        assert!(error.message.contains("uncaught exception:"));
+        assert!(error.message.contains("test"));
     }
 
     #[test]
@@ -8344,6 +9331,93 @@ mod tests {
                 &ExecutionContext::new(Value::Datum(src), Value::Null),
             ),
             Ok(Value::number(3.0))
+        );
+    }
+
+    #[test]
+    fn clamp_accepts_reversed_numeric_bounds() {
+        let source = "/proc/test()\n\treturn clamp(15, 10, 0)\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("clamp should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(10.0)));
+    }
+
+    #[test]
+    fn clamp_list_returns_new_clamped_numeric_values() {
+        let source = "/proc/test()\n\tvar/list/input = list(-10, \"skip\", 5, 40)\n\tvar/list/output = clamp(input, 1, 10)\n\treturn output[1] * 100 + output[2] * 10 + output[3]\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("list clamp should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(160.0)));
+    }
+
+    #[test]
+    fn inverse_trig_builtins_use_dm_degrees_and_fallbacks() {
+        let source = "/proc/test()\n\treturn round(arctan(3, 4)) + round(arctan(-1, 1)) + round(arcsin(1)) + round(arccos(0)) + arcsin(2)\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("inverse trig builtins should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(368.0)));
+    }
+
+    #[test]
+    fn prefix_increment_is_an_expression_for_list_indexing() {
+        let source =
+            "/proc/test()\n\tvar/list/values = list(10, 20)\n\tvar/i = 0\n\treturn values[++i]\n";
+        let syntax = parse(source).expect("source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("prefix increment should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(10.0)));
+    }
+
+    #[test]
+    fn increment_expressions_follow_byond_coercion_and_return_rules() {
+        let source = "/proc/test()\n\tvar/a = 1\n\tvar/old = a++\n\tvar/new_value = ++a\n\tvar/text_value = \"bad\"\n\tvar/text_new = ++text_value\n\tvar/null_value = null\n\tvar/null_new = ++null_value\n\tvar/list/values = list(1)\n\tvar/list_old = values[1]++\n\tvar/list_new = values[1]\n\treturn old * 10000 + new_value * 1000 + text_new * 100 + null_new * 10 + list_old + list_new\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("increment expressions should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(13_113.0)));
+    }
+
+    #[test]
+    fn decrement_expressions_preserve_postfix_old_value() {
+        let source = "/proc/test()\n\tvar/value = 3\n\tvar/old = value--\n\tvar/new_value = --value\n\treturn old * 10 + new_value\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("decrement expressions should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(31.0)));
+    }
+
+    #[test]
+    fn field_increment_expressions_mutate_once_and_return_correct_value() {
+        let source = "/proc/test()\n\tvar/old = count++\n\tvar/current = ++count\n\treturn old * 10 + current\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure_with_resolver_and_fields(
+            &syntax.definitions[0],
+            &HashMap::new(),
+            &BTreeMap::from([("count".to_owned(), field("count"))]),
+            &BTreeMap::new(),
+        )
+        .expect("field mutation should compile");
+        let mut state = ExecutionState::new();
+        let src = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/source").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(src, field("count"), Value::number(3.0))
+            .unwrap();
+        assert_eq!(
+            execute_in_context(
+                &program,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(src), Value::Null),
+            ),
+            Ok(Value::number(35.0))
+        );
+        assert_eq!(
+            state.heap().datum_field(src, &field("count")),
+            Ok(&Value::number(5.0))
         );
     }
 
@@ -8737,6 +9811,102 @@ mod tests {
         assert!(module.procedure(entry).expect("entry program should exist").instructions.iter().any(
             |instruction| matches!(instruction, Instruction::Pick { weighted } if weighted == &vec![true, true]),
         ));
+    }
+
+    #[test]
+    fn namespace_qualified_call_is_parsed_as_static_call() {
+        let source =
+            parse("/proc/entry()\n\tTypeA::helper()\n\treturn 11\n/proc/helper()\n\treturn 11\n")
+                .expect("source should parse");
+        let module = compile_module(&source.definitions)
+            .expect("namespace-qualified static calls should compile");
+        let entry = module
+            .procedure_id("/proc/entry")
+            .expect("entry should resolve");
+        let helper = module
+            .procedure_id("/proc/helper")
+            .expect("helper should resolve");
+
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(11.0)));
+        let entry_program = module.procedure(entry).expect("entry program should exist");
+        assert!(
+            entry_program.instructions.iter().any(|instruction| {
+                matches!(instruction, Instruction::Call { procedure, .. } if *procedure == helper)
+            }),
+            "namespace-qualified call should resolve to a real static call",
+        );
+    }
+
+    #[test]
+    fn spawn_statement_runs_only_when_its_scheduler_delay_elapses() {
+        let source = parse(
+            "/proc/entry()\n\tspawn(1)\n\t\thelper()\n\treturn 11\n/proc/helper()\n\treturn 22\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&source.definitions).expect("spawn statement should compile");
+        let entry = module
+            .procedure_id("/proc/entry")
+            .expect("entry should resolve");
+
+        let mut state = ExecutionState::new();
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::number(11.0))
+        );
+        assert_eq!(
+            advance_scheduler(&module, 0, ExecutionLimits::default(), &mut state),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::Null])
+        );
+    }
+
+    #[test]
+    fn sleep_yields_and_resumes_the_full_procedure_frame() {
+        let source = parse("/proc/entry()\n\tvar/value = sleep(1)\n\treturn value + 11\n")
+            .expect("source should parse");
+        let module = compile_module(&source.definitions).expect("sleep should compile");
+        let entry = module
+            .procedure_id("/proc/entry")
+            .expect("entry should resolve");
+        let mut state = ExecutionState::new();
+
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::Null),
+            "a yielding entry returns control to the scheduler"
+        );
+        assert_eq!(
+            advance_scheduler(&module, 0, ExecutionLimits::default(), &mut state),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::number(11.0)])
+        );
+    }
+
+    #[test]
+    fn sleep_preserves_callers_waiting_on_a_nested_call() {
+        let source =
+            parse("/proc/entry()\n\treturn helper() + 1\n/proc/helper()\n\tsleep(1)\n\treturn 2\n")
+                .expect("source should parse");
+        let module = compile_module(&source.definitions).expect("sleep should compile");
+        let entry = module
+            .procedure_id("/proc/entry")
+            .expect("entry should resolve");
+        let mut state = ExecutionState::new();
+
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::Null)
+        );
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::number(3.0)])
+        );
     }
 
     #[test]
@@ -9280,6 +10450,77 @@ mod tests {
         .expect("native builtin procedure should execute");
         // 2 ** (3 ** 2) = 512; floor=1; abs=2; final slash is byte 7; initial=7.
         assert_eq!(result, Value::number(529.0));
+    }
+
+    #[test]
+    fn namespaced_runtime_type_value_reads_its_initial_field() {
+        let source = parse("/proc/read_mode(component_type)\n\treturn component_type::dupe_mode\n")
+            .expect("namespaced value source should parse");
+        let module = compile_module(&source.definitions)
+            .expect("namespaced runtime type value should compile");
+        let component = TypePath::parse("/datum/component/example").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_initial_values(BTreeMap::from([(
+            component.clone(),
+            BTreeMap::from([(field("dupe_mode"), Value::number(3.0))]),
+        )]));
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/read_mode").unwrap(),
+                &[Value::TypePath(component)],
+                &mut state,
+            ),
+            Ok(Value::number(3.0))
+        );
+    }
+
+    #[test]
+    fn scope_operator_supports_type_src_and_global_values() {
+        let type_source = parse("/proc/read()\n\treturn /datum/example::flag\n")
+            .expect("type scope source should parse");
+        let type_program =
+            compile_procedure(&type_source.definitions[0]).expect("type scope should compile");
+        let path = TypePath::parse("/datum/example").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_initial_values(BTreeMap::from([(
+            path.clone(),
+            BTreeMap::from([(field("flag"), Value::number(7.0))]),
+        )]));
+        assert_eq!(
+            execute_in_context(&type_program, &[], &mut state, &ExecutionContext::default(),),
+            Ok(Value::number(7.0))
+        );
+
+        let global_source =
+            parse("/proc/read()\n\treturn ::answer\n").expect("global scope source should parse");
+        let global_program =
+            compile_procedure(&global_source.definitions[0]).expect("global scope should compile");
+        state.set_global(field("answer"), Value::number(42.0));
+        assert_eq!(
+            execute_in_context(
+                &global_program,
+                &[],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::number(42.0))
+        );
+
+        let src_source =
+            parse("/proc/read()\n\treturn src::flag\n").expect("src scope source should parse");
+        let src_program =
+            compile_procedure(&src_source.definitions[0]).expect("src scope should compile");
+        let src = state.heap_mut().allocate_datum(path);
+        assert_eq!(
+            execute_in_context(
+                &src_program,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(src), Value::Null),
+            ),
+            Ok(Value::number(7.0))
+        );
     }
 
     #[test]
@@ -9980,6 +11221,29 @@ mod tests {
     }
 
     #[test]
+    fn do_while_accepts_byond_single_statement_body() {
+        // The DM reference defines the body as a Statement, which may be a
+        // block or one statement. One level of indentation is sufficient; it
+        // does not require a nested multi-line block.
+        let source = "/proc/count(limit)\n\tvar/result = 0\n\tdo\n\t\tresult += 1\n\twhile(result < limit)\n\treturn result\n";
+
+        assert_eq!(execute_source(source, 0.0), Value::number(1.0));
+        assert_eq!(execute_source(source, 4.0), Value::number(4.0));
+    }
+
+    #[test]
+    fn do_while_accepts_multiline_braced_macro_body() {
+        // Continued macros and generated DM commonly spell statement blocks
+        // with braces. The lexer retains the whole delimited region as one
+        // logical line, then compact-statement normalization must recover the
+        // same structure as an indented DM block.
+        let source = "/proc/count(limit)\n\tvar/result = 0\n\tdo {\n\t\tresult += 1;\n\t\tif(result == 2) {\n\t\t\tcontinue;\n\t\t}\n\t\tif(result > limit) {\n\t\t\tbreak;\n\t\t}\n\t} while(result <= limit)\n\treturn result\n";
+
+        assert_eq!(execute_source(source, 0.0), Value::number(1.0));
+        assert_eq!(execute_source(source, 3.0), Value::number(4.0));
+    }
+
+    #[test]
     fn switch_matches_values_ranges_and_default_after_evaluating_selector_once() {
         let source = "/proc/classify(value)\n\tvar/calls = 0\n\tswitch(value + 0)\n\t\tif(1, 3)\n\t\t\treturn 10\n\t\tif(4 to 6)\n\t\t\treturn 20\n\t\telse\n\t\t\treturn 30\n";
         let syntax = parse(source).expect("source should parse");
@@ -10200,6 +11464,9 @@ mod tests {
         let error = compile_procedure(&escaped.definitions[0])
             .expect_err("for initializer should be scoped to its loop");
         assert_eq!(error.message, "unknown local \"i\"");
+
+        let comma_source = "/proc/sum(limit)\n\tvar/total = 0\n\tfor(var/i = 0, i < limit, i++)\n\t\ttotal += i\n\treturn total\n";
+        assert_eq!(execute_source(comma_source, 5.0), Value::number(10.0));
     }
 
     #[test]
@@ -10247,6 +11514,17 @@ mod tests {
         let syntax = parse(optional).expect("source should parse");
         let program = compile_procedure(&syntax.definitions[0]).expect("procedure should compile");
         assert_eq!(execute(&program, &[]), Ok(Value::number(9.0)));
+
+        let empty = "/proc/count()\n\tvar/i = 0\n\tfor()\n\t\tif(i > 3)\n\t\t\tbreak\n\t\ti++\n\treturn i\n";
+        let syntax = parse(empty).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("empty for should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(4.0)));
+
+        let one_separator = "/proc/count()\n\tvar/i = 1\n\tvar/count = 0\n\tfor(, i++ <= 3)\n\t\tcount++\n\treturn count\n";
+        let syntax = parse(one_separator).expect("source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("short comma for should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(3.0)));
     }
 
     #[test]
@@ -10302,6 +11580,34 @@ mod tests {
                 .iter()
                 .any(|instruction| matches!(instruction, Instruction::ListLength))
         );
+    }
+
+    #[test]
+    fn for_in_and_for_to_accept_existing_iterator_locals() {
+        let list_source = "/proc/sum()\n\tvar/item\n\tvar/total = 0\n\tfor(item in list(1, 2, 3))\n\t\ttotal += item\n\treturn total\n";
+        let syntax = parse(list_source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("existing for-in iterator should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(6.0)));
+
+        let range_source = "/proc/sum()\n\tvar/item\n\tvar/total = 0\n\tfor(item in 1 to 3)\n\t\ttotal += item\n\treturn total\n";
+        let syntax = parse(range_source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("existing for-to iterator should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(6.0)));
+
+        let assignment_range = "/proc/sum()\n\tvar/total = 0\n\tfor(var/item = 1 to 8 step 3)\n\t\ttotal += item\n\treturn total\n";
+        let syntax = parse(assignment_range).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("assignment-style for-to should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(12.0)));
+
+        let empty_range =
+            "/proc/check()\n\tvar/item = -1\n\tfor(item = 1 to 0)\n\t\tcontinue\n\treturn item\n";
+        let syntax = parse(empty_range).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("empty existing-variable range should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(-1.0)));
     }
 
     #[test]
@@ -11105,6 +12411,127 @@ mod tests {
             &state,
         );
         assert_eq!(implicit_values, vec![Value::Datum(center)]);
+    }
+
+    #[test]
+    fn qdel_builtin_removes_a_datum_from_heap() {
+        let syntax = parse("/proc/test(v)\n\tqdel(v)\n").expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("qdel call should compile");
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::StandardBuiltin { name, .. } if name == "qdel"))
+        );
+
+        let mut state = ExecutionState::new();
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").expect("type path"));
+        let result = execute_in_state(&program, &[Value::Datum(datum)], &mut state)
+            .expect("qdel should execute");
+        assert_eq!(result, Value::Null);
+        assert!(state.heap().datum(datum).is_err());
+    }
+
+    #[test]
+    fn sort_list_builtin_orders_positional_values_with_stable_text_order() {
+        let syntax = parse("/proc/test()\n\tvar/list/L = list(2, 10, 1)\n\treturn sort_list(L)\n")
+            .expect("source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("sort_list call should compile");
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::StandardBuiltin { name, .. } if name == "sort_list"))
+        );
+
+        let mut state = ExecutionState::new();
+        let result = execute_in_state(&program, &[], &mut state).expect("sort_list should execute");
+        let Value::List(sorted) = result else {
+            panic!("sort_list should return a list");
+        };
+        let items = state
+            .heap()
+            .list(sorted)
+            .expect("sorted list should exist")
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            items,
+            vec![Value::number(1.0), Value::number(2.0), Value::number(10.0)]
+        );
+    }
+
+    #[test]
+    fn typecacheof_builtin_returns_descendant_type_map() {
+        let syntax =
+            parse("/proc/test()\n\treturn typecacheof(/datum)\n").expect("source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("typecacheof call should compile");
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::StandardBuiltin { name, .. } if name == "typecacheof"))
+        );
+
+        let mut state = ExecutionState::new();
+        let base = TypePath::parse("/datum").expect("type path");
+        let child = TypePath::parse("/datum/child").expect("type path");
+        let grandchild = TypePath::parse("/datum/child/grandchild").expect("type path");
+        state.set_type_paths([base.clone(), child.clone(), grandchild.clone()]);
+
+        let result =
+            execute_in_state(&program, &[], &mut state).expect("typecacheof should execute");
+        let Value::List(cache) = result else {
+            panic!("typecacheof should return a list");
+        };
+        let cache = state
+            .heap()
+            .list(cache)
+            .expect("type cache list should exist");
+        assert_eq!(
+            cache.get_key(&Value::TypePath(base)),
+            Ok(&Value::number(1.0))
+        );
+        assert_eq!(
+            cache.get_key(&Value::TypePath(child)),
+            Ok(&Value::number(1.0))
+        );
+        assert_eq!(
+            cache.get_key(&Value::TypePath(grandchild)),
+            Ok(&Value::number(1.0))
+        );
+    }
+
+    #[test]
+    fn image_builtin_constructs_image_datum_with_icon_fields() {
+        let syntax = parse("/proc/build()\n\treturn image(null, null, \"state\", 4, 2)\n")
+            .expect("source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("image constructor should compile");
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::StandardBuiltin { name, .. } if name == "image"))
+        );
+        let mut state = ExecutionState::new();
+        let result =
+            execute_in_state(&program, &[], &mut state).expect("image constructor should execute");
+        let Value::Datum(image) = result else {
+            panic!("image should return a datum");
+        };
+        let datum = state.heap().datum(image).expect("image datum should exist");
+        assert_eq!(datum.type_path(), &TypePath::parse("/image").unwrap());
+        assert_eq!(datum.field(&field("icon")), Ok(&Value::Null));
+        assert_eq!(datum.field(&field("loc")), Ok(&Value::Null));
+        assert_eq!(datum.field(&field("icon_state")), Ok(&Value::text("state")));
+        assert_eq!(datum.field(&field("layer")), Ok(&Value::number(4.0)));
+        assert_eq!(datum.field(&field("dir")), Ok(&Value::number(2.0)));
     }
 
     #[test]

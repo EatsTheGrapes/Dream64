@@ -570,6 +570,24 @@ fn seed_standard_prelude(pending: &mut BTreeMap<CodePath, PendingNode>) {
         &["mob"],
         &["world"],
         &["client"],
+        &["list"],
+        &["alist"],
+        &["savefile"],
+        &["regex"],
+        &["sound"],
+        &["image"],
+        &["icon"],
+        &["mutable_appearance"],
+        &["matrix"],
+        &["database"],
+        &["database", "query"],
+        &["exception"],
+        &["generator"],
+        &["particles"],
+        &["pixloc"],
+        &["vector"],
+        &["dm_filter"],
+        &["callee"],
     ];
 
     for segments in STANDARD_TYPES {
@@ -834,6 +852,9 @@ fn default_parent_path(path: &CodePath) -> Option<CodePath> {
     if path_is(path, &["obj"]) || path_is(path, &["mob"]) {
         return Some(CodePath(vec!["atom".to_owned(), "movable".to_owned()]));
     }
+    if path_is(path, &["mutable_appearance"]) {
+        return Some(CodePath(vec!["image".to_owned()]));
+    }
     if path.0.len() == 1 {
         return Some(CodePath(vec!["datum".to_owned()]));
     }
@@ -1054,6 +1075,69 @@ mod tests {
         assert_eq!(parent_path("/obj/item").as_deref(), Some("/obj"));
         assert_eq!(parent_path("/world"), None);
         assert_eq!(parent_path("/client"), None);
+    }
+
+    #[test]
+    fn seeds_the_complete_builtin_type_family_with_byond_parents() {
+        let syntax = parse("").expect("empty source should parse");
+        let output = build(&[SyntaxUnit {
+            file_id: FileId::from_index(0),
+            syntax: &syntax,
+        }]);
+
+        let expected = [
+            ("/datum", None),
+            ("/atom", Some("/datum")),
+            ("/atom/movable", Some("/atom")),
+            ("/area", Some("/atom")),
+            ("/turf", Some("/atom")),
+            ("/obj", Some("/atom/movable")),
+            ("/mob", Some("/atom/movable")),
+            ("/world", None),
+            ("/client", None),
+            ("/list", None),
+            ("/alist", None),
+            ("/savefile", None),
+            ("/regex", Some("/datum")),
+            ("/sound", Some("/datum")),
+            ("/image", Some("/datum")),
+            ("/icon", Some("/datum")),
+            ("/mutable_appearance", Some("/image")),
+            ("/matrix", Some("/datum")),
+            ("/database", Some("/datum")),
+            ("/database/query", Some("/database")),
+            ("/exception", Some("/datum")),
+            ("/generator", Some("/datum")),
+            ("/particles", Some("/datum")),
+            ("/pixloc", None),
+            ("/vector", None),
+            ("/dm_filter", Some("/datum")),
+            ("/callee", None),
+        ];
+
+        for (path, expected_parent) in expected {
+            let node = output
+                .tree
+                .nodes()
+                .iter()
+                .find(|node| node.path.to_string() == path)
+                .unwrap_or_else(|| panic!("standard type {path} should exist"));
+            assert!(node.is_standard(), "{path} should be marked standard");
+            assert!(!node.is_implicit(), "{path} should not be implicit");
+            let actual_parent = node.parent_type.map(|parent| {
+                output
+                    .tree
+                    .node(parent)
+                    .expect("parent identity should be valid")
+                    .path
+                    .to_string()
+            });
+            assert_eq!(
+                actual_parent.as_deref(),
+                expected_parent,
+                "parent of {path}"
+            );
+        }
     }
 
     #[test]

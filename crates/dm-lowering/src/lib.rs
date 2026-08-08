@@ -509,7 +509,7 @@ mod tests {
         let diagnostic = &inventory.diagnostics()[0];
         assert_eq!(diagnostic.procedure_path, "/proc/later");
         assert_eq!(diagnostic.source_path, "unsupported.dm");
-        assert_eq!(diagnostic.category, UnsupportedCategory::CallResolution);
+        assert_eq!(diagnostic.category, UnsupportedCategory::Parameter);
         assert!(!diagnostic.original_span.is_empty());
     }
 

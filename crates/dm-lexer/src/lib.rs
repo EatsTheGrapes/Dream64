@@ -183,6 +183,25 @@ impl<'source> Lexer<'source> {
         while self.offset < self.source.len() {
             if self.remaining().starts_with("*/") {
                 self.offset += 2;
+                if self.at_line_start {
+                    let line_start = self.source[..self.offset]
+                        .rfind(['\r', '\n'])
+                        .map_or(0, |newline| newline + 1);
+                    let mut tabs = 0;
+                    let mut spaces = 0;
+                    for character in self.source[line_start..].chars() {
+                        match character {
+                            '\t' => tabs += 1,
+                            ' ' => spaces += 1,
+                            _ => break,
+                        }
+                    }
+                    self.tokens.push(SpannedToken {
+                        kind: TokenKind::LineStart { tabs, spaces },
+                        span: SourceSpan::new(line_start, self.offset),
+                    });
+                    self.at_line_start = false;
+                }
                 return Ok(());
             }
             if matches!(self.current_char(), Some('\r' | '\n')) {

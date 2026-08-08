@@ -413,6 +413,8 @@ struct Loader {
     identities: HashMap<PathBuf, FileId>,
     macros: HashMap<String, MacroDefinition>,
     next_include_ordinal: usize,
+    warning_directive_is_error: bool,
+    duplicate_include_is_error: bool,
 }
 
 impl Loader {
@@ -440,6 +442,8 @@ impl Loader {
             identities: HashMap::new(),
             macros,
             next_include_ordinal: 0,
+            warning_directive_is_error: false,
+            duplicate_include_is_error: false,
         })
     }
 
@@ -513,20 +517,57 @@ impl Loader {
         let mut compiler_source = CompilerSourceBuilder::new();
         let mut conditionals = Vec::new();
         let mut cursor = 0usize;
+        let mut deferred_expansion: Option<(usize, String)> = None;
         for directive in directives {
             let span = directive.span;
             let ordinary_span = SourceSpan::new(cursor, span.start);
             if conditional_active(&conditionals) {
-                compiler_source.append_expanded_source(
-                    original_text,
-                    ordinary_span,
-                    &self.macros,
-                    path,
-                )?;
+                if let Some((start, mut deferred)) = deferred_expansion.take() {
+                    deferred.push_str(&original_text[ordinary_span.start..ordinary_span.end]);
+                    match compiler_source.append_deferred_source(
+                        &deferred,
+                        &mut self.macros,
+                        path,
+                    )? {
+                        Some(contents) => compiler_source.append_replacement(
+                            &contents,
+                            SourceSpan::new(start, ordinary_span.end),
+                        ),
+                        None => deferred_expansion = Some((start, deferred)),
+                    }
+                } else {
+                    let checkpoint = compiler_source.checkpoint();
+                    match compiler_source.append_expanded_source(
+                        original_text,
+                        ordinary_span,
+                        &mut self.macros,
+                        path,
+                    ) {
+                        Ok(()) => {}
+                        Err(ProjectError::MacroExpansion { ref message, .. })
+                            if message == "unterminated function macro invocation" =>
+                        {
+                            compiler_source.restore(checkpoint);
+                            deferred_expansion = Some((
+                                ordinary_span.start,
+                                original_text[ordinary_span.start..ordinary_span.end].to_owned(),
+                            ));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
             } else {
-                compiler_source.append_masked(original_text, ordinary_span);
+                if let Some((_, deferred)) = &mut deferred_expansion {
+                    deferred.push_str(&masked_text(original_text, ordinary_span));
+                } else {
+                    compiler_source.append_masked(original_text, ordinary_span);
+                }
             }
-            compiler_source.append_masked(original_text, span);
+            if let Some((_, deferred)) = &mut deferred_expansion {
+                deferred.push_str(&masked_text(original_text, span));
+            } else {
+                compiler_source.append_masked(original_text, span);
+            }
             cursor = span.end;
             self.process_directive(source, path, directive, &mut conditionals)?;
         }
@@ -544,7 +585,28 @@ impl Loader {
         }
         let tail = SourceSpan::new(cursor, original.len());
         if conditional_active(&conditionals) {
-            compiler_source.append_expanded_source(original_text, tail, &self.macros, path)?;
+            if let Some((start, mut deferred)) = deferred_expansion.take() {
+                deferred.push_str(&original_text[tail.start..tail.end]);
+                let contents = compiler_source
+                    .append_deferred_source(
+                        &deferred,
+                        &mut self.macros,
+                        path,
+                    )?
+                    .ok_or_else(|| ProjectError::MacroExpansion {
+                        path: path.to_path_buf(),
+                        offset: start,
+                        message: "unterminated function macro invocation".to_owned(),
+                    })?;
+                compiler_source.append_replacement(&contents, SourceSpan::new(start, tail.end));
+            } else {
+                compiler_source.append_expanded_source(
+                    original_text,
+                    tail,
+                    &mut self.macros,
+                    path,
+                )?;
+            }
         } else {
             compiler_source.append_masked(original_text, tail);
         }
@@ -555,6 +617,7 @@ impl Loader {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn process_directive(
         &mut self,
         source: FileId,
@@ -639,14 +702,53 @@ impl Loader {
             } if active => {
                 self.process_include(source, path, spelling, delimiter, directive.span)?;
             }
-            DirectiveKind::Define { .. }
+            DirectiveKind::Error(message) if active => {
+                return Err(preprocessor_error(
+                    path,
+                    offset,
+                    format!("#error{}", directive_message_suffix(&message)),
+                ));
+            }
+            DirectiveKind::Warning(message) if active && self.warning_directive_is_error => {
+                return Err(preprocessor_error(
+                    path,
+                    offset,
+                    format!("#warn{}", directive_message_suffix(&message)),
+                ));
+            }
+            DirectiveKind::Pragma(value) if active => {
+                self.apply_pragma(&value);
+            }
+            DirectiveKind::Warning(_)
+            | DirectiveKind::Pragma(_)
+            | DirectiveKind::Define { .. }
             | DirectiveKind::Undef(_)
-            | DirectiveKind::Include { .. } => {}
+            | DirectiveKind::Include { .. }
+            | DirectiveKind::Error(_) => {}
             DirectiveKind::Malformed(message) => {
                 return Err(preprocessor_error(path, offset, message));
             }
         }
         Ok(())
+    }
+
+    fn apply_pragma(&mut self, value: &str) {
+        let mut words = value.split_whitespace();
+        match (words.next(), words.next()) {
+            (Some("WarningDirective"), Some("error")) => {
+                self.warning_directive_is_error = true;
+            }
+            (Some("WarningDirective"), Some("warning" | "disabled")) => {
+                self.warning_directive_is_error = false;
+            }
+            (Some("FileAlreadyIncluded"), Some("error")) => {
+                self.duplicate_include_is_error = true;
+            }
+            (Some("FileAlreadyIncluded"), Some("warning" | "disabled")) => {
+                self.duplicate_include_is_error = false;
+            }
+            _ => {}
+        }
     }
 
     fn process_include(
@@ -663,6 +765,13 @@ impl Loader {
             IncludeDelimiter::System => IncludeTarget::System(spelling.clone()),
             IncludeDelimiter::Quoted => {
                 let target_path = self.resolve_quoted(path, &spelling)?;
+                if self.duplicate_include_is_error && self.identities.contains_key(&target_path) {
+                    return Err(preprocessor_error(
+                        path,
+                        span.start,
+                        format!("file already included: {spelling:?}"),
+                    ));
+                }
                 IncludeTarget::File(self.load_file(&target_path)?)
             }
         };
@@ -679,7 +788,7 @@ impl Loader {
     }
 
     fn evaluate(&self, path: &Path, offset: usize, expression: &str) -> Result<bool, ProjectError> {
-        ConditionParser::new(expression, &self.macros)
+        ConditionParser::new(expression, &self.macros, path, &self.root_directory)
             .parse()
             .map(|value| value != 0)
             .map_err(|message| preprocessor_error(path, offset, message))
@@ -749,7 +858,19 @@ enum DirectiveKind {
     Elif(String),
     Else,
     Endif,
+    Error(String),
+    Warning(String),
+    Pragma(String),
     Malformed(String),
+}
+
+fn directive_message_suffix(message: &str) -> String {
+    let message = message.trim();
+    if message.is_empty() {
+        String::new()
+    } else {
+        format!(" {message}")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -834,12 +955,47 @@ impl CompilerSourceBuilder {
         }
     }
 
+    fn checkpoint(&self) -> (usize, usize) {
+        (self.contents.len(), self.mappings.len())
+    }
+
+    fn restore(&mut self, checkpoint: (usize, usize)) {
+        self.contents.truncate(checkpoint.0);
+        self.mappings.truncate(checkpoint.1);
+    }
+
+    fn append_deferred_source(
+        &self,
+        source: &str,
+        macros: &mut HashMap<String, MacroDefinition>,
+        path: &Path,
+    ) -> Result<Option<String>, ProjectError> {
+        let mut expanded = Self::new();
+        match expanded.append_expanded_source(
+            source,
+            SourceSpan::new(0, source.len()),
+            macros,
+            path,
+        ) {
+            Ok(()) => Ok(Some(
+                String::from_utf8(expanded.contents)
+                    .expect("macro expansion preserves UTF-8 source"),
+            )),
+            Err(ProjectError::MacroExpansion { ref message, .. })
+                if message == "unterminated function macro invocation" =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn append_expanded_source(
         &mut self,
         source: &str,
         span: SourceSpan,
-        macros: &HashMap<String, MacroDefinition>,
+        macros: &mut HashMap<String, MacroDefinition>,
         path: &Path,
     ) -> Result<(), ProjectError> {
         let file_macro = path.to_string_lossy().replace('\\', "/");
@@ -872,7 +1028,7 @@ impl CompilerSourceBuilder {
                     literal_start = offset;
                     continue;
                 }
-                if let Some(definition) = macros.get(name) {
+                if let Some(definition) = macros.get(name).cloned() {
                     let invocation_end = if definition.parameters.is_some() {
                         let open = skip_horizontal_whitespace(text, identifier_end);
                         if text.as_bytes().get(open) != Some(&b'(') {
@@ -915,8 +1071,34 @@ impl CompilerSourceBuilder {
                         offset: invocation.start,
                         message,
                     })?;
-                    self.append_replacement(&replacement, invocation);
-                    offset = invocation_end;
+                    let line_end = text[invocation_end..]
+                        .find(['\r', '\n'])
+                        .map_or(text.len(), |relative| invocation_end + relative);
+                    if replacement.trim() == "#define" {
+                        let generated = format!("#define{}", &text[invocation_end..line_end]);
+                        apply_generated_define(&generated, macros).map_err(|message| {
+                            ProjectError::MacroExpansion {
+                                path: path.to_path_buf(),
+                                offset: invocation.start,
+                                message,
+                            }
+                        })?;
+                        offset = line_end;
+                    } else if let Some((visible, definition)) = split_generated_define(&replacement)
+                    {
+                        self.append_replacement(visible, invocation);
+                        apply_generated_define(definition, macros).map_err(|message| {
+                            ProjectError::MacroExpansion {
+                                path: path.to_path_buf(),
+                                offset: invocation.start,
+                                message,
+                            }
+                        })?;
+                        offset = invocation_end;
+                    } else {
+                        self.append_replacement(&replacement, invocation);
+                        offset = invocation_end;
+                    }
                     literal_start = offset;
                     continue;
                 }
@@ -979,6 +1161,71 @@ impl CompilerSourceBuilder {
             original: invocation,
         });
     }
+}
+
+fn masked_text(source: &str, span: SourceSpan) -> String {
+    source.as_bytes()[span.start..span.end]
+        .iter()
+        .map(|byte| {
+            if matches!(*byte, b'\r' | b'\n') {
+                char::from(*byte)
+            } else {
+                ' '
+            }
+        })
+        .collect()
+}
+
+fn split_generated_define(expansion: &str) -> Option<(&str, &str)> {
+    let mut offset = 0usize;
+    while offset < expansion.len() {
+        if let Some(end) = protected_text_end(expansion, offset) {
+            offset = end;
+            continue;
+        }
+        if expansion.as_bytes()[offset] == b'#' {
+            let after_hash = skip_horizontal_whitespace(expansion, offset + 1);
+            if expansion[after_hash..].starts_with("define")
+                && expansion[after_hash + "define".len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(char::is_whitespace)
+            {
+                return Some((&expansion[..offset], &expansion[offset..]));
+            }
+        }
+        offset += expansion[offset..]
+            .chars()
+            .next()
+            .expect("offset is inside macro expansion")
+            .len_utf8();
+    }
+    None
+}
+
+fn apply_generated_define(
+    directive: &str,
+    macros: &mut HashMap<String, MacroDefinition>,
+) -> Result<(), String> {
+    let Some(kind) = parse_directive_line(directive) else {
+        return Err("macro generated a malformed #define directive".to_owned());
+    };
+    let DirectiveKind::Define {
+        name,
+        value,
+        parameters,
+    } = kind
+    else {
+        return Err("macro generated a non-define directive".to_owned());
+    };
+    macros.insert(
+        name,
+        MacroDefinition {
+            replacement: value,
+            parameters,
+        },
+    );
+    Ok(())
 }
 
 fn source_line_number(source: &str, offset: usize) -> usize {
@@ -1646,6 +1893,9 @@ fn parse_directive_line(line: &str) -> Option<DirectiveKind> {
         } else {
             DirectiveKind::Malformed("#endif does not accept arguments".to_owned())
         }),
+        "error" => Some(DirectiveKind::Error(value.to_owned())),
+        "warn" => Some(DirectiveKind::Warning(value.to_owned())),
+        "pragma" => Some(DirectiveKind::Pragma(value.to_owned())),
         _ => None,
     }
 }
@@ -1698,14 +1948,23 @@ struct ConditionParser<'a> {
     source: &'a str,
     offset: usize,
     macros: &'a HashMap<String, MacroDefinition>,
+    source_file: &'a Path,
+    root_directory: &'a Path,
 }
 
 impl<'a> ConditionParser<'a> {
-    fn new(source: &'a str, macros: &'a HashMap<String, MacroDefinition>) -> Self {
+    fn new(
+        source: &'a str,
+        macros: &'a HashMap<String, MacroDefinition>,
+        source_file: &'a Path,
+        root_directory: &'a Path,
+    ) -> Self {
         Self {
             source: source.split("//").next().unwrap_or(source),
             offset: 0,
             macros,
+            source_file,
+            root_directory,
         }
     }
 
@@ -1787,6 +2046,24 @@ impl<'a> ConditionParser<'a> {
             }
             return Ok(i64::from(self.macros.contains_key(name)));
         }
+        if self.consume_word("fexists") {
+            if !self.consume("(") {
+                return Err("expected '(' after fexists".to_owned());
+            }
+            let spelling = self.parse_quoted_path()?;
+            if !self.consume(")") {
+                return Err("expected ')' after fexists path".to_owned());
+            }
+            let portable = spelling.replace(['\\', '/'], std::path::MAIN_SEPARATOR_STR);
+            let relative = Path::new(&portable);
+            let beside_source = self
+                .source_file
+                .parent()
+                .expect("a loaded source file has a parent")
+                .join(relative);
+            let from_root = self.root_directory.join(relative);
+            return Ok(i64::from(beside_source.exists() || from_root.exists()));
+        }
         if let Some(number) = self.parse_number()? {
             return Ok(number);
         }
@@ -1794,6 +2071,35 @@ impl<'a> ConditionParser<'a> {
             return Ok(resolve_macro_number(name, self.macros, 0));
         }
         Err("expected a value in conditional expression".to_owned())
+    }
+
+    fn parse_quoted_path(&mut self) -> Result<String, String> {
+        self.skip_whitespace();
+        if self.source.as_bytes().get(self.offset) != Some(&b'"') {
+            return Err("fexists requires a quoted path".to_owned());
+        }
+        self.offset += 1;
+        let mut path = String::new();
+        while self.offset < self.source.len() {
+            let character = self.source[self.offset..]
+                .chars()
+                .next()
+                .expect("offset is inside conditional expression");
+            self.offset += character.len_utf8();
+            match character {
+                '"' => return Ok(path),
+                '\\' => {
+                    let escaped = self.source[self.offset..]
+                        .chars()
+                        .next()
+                        .ok_or_else(|| "unterminated fexists path".to_owned())?;
+                    self.offset += escaped.len_utf8();
+                    path.push(escaped);
+                }
+                _ => path.push(character),
+            }
+        }
+        Err("unterminated fexists path".to_owned())
     }
 
     fn parse_number(&mut self) -> Result<Option<i64>, String> {
@@ -2271,6 +2577,38 @@ mod tests {
     }
 
     #[test]
+    fn applies_define_directives_generated_by_object_and_function_macros() {
+        let scratch = ScratchDirectory::new();
+        let source = concat!(
+            "#define EMPTY\n",
+            "#define DEFINE #define\n",
+            "#define DEFINE_WITH_EMPTY EMPTY #define\n",
+            "#define DEFINE_NESTED(name, value) DEFINE name value\n",
+            "#define DEFINE_AFTER_STATEMENT(name, value) var/kept = 4; DEFINE name value\n",
+            "DEFINE A 1\n",
+            "DEFINE_WITH_EMPTY B 2\n",
+            "DEFINE_NESTED(C, 3)\n",
+            "EMPTY DEFINE D 4\n",
+            " DEFINE E 5\n",
+            "DEFINE_AFTER_STATEMENT(F, 6)\n",
+            "/proc/check()\n",
+            "\treturn A + B + C + D + E + F\n",
+        );
+        fs::write(scratch.path().join("world.dme"), source)
+            .expect("generated-directive fixture should be written");
+
+        let project = Project::load(scratch.path().join("world.dme"))
+            .expect("generated define directives should preprocess");
+        let expanded = project.files[0]
+            .compiler_text()
+            .expect("expanded source should remain UTF-8");
+
+        assert!(expanded.contains("var/kept = 4;"));
+        assert!(expanded.contains("return 1 + 2 + 3 + 4 + 5 + 6"));
+        assert!(!expanded.contains("#define"));
+    }
+
+    #[test]
     fn expands_predefined_file_macro_inside_user_macros() {
         let scratch = ScratchDirectory::new();
         let source = concat!(
@@ -2362,6 +2700,162 @@ mod tests {
 
         assert_eq!(project.files.len(), 2);
         assert_eq!(project.includes.len(), 1);
+    }
+
+    #[test]
+    fn evaluates_fexists_relative_to_source_and_project_root() {
+        let scratch = ScratchDirectory::new();
+        fs::create_dir(scratch.path().join("nested"))
+            .expect("nested source directory should be created");
+        fs::write(
+            scratch.path().join("world.dme"),
+            "#include \"nested/check.dm\"\n",
+        )
+        .expect("environment should be written");
+        fs::write(scratch.path().join("root.resource"), b"root")
+            .expect("root resource should be written");
+        fs::write(
+            scratch.path().join("nested").join("local.resource"),
+            b"local",
+        )
+        .expect("local resource should be written");
+        fs::write(
+            scratch.path().join("nested").join("check.dm"),
+            concat!(
+                "#if fexists(\"local.resource\")\n",
+                "#include \"local.dm\"\n",
+                "#endif\n",
+                "#if fexists(\"root.resource\")\n",
+                "#include \"root.dm\"\n",
+                "#endif\n",
+                "#if fexists(\"missing.resource\")\n",
+                "#include \"missing.dm\"\n",
+                "#endif\n",
+            ),
+        )
+        .expect("conditional source should be written");
+        fs::write(
+            scratch.path().join("nested").join("local.dm"),
+            "/datum/local\n",
+        )
+        .expect("local include should be written");
+        fs::write(scratch.path().join("root.dm"), "/datum/root\n")
+            .expect("root include should be written");
+
+        let project = Project::load(scratch.path().join("world.dme"))
+            .expect("fexists conditions should load");
+
+        assert_eq!(project.includes.len(), 3);
+        assert!(
+            project
+                .includes
+                .iter()
+                .any(|edge| edge.spelling == "local.dm")
+        );
+        assert!(
+            project
+                .includes
+                .iter()
+                .any(|edge| edge.spelling == "root.dm")
+        );
+        assert!(
+            !project
+                .includes
+                .iter()
+                .any(|edge| edge.spelling == "missing.dm")
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_fexists_conditions() {
+        let (_, unquoted) = preprocessor_error_for("#if fexists(file.dm)\n#endif\n");
+        assert_eq!(unquoted, "fexists requires a quoted path");
+
+        let (_, unclosed) = preprocessor_error_for("#if fexists(\"file.dm\"\n#endif\n");
+        assert_eq!(unclosed, "expected ')' after fexists path");
+    }
+
+    #[test]
+    fn masks_warning_and_pragma_directives_without_rejecting_source() {
+        let scratch = ScratchDirectory::new();
+        let source = concat!(
+            "#pragma WarningDirective warning\n",
+            "#warn this is a warning, not DM source\n",
+            "/datum/after_warning\n",
+        );
+        fs::write(scratch.path().join("world.dme"), source).expect("environment should be written");
+
+        let project = Project::load(scratch.path().join("world.dme"))
+            .expect("warnings and pragmas should not reject the project");
+        let compiler_source = project.files[0]
+            .compiler_text()
+            .expect("compiler source should remain UTF-8");
+
+        assert!(!compiler_source.contains("#warn"));
+        assert!(!compiler_source.contains("#pragma"));
+        assert!(compiler_source.contains("/datum/after_warning"));
+    }
+
+    #[test]
+    fn reports_error_directives_only_in_active_branches() {
+        let scratch = ScratchDirectory::new();
+        fs::write(
+            scratch.path().join("world.dme"),
+            "#if 0\n#error inactive failure\n#endif\n/datum/valid\n",
+        )
+        .expect("environment should be written");
+        Project::load(scratch.path().join("world.dme"))
+            .expect("an inactive error directive should be ignored");
+
+        fs::write(
+            scratch.path().join("world.dme"),
+            "#error \"active failure\"\n",
+        )
+        .expect("environment should be replaced");
+        let error = Project::load(scratch.path().join("world.dme"))
+            .expect_err("an active error directive should reject the project");
+        assert!(matches!(
+            error,
+            ProjectError::Preprocessor { ref message, .. }
+                if message == "#error \"active failure\""
+        ));
+    }
+
+    #[test]
+    fn applies_warning_and_duplicate_include_pragma_severity() {
+        let warning_scratch = ScratchDirectory::new();
+        fs::write(
+            warning_scratch.path().join("world.dme"),
+            "#pragma WarningDirective error\n#warn promoted warning\n",
+        )
+        .expect("warning fixture should be written");
+        let warning = Project::load(warning_scratch.path().join("world.dme"))
+            .expect_err("the warning pragma should promote warnings to errors");
+        assert!(matches!(
+            warning,
+            ProjectError::Preprocessor { ref message, .. }
+                if message == "#warn promoted warning"
+        ));
+
+        let include_scratch = ScratchDirectory::new();
+        fs::write(
+            include_scratch.path().join("world.dme"),
+            concat!(
+                "#pragma FileAlreadyIncluded error\n",
+                "#include \"shared.dm\"\n",
+                "#include \"./shared.dm\"\n",
+            ),
+        )
+        .expect("include fixture should be written");
+        fs::write(include_scratch.path().join("shared.dm"), "/datum/shared\n")
+            .expect("included file should be written");
+        let duplicate = Project::load(include_scratch.path().join("world.dme"))
+            .expect_err("the include pragma should reject duplicate canonical files");
+        assert!(matches!(
+            duplicate,
+            ProjectError::Preprocessor { ref message, .. }
+                if message == "file already included: \"./shared.dm\""
+        ));
     }
 
     #[test]

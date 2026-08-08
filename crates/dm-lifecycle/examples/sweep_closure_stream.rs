@@ -91,12 +91,41 @@ fn main() -> ExitCode {
     let ordered_targets = locations.keys().copied().collect::<Vec<_>>();
     let mut compatible = 0usize;
     let mut grouped = BTreeMap::<(String, String), Vec<LifecycleCompatibilityLocation>>::new();
+    let trace_procedure = env::var("DREAM64_TRACE_PROCEDURE").ok();
+    let only_procedure = env::var("DREAM64_SWEEP_ONLY_PROCEDURE").ok();
 
     for (index, implementation) in ordered_targets.into_iter().enumerate() {
+        if only_procedure.as_deref().is_some_and(|path| {
+            procedures
+                .procedure(implementation.procedure())
+                .is_some_and(|procedure| procedure.path.to_string() != path)
+        }) {
+            continue;
+        }
         if index == 0 || (index + 1) % 10 == 0 || index + 1 == targets {
             eprintln!("sweep-progress: target {}/{}", index + 1, targets);
         }
 
+        if trace_procedure.as_deref().is_some_and(|path| {
+            procedures
+                .procedure(implementation.procedure())
+                .is_some_and(|procedure| procedure.path.to_string() == path)
+        }) {
+            let body = procedures
+                .implementation(implementation)
+                .expect("sweep implementation should exist");
+            let definition = compilation
+                .syntax(body.file_id)
+                .and_then(|syntax| syntax.definitions.get(body.definition_index))
+                .expect("sweep implementation syntax should exist");
+            eprintln!("sweep-trace procedure={trace_procedure:?}");
+            for line in &definition.body {
+                eprintln!(
+                    "sweep-trace indent={} tokens={:?}",
+                    line.indentation.spaces, line.tokens
+                );
+            }
+        }
         let result = procedures.compile_vm_implementations(&compilation, [implementation]);
         let target_locations = locations
             .remove(&implementation)

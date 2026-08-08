@@ -24,11 +24,14 @@ use super::{CompoundAssignmentOperator, ExecutionState};
 pub(super) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
     Some(match name {
         "abs" | "ceil" | "floor" | "fract" | "trunc" | "sign" | "sqrt" | "sin" | "cos" | "tan"
-        | "length_char" | "lowertext" | "uppertext" | "trimtext" | "ascii2text" | "text2path"
-        | "isinf" | "isnan" | "ckey" | "fexists" | "file2text" | "lentext" | "list2params"
-        | "params2list" => (1, 1),
-        "log" | "text2ascii" | "text2ascii_char" | "text2num" => (1, 2),
-        "lerp" => (3, 3),
+        | "arcsin" | "arccos" | "length_char" | "lowertext" | "uppertext" | "trimtext"
+        | "ascii2text" | "text2path" | "isinf" | "isnan" | "ckey" | "fexists" | "file2text"
+        | "lentext" | "list2params" | "params2list" => (1, 1),
+        "json_decode" | "md5" => (0, 1),
+        "json_encode" => (0, 2),
+        "log" | "arctan" | "text2ascii" | "text2ascii_char" | "text2num" => (1, 2),
+        "image" | "sort_list" | "qdel" | "typecacheof" => (0, 5),
+        "clamp" | "lerp" => (3, 3),
         "cmptext" | "cmptextEx" | "sorttext" | "sorttextEx" | "sortText" | "addtext" => {
             (0, usize::MAX)
         }
@@ -56,6 +59,7 @@ pub(super) fn execute_standard_builtin(
     state: &mut ExecutionState,
 ) -> Result<Value, String> {
     match name {
+        "qdel" => qdel_builtin(arguments, state),
         "abs" => unary_number(arguments, f32::abs),
         "ceil" => unary_number(arguments, f32::ceil),
         "floor" => unary_number(arguments, f32::floor),
@@ -74,12 +78,18 @@ pub(super) fn execute_standard_builtin(
         "sin" => unary_number(arguments, |value| value.to_radians().sin()),
         "cos" => unary_number(arguments, |value| value.to_radians().cos()),
         "tan" => unary_number(arguments, |value| value.to_radians().tan()),
+        "arcsin" => inverse_trig(arguments, f32::asin),
+        "arccos" => inverse_trig(arguments, f32::acos),
+        "arctan" => arctan_builtin(arguments),
         "log" => log_builtin(arguments),
+        "clamp" => clamp_builtin(arguments, state),
         "lerp" => lerp_builtin(arguments),
         "length_char" => length_char(arguments, state),
         "lowertext" => text_map(arguments, state, str::to_lowercase),
         "uppertext" => text_map(arguments, state, str::to_uppercase),
         "trimtext" => text_map(arguments, state, |value| value.trim().to_owned()),
+        "sort_list" => sort_list_builtin(arguments, state),
+        "typecacheof" => typecacheof_builtin(arguments, state),
         "ascii2text" => ascii2text(arguments),
         "text2ascii" => text2ascii(arguments, state, false),
         "text2ascii_char" => text2ascii(arguments, state, true),
@@ -119,7 +129,174 @@ pub(super) fn execute_standard_builtin(
         "num2text" => num2text(arguments),
         "list2params" => list2params(arguments, state),
         "params2list" => params2list(arguments, state),
+        "json_decode" => json_decode_builtin(arguments, state),
+        "json_encode" => json_encode_builtin(arguments, state),
+        "md5" => md5_builtin(arguments),
+        "image" => image_builtin(arguments, state),
         _ => Err(format!("unknown native DM builtin {name:?}")),
+    }
+}
+
+fn md5_builtin(arguments: &[Value]) -> Result<Value, String> {
+    let Some(Value::Text(text)) = arguments.first() else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::text(format!("{:x}", md5::compute(text.as_bytes()))))
+}
+
+fn json_encode_builtin(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
+    let pretty = arguments
+        .get(1)
+        .and_then(Value::as_number)
+        .is_some_and(|flags| flags.trunc() as i32 & 1 != 0);
+    let value = arguments.first().unwrap_or(&Value::Null);
+    let json = json_value_from_dm(value, state, 0)?;
+    let encoded = if pretty {
+        serde_json::to_string_pretty(&json)
+    } else {
+        serde_json::to_string(&json)
+    }
+    .map_err(|error| format!("json_encode failed: {error}"))?;
+    Ok(Value::text(encoded))
+}
+
+fn json_value_from_dm(
+    value: &Value,
+    state: &ExecutionState,
+    depth: usize,
+) -> Result<serde_json::Value, String> {
+    if depth >= 20 {
+        return Ok(serde_json::Value::Null);
+    }
+    match value {
+        Value::Null => Ok(serde_json::Value::Null),
+        Value::Number(number) => {
+            let number = number.to_f32();
+            if number.is_finite() {
+                let json_number =
+                    number
+                        .to_string()
+                        .parse::<serde_json::Number>()
+                        .map_err(|error| {
+                            format!("json_encode cannot encode number {number}: {error}")
+                        })?;
+                Ok(serde_json::Value::Number(json_number))
+            } else {
+                let spelling = if number.is_nan() {
+                    "NaN"
+                } else if number.is_sign_positive() {
+                    "Infinity"
+                } else {
+                    "-Infinity"
+                };
+                let mut object = serde_json::Map::new();
+                object.insert(
+                    "__number__".to_owned(),
+                    serde_json::Value::String(spelling.to_owned()),
+                );
+                Ok(serde_json::Value::Object(object))
+            }
+        }
+        Value::Text(text) => Ok(serde_json::Value::String(text.to_string())),
+        Value::TypePath(path) => Ok(serde_json::Value::String(path.to_string())),
+        Value::Datum(_) => Ok(serde_json::Value::String(runtime_text(
+            value,
+            state,
+            "json_encode datum",
+        )?)),
+        Value::List(id) => {
+            let list = state.heap.list(*id).map_err(|error| error.to_string())?;
+            let entries = list
+                .positions()
+                .map(|(_, key)| Ok((key.clone(), list.get_key(key).ok().cloned())))
+                .collect::<Result<Vec<_>, String>>()?;
+            if list.associative_len() == 0 {
+                entries
+                    .into_iter()
+                    .map(|(value, _)| json_value_from_dm(&value, state, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(serde_json::Value::Array)
+            } else {
+                let mut object = serde_json::Map::new();
+                for (key, associated) in entries {
+                    let key = runtime_text(&key, state, "json_encode list key")?;
+                    let value = associated.map_or(Ok(serde_json::Value::Null), |value| {
+                        json_value_from_dm(&value, state, depth + 1)
+                    })?;
+                    object.insert(key, value);
+                }
+                Ok(serde_json::Value::Object(object))
+            }
+        }
+    }
+}
+
+fn json_decode_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    let Some(Value::Text(text)) = arguments.first() else {
+        return Err("json_decode requires text".to_owned());
+    };
+    let json: serde_json::Value =
+        serde_json::from_str(text).map_err(|error| format!("json_decode failed: {error}"))?;
+    dm_value_from_json(&json, state)
+}
+
+fn dm_value_from_json(
+    json: &serde_json::Value,
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    match json {
+        serde_json::Value::Null => Ok(Value::Null),
+        serde_json::Value::Bool(value) => Ok(Value::number(f32::from(*value))),
+        serde_json::Value::Number(value) => {
+            let number = value
+                .as_f64()
+                .ok_or_else(|| format!("json_decode invalid number {value}"))?
+                as f32;
+            if !number.is_finite() {
+                return Err(format!("json_decode number is outside DM's range: {value}"));
+            }
+            Ok(Value::number(number))
+        }
+        serde_json::Value::String(value) => Ok(Value::text(value.clone())),
+        serde_json::Value::Array(values) => {
+            let decoded = values
+                .iter()
+                .map(|value| dm_value_from_json(value, state))
+                .collect::<Result<Vec<_>, _>>()?;
+            let id = state.heap.allocate_list();
+            let list = state.heap.list_mut(id).map_err(|error| error.to_string())?;
+            for value in decoded {
+                list.add(value);
+            }
+            Ok(Value::List(id))
+        }
+        serde_json::Value::Object(object) => {
+            if object.len() == 1 {
+                if let Some(serde_json::Value::String(number)) = object.get("__number__") {
+                    let value = match number.as_str() {
+                        "NaN" => f32::NAN,
+                        "Infinity" => f32::INFINITY,
+                        "-Infinity" => f32::NEG_INFINITY,
+                        _ => number.parse::<f32>().map_err(|_| {
+                            format!("json_decode invalid special number {number:?}")
+                        })?,
+                    };
+                    return Ok(Value::number(value));
+                }
+            }
+            let decoded = object
+                .iter()
+                .map(|(key, value)| {
+                    dm_value_from_json(value, state).map(|value| (Value::text(key.clone()), value))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let id = state.heap.allocate_list();
+            let list = state.heap.list_mut(id).map_err(|error| error.to_string())?;
+            for (key, value) in decoded {
+                list.set_key(key, value);
+            }
+            Ok(Value::List(id))
+        }
     }
 }
 
@@ -291,6 +468,34 @@ fn unary_number(arguments: &[Value], operation: impl FnOnce(f32) -> f32) -> Resu
     Ok(Value::number(operation(value)))
 }
 
+fn fallback_number(value: &Value) -> f32 {
+    match value {
+        Value::Number(number) => number.to_f32(),
+        Value::Null | Value::Text(_) | Value::TypePath(_) | Value::Datum(_) | Value::List(_) => 0.0,
+    }
+}
+
+fn inverse_trig(arguments: &[Value], operation: impl FnOnce(f32) -> f32) -> Result<Value, String> {
+    let value = fallback_number(&arguments[0]);
+    let value = if (-1.0..=1.0).contains(&value) {
+        operation(value).to_degrees()
+    } else {
+        0.0
+    };
+    Ok(Value::number(value))
+}
+
+fn arctan_builtin(arguments: &[Value]) -> Result<Value, String> {
+    let first = fallback_number(&arguments[0]);
+    let value = if arguments.len() == 1 {
+        first.atan().to_degrees()
+    } else {
+        let second = fallback_number(&arguments[1]);
+        second.atan2(first).to_degrees()
+    };
+    Ok(Value::number(value))
+}
+
 fn number(value: &Value, context: &str) -> Result<f32, String> {
     match value {
         Value::Null => Ok(0.0),
@@ -326,6 +531,41 @@ fn lerp_builtin(arguments: &[Value]) -> Result<Value, String> {
     Ok(Value::number(start + (end - start) * factor))
 }
 
+/// Implements BYOND's scalar and list `clamp(value, low, high)` forms.
+/// Bounds are interchangeable. List input produces a new positional list and
+/// skips nonnumeric entries, matching Dream Maker's observable behavior.
+fn clamp_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    let mut low = number(&arguments[1], "clamp lower bound")?;
+    let mut high = number(&arguments[2], "clamp upper bound")?;
+    if low > high {
+        std::mem::swap(&mut low, &mut high);
+    }
+    if let Value::List(list) = arguments[0] {
+        let clamped = state
+            .heap
+            .list(list)
+            .map_err(|error| error.to_string())?
+            .positions()
+            .filter_map(|(_, value)| match value {
+                Value::Number(number) => Some(Value::number(number.to_f32().clamp(low, high))),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let result = state.heap.allocate_list();
+        let list = state
+            .heap
+            .list_mut(result)
+            .map_err(|error| error.to_string())?;
+        for value in clamped {
+            list.add(value);
+        }
+        Ok(Value::List(result))
+    } else {
+        let value = number(&arguments[0], "clamp value")?;
+        Ok(Value::number(value.clamp(low, high)))
+    }
+}
+
 fn runtime_text(value: &Value, state: &ExecutionState, context: &str) -> Result<String, String> {
     match value {
         Value::Text(text) => Ok(text.to_string()),
@@ -345,6 +585,171 @@ fn runtime_text(value: &Value, state: &ExecutionState, context: &str) -> Result<
         }
         Value::List(_) => Err(format!("{context} cannot convert a list to text")),
     }
+}
+
+fn qdel_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    if arguments.is_empty() {
+        return Ok(Value::Null);
+    }
+    for argument in arguments {
+        qdel_value(argument, state).map_err(|error| format!("qdel failed: {error}"))?;
+    }
+    Ok(Value::Null)
+}
+
+fn qdel_value(value: &Value, state: &mut ExecutionState) -> Result<(), String> {
+    match value {
+        Value::Null => Ok(()),
+        Value::Number(_) | Value::Text(_) | Value::TypePath(_) => Ok(()),
+        Value::Datum(datum) => state
+            .heap_mut()
+            .destroy_datum(*datum)
+            .map_err(|error| error.to_string())
+            .map(|_| ()),
+        Value::List(list) => {
+            let entries = state
+                .heap
+                .list(*list)
+                .map_err(|error| error.to_string())?
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>();
+            for entry in entries {
+                qdel_value(&entry, state)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn typecacheof_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    let target = arguments
+        .first()
+        .ok_or_else(|| "typecacheof requires a base type".to_owned())?;
+    let target = match target {
+        Value::TypePath(path) => path.clone(),
+        Value::Text(text) => TypePath::parse(text)
+            .map_err(|_| format!("typecacheof requires a type path, received {target}"))?,
+        _ => {
+            return Err(format!(
+                "typecacheof requires a type path, received {target}"
+            ));
+        }
+    };
+
+    let paths = {
+        let mut paths = state
+            .type_paths()
+            .filter(|path| {
+                let path = *path;
+                path == &target || path.as_str().starts_with(&format!("{}/", target.as_str()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        paths.push(target.clone());
+        paths.sort_unstable();
+        paths
+    };
+
+    let result = state.heap_mut().allocate_list();
+    let list = state
+        .heap_mut()
+        .list_mut(result)
+        .map_err(|error| error.to_string())?;
+
+    for path in paths {
+        let _ = list.set_key(Value::TypePath(path), Value::number(1.0));
+    }
+    Ok(Value::List(result))
+}
+
+fn image_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    let image_path = TypePath::parse("/image").expect("\"/image\" is a canonical BYOND type path");
+    let image = state.heap_mut().allocate_datum(image_path);
+    let datum = state
+        .heap_mut()
+        .datum_mut(image)
+        .map_err(|error| error.to_string())?;
+
+    if let Some(icon) = arguments.first() {
+        let _ = datum.set_field(
+            FieldName::parse("icon").expect("field name icon"),
+            icon.clone(),
+        );
+    }
+    if let Some(location) = arguments.get(1) {
+        let _ = datum.set_field(
+            FieldName::parse("loc").expect("field name loc"),
+            location.clone(),
+        );
+    }
+    if let Some(icon_state) = arguments.get(2) {
+        let _ = datum.set_field(
+            FieldName::parse("icon_state").expect("field name icon_state"),
+            icon_state.clone(),
+        );
+    }
+    if let Some(layer) = arguments.get(3) {
+        let _ = datum.set_field(
+            FieldName::parse("layer").expect("field name layer"),
+            layer.clone(),
+        );
+    }
+    if let Some(direction) = arguments.get(4) {
+        let _ = datum.set_field(
+            FieldName::parse("dir").expect("field name dir"),
+            direction.clone(),
+        );
+    }
+
+    Ok(Value::Datum(image))
+}
+
+fn sort_list_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    let list = arguments
+        .first()
+        .ok_or_else(|| "sort_list requires a list argument".to_owned())?;
+    let list = match list {
+        Value::List(list) => *list,
+        value => return Err(format!("sort_list requires a list, received {value}")),
+    };
+
+    let entries = {
+        let snapshot = state.heap.list(list).map_err(|error| error.to_string())?;
+        if snapshot.associative_len() > 0 {
+            return Err("sort_list does not support associative entries yet".to_owned());
+        }
+        snapshot
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let mut entries = entries;
+    entries.sort_by(|left, right| match (left, right) {
+        (Value::Number(left), Value::Number(right)) => left
+            .to_f32()
+            .partial_cmp(&right.to_f32())
+            .unwrap_or(std::cmp::Ordering::Equal),
+        _ => {
+            let left =
+                runtime_text(left, state, "sort_list item").unwrap_or_else(|_| left.to_string());
+            let right =
+                runtime_text(right, state, "sort_list item").unwrap_or_else(|_| right.to_string());
+            left.cmp(&right)
+        }
+    });
+
+    let list_id = list;
+    let list = state
+        .heap
+        .list_mut(list_id)
+        .map_err(|error| error.to_string())?;
+    list.resize(0).map_err(|error| error.to_string())?;
+    for entry in entries {
+        list.add(entry);
+    }
+    Ok(Value::List(list_id))
 }
 
 fn strict_text(value: &Value, state: &ExecutionState, context: &str) -> Result<String, String> {
@@ -1571,5 +1976,98 @@ fn file2text(arguments: &[Value], state: &ExecutionState) -> Result<Value, Strin
         Ok(text) => Ok(Value::text(text)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
         Err(error) => Err(format!("file2text failed: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod json_md5_tests {
+    use super::*;
+
+    fn encoded(value: Value, state: &ExecutionState) -> String {
+        let Value::Text(text) = json_encode_builtin(&[value], state).expect("JSON should encode")
+        else {
+            panic!("json_encode must return text");
+        };
+        text.to_string()
+    }
+
+    #[test]
+    fn json_encodes_dm_scalars_and_special_numbers() {
+        let state = ExecutionState::new();
+        assert_eq!(encoded(Value::Null, &state), "null");
+        assert_eq!(encoded(Value::number(7.0), &state), "7");
+        assert_eq!(encoded(Value::number(15.5), &state), "15.5");
+        assert_eq!(encoded(Value::text("A\nB"), &state), r#""A\nB""#);
+        assert_eq!(
+            encoded(Value::number(f32::NAN), &state),
+            r#"{"__number__":"NaN"}"#
+        );
+        assert_eq!(
+            encoded(Value::number(f32::INFINITY), &state),
+            r#"{"__number__":"Infinity"}"#
+        );
+    }
+
+    #[test]
+    fn json_encodes_positional_associative_and_pretty_lists() {
+        let mut state = ExecutionState::new();
+        let positional = state.heap.allocate_list();
+        state
+            .heap
+            .list_mut(positional)
+            .unwrap()
+            .add(Value::number(1.0));
+        state
+            .heap
+            .list_mut(positional)
+            .unwrap()
+            .add(Value::text("two"));
+        assert_eq!(encoded(Value::List(positional), &state), r#"[1,"two"]"#);
+
+        let associative = state.heap.allocate_list();
+        state
+            .heap
+            .list_mut(associative)
+            .unwrap()
+            .set_key(Value::text("name"), Value::text("fridge"));
+        state
+            .heap
+            .list_mut(associative)
+            .unwrap()
+            .set_key(Value::text("power"), Value::number(12.0));
+        assert_eq!(
+            encoded(Value::List(associative), &state),
+            r#"{"name":"fridge","power":12}"#
+        );
+        let Value::Text(pretty) =
+            json_encode_builtin(&[Value::List(associative), Value::number(1.0)], &state).unwrap()
+        else {
+            panic!("pretty JSON must be text");
+        };
+        assert!(pretty.contains('\n'));
+    }
+
+    #[test]
+    fn json_decodes_arrays_objects_booleans_and_special_numbers() {
+        let mut state = ExecutionState::new();
+        let decoded =
+            json_decode_builtin(&[Value::text(r#"{"a":[true,null,2.5]}"#)], &mut state).unwrap();
+        assert_eq!(encoded(decoded, &state), r#"{"a":[1,null,2.5]}"#);
+        let special =
+            json_decode_builtin(&[Value::text(r#"{"__number__":"-Infinity"}"#)], &mut state)
+                .unwrap();
+        assert!(special.as_number().unwrap().is_infinite());
+        assert!(special.as_number().unwrap().is_sign_negative());
+    }
+
+    #[test]
+    fn md5_hashes_text_bytes_and_rejects_non_text_values() {
+        assert_eq!(
+            md5_builtin(&[Value::text("md5_test")]).unwrap(),
+            Value::text("c74318b61a3024520c466f828c043c79")
+        );
+        assert_eq!(md5_builtin(&[Value::number(5.0)]).unwrap(), Value::Null);
+        assert_eq!(md5_builtin(&[]).unwrap(), Value::Null);
+        assert_eq!(encoded(Value::Null, &ExecutionState::new()), "null");
     }
 }

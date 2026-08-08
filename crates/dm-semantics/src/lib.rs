@@ -88,10 +88,6 @@ const STANDARD_BUILTINS: &str = concat!(
     "\t\t\tresult = value\n",
     "\treturn result\n",
 );
-const STANDARD_BUILTIN_NAMES: [&str; 8] = [
-    "isarea", "ismob", "isobj", "get_dir", "istext", "orange", "min", "max",
-];
-
 /// Tree-local identity of a canonical procedure.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProcedureId(u32);
@@ -496,17 +492,26 @@ impl ProcedureRegistry {
             .collect();
         let builtin_syntax =
             dm_syntax::parse(STANDARD_BUILTINS).map_err(|error| dm_vm::CompileError {
-                message: format!("failed to parse Dream64 standard location builtins: {error}"),
+                message: format!(
+                    "failed to parse Dream64 standard location builtins: {}",
+                    error
+                ),
             })?;
-        if builtin_syntax.definitions.len() != STANDARD_BUILTIN_NAMES.len() {
-            return Err(dm_vm::CompileError {
-                message: "Dream64 standard location builtin catalog is malformed".to_owned(),
-            });
+        let mut builtin_names = Vec::with_capacity(builtin_syntax.definitions.len());
+        for definition in &builtin_syntax.definitions {
+            let name = definition
+                .path
+                .segments()
+                .last()
+                .ok_or_else(|| dm_vm::CompileError {
+                    message: "Dream64 standard location builtin with invalid path".to_owned(),
+                })?;
+            builtin_names.push(name.to_owned());
         }
-        let builtin_indices: BTreeMap<_, _> = STANDARD_BUILTIN_NAMES
+        let builtin_indices: BTreeMap<_, _> = builtin_names
             .iter()
             .enumerate()
-            .map(|(offset, name)| ((*name).to_owned(), ordered.len() + offset))
+            .map(|(offset, name)| (name.clone(), ordered.len() + offset))
             .collect();
         let mut specs: Vec<_> = ordered
             .iter()
@@ -564,9 +569,9 @@ impl ProcedureRegistry {
             })
             .collect::<Result<_, dm_vm::CompileError>>()?;
         for (offset, definition) in builtin_syntax.definitions.iter().enumerate() {
-            let name = STANDARD_BUILTIN_NAMES[offset];
+            let name = &builtin_names[offset];
             specs.push(dm_vm::ProcedureSpec {
-                path: format!("/proc/{name}@dream64_builtin"),
+                path: format!("/proc/{}@dream64_builtin", name),
                 definition,
                 parent: None,
                 static_calls: BTreeMap::new(),
@@ -584,7 +589,10 @@ impl ProcedureRegistry {
                     module
                         .procedure_id_at(index)
                         .ok_or_else(|| dm_vm::CompileError {
-                            message: format!("compiled procedure spec {index} has no VM identity"),
+                            message: format!(
+                                "compiled procedure spec {} has no VM identity",
+                                index
+                            ),
                         })?,
                 ))
             })
@@ -909,7 +917,8 @@ mod tests {
         fn compile(source: &str) -> Compilation {
             let ordinal = NEXT_PROJECT.fetch_add(1, Ordering::Relaxed);
             let root = std::env::temp_dir().join(format!(
-                "dream64-dm-semantics-{}-{ordinal}",
+                "dream64-dm-semantics-{}-{}",
+                ordinal,
                 std::process::id()
             ));
             fs::create_dir(&root).expect("test project directory should be created");
@@ -982,6 +991,89 @@ mod tests {
         assert_eq!(
             procedure.effective_target,
             Some(procedure.implementations[0].id)
+        );
+    }
+
+    #[test]
+    fn function_macro_brace_blocks_keep_locals_visible_to_nested_children() {
+        let compilation = TestProject::compile(
+            "#define WRAP(value) \\\n\tdo {\\
+\t\tif(value) {\\
+\t\t\tvar/_cached_plane = value;\\
+\t\t\tif(_cached_plane) {\\
+\t\t\t\tvalue = _cached_plane;\\
+\t\t\t}\\
+\t\t}\\
+\t} while(FALSE)\n\n/proc/run(value)\n\tWRAP(value)\n\treturn value\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        registry
+            .compile_vm(&compilation)
+            .expect("macro-expanded brace locals should compile");
+    }
+
+    #[test]
+    fn multiline_macro_brace_blocks_keep_locals_visible_to_nested_children() {
+        let compilation = TestProject::compile(
+            r#"#define WRAP(value) \
+	do {\
+		if(value) {\
+			var/_cached_plane = value;\
+			var/turf/_our_turf = value;\
+			if(_our_turf) {\
+				value = _cached_plane;\
+			} else if(value) {\
+				value = _cached_plane;\
+			}\
+		}\
+	} while(FALSE)
+
+/proc/run(value)
+	WRAP(value)
+	return value
+"#,
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        registry
+            .compile_vm(&compilation)
+            .expect("macro-expanded brace locals should compile");
+    }
+
+    #[test]
+    fn typed_global_macro_declaration_is_visible_as_a_bare_global() {
+        let compilation = TestProject::compile(
+            r#"#define GLOBAL_REAL(X, Typepath) var/global##Typepath/##X
+
+GLOBAL_REAL(Master, /datum/controller/master)
+
+/proc/run()
+	return Master
+"#,
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        registry
+            .compile_vm(&compilation)
+            .expect("typed global declarations should resolve by bare name");
+    }
+
+    #[test]
+    fn typed_global_proc_parameters_keep_if_lines_in_the_procedure_body() {
+        let compilation = TestProject::compile(
+            "/proc/overwrite_field_if_available(datum/record/base, datum/record/other, field_name)\n\tif(!istype(base) || !istype(other))\n\t\treturn\n\tif(other.vars[field_name])\n\t\tbase.vars[field_name] = other.vars[field_name]\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        assert!(
+            registry
+                .procedures()
+                .iter()
+                .all(|procedure| procedure.path.to_string() != "/proc/if"),
+            "if statements must not become phantom global procedures"
+        );
+        assert!(
+            registry.procedures().iter().any(|procedure| {
+                procedure.path.to_string() == "/proc/overwrite_field_if_available"
+            }),
+            "the typed global procedure should be indexed"
         );
     }
 
