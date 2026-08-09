@@ -58,6 +58,19 @@ impl fmt::Display for TypePath {
 pub struct FieldName(Arc<str>);
 
 impl FieldName {
+    /// Produces a collision-free VM storage key for a canonical type-static
+    /// variable path. Each source byte is hex encoded so owner qualification
+    /// and reopening identity survive the identifier-only VM namespace.
+    #[must_use]
+    pub fn static_storage(variable_path: &str) -> Self {
+        let mut encoded = String::from("__dm_static_");
+        for byte in variable_path.bytes() {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        Self(Arc::from(encoded))
+    }
+
     /// Validates and stores one DM identifier.
     ///
     /// # Errors
@@ -129,6 +142,8 @@ pub enum Value {
     Text(Arc<str>),
     /// A canonical type path value.
     TypePath(TypePath),
+    /// A type path carrying evaluated per-construction field overrides.
+    ModifiedTypePath(Arc<ModifiedTypePath>),
     /// Reference to a heap datum.
     Datum(DatumId),
     /// Reference to a mutable heap list.
@@ -153,7 +168,12 @@ impl Value {
     pub const fn as_number(&self) -> Option<f32> {
         match self {
             Self::Number(number) => Some(number.to_f32()),
-            Self::Null | Self::Text(_) | Self::TypePath(_) | Self::Datum(_) | Self::List(_) => None,
+            Self::Null
+            | Self::Text(_)
+            | Self::TypePath(_)
+            | Self::ModifiedTypePath(_)
+            | Self::Datum(_)
+            | Self::List(_) => None,
         }
     }
 
@@ -172,6 +192,7 @@ impl Value {
             }
             (Self::Text(left), Self::Text(right)) => left == right,
             (Self::TypePath(left), Self::TypePath(right)) => left == right,
+            (Self::ModifiedTypePath(left), Self::ModifiedTypePath(right)) => left == right,
             (Self::Datum(left), Self::Datum(right)) => left == right,
             (Self::List(left), Self::List(right)) => left == right,
             _ => false,
@@ -192,9 +213,37 @@ impl fmt::Display for Value {
             Self::Number(number) => write!(formatter, "{}", number.to_f32()),
             Self::Text(text) => write!(formatter, "{text:?}"),
             Self::TypePath(path) => write!(formatter, "{path}"),
+            Self::ModifiedTypePath(path) => write!(formatter, "{}{{...}}", path.base),
             Self::Datum(id) => write!(formatter, "datum({id:?})"),
             Self::List(id) => write!(formatter, "list({id:?})"),
         }
+    }
+}
+
+/// A first-class modified type path such as `/obj/item{amount = 15}`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModifiedTypePath {
+    base: TypePath,
+    overrides: Vec<(FieldName, Value)>,
+}
+
+impl ModifiedTypePath {
+    /// Creates a modified path from its canonical base and evaluated overrides.
+    #[must_use]
+    pub const fn new(base: TypePath, overrides: Vec<(FieldName, Value)>) -> Self {
+        Self { base, overrides }
+    }
+
+    /// Returns the canonical base type.
+    #[must_use]
+    pub const fn base(&self) -> &TypePath {
+        &self.base
+    }
+
+    /// Returns overrides in source order.
+    #[must_use]
+    pub fn overrides(&self) -> &[(FieldName, Value)] {
+        &self.overrides
     }
 }
 
@@ -1003,6 +1052,7 @@ impl ValueHeap {
             Value::Number(number) => Ok(number.to_f32() != 0.0),
             Value::Text(text) => Ok(!text.is_empty()),
             Value::TypePath(_) => Ok(true),
+            Value::ModifiedTypePath(_) => Ok(true),
             Value::Datum(id) => self.datum(*id).map(|_| true),
             Value::List(id) => self.list(*id).map(|_| true),
         }

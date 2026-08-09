@@ -21,6 +21,7 @@ dependencies = [
  "dm-lexer",
  "dm-project",
  "dm-syntax",
+ "dm-value",
  "dm-vm",
 ]
 
@@ -110,6 +111,7 @@ dependencies = [
  "dm-globals",
  "dm-lexer",
  "dm-object-tree",
+ "dm-semantics",
  "dm-value",
  "dm-vm",
 ]
@@ -166,6 +168,7 @@ dependencies = [
  "dm-object-tree",
  "dm-runtime",
  "dm-value",
+ "dm-vm",
 ]
 
 [[package]]

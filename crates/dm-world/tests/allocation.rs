@@ -7,7 +7,10 @@ use dm_globals::UnsupportedCategory;
 use dm_map::parse;
 use dm_runtime::RuntimeImage;
 use dm_value::{FieldName, Value};
-use dm_world::{WorldAllocationWorkKind, WorldCoordinate, allocate_world, build_plan};
+use dm_world::{
+    WorldAllocationWorkKind, WorldCoordinate, allocate_world, build_plan,
+    materialize_world_map_state,
+};
 
 static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
 
@@ -104,6 +107,16 @@ fn allocates_defaults_and_constants_but_defers_dynamic_map_values() {
         first_turf.field(&field("density")).unwrap().as_number(),
         Some(1.0)
     );
+    assert_eq!(
+        first_turf.field(&field("loc")),
+        Ok(&Value::Datum(first.area.expect("area should exist"))),
+        "a map turf's loc is its effective area before lifecycle execution"
+    );
+    assert_eq!(
+        object.field(&field("loc")),
+        Ok(&Value::Datum(first.turf.expect("turf should exist"))),
+        "a map movable's loc is its coordinate turf before lifecycle execution"
+    );
 
     assert_eq!(allocation.stats().cells, 2);
     assert_eq!(allocation.stats().datums_allocated, 4);
@@ -112,6 +125,12 @@ fn allocates_defaults_and_constants_but_defers_dynamic_map_values() {
     assert_eq!(allocation.stats().movables, 1);
     assert_eq!(allocation.stats().constant_overrides, 3);
     assert_eq!(allocation.stats().unsupported_overrides, 1);
+    assert_eq!(
+        allocation.stats().execution_state_transfers,
+        1,
+        "bulk world allocation must reuse one VM execution state"
+    );
+    assert_eq!(image.stats().stateful_datums_allocated, 4);
     assert_eq!(allocation.work_items().len(), 1);
     assert_eq!(
         allocation.work_items()[0].kind,
@@ -144,4 +163,72 @@ fn different_ordered_area_overrides_create_distinct_instances() {
     assert_eq!(allocation.stats().unique_areas, 2);
     assert_eq!(allocation.stats().datums_allocated, 4);
     assert!(allocation.work_items().is_empty());
+}
+
+#[test]
+fn materializes_map_dimensions_and_initial_world_contents() {
+    let (_project, compilation) = TestProject::compile(concat!(
+        "/world\n\tmaxx = 9\n",
+        "/area/test\n/turf/test\n/obj/test\n",
+    ));
+    let map = parse(concat!(
+        "\"a\" = (/obj/test, /turf/test, /area/test)\n",
+        "(4,7,2) = {\"\naa\n\"}\n",
+    ))
+    .expect("map should parse");
+    let plan = build_plan(&map, &compilation);
+    let mut image = RuntimeImage::from_compilation(&compilation).expect("image should materialize");
+    let allocation = allocate_world(&plan, &mut image).expect("world should allocate");
+    let world = image
+        .allocate_datum(&dm_value::TypePath::parse("/world").unwrap())
+        .expect("world datum should allocate");
+
+    materialize_world_map_state(&allocation, &mut image, world)
+        .expect("map-derived world fields should materialize");
+
+    assert_eq!(
+        image.heap().datum_field(world, &field("maxx")),
+        Ok(&Value::number(9.0)),
+        "the compile-time lower bound must win over the map's maximum x"
+    );
+    assert_eq!(
+        image.heap().datum_field(world, &field("maxy")),
+        Ok(&Value::number(7.0))
+    );
+    assert_eq!(
+        image.heap().datum_field(world, &field("maxz")),
+        Ok(&Value::number(2.0))
+    );
+    let Value::List(contents) = image
+        .heap()
+        .datum_field(world, &field("contents"))
+        .expect("world contents should exist")
+    else {
+        panic!("world contents should be a live list")
+    };
+    assert_eq!(
+        image.heap().list(*contents).unwrap().len(),
+        allocation.allocation_order().len()
+    );
+    let first = &allocation.snapshots()[0];
+    let Value::List(turf_contents) = image
+        .heap()
+        .datum_field(first.turf.unwrap(), &field("contents"))
+        .unwrap()
+    else {
+        panic!("turf contents should be a list")
+    };
+    assert_eq!(image.heap().list(*turf_contents).unwrap().len(), 1);
+    let Value::List(area_contents) = image
+        .heap()
+        .datum_field(first.area.unwrap(), &field("contents"))
+        .unwrap()
+    else {
+        panic!("area contents should be a list")
+    };
+    assert_eq!(
+        image.heap().list(*area_contents).unwrap().len(),
+        4,
+        "a shared area's contents include both turfs and both mapped movables"
+    );
 }

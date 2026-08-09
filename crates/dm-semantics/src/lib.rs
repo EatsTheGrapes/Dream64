@@ -14,11 +14,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dm_compiler::Compilation;
 use dm_core::{FileId, SourceSpan};
-use dm_globals::VariableRegistry;
+use dm_globals::{StorageClass, VariableRegistry};
 use dm_lexer::TokenKind;
 use dm_object_tree::{CodePath, NodeId, NodeKind};
 use dm_syntax::DefinitionKind;
-use dm_value::FieldName;
+use dm_value::{FieldName, TypePath};
 
 const STANDARD_BUILTINS: &str = concat!(
     "/proc/isarea(...)\n",
@@ -88,6 +88,19 @@ const STANDARD_BUILTINS: &str = concat!(
     "\t\tif(value > result)\n",
     "\t\t\tresult = value\n",
     "\treturn result\n",
+);
+
+// Engine-owned methods that user DM may override and reach through `..()`.
+// These are kept distinct from global standard procedures so they never enter
+// bare-call resolution. Headless profiling control has no observable profile
+// payload yet, but BYOND's start/stop/restart calls legitimately return null.
+const NATIVE_PARENT_BUILTINS: &str = concat!(
+    "/world/Profile(command, type, format)\n\treturn _dream64_world_profile(command, type, format)\n",
+    "/world/GetConfig(config_set, param)\n\treturn _dream64_world_get_config(config_set, param)\n",
+    "/world/SetConfig(config_set, param, value)\n\treturn _dream64_world_set_config(config_set, param, value)\n",
+    "/world/OpenPort(port)\n\treturn _dream64_world_open_port(src, port)\n",
+    "/world/IsBanned(key, address, computer_id, type)\n\treturn 0\n",
+    "/world/Error(exception)\n\treturn null\n",
 );
 /// Tree-local identity of a canonical procedure.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -175,6 +188,25 @@ pub struct ProcedureRegistry {
     procedures: Vec<Procedure>,
     by_node: BTreeMap<NodeId, ProcedureId>,
     by_path: BTreeMap<CodePath, ProcedureId>,
+    by_owner_name: BTreeMap<(Option<NodeId>, String), ProcedureId>,
+    dynamic_targets: BTreeMap<String, Vec<ProcedureImplementationId>>,
+    static_selectors: BTreeMap<ProcedureImplementationId, BTreeSet<String>>,
+    dynamic_selectors: BTreeMap<ProcedureImplementationId, BTreeSet<String>>,
+    exact_member_targets: BTreeMap<ProcedureImplementationId, BTreeSet<ProcedureImplementationId>>,
+    typed_virtual_targets: BTreeMap<ProcedureImplementationId, BTreeSet<ProcedureImplementationId>>,
+}
+
+/// Deterministic counters for one dependency-closure resolution.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProcedureClosureStats {
+    /// Unique procedure bodies visited.
+    pub bodies_visited: usize,
+    /// Static call selectors resolved through the owner/name index.
+    pub static_selectors_resolved: usize,
+    /// Dynamic literal selectors resolved through the name index.
+    pub dynamic_selectors_resolved: usize,
+    /// Exact implementations considered for dynamic literal selectors.
+    pub dynamic_candidates_considered: usize,
 }
 
 /// Executable VM module paired with semantic implementation identities.
@@ -182,6 +214,20 @@ pub struct ProcedureRegistry {
 pub struct ExecutableProcedures {
     module: dm_vm::Module,
     implementations: BTreeMap<ProcedureImplementationId, dm_vm::ProcedureId>,
+    stats: ExecutableProcedureStats,
+}
+
+/// Deterministic module-building counters for semantic procedure compilation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExecutableProcedureStats {
+    /// Procedure specifications compiled into the module.
+    pub procedures: usize,
+    /// Referenced `src` field bindings copied into procedure specifications.
+    pub src_field_bindings: usize,
+    /// Referenced global bindings copied into procedure specifications.
+    pub global_field_bindings: usize,
+    /// Full variable-registry passes used to index static fields.
+    pub static_registry_builds: usize,
 }
 
 impl ExecutableProcedures {
@@ -199,6 +245,12 @@ impl ExecutableProcedures {
     ) -> Option<dm_vm::ProcedureId> {
         self.implementations.get(&implementation).copied()
     }
+
+    /// Returns deterministic module-building counters.
+    #[must_use]
+    pub const fn stats(&self) -> &ExecutableProcedureStats {
+        &self.stats
+    }
 }
 
 impl ProcedureRegistry {
@@ -209,7 +261,7 @@ impl ProcedureRegistry {
         let procedure_nodes: Vec<_> = tree
             .nodes()
             .iter()
-            .filter(|node| node.kind == NodeKind::Procedure)
+            .filter(|node| matches!(node.kind, NodeKind::Procedure | NodeKind::Verb))
             .collect();
         let by_node: BTreeMap<_, _> = procedure_nodes
             .iter()
@@ -231,12 +283,13 @@ impl ProcedureRegistry {
                     .filter_map(|declaration_id| tree.declaration(*declaration_id))
                     .filter_map(|declaration| {
                         let kind = match declaration.kind {
-                            DefinitionKind::Procedure => ProcedureImplementationKind::Declaration,
+                            DefinitionKind::Procedure | DefinitionKind::Verb => {
+                                ProcedureImplementationKind::Declaration
+                            }
                             DefinitionKind::ProcedureOverride => {
                                 ProcedureImplementationKind::Override
                             }
                             DefinitionKind::Type
-                            | DefinitionKind::Verb
                             | DefinitionKind::Variable
                             | DefinitionKind::VariableOverride => return None,
                         };
@@ -285,10 +338,69 @@ impl ProcedureRegistry {
             }
         }
 
+        let by_owner_name = procedures
+            .iter()
+            .filter_map(|procedure| {
+                procedure
+                    .path
+                    .segments()
+                    .last()
+                    .map(|name| ((procedure.owner_type, name.clone()), procedure.id))
+            })
+            .collect();
+        let mut dynamic_targets = BTreeMap::<String, Vec<_>>::new();
+        for procedure in &procedures {
+            if let (Some(name), Some(target)) =
+                (procedure.path.segments().last(), procedure.effective_target)
+            {
+                dynamic_targets
+                    .entry(name.clone())
+                    .or_default()
+                    .push(target);
+            }
+        }
+        let mut static_selectors = BTreeMap::new();
+        let mut dynamic_selectors = BTreeMap::new();
+        let mut exact_member_targets = BTreeMap::new();
+        let mut typed_virtual_targets = BTreeMap::new();
+        let global_types = declared_global_types(compilation);
+        let field_types = declared_field_types(compilation);
+        for procedure in &procedures {
+            for implementation in &procedure.implementations {
+                if let Some(definition) = compilation
+                    .syntax(implementation.file_id)
+                    .and_then(|syntax| syntax.definitions.get(implementation.definition_index))
+                {
+                    static_selectors.insert(implementation.id, static_call_selectors(definition));
+                    let (member_targets, virtual_targets, unresolved_members) =
+                        member_call_dependencies(
+                            definition,
+                            procedure.owner_type,
+                            compilation,
+                            &global_types,
+                            &field_types,
+                            &by_owner_name,
+                            &dynamic_targets,
+                            &procedures,
+                        );
+                    let mut dynamic = dynamic_call_literal_selectors(definition);
+                    dynamic.extend(unresolved_members);
+                    dynamic_selectors.insert(implementation.id, dynamic);
+                    exact_member_targets.insert(implementation.id, member_targets);
+                    typed_virtual_targets.insert(implementation.id, virtual_targets);
+                }
+            }
+        }
         Self {
             procedures,
             by_node,
             by_path,
+            by_owner_name,
+            dynamic_targets,
+            static_selectors,
+            dynamic_selectors,
+            exact_member_targets,
+            typed_virtual_targets,
         }
     }
 
@@ -363,9 +475,87 @@ impl ProcedureRegistry {
         compilation: &Compilation,
         implementations: impl IntoIterator<Item = ProcedureImplementationId>,
     ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
+        let selected = self.implementation_closure(compilation, implementations);
+        self.compile_vm_selected(compilation, selected)
+    }
+
+    /// Links the complete dynamic dispatch symbol graph while eagerly
+    /// compiling only statically proven, typed-member, and parent targets.
+    /// Genuinely untyped receiver candidates keep stable VM identities and
+    /// materialize on their first runtime dispatch.
+    pub fn compile_vm_implementations_symbolic_dynamic(
+        &self,
+        compilation: &Compilation,
+        implementations: impl IntoIterator<Item = ProcedureImplementationId>,
+    ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
+        let roots = implementations.into_iter().collect::<BTreeSet<_>>();
+        let selected = self.implementation_closure(compilation, roots.iter().copied());
+        let eager = self.eager_implementation_closure(compilation, roots);
+        self.compile_vm_selected_deferred(compilation, selected, &eager)
+    }
+
+    /// Resolves the bodies that a symbolic module must compile eagerly:
+    /// roots, exact parents, statically resolved calls, and typed member
+    /// targets. Genuinely untyped dynamic candidates are intentionally absent.
+    #[must_use]
+    pub fn eager_implementation_closure(
+        &self,
+        compilation: &Compilation,
+        implementations: impl IntoIterator<Item = ProcedureImplementationId>,
+    ) -> BTreeSet<ProcedureImplementationId> {
+        let mut selected = implementations.into_iter().collect::<BTreeSet<_>>();
+        let mut pending = selected.iter().copied().collect::<Vec<_>>();
+        while let Some(implementation) = pending.pop() {
+            let parent = self
+                .implementation(implementation)
+                .and_then(|body| body.parent_target);
+            let exact = self
+                .exact_member_targets
+                .get(&implementation)
+                .into_iter()
+                .flatten()
+                .copied();
+            let static_targets = self
+                .static_selectors
+                .get(&implementation)
+                .into_iter()
+                .flatten()
+                .filter_map(|selector| {
+                    self.static_call_target(implementation, selector, compilation)
+                });
+            for target in parent.into_iter().chain(exact).chain(static_targets) {
+                if selected.insert(target) {
+                    pending.push(target);
+                }
+            }
+        }
+        selected
+    }
+
+    /// Resolves the complete static, dynamic-literal, and parent-call closure
+    /// for a set of procedure implementations without compiling it.
+    #[must_use]
+    pub fn implementation_closure(
+        &self,
+        compilation: &Compilation,
+        implementations: impl IntoIterator<Item = ProcedureImplementationId>,
+    ) -> BTreeSet<ProcedureImplementationId> {
+        self.implementation_closure_with_stats(compilation, implementations)
+            .0
+    }
+
+    /// Resolves a dependency closure and returns indexed-resolution counters.
+    #[must_use]
+    pub fn implementation_closure_with_stats(
+        &self,
+        compilation: &Compilation,
+        implementations: impl IntoIterator<Item = ProcedureImplementationId>,
+    ) -> (BTreeSet<ProcedureImplementationId>, ProcedureClosureStats) {
+        let mut stats = ProcedureClosureStats::default();
         let mut selected: BTreeSet<_> = implementations.into_iter().collect();
         let mut pending: Vec<_> = selected.iter().copied().collect();
         while let Some(implementation) = pending.pop() {
+            stats.bodies_visited += 1;
             if let Some(parent) = self
                 .implementation(implementation)
                 .and_then(|body| body.parent_target)
@@ -374,37 +564,61 @@ impl ProcedureRegistry {
                 pending.push(parent);
             }
 
-            let Some(body) = self.implementation(implementation) else {
-                continue;
-            };
-            let Some(definition) = compilation
-                .syntax(body.file_id)
-                .and_then(|syntax| syntax.definitions.get(body.definition_index))
-            else {
-                continue;
-            };
-            for selector in dynamic_call_literal_selectors(definition) {
-                for procedure in &self.procedures {
-                    if !procedure_matches_dynamic_selector(procedure, &selector) {
-                        continue;
-                    }
-                    if let Some(target) = procedure.effective_target
-                        && selected.insert(target)
-                    {
-                        pending.push(target);
+            for &target in self
+                .exact_member_targets
+                .get(&implementation)
+                .into_iter()
+                .flatten()
+            {
+                if selected.insert(target) {
+                    pending.push(target);
+                }
+            }
+
+            for &target in self
+                .typed_virtual_targets
+                .get(&implementation)
+                .into_iter()
+                .flatten()
+            {
+                if selected.insert(target) {
+                    pending.push(target);
+                }
+            }
+
+            for selector in self
+                .dynamic_selectors
+                .get(&implementation)
+                .into_iter()
+                .flatten()
+            {
+                stats.dynamic_selectors_resolved += 1;
+                let selector = selector.trim_matches('/');
+                let selector = selector.rsplit('/').next().unwrap_or(selector);
+                if let Some(targets) = self.dynamic_targets.get(selector) {
+                    stats.dynamic_candidates_considered += targets.len();
+                    for &target in targets {
+                        if selected.insert(target) {
+                            pending.push(target);
+                        }
                     }
                 }
             }
-            for selector in static_call_selectors(definition) {
-                if let Some(target) =
-                    self.static_call_target(implementation, &selector, compilation)
+            for selector in self
+                .static_selectors
+                .get(&implementation)
+                .into_iter()
+                .flatten()
+            {
+                stats.static_selectors_resolved += 1;
+                if let Some(target) = self.static_call_target(implementation, selector, compilation)
                     && selected.insert(target)
                 {
                     pending.push(target);
                 }
             }
         }
-        self.compile_vm_selected(compilation, selected)
+        (selected, stats)
     }
 
     /// Compiles each requested body independently, without following calls or
@@ -423,7 +637,13 @@ impl ProcedureRegistry {
         Result<ExecutableProcedures, dm_vm::CompileError>,
     )> {
         let direct_fields = direct_instance_fields(compilation);
+        let static_registry = VariableRegistry::build(compilation);
+        let direct_static_fields = direct_static_fields(&static_registry);
+        let global_fields = declared_global_fields(compilation);
+        let global_types = declared_global_types(compilation);
+        let const_bindings = ConstBindings::build(compilation);
         let mut inherited_field_cache = BTreeMap::new();
+        let mut inherited_static_field_cache = BTreeMap::new();
         implementations
             .into_iter()
             .map(|implementation| {
@@ -434,7 +654,13 @@ impl ProcedureRegistry {
                         [implementation],
                         &direct_fields,
                         &mut inherited_field_cache,
+                        &direct_static_fields,
+                        &mut inherited_static_field_cache,
+                        &global_fields,
+                        &global_types,
+                        &const_bindings,
                         false,
+                        None,
                     ),
                 )
             })
@@ -447,13 +673,54 @@ impl ProcedureRegistry {
         selected: impl IntoIterator<Item = ProcedureImplementationId>,
     ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
         let direct_fields = direct_instance_fields(compilation);
+        let static_registry = VariableRegistry::build(compilation);
+        let direct_static_fields = direct_static_fields(&static_registry);
+        let global_fields = declared_global_fields(compilation);
+        let global_types = declared_global_types(compilation);
+        let const_bindings = ConstBindings::build(compilation);
         let mut inherited_field_cache = BTreeMap::new();
+        let mut inherited_static_field_cache = BTreeMap::new();
         self.compile_vm_selected_with_fields(
             compilation,
             selected,
             &direct_fields,
             &mut inherited_field_cache,
+            &direct_static_fields,
+            &mut inherited_static_field_cache,
+            &global_fields,
+            &global_types,
+            &const_bindings,
             true,
+            None,
+        )
+    }
+
+    fn compile_vm_selected_deferred(
+        &self,
+        compilation: &Compilation,
+        selected: impl IntoIterator<Item = ProcedureImplementationId>,
+        eager: &BTreeSet<ProcedureImplementationId>,
+    ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
+        let direct_fields = direct_instance_fields(compilation);
+        let static_registry = VariableRegistry::build(compilation);
+        let direct_static_fields = direct_static_fields(&static_registry);
+        let global_fields = declared_global_fields(compilation);
+        let global_types = declared_global_types(compilation);
+        let const_bindings = ConstBindings::build(compilation);
+        let mut inherited_field_cache = BTreeMap::new();
+        let mut inherited_static_field_cache = BTreeMap::new();
+        self.compile_vm_selected_with_fields(
+            compilation,
+            selected,
+            &direct_fields,
+            &mut inherited_field_cache,
+            &direct_static_fields,
+            &mut inherited_static_field_cache,
+            &global_fields,
+            &global_types,
+            &const_bindings,
+            true,
+            Some(eager),
         )
     }
 
@@ -464,36 +731,60 @@ impl ProcedureRegistry {
         selected: impl IntoIterator<Item = ProcedureImplementationId>,
         direct_fields: &BTreeMap<NodeId, BTreeMap<String, FieldName>>,
         inherited_field_cache: &mut BTreeMap<NodeId, BTreeMap<String, FieldName>>,
+        direct_static_fields: &BTreeMap<NodeId, BTreeMap<String, FieldName>>,
+        inherited_static_field_cache: &mut BTreeMap<NodeId, BTreeMap<String, FieldName>>,
+        global_fields: &BTreeMap<String, FieldName>,
+        global_types: &BTreeMap<String, TypePath>,
+        const_bindings: &ConstBindings,
         include_parent_targets: bool,
+        eager_implementations: Option<&BTreeSet<ProcedureImplementationId>>,
     ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
         let selected: BTreeSet<_> = selected.into_iter().collect();
-        let global_fields = declared_global_fields(compilation);
-        let const_bindings = ConstBindings::build(compilation);
-        let mut ordered = Vec::new();
-        for procedure in &self.procedures {
-            for implementation in &procedure.implementations {
-                if !selected.contains(&implementation.id) {
-                    continue;
-                }
-                let definition = compilation
-                    .syntax(implementation.file_id)
-                    .and_then(|syntax| syntax.definitions.get(implementation.definition_index))
-                    .ok_or_else(|| dm_vm::CompileError {
-                        message: format!(
-                            "missing syntax definition for implementation of {}",
-                            procedure.path
-                        ),
-                    })?;
-                validate_const_assignments(
-                    definition,
-                    procedure.owner_type,
-                    compilation,
-                    &const_bindings,
-                    self,
-                    implementation.id,
-                )?;
-                ordered.push((procedure, implementation, definition));
+        let mut ordered = Vec::with_capacity(selected.len());
+        let mut deferred_validation_errors =
+            BTreeMap::<ProcedureImplementationId, dm_vm::CompileError>::new();
+        for implementation_id in selected {
+            let procedure = self
+                .procedure(implementation_id.procedure())
+                .ok_or_else(|| dm_vm::CompileError {
+                    message: format!(
+                        "missing procedure for selected implementation {:?}",
+                        implementation_id
+                    ),
+                })?;
+            let implementation = procedure
+                .implementations
+                .get(implementation_id.index())
+                .ok_or_else(|| dm_vm::CompileError {
+                    message: format!(
+                        "missing selected implementation of {} at index {}",
+                        procedure.path,
+                        implementation_id.index()
+                    ),
+                })?;
+            let definition = compilation
+                .syntax(implementation.file_id)
+                .and_then(|syntax| syntax.definitions.get(implementation.definition_index))
+                .ok_or_else(|| dm_vm::CompileError {
+                    message: format!(
+                        "missing syntax definition for implementation of {}",
+                        procedure.path
+                    ),
+                })?;
+            let validation = validate_const_assignments(
+                definition,
+                procedure.owner_type,
+                compilation,
+                const_bindings,
+                self,
+                implementation.id,
+            );
+            if eager_implementations.is_none_or(|eager| eager.contains(&implementation.id)) {
+                validation?;
+            } else if let Err(error) = validation {
+                deferred_validation_errors.insert(implementation.id, error);
             }
+            ordered.push((procedure, implementation, definition));
         }
         let indices: BTreeMap<_, _> = ordered
             .iter()
@@ -503,7 +794,14 @@ impl ProcedureRegistry {
         let normalized_definitions: Vec<_> = ordered
             .iter()
             .map(|(procedure, _, definition)| {
-                normalize_upward_paths(compilation, procedure.owner_type, definition)
+                let mut normalized = normalize_upward_paths(
+                    compilation,
+                    procedure.owner_type,
+                    definition,
+                    &global_types,
+                );
+                expand_proc_pseudo_macro(&mut normalized, &procedure.path);
+                normalized
             })
             .collect();
         let builtin_syntax =
@@ -512,6 +810,10 @@ impl ProcedureRegistry {
                     "failed to parse Dream64 standard location builtins: {}",
                     error
                 ),
+            })?;
+        let native_parent_syntax =
+            dm_syntax::parse(NATIVE_PARENT_BUILTINS).map_err(|error| dm_vm::CompileError {
+                message: format!("failed to parse Dream64 native parent builtins: {error}"),
             })?;
         let mut builtin_names = Vec::with_capacity(builtin_syntax.definitions.len());
         for definition in &builtin_syntax.definitions {
@@ -529,6 +831,17 @@ impl ProcedureRegistry {
             .enumerate()
             .map(|(offset, name)| (name.clone(), ordered.len() + offset))
             .collect();
+        let native_parent_indices = native_parent_syntax
+            .definitions
+            .iter()
+            .enumerate()
+            .map(|(offset, definition)| {
+                (
+                    definition.path.to_string(),
+                    ordered.len() + builtin_syntax.definitions.len() + offset,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut specs: Vec<_> = ordered
             .iter()
             .enumerate()
@@ -549,15 +862,28 @@ impl ProcedureRegistry {
                                 })
                         })
                         .transpose()?
+                        .or_else(|| native_parent_indices.get(&procedure.path.to_string()).copied())
                 } else {
                     None
                 };
-                let selectors = static_call_selectors(definition);
+                let selectors = self
+                    .static_selectors
+                    .get(&implementation.id)
+                    .cloned()
+                    .unwrap_or_default();
                 let mut static_calls: BTreeMap<_, _> = selectors
                     .iter()
                     .filter_map(|selector| {
                         self.static_call_target(implementation.id, selector, compilation)
-                            .and_then(|target| indices.get(&target).copied())
+                            .and_then(|target| {
+                                indices.get(&target).copied().or_else(|| {
+                                    // Independent body inventories intentionally omit the
+                                    // target implementation. Point a semantically resolved
+                                    // call at an inert standard procedure so lowering can
+                                    // validate the caller without recursively compiling it.
+                                    (!include_parent_targets).then_some(ordered.len())
+                                })
+                            })
                             .map(|target| (selector.clone(), target))
                     })
                     .collect();
@@ -566,23 +892,70 @@ impl ProcedureRegistry {
                         static_calls.entry(selector).or_insert(*target);
                     }
                 }
+                let referenced = referenced_identifiers(definition);
+                let mut src_fields: BTreeMap<String, FieldName> = procedure
+                    .owner_type
+                    .map(|owner| {
+                        inherited_fields(
+                            compilation,
+                            owner,
+                            direct_fields,
+                            inherited_field_cache,
+                        )
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(name, _)| referenced.contains(name))
+                    .collect();
+                if procedure.owner_type.is_some() {
+                    for builtin in ["type", "parent_type"] {
+                        if referenced.contains(builtin) {
+                            src_fields.insert(
+                                builtin.to_owned(),
+                                FieldName::parse(builtin)
+                                    .expect("built-in datum field name is valid"),
+                            );
+                        }
+                    }
+                }
+                let referenced_globals = global_fields
+                    .iter()
+                    .filter(|(name, _)| referenced.contains(*name))
+                    .map(|(name, field)| (name.clone(), field.clone()))
+                    .collect();
+                let mut referenced_globals: BTreeMap<String, FieldName> = referenced_globals;
+                for (name, field) in inherited_static_fields(
+                    compilation,
+                    procedure.owner_type,
+                    direct_static_fields,
+                    inherited_static_field_cache,
+                ) {
+                    if referenced.contains(&name) {
+                        // Type statics use a qualified VM slot and shadow a
+                        // project global of the same bare name.
+                        referenced_globals.insert(name.clone(), field.clone());
+                        referenced_globals.insert(format!("src.{name}"), field);
+                    }
+                }
+                for (receiver, path) in declared_receiver_types(definition) {
+                    if let Some(type_id) = compilation.code_tree().find(&path) {
+                        for (name, field) in inherited_static_fields(
+                            compilation,
+                            Some(type_id),
+                            direct_static_fields,
+                            inherited_static_field_cache,
+                        ) {
+                            referenced_globals.insert(format!("{receiver}.{name}"), field);
+                        }
+                    }
+                }
                 Ok(dm_vm::ProcedureSpec {
                     path: format!("{}@{}", procedure.path, implementation.ordinal),
                     definition,
                     parent,
                     static_calls,
-                    src_fields: procedure
-                        .owner_type
-                        .map(|owner| {
-                            inherited_fields(
-                                compilation,
-                                owner,
-                                direct_fields,
-                                inherited_field_cache,
-                            )
-                        })
-                        .unwrap_or_default(),
-                    global_fields: global_fields.clone(),
+                    src_fields,
+                    global_fields: referenced_globals,
                 })
             })
             .collect::<Result<_, dm_vm::CompileError>>()?;
@@ -594,10 +967,55 @@ impl ProcedureRegistry {
                 parent: None,
                 static_calls: BTreeMap::new(),
                 src_fields: BTreeMap::new(),
-                global_fields: global_fields.clone(),
+                global_fields: BTreeMap::new(),
             });
         }
-        let module = dm_vm::compile_module_specs(&specs)?;
+        for definition in &native_parent_syntax.definitions {
+            specs.push(dm_vm::ProcedureSpec {
+                path: format!("{}@dream64_native", definition.path),
+                definition,
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            });
+        }
+        let mut spec_global_types = normalized_definitions
+            .iter()
+            .map(|definition| {
+                let referenced = referenced_identifiers(definition);
+                global_types
+                    .iter()
+                    .filter(|(name, _)| referenced.contains(*name))
+                    .map(|(name, path)| (name.clone(), path.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .collect::<Vec<_>>();
+        spec_global_types.resize_with(specs.len(), BTreeMap::new);
+        let module = if let Some(eager) = eager_implementations {
+            let mut eager_indices = eager
+                .iter()
+                .filter_map(|implementation| indices.get(implementation).copied())
+                .collect::<BTreeSet<_>>();
+            eager_indices.extend(ordered.len()..specs.len());
+            let deferred_errors = deferred_validation_errors
+                .into_iter()
+                .filter_map(|(implementation, error)| {
+                    indices
+                        .get(&implementation)
+                        .copied()
+                        .map(|index| (index, error))
+                })
+                .collect::<BTreeMap<_, _>>();
+            dm_vm::compile_module_specs_selective_with_errors(
+                &specs,
+                &spec_global_types,
+                &eager_indices,
+                &deferred_errors,
+            )?
+        } else {
+            dm_vm::compile_module_specs_with_global_types(&specs, &spec_global_types)?
+        };
         let implementations = ordered
             .iter()
             .enumerate()
@@ -615,9 +1033,16 @@ impl ProcedureRegistry {
                 ))
             })
             .collect::<Result<_, dm_vm::CompileError>>()?;
+        let stats = ExecutableProcedureStats {
+            procedures: specs.len(),
+            src_field_bindings: specs.iter().map(|spec| spec.src_fields.len()).sum(),
+            global_field_bindings: specs.iter().map(|spec| spec.global_fields.len()).sum(),
+            static_registry_builds: 1,
+        };
         Ok(ExecutableProcedures {
             module,
             implementations,
+            stats,
         })
     }
 }
@@ -626,8 +1051,32 @@ fn normalize_upward_paths(
     compilation: &Compilation,
     owner: Option<NodeId>,
     definition: &dm_syntax::Definition,
+    global_types: &BTreeMap<String, TypePath>,
 ) -> dm_syntax::Definition {
     let mut normalized = definition.clone();
+    let mut local_types = BTreeMap::<String, dm_syntax::DefinitionPath>::new();
+    for parameter in &normalized.parameters {
+        let identifiers = parameter
+            .tokens
+            .iter()
+            .take_while(
+                |token| !matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
+            )
+            .filter_map(|token| match &token.kind {
+                TokenKind::Identifier(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let end = identifiers
+            .iter()
+            .position(|name| *name == "as")
+            .unwrap_or(identifiers.len());
+        if let Some(name) = identifiers[..end].last()
+            && let Some(path) = declared_type_path(&parameter.tokens, name)
+        {
+            local_types.insert((*name).to_owned(), path);
+        }
+    }
     let contextual_anchor = owner
         .and_then(|node| compilation.code_tree().node(node))
         .map(|node| dm_syntax::DefinitionPath::new(node.path.segments().to_vec()));
@@ -635,6 +1084,93 @@ fn normalize_upward_paths(
         line.tokens = compilation
             .code_tree()
             .normalize_upward_paths(contextual_anchor.as_ref(), &line.tokens);
+        if matches!(line.tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(name)) if name == "var")
+        {
+            let identifiers = line
+                .tokens
+                .iter()
+                .take_while(|token| {
+                    !matches!(&token.kind, TokenKind::Operator(operator) if operator == "=")
+                        && !matches!(token.kind, TokenKind::Punctuation('['))
+                })
+                .filter_map(|token| match &token.kind {
+                    TokenKind::Identifier(name) => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let end = identifiers
+                .iter()
+                .position(|name| *name == "as")
+                .unwrap_or(identifiers.len());
+            let declared_name = identifiers[..end].last().map(|name| (*name).to_owned());
+            if let Some(name) = declared_name
+                && let Some(path) = declared_type_path(&line.tokens, &name)
+            {
+                qualify_contextual_new(&mut line.tokens, &path);
+                local_types.insert(name, path);
+            }
+        }
+        // Function-like macros commonly retain compact `; if(...) { ... }`
+        // bodies on one source line. Discover every typed local declaration,
+        // not only a declaration occupying the first token.
+        for var_index in line
+            .tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(index, token)| {
+                matches!(&token.kind, TokenKind::Identifier(name) if name == "var").then_some(index)
+            })
+            .collect::<Vec<_>>()
+        {
+            let end = line.tokens[var_index..]
+                .iter()
+                .position(|token| {
+                    matches!(
+                        token.kind,
+                        TokenKind::Punctuation(';') | TokenKind::Punctuation('}')
+                    ) || matches!(&token.kind, TokenKind::Identifier(name) if name == "in")
+                        || matches!(token.kind, TokenKind::Punctuation('['))
+                })
+                .map_or(line.tokens.len(), |offset| var_index + offset);
+            let declaration = &line.tokens[var_index..end];
+            let assignment = declaration
+                .iter()
+                .position(|token| matches!(&token.kind, TokenKind::Operator(op) if op == "="))
+                .unwrap_or(declaration.len());
+            if let Some(name) =
+                declaration[..assignment]
+                    .iter()
+                    .rev()
+                    .find_map(|token| match &token.kind {
+                        TokenKind::Identifier(name) if name != "var" => Some(name.as_str()),
+                        _ => None,
+                    })
+                && let Some(path) = declared_type_path(declaration, name)
+            {
+                local_types.insert(name.to_owned(), path);
+            }
+        }
+        qualify_compact_local_assignments(&mut line.tokens, &local_types);
+        // BYOND's inferred `new` is destination typed.  Preserve that context
+        // through the complete RHS (including parentheses, simple assignment
+        // wrappers and ternary arms), but never invent the executing datum's
+        // type for a contextless expression.
+        if let Some(assignment) = top_level_simple_assignment(&line.tokens) {
+            let target = &line.tokens[..assignment];
+            let expected =
+                inferred_assignment_type(compilation, owner, target, &local_types, global_types);
+            if let Some(expected) = expected {
+                let start = if line.tokens[..assignment]
+                    .iter()
+                    .any(|token| matches!(token.kind, TokenKind::Punctuation('[')))
+                {
+                    0
+                } else {
+                    assignment + 1
+                };
+                qualify_contextual_new_from(&mut line.tokens, start, &expected);
+            }
+        }
         if matches!(line.tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(name)) if name == "var")
             && let Some(annotation) = line.tokens.iter().position(
                 |token| matches!(&token.kind, TokenKind::Identifier(name) if name == "as"),
@@ -653,6 +1189,25 @@ fn normalize_upward_paths(
         }
     }
     for parameter in &mut normalized.parameters {
+        let declaration_end = parameter
+            .tokens
+            .iter()
+            .position(
+                |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
+            )
+            .unwrap_or(parameter.tokens.len());
+        let declared_name = parameter.tokens[..declaration_end]
+            .iter()
+            .rev()
+            .find_map(|token| match &token.kind {
+                TokenKind::Identifier(name) if name != "var" => Some(name.clone()),
+                _ => None,
+            });
+        if let Some(name) = declared_name
+            && let Some(path) = declared_type_path(&parameter.tokens, &name)
+        {
+            qualify_contextual_new(&mut parameter.tokens, &path);
+        }
         let assignment = parameter.tokens.iter().position(
             |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
         );
@@ -674,6 +1229,233 @@ fn normalize_upward_paths(
     normalized
 }
 
+/// Expands BYOND's compiler-owned `__PROC__` pseudo-macro to the canonical
+/// current procedure reference. Unlike an ordinary preprocessor macro this
+/// requires the resolved object-tree identity, so expansion belongs here.
+fn expand_proc_pseudo_macro(definition: &mut dm_syntax::Definition, path: &CodePath) {
+    fn expand(tokens: &mut Vec<dm_lexer::SpannedToken>, segments: &[String]) {
+        let mut index = 0;
+        while index < tokens.len() {
+            if !matches!(&tokens[index].kind, TokenKind::Identifier(name) if name == "__PROC__") {
+                index += 1;
+                continue;
+            }
+            let span = tokens[index].span;
+            let replacement = segments
+                .iter()
+                .flat_map(|segment| {
+                    [
+                        dm_lexer::SpannedToken {
+                            kind: TokenKind::Operator("/".to_owned()),
+                            span,
+                        },
+                        dm_lexer::SpannedToken {
+                            kind: TokenKind::Identifier(segment.clone()),
+                            span,
+                        },
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let replacement_len = replacement.len();
+            tokens.splice(index..=index, replacement);
+            index += replacement_len;
+        }
+    }
+
+    let segments = path.segments();
+    expand(&mut definition.header, segments);
+    for parameter in &mut definition.parameters {
+        expand(&mut parameter.tokens, segments);
+    }
+    for line in &mut definition.body {
+        expand(&mut line.tokens, segments);
+    }
+}
+
+fn qualify_contextual_new(
+    tokens: &mut Vec<dm_lexer::SpannedToken>,
+    expected_type: &dm_syntax::DefinitionPath,
+) {
+    qualify_contextual_new_from(tokens, 0, expected_type);
+}
+
+fn qualify_contextual_new_from(
+    tokens: &mut Vec<dm_lexer::SpannedToken>,
+    start: usize,
+    expected_type: &dm_syntax::DefinitionPath,
+) {
+    let mut index = start;
+    while index < tokens.len() {
+        if matches!(&tokens[index].kind, TokenKind::Identifier(name) if name == "new")
+            && !matches!(tokens.get(index + 1).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "/")
+            && !matches!(
+                tokens.get(index + 1).map(|token| &token.kind),
+                Some(TokenKind::Identifier(_))
+            )
+        {
+            let span = tokens[index].span;
+            let mut inserted = Vec::new();
+            for segment in expected_type.segments() {
+                inserted.push(dm_lexer::SpannedToken {
+                    kind: TokenKind::Operator("/".to_owned()),
+                    span,
+                });
+                inserted.push(dm_lexer::SpannedToken {
+                    kind: TokenKind::Identifier(segment.clone()),
+                    span,
+                });
+            }
+            let inserted_len = inserted.len();
+            tokens.splice(index + 1..index + 1, inserted);
+            index += inserted_len;
+        }
+        index += 1;
+    }
+}
+
+fn top_level_simple_assignment(tokens: &[dm_lexer::SpannedToken]) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match &token.kind {
+            TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+            TokenKind::Punctuation(')' | ']' | '}') => depth = depth.saturating_sub(1),
+            TokenKind::Operator(operator)
+                if matches!(operator.as_str(), "=" | "||=" | "&&=") && depth == 0 =>
+            {
+                return Some(index);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn qualify_compact_local_assignments(
+    tokens: &mut Vec<dm_lexer::SpannedToken>,
+    locals: &BTreeMap<String, dm_syntax::DefinitionPath>,
+) {
+    let mut index = 0;
+    while index + 2 < tokens.len() {
+        let receiver = match &tokens[index].kind {
+            TokenKind::Identifier(name) => name.clone(),
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        if matches!(&tokens[index + 1].kind, TokenKind::Operator(op) if matches!(op.as_str(), "=" | "||=" | "&&="))
+            && matches!(&tokens[index + 2].kind, TokenKind::Identifier(name) if name == "new")
+            && let Some(path) = locals.get(&receiver)
+        {
+            qualify_contextual_new_from(tokens, index + 2, path);
+        }
+        index += 1;
+    }
+}
+
+fn inferred_assignment_type(
+    compilation: &Compilation,
+    owner: Option<NodeId>,
+    target: &[dm_lexer::SpannedToken],
+    locals: &BTreeMap<String, dm_syntax::DefinitionPath>,
+    globals: &BTreeMap<String, TypePath>,
+) -> Option<dm_syntax::DefinitionPath> {
+    if target
+        .iter()
+        .any(|token| matches!(token.kind, TokenKind::Punctuation('[')))
+        && let Some(receiver) = target.iter().find_map(|token| match &token.kind {
+            TokenKind::Identifier(name) => Some(name.as_str()),
+            _ => None,
+        })
+        && let Some(path) = locals.get(receiver)
+    {
+        return Some(path.clone());
+    }
+    let identifiers = target
+        .iter()
+        .filter_map(|token| match &token.kind {
+            TokenKind::Identifier(name) if name != "var" => Some(name.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let name = *identifiers.last()?;
+    // A plain destination obeys normal local -> src -> global resolution.
+    if identifiers.len() == 1 {
+        if let Some(path) = locals.get(name) {
+            return Some(path.clone());
+        }
+        if let Some(path) = declared_member_type(compilation, owner, name) {
+            return Some(path);
+        }
+        return globals.get(name).map(|path| {
+            dm_syntax::DefinitionPath::new(
+                path.as_str()[1..].split('/').map(str::to_owned).collect(),
+            )
+        });
+    }
+    // `src.field` is statically typed even though its receiver is implicit at
+    // runtime. More general chains are handled when every member declaration
+    // supplies a concrete type.
+    let mut current = if identifiers[0] == "src" {
+        owner
+    } else {
+        locals
+            .get(identifiers[0])
+            .and_then(|path| compilation.code_tree().find(path))
+            .or_else(|| {
+                globals.get(identifiers[0]).and_then(|path| {
+                    let path = dm_syntax::DefinitionPath::new(
+                        path.as_str()[1..].split('/').map(str::to_owned).collect(),
+                    );
+                    compilation.code_tree().find(&path)
+                })
+            })
+            .or_else(|| {
+                declared_member_type(compilation, owner, identifiers[0])
+                    .and_then(|path| compilation.code_tree().find(&path))
+            })
+    };
+    let start = 1;
+    let mut result = None;
+    for member in &identifiers[start..] {
+        result = declared_member_type(compilation, current, member);
+        current = result
+            .as_ref()
+            .and_then(|path| compilation.code_tree().find(path));
+    }
+    result
+}
+
+fn declared_member_type(
+    compilation: &Compilation,
+    mut owner: Option<NodeId>,
+    name: &str,
+) -> Option<dm_syntax::DefinitionPath> {
+    while let Some(type_id) = owner {
+        let type_node = compilation.code_tree().node(type_id)?;
+        let mut segments = type_node.path.segments().to_vec();
+        segments.extend(["var".to_owned(), name.to_owned()]);
+        if let Some(field) = compilation
+            .code_tree()
+            .find(&dm_syntax::DefinitionPath::new(segments))
+            .and_then(|id| compilation.code_tree().node(id))
+            && let Some(declaration) = field
+                .declarations
+                .iter()
+                .rev()
+                .find_map(|id| compilation.code_tree().declaration(*id))
+            && let Some(definition) = compilation
+                .syntax(declaration.file_id)
+                .and_then(|syntax| syntax.definitions.get(declaration.definition_index))
+            && let Some(path) = declared_type_path(&definition.header, name)
+        {
+            return Some(path);
+        }
+        owner = type_node.parent_type;
+    }
+    None
+}
+
 #[derive(Default)]
 struct ConstBindings {
     globals: BTreeSet<String>,
@@ -681,6 +1463,7 @@ struct ConstBindings {
     field_types: BTreeMap<NodeId, BTreeMap<String, NodeId>>,
     scalar_field_types: BTreeMap<NodeId, ScalarConstraint>,
     scalar_field_conflicts: Vec<String>,
+    unresolved_type_conflicts: Vec<String>,
 }
 
 impl ConstBindings {
@@ -715,6 +1498,16 @@ impl ConstBindings {
                 && let Some(constraint) = scalar_constraint(&definition.header)
             {
                 bindings.scalar_field_types.insert(entry.node, constraint);
+            }
+            if definition.header.iter().any(
+                |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
+            ) && let Some(path) = declared_type_path(&definition.header, name)
+                && !is_known_declared_type(compilation, &path)
+            {
+                bindings.unresolved_type_conflicts.push(format!(
+                    "unknown declared type `{path}` for variable {}",
+                    entry.path
+                ));
             }
             if let Some(type_node) = declared_type_node(compilation, &definition.header, name) {
                 bindings
@@ -820,13 +1613,26 @@ fn validate_const_assignments(
             message: message.clone(),
         });
     }
+    if let Some(message) = bindings.unresolved_type_conflicts.first() {
+        return Err(dm_vm::CompileError {
+            message: message.clone(),
+        });
+    }
     let mut locals = BTreeSet::new();
     let mut const_locals = BTreeSet::new();
     let mut local_types = BTreeMap::new();
     let mut scalar_types = BTreeMap::new();
+    let mut known_truthy = BTreeSet::new();
     let procedure_node = registry
         .procedure(implementation.procedure())
         .map(|procedure| procedure.node);
+    if let Some(path) = procedure_return_type_path(&definition.header)
+        && !is_known_declared_type(compilation, &path)
+    {
+        return Err(dm_vm::CompileError {
+            message: format!("unknown declared procedure return type `{path}`"),
+        });
+    }
     if let Some(node) = procedure_node {
         validate_override_return_signature(compilation, node)?;
     }
@@ -850,6 +1656,7 @@ fn validate_const_assignments(
             continue;
         };
         locals.insert(name.to_owned());
+        validate_declared_type_exists(compilation, &parameter.tokens, name)?;
         if let Some(type_node) = declared_type_node(compilation, &parameter.tokens, name) {
             local_types.insert(name.to_owned(), type_node);
         }
@@ -863,9 +1670,13 @@ fn validate_const_assignments(
         let assignment = tokens.iter().position(|token| {
             matches!(&token.kind, TokenKind::Operator(operator) if is_assignment_operator(operator))
         });
+        let declaration_end = tokens
+            .iter()
+            .position(|token| matches!(token.kind, TokenKind::Punctuation('[')))
+            .unwrap_or_else(|| assignment.unwrap_or(tokens.len()));
         let identifiers: Vec<_> = tokens
             .iter()
-            .take(assignment.unwrap_or(tokens.len()))
+            .take(declaration_end)
             .filter_map(|token| match &token.kind {
                 TokenKind::Identifier(name) => Some(name.as_str()),
                 _ => None,
@@ -879,6 +1690,7 @@ fn validate_const_assignments(
                 .unwrap_or(identifiers.len());
             if let Some(name) = identifiers[..name_index].last().copied() {
                 locals.insert(name.to_owned());
+                validate_declared_type_exists(compilation, tokens, name)?;
                 if let Some(type_node) = declared_type_node(compilation, tokens, name) {
                     local_types.insert(name.to_owned(), type_node);
                 }
@@ -893,24 +1705,38 @@ fn validate_const_assignments(
                             &local_types,
                             owner,
                             bindings,
+                            &known_truthy,
                         )
                     {
                         validate_scalar_assignment(name, constraint, actual)?;
                     }
                     scalar_types.insert(name.to_owned(), constraint);
-                } else if let Some(assignment) = assignment
-                    && let Some(actual) = proven_scalar_type(
-                        compilation,
-                        registry,
-                        implementation,
-                        &tokens[assignment + 1..],
-                        &scalar_types,
-                        &local_types,
-                        owner,
-                        bindings,
-                    )
-                {
-                    scalar_types.insert(name.to_owned(), ScalarConstraint::exact(actual));
+                } else if identifiers.contains(&"const") {
+                    if let Some(assignment) = assignment
+                        && let Some(actual) = proven_scalar_type(
+                            compilation,
+                            registry,
+                            implementation,
+                            &tokens[assignment + 1..],
+                            &scalar_types,
+                            &local_types,
+                            owner,
+                            bindings,
+                            &known_truthy,
+                        )
+                    {
+                        scalar_types.insert(name.to_owned(), ScalarConstraint::exact(actual));
+                    }
+                } else {
+                    scalar_types.insert(
+                        name.to_owned(),
+                        ScalarConstraint::exact(ScalarType::Dynamic),
+                    );
+                }
+                if assignment.is_some_and(|assignment| {
+                    expression_is_proven_truthy(&tokens[assignment + 1..])
+                }) {
+                    known_truthy.insert(name.to_owned());
                 }
                 if identifiers.contains(&"const") {
                     const_locals.insert(name.to_owned());
@@ -924,6 +1750,7 @@ fn validate_const_assignments(
                             &local_types,
                             owner,
                             bindings,
+                            &known_truthy,
                             registry,
                             implementation,
                         )
@@ -945,6 +1772,7 @@ fn validate_const_assignments(
                         &local_types,
                         owner,
                         bindings,
+                        &known_truthy,
                         registry,
                         implementation,
                     ),
@@ -964,6 +1792,7 @@ fn validate_const_assignments(
                         &local_types,
                         owner,
                         bindings,
+                        &known_truthy,
                     ),
                 )
             {
@@ -1022,7 +1851,16 @@ fn validate_const_assignments(
                 message: format!("cannot assign to const variable `{name}`"),
             });
         }
-        if let (Some(expected), Some(actual)) = (
+        if locals.contains(name) {
+            known_truthy.remove(name);
+        }
+        if matches!(
+            tokens.get(assignment_index).map(|token| &token.kind),
+            Some(TokenKind::Operator(operator)) if operator == "="
+        ) && matches!(
+            tokens.get(assignment_index + 1).map(|token| &token.kind),
+            Some(TokenKind::Identifier(keyword)) if keyword == "new"
+        ) && let (Some(expected), Some(actual)) = (
             local_types.get(name).copied(),
             proven_datum_expression_type(
                 compilation,
@@ -1030,6 +1868,7 @@ fn validate_const_assignments(
                 &local_types,
                 owner,
                 bindings,
+                &known_truthy,
                 registry,
                 implementation,
             ),
@@ -1047,9 +1886,13 @@ fn validate_const_assignments(
                 &local_types,
                 owner,
                 bindings,
+                &known_truthy,
             ),
         ) {
             validate_scalar_assignment(name, expected, actual)?;
+        }
+        if locals.contains(name) && expression_is_proven_truthy(&tokens[assignment_index + 1..]) {
+            known_truthy.insert(name.to_owned());
         }
     }
     Ok(())
@@ -1111,6 +1954,26 @@ fn validate_type_assignment(
         }
         current = tree.node(node).and_then(|node| node.parent_type);
     }
+    // DreamMaker's path annotations permit a value declared as a base path to
+    // flow into a variable declared as one of its subpaths. The runtime value
+    // can still be an instance of that subtype. Unrelated type branches remain
+    // a compile-time mismatch.
+    let mut current = Some(expected);
+    while let Some(node) = current {
+        if node == actual {
+            return Ok(());
+        }
+        current = tree.node(node).and_then(|node| node.parent_type);
+    }
+    // A datum path on a DM local/parameter is a static hint used for member
+    // lookup and inferred `new`; it is not a Rust-style assignment barrier.
+    // BYOND accepts values from unrelated branches here (including values
+    // supplied through `as mob|obj|turf` call sites) and leaves runtime
+    // predicates/casts to the program. Keep the stricter check for declared
+    // procedure return contracts, which Dream64 uses to narrow call results.
+    if name != "return" {
+        return Ok(());
+    }
     let expected = tree
         .node(expected)
         .map(|node| node.path.to_string())
@@ -1131,6 +1994,13 @@ enum ScalarType {
     Number,
     Text,
     Null,
+    Dynamic,
+}
+
+fn expression_is_proven_truthy(tokens: &[dm_lexer::SpannedToken]) -> bool {
+    matches!(tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(name)) if name == "new")
+        || matches!(tokens, [token] if matches!(&token.kind, TokenKind::Number(value) if value != "0" && value != "0.0"))
+        || matches!(tokens, [token] if matches!(&token.kind, TokenKind::String(value) | TokenKind::RawString(value) if !value.is_empty()))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1244,6 +2114,7 @@ fn proven_scalar_type(
     datum_locals: &BTreeMap<String, NodeId>,
     owner: Option<NodeId>,
     bindings: &ConstBindings,
+    known_truthy: &BTreeSet<String>,
 ) -> Option<ScalarType> {
     if let Some(inferred) = infer_scalar_composite(
         compilation,
@@ -1254,6 +2125,7 @@ fn proven_scalar_type(
         datum_locals,
         owner,
         bindings,
+        known_truthy,
     ) {
         return Some(inferred);
     }
@@ -1284,6 +2156,22 @@ fn proven_scalar_type(
                     .map(|constraint| constraint.kind)
             }
         })
+        .or_else(|| {
+            let (receiver, member) = parenthesized_receiver_method(tokens)?;
+            let receiver_type = proven_datum_expression_type(
+                compilation,
+                receiver,
+                datum_locals,
+                owner,
+                bindings,
+                known_truthy,
+                registry,
+                implementation,
+            )?;
+            find_member_node(compilation, receiver_type, "proc", member)
+                .and_then(|node| effective_scalar_return(compilation, node))
+                .map(|constraint| constraint.kind)
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1296,6 +2184,7 @@ fn infer_scalar_composite(
     datum_locals: &BTreeMap<String, NodeId>,
     owner: Option<NodeId>,
     bindings: &ConstBindings,
+    known_truthy: &BTreeSet<String>,
 ) -> Option<ScalarType> {
     if matches!(
         tokens.first().map(|token| &token.kind),
@@ -1314,6 +2203,7 @@ fn infer_scalar_composite(
             datum_locals,
             owner,
             bindings,
+            known_truthy,
         );
     }
     if matches!(tokens.first().map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "..")
@@ -1332,6 +2222,19 @@ fn infer_scalar_composite(
         return effective_scalar_return(compilation, node).map(|constraint| constraint.kind);
     }
     if let Some((question, colon)) = top_level_ternary(tokens) {
+        if condition_is_known_truthy(&tokens[..question], known_truthy) {
+            return proven_scalar_type(
+                compilation,
+                registry,
+                implementation,
+                &tokens[question + 1..colon],
+                locals,
+                datum_locals,
+                owner,
+                bindings,
+                known_truthy,
+            );
+        }
         let left = proven_scalar_type(
             compilation,
             registry,
@@ -1341,6 +2244,7 @@ fn infer_scalar_composite(
             datum_locals,
             owner,
             bindings,
+            known_truthy,
         )?;
         let right = proven_scalar_type(
             compilation,
@@ -1351,6 +2255,7 @@ fn infer_scalar_composite(
             datum_locals,
             owner,
             bindings,
+            known_truthy,
         )?;
         return (left == right).then_some(left);
     }
@@ -1364,6 +2269,7 @@ fn infer_scalar_composite(
             datum_locals,
             owner,
             bindings,
+            known_truthy,
         )?;
         let right = proven_scalar_type(
             compilation,
@@ -1374,6 +2280,7 @@ fn infer_scalar_composite(
             datum_locals,
             owner,
             bindings,
+            known_truthy,
         )?;
         return match operator {
             "+" if left == right && matches!(left, ScalarType::Number | ScalarType::Text) => {
@@ -1394,6 +2301,7 @@ fn infer_scalar_composite(
         datum_locals,
         owner,
         bindings,
+        known_truthy,
     )
 }
 
@@ -1423,6 +2331,36 @@ fn receiver_member_expression(tokens: &[dm_lexer::SpannedToken]) -> Option<(&str
         return None;
     }
     Some((receiver, member, call))
+}
+
+fn parenthesized_receiver_method(
+    tokens: &[dm_lexer::SpannedToken],
+) -> Option<(&[dm_lexer::SpannedToken], &str)> {
+    if !matches!(
+        tokens.first().map(|token| &token.kind),
+        Some(TokenKind::Punctuation('('))
+    ) {
+        return None;
+    }
+    let close = matching_closing(tokens, 0, '(', ')')?;
+    if close + 5 != tokens.len()
+        || !matches!(&tokens[close + 1].kind, TokenKind::Operator(operator) if operator == ".")
+        || !matches!(&tokens[close + 3].kind, TokenKind::Punctuation('('))
+        || !matches!(&tokens[close + 4].kind, TokenKind::Punctuation(')'))
+    {
+        return None;
+    }
+    let TokenKind::Identifier(member) = &tokens[close + 2].kind else {
+        return None;
+    };
+    Some((&tokens[1..close], member))
+}
+
+fn condition_is_known_truthy(
+    tokens: &[dm_lexer::SpannedToken],
+    known_truthy: &BTreeSet<String>,
+) -> bool {
+    matches!(tokens, [token] if matches!(&token.kind, TokenKind::Identifier(name) if known_truthy.contains(name)))
 }
 
 fn proven_receiver_type(
@@ -1543,6 +2481,7 @@ fn inline_list_index_scalar(
     datum_locals: &BTreeMap<String, NodeId>,
     owner: Option<NodeId>,
     bindings: &ConstBindings,
+    known_truthy: &BTreeSet<String>,
 ) -> Option<ScalarType> {
     if !matches!(tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(name)) if name == "list")
         || !matches!(
@@ -1576,6 +2515,7 @@ fn inline_list_index_scalar(
                 datum_locals,
                 owner,
                 bindings,
+                known_truthy,
             )?;
             if inferred.is_some_and(|previous| previous != entry) {
                 return None;
@@ -1598,7 +2538,10 @@ fn validate_scalar_assignment(
     expected: ScalarConstraint,
     actual: ScalarType,
 ) -> Result<(), dm_vm::CompileError> {
-    if actual == expected.kind || (actual == ScalarType::Null && expected.allows_null) {
+    if expected.kind == ScalarType::Dynamic
+        || actual == expected.kind
+        || (actual == ScalarType::Null && expected.allows_null)
+    {
         return Ok(());
     }
     Err(dm_vm::CompileError {
@@ -1615,16 +2558,30 @@ fn proven_datum_expression_type(
     local_types: &BTreeMap<String, NodeId>,
     owner: Option<NodeId>,
     bindings: &ConstBindings,
+    known_truthy: &BTreeSet<String>,
     registry: &ProcedureRegistry,
     implementation: ProcedureImplementationId,
 ) -> Option<NodeId> {
     if let Some((question, colon)) = top_level_ternary(tokens) {
+        if condition_is_known_truthy(&tokens[..question], known_truthy) {
+            return proven_datum_expression_type(
+                compilation,
+                &tokens[question + 1..colon],
+                local_types,
+                owner,
+                bindings,
+                known_truthy,
+                registry,
+                implementation,
+            );
+        }
         let left = proven_datum_expression_type(
             compilation,
             &tokens[question + 1..colon],
             local_types,
             owner,
             bindings,
+            known_truthy,
             registry,
             implementation,
         )?;
@@ -1634,6 +2591,7 @@ fn proven_datum_expression_type(
             local_types,
             owner,
             bindings,
+            known_truthy,
             registry,
             implementation,
         )?;
@@ -1658,6 +2616,20 @@ fn proven_datum_expression_type(
                 .and_then(|node| effective_datum_return(compilation, node));
         }
         return bindings.field_type(compilation, Some(receiver_type), member);
+    }
+    if let Some((receiver, member)) = parenthesized_receiver_method(tokens) {
+        let receiver_type = proven_datum_expression_type(
+            compilation,
+            receiver,
+            local_types,
+            owner,
+            bindings,
+            known_truthy,
+            registry,
+            implementation,
+        )?;
+        return find_member_node(compilation, receiver_type, "proc", member)
+            .and_then(|node| effective_datum_return(compilation, node));
     }
     let mut index = usize::from(
         matches!(tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(name)) if name == "new"),
@@ -1702,11 +2674,73 @@ fn declared_type_node(
     tokens: &[dm_lexer::SpannedToken],
     variable_name: &str,
 ) -> Option<NodeId> {
+    compilation
+        .code_tree()
+        .find(&declared_type_path(tokens, variable_name)?)
+}
+
+fn validate_declared_type_exists(
+    compilation: &Compilation,
+    tokens: &[dm_lexer::SpannedToken],
+    variable_name: &str,
+) -> Result<(), dm_vm::CompileError> {
+    let Some(path) = declared_type_path(tokens, variable_name) else {
+        return Ok(());
+    };
+    if is_known_declared_type(compilation, &path) {
+        return Ok(());
+    }
+    Err(dm_vm::CompileError {
+        message: format!("unknown declared type `{path}` for variable `{variable_name}`"),
+    })
+}
+
+fn is_known_declared_type(compilation: &Compilation, path: &dm_syntax::DefinitionPath) -> bool {
+    if compilation.code_tree().find(path).is_some() {
+        return true;
+    }
+    let segments = path.segments();
+    for length in (1..segments.len()).rev() {
+        let ancestor = dm_syntax::DefinitionPath::new(segments[..length].to_vec());
+        if let Some(node) = compilation
+            .code_tree()
+            .find(&ancestor)
+            .and_then(|id| compilation.code_tree().node(id))
+        {
+            return !node.is_standard();
+        }
+    }
+    false
+}
+
+fn declared_type_path(
+    tokens: &[dm_lexer::SpannedToken],
+    variable_name: &str,
+) -> Option<dm_syntax::DefinitionPath> {
     let assignment = tokens
         .iter()
         .position(|token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="))
         .unwrap_or(tokens.len());
     let header = &tokens[..assignment];
+    if let Some(name_index) = header.iter().position(
+        |token| matches!(&token.kind, TokenKind::Identifier(name) if name == variable_name),
+    ) && matches!(
+        header.get(name_index + 1).map(|token| &token.kind),
+        Some(TokenKind::Punctuation('['))
+    ) {
+        return Some(dm_syntax::DefinitionPath::new(vec!["list".to_owned()]));
+    }
+    if let Some(as_index) = header
+        .iter()
+        .position(|token| matches!(&token.kind, TokenKind::Identifier(name) if name == "as"))
+        && header[as_index + 1..]
+            .iter()
+            .any(|token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "|"))
+    {
+        // `as mob|obj|turf` is a union constraint, not the path
+        // `/mob/obj/turf`. No single exact receiver type is proven.
+        return None;
+    }
     let identifiers: Vec<_> = header
         .iter()
         .filter_map(|token| match &token.kind {
@@ -1722,28 +2756,43 @@ fn declared_type_node(
                 .map(|name| (**name).to_owned())
                 .collect()
         } else {
-            let var_index = identifiers.iter().position(|name| *name == "var")?;
             let name_index = identifiers
                 .iter()
                 .rposition(|name| *name == variable_name)?;
-            identifiers[var_index + 1..name_index]
+            let type_start = identifiers
                 .iter()
-                .filter(|name| !matches!(**name, "global" | "static" | "tmp" | "const"))
+                .position(|name| *name == "var")
+                .map_or(0, |index| index + 1);
+            identifiers[type_start..name_index]
+                .iter()
+                .filter(|name| !matches!(**name, "global" | "static" | "tmp" | "const" | "final"))
                 .map(|name| (**name).to_owned())
                 .collect()
         };
     if segments.is_empty() {
         return None;
     }
-    compilation
-        .code_tree()
-        .find(&dm_syntax::DefinitionPath::new(segments))
+    // DM permits a list declaration to carry an element type after `list`, as
+    // in `var/list/datum/item/items`.  The variable itself is still a /list;
+    // the following path is not a subtype rooted beneath /list.
+    if matches!(segments.first().map(String::as_str), Some("list" | "alist")) {
+        return Some(dm_syntax::DefinitionPath::new(vec![segments[0].clone()]));
+    }
+    Some(dm_syntax::DefinitionPath::new(segments))
 }
 
 fn procedure_return_type_node(
     compilation: &Compilation,
     tokens: &[dm_lexer::SpannedToken],
 ) -> Option<NodeId> {
+    compilation
+        .code_tree()
+        .find(&procedure_return_type_path(tokens)?)
+}
+
+fn procedure_return_type_path(
+    tokens: &[dm_lexer::SpannedToken],
+) -> Option<dm_syntax::DefinitionPath> {
     let closing = tokens
         .iter()
         .rposition(|token| token.kind == TokenKind::Punctuation(')'))?;
@@ -1755,16 +2804,18 @@ fn procedure_return_type_node(
     let segments = tokens[annotation + 1..]
         .iter()
         .filter_map(|token| match &token.kind {
-            TokenKind::Identifier(segment) => Some(segment.clone()),
+            TokenKind::Identifier(segment)
+                if !matches!(segment.as_str(), "null" | "num" | "text") =>
+            {
+                Some(segment.clone())
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
     if segments.is_empty() {
         return None;
     }
-    compilation
-        .code_tree()
-        .find(&dm_syntax::DefinitionPath::new(segments))
+    Some(dm_syntax::DefinitionPath::new(segments))
 }
 
 fn is_assignment_operator(operator: &str) -> bool {
@@ -1799,6 +2850,188 @@ fn declared_global_fields(compilation: &Compilation) -> BTreeMap<String, FieldNa
     fields
 }
 
+fn direct_static_fields(
+    registry: &VariableRegistry,
+) -> BTreeMap<NodeId, BTreeMap<String, FieldName>> {
+    let mut fields = BTreeMap::<NodeId, BTreeMap<String, FieldName>>::new();
+    for entry in registry
+        .entries()
+        .iter()
+        .filter(|entry| entry.storage == StorageClass::Static)
+    {
+        let Some(owner) = entry.owner.as_ref().map(|owner| owner.node) else {
+            continue;
+        };
+        let Some(name) = entry.path.rsplit('/').next() else {
+            continue;
+        };
+        fields
+            .entry(owner)
+            .or_default()
+            .insert(name.to_owned(), FieldName::static_storage(&entry.path));
+    }
+    fields
+}
+
+fn inherited_static_fields(
+    compilation: &Compilation,
+    owner: Option<NodeId>,
+    direct_fields: &BTreeMap<NodeId, BTreeMap<String, FieldName>>,
+    cache: &mut BTreeMap<NodeId, BTreeMap<String, FieldName>>,
+) -> BTreeMap<String, FieldName> {
+    let Some(owner) = owner else {
+        return BTreeMap::new();
+    };
+    if let Some(fields) = cache.get(&owner) {
+        return fields.clone();
+    }
+    let tree = compilation.code_tree();
+    let mut hierarchy = Vec::new();
+    let mut current = Some(owner);
+    while let Some(node) = current {
+        hierarchy.push(node);
+        current = tree.node(node).and_then(|type_node| type_node.parent_type);
+    }
+    hierarchy.reverse();
+    let mut fields = BTreeMap::new();
+    for node in hierarchy {
+        if let Some(direct) = direct_fields.get(&node) {
+            fields.extend(direct.clone());
+        }
+    }
+    cache.insert(owner, fields.clone());
+    fields
+}
+
+fn declared_receiver_types(
+    definition: &dm_syntax::Definition,
+) -> BTreeMap<String, dm_syntax::DefinitionPath> {
+    let mut types = BTreeMap::new();
+    for parameter in &definition.parameters {
+        let Some(name) = parameter
+            .tokens
+            .iter()
+            .rev()
+            .find_map(|token| match &token.kind {
+                TokenKind::Identifier(name) if name != "as" => Some(name.as_str()),
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        if let Some(path) = declared_type_path(&parameter.tokens, name) {
+            types.insert(name.to_owned(), path);
+        }
+    }
+    for line in &definition.body {
+        if !matches!(line.tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(name)) if name == "var")
+        {
+            continue;
+        }
+        let assignment = line
+            .tokens
+            .iter()
+            .position(|token| matches!(&token.kind, TokenKind::Operator(op) if op == "="))
+            .unwrap_or(line.tokens.len());
+        let Some(name) =
+            line.tokens[..assignment]
+                .iter()
+                .rev()
+                .find_map(|token| match &token.kind {
+                    TokenKind::Identifier(name) if !matches!(name.as_str(), "var" | "as") => {
+                        Some(name.as_str())
+                    }
+                    _ => None,
+                })
+        else {
+            continue;
+        };
+        if let Some(path) = declared_type_path(&line.tokens, name) {
+            types.insert(name.to_owned(), path);
+        }
+    }
+    types
+}
+
+fn declared_global_types(compilation: &Compilation) -> BTreeMap<String, TypePath> {
+    compilation
+        .code_tree()
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == NodeKind::Variable && node.owner_type.is_none())
+        .filter_map(|node| {
+            let name = node.path.segments().last()?;
+            let declaration = node
+                .declarations
+                .iter()
+                .rev()
+                .find_map(|id| compilation.code_tree().declaration(*id))?;
+            let definition = compilation
+                .syntax(declaration.file_id)
+                .and_then(|syntax| syntax.definitions.get(declaration.definition_index))?;
+            let path = declared_type_path(&definition.header, name)?;
+            TypePath::parse(&path.to_string())
+                .ok()
+                .map(|path| (name.clone(), path))
+        })
+        .collect()
+}
+
+fn declared_field_types(compilation: &Compilation) -> BTreeMap<NodeId, BTreeMap<String, NodeId>> {
+    let mut types = BTreeMap::<NodeId, BTreeMap<String, NodeId>>::new();
+    for node in compilation
+        .code_tree()
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == NodeKind::Variable)
+    {
+        let Some(owner) = node.owner_type else {
+            continue;
+        };
+        let Some(name) = node.path.segments().last() else {
+            continue;
+        };
+        let Some(definition) = node
+            .declarations
+            .iter()
+            .filter_map(|id| compilation.code_tree().declaration(*id))
+            .filter_map(|declaration| {
+                compilation
+                    .syntax(declaration.file_id)
+                    .and_then(|syntax| syntax.definitions.get(declaration.definition_index))
+            })
+            .find(|definition| declared_type_path(&definition.header, name).is_some())
+        else {
+            continue;
+        };
+        let Some(path) = declared_type_path(&definition.header, name) else {
+            continue;
+        };
+        let Some(field_type) = compilation.code_tree().find(&path) else {
+            continue;
+        };
+        types
+            .entry(owner)
+            .or_default()
+            .insert(name.clone(), field_type);
+    }
+    types
+}
+
+fn inherited_declared_field_type(
+    compilation: &Compilation,
+    field_types: &BTreeMap<NodeId, BTreeMap<String, NodeId>>,
+    mut owner: NodeId,
+    name: &str,
+) -> Option<NodeId> {
+    loop {
+        if let Some(field_type) = field_types.get(&owner).and_then(|fields| fields.get(name)) {
+            return Some(*field_type);
+        }
+        owner = compilation.code_tree().node(owner)?.parent_type?;
+    }
+}
+
 impl ProcedureRegistry {
     fn static_call_target(
         &self,
@@ -1810,28 +3043,18 @@ impl ProcedureRegistry {
         let mut owner = procedure.owner_type;
         let tree = compilation.code_tree();
         while let Some(current_owner) = owner {
-            if let Some(candidate) = self.procedures.iter().find(|candidate| {
-                candidate.owner_type == Some(current_owner)
-                    && candidate
-                        .path
-                        .segments()
-                        .last()
-                        .is_some_and(|name| name == selector)
-            }) {
+            if let Some(candidate) = self
+                .by_owner_name
+                .get(&(Some(current_owner), selector.to_owned()))
+                .and_then(|id| self.procedure(*id))
+            {
                 return effective_target(&self.procedures, candidate.id);
             }
             owner = tree.node(current_owner).and_then(|node| node.parent_type);
         }
-        self.procedures
-            .iter()
-            .find(|candidate| {
-                candidate.owner_type.is_none()
-                    && candidate
-                        .path
-                        .segments()
-                        .last()
-                        .is_some_and(|name| name == selector)
-            })
+        self.by_owner_name
+            .get(&(None, selector.to_owned()))
+            .and_then(|id| self.procedure(*id))
             .and_then(|candidate| effective_target(&self.procedures, candidate.id))
     }
 }
@@ -1875,26 +3098,464 @@ fn dynamic_call_literal_selectors(definition: &dm_syntax::Definition) -> BTreeSe
     selectors
 }
 
-fn static_call_selectors(definition: &dm_syntax::Definition) -> BTreeSet<String> {
-    definition
-        .body
+fn member_call_dependencies(
+    definition: &dm_syntax::Definition,
+    owner: Option<NodeId>,
+    compilation: &Compilation,
+    global_types: &BTreeMap<String, TypePath>,
+    field_types: &BTreeMap<NodeId, BTreeMap<String, NodeId>>,
+    by_owner_name: &BTreeMap<(Option<NodeId>, String), ProcedureId>,
+    dynamic_targets: &BTreeMap<String, Vec<ProcedureImplementationId>>,
+    procedures: &[Procedure],
+) -> (
+    BTreeSet<ProcedureImplementationId>,
+    BTreeSet<ProcedureImplementationId>,
+    BTreeSet<String>,
+) {
+    let receiver_types = declared_receiver_types(definition);
+    let mut flowing_types = receiver_types
         .iter()
-        .flat_map(|line| line.tokens.windows(2))
-        .filter_map(|tokens| match (&tokens[0].kind, &tokens[1].kind) {
-            (TokenKind::Identifier(name), TokenKind::Punctuation('(')) => Some(name.clone()),
-            _ => None,
+        .filter_map(|(name, path)| {
+            compilation
+                .code_tree()
+                .find(path)
+                .map(|node| (name.clone(), node))
         })
-        .collect()
+        .collect::<BTreeMap<_, _>>();
+    let declared_names = flowing_types.keys().cloned().collect::<BTreeSet<_>>();
+    let mut exact = BTreeSet::new();
+    let mut typed_virtual = BTreeSet::new();
+    let mut unresolved = BTreeSet::new();
+    for line in &definition.body {
+        for selector_index in 2..line.tokens.len().saturating_sub(1) {
+            let dot = &line.tokens[selector_index - 1];
+            let selector = &line.tokens[selector_index];
+            let open = &line.tokens[selector_index + 1];
+            if !matches!(&dot.kind, TokenKind::Operator(operator) if operator == "." || operator == "?.")
+                || !matches!(open.kind, TokenKind::Punctuation('('))
+            {
+                continue;
+            }
+            let TokenKind::Identifier(selector) = &selector.kind else {
+                continue;
+            };
+            let receiver_end = selector_index - 1;
+            let receiver_node = (0..receiver_end).find_map(|start| {
+                proven_receiver_expression_type(
+                    compilation,
+                    owner,
+                    &line.tokens[start..receiver_end],
+                    &flowing_types,
+                    global_types,
+                    field_types,
+                    by_owner_name,
+                    procedures,
+                )
+            });
+            let Some(mut receiver_node) = receiver_node else {
+                unresolved.insert(selector.clone());
+                continue;
+            };
+            let declared_receiver = receiver_node;
+            let mut target = None;
+            loop {
+                if let Some(procedure) = by_owner_name
+                    .get(&(Some(receiver_node), selector.clone()))
+                    .and_then(|id| procedures.get(id.index()))
+                    && let Some(effective) = effective_target(procedures, procedure.id)
+                {
+                    target = Some(effective);
+                    break;
+                }
+                let Some(parent) = compilation
+                    .code_tree()
+                    .node(receiver_node)
+                    .and_then(|node| node.parent_type)
+                else {
+                    break;
+                };
+                receiver_node = parent;
+            }
+            if let Some(target) = target {
+                exact.insert(target);
+                // A typed DM variable may hold any compatible subtype. Keep
+                // runtime virtual dispatch while narrowing the linked module
+                // to overrides beneath the declared receiver type.
+                for &candidate in dynamic_targets.get(selector).into_iter().flatten() {
+                    let Some(candidate_owner) = procedures
+                        .get(candidate.procedure().index())
+                        .and_then(|procedure| procedure.owner_type)
+                    else {
+                        continue;
+                    };
+                    if type_is_descendant_or_same(compilation, candidate_owner, declared_receiver) {
+                        if candidate != target {
+                            typed_virtual.insert(candidate);
+                        }
+                    }
+                }
+            } else {
+                unresolved.insert(selector.clone());
+            }
+        }
+        if let Some(assignment) = top_level_simple_assignment(&line.tokens) {
+            let lhs = &line.tokens[..assignment];
+            let rhs = &line.tokens[assignment + 1..];
+            let local = lhs.iter().rev().find_map(|token| match &token.kind {
+                TokenKind::Identifier(name) if !matches!(name.as_str(), "var" | "as") => {
+                    Some(name.clone())
+                }
+                _ => None,
+            });
+            if let Some(local) = local
+                && !lhs.iter().any(|token| {
+                    matches!(&token.kind, TokenKind::Operator(operator) if operator == "." || operator == "?.")
+                        || matches!(token.kind, TokenKind::Punctuation('['))
+                })
+                && !declared_names.contains(&local)
+            {
+                if let Some(alias_type) = proven_field_chain_type(
+                    compilation,
+                    owner,
+                    rhs,
+                    &flowing_types,
+                    global_types,
+                    field_types,
+                ) {
+                    flowing_types.insert(local, alias_type);
+                } else {
+                    flowing_types.remove(&local);
+                }
+            }
+        }
+    }
+    (exact, typed_virtual, unresolved)
 }
 
-fn procedure_matches_dynamic_selector(procedure: &Procedure, selector: &str) -> bool {
-    let selector = selector.trim_matches('/');
-    let selector = selector.rsplit('/').next().unwrap_or(selector);
-    procedure
-        .path
-        .segments()
-        .last()
-        .is_some_and(|name| name == selector)
+fn receiver_root_type(
+    compilation: &Compilation,
+    owner: Option<NodeId>,
+    name: &str,
+    local_types: &BTreeMap<String, NodeId>,
+    global_types: &BTreeMap<String, TypePath>,
+    field_types: &BTreeMap<NodeId, BTreeMap<String, NodeId>>,
+) -> Option<NodeId> {
+    if name == "src" {
+        return owner;
+    }
+    local_types
+        .get(name)
+        .copied()
+        .or_else(|| {
+            global_types.get(name).and_then(|path| {
+                let segments = path
+                    .as_str()
+                    .trim_matches('/')
+                    .split('/')
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                compilation
+                    .code_tree()
+                    .find(&dm_syntax::DefinitionPath::new(segments))
+            })
+        })
+        .or_else(|| {
+            owner.and_then(|owner| {
+                inherited_declared_field_type(compilation, field_types, owner, name)
+            })
+        })
+}
+
+fn proven_field_chain_type(
+    compilation: &Compilation,
+    owner: Option<NodeId>,
+    tokens: &[dm_lexer::SpannedToken],
+    local_types: &BTreeMap<String, NodeId>,
+    global_types: &BTreeMap<String, TypePath>,
+    field_types: &BTreeMap<NodeId, BTreeMap<String, NodeId>>,
+) -> Option<NodeId> {
+    let TokenKind::Identifier(first) = &tokens.first()?.kind else {
+        return None;
+    };
+    let mut current = receiver_root_type(
+        compilation,
+        owner,
+        first,
+        local_types,
+        global_types,
+        field_types,
+    )?;
+    let mut index = 1;
+    while index < tokens.len() {
+        if !matches!(&tokens[index].kind, TokenKind::Operator(operator) if operator == "." || operator == "?.")
+        {
+            return None;
+        }
+        let TokenKind::Identifier(member) = &tokens.get(index + 1)?.kind else {
+            return None;
+        };
+        current = inherited_declared_field_type(compilation, field_types, current, member)?;
+        index += 2;
+    }
+    Some(current)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn proven_receiver_expression_type(
+    compilation: &Compilation,
+    owner: Option<NodeId>,
+    tokens: &[dm_lexer::SpannedToken],
+    local_types: &BTreeMap<String, NodeId>,
+    global_types: &BTreeMap<String, TypePath>,
+    field_types: &BTreeMap<NodeId, BTreeMap<String, NodeId>>,
+    by_owner_name: &BTreeMap<(Option<NodeId>, String), ProcedureId>,
+    procedures: &[Procedure],
+) -> Option<NodeId> {
+    if let Some((question, colon)) = top_level_ternary(tokens) {
+        let truthy = proven_receiver_expression_type(
+            compilation,
+            owner,
+            &tokens[question + 1..colon],
+            local_types,
+            global_types,
+            field_types,
+            by_owner_name,
+            procedures,
+        )?;
+        let falsey = proven_receiver_expression_type(
+            compilation,
+            owner,
+            &tokens[colon + 1..],
+            local_types,
+            global_types,
+            field_types,
+            by_owner_name,
+            procedures,
+        )?;
+        return (truthy == falsey).then_some(truthy);
+    }
+    if let Some(field) = proven_field_chain_type(
+        compilation,
+        owner,
+        tokens,
+        local_types,
+        global_types,
+        field_types,
+    ) {
+        return Some(field);
+    }
+    if matches!(
+        tokens.first().map(|token| &token.kind),
+        Some(TokenKind::Punctuation('('))
+    ) && matching_closing(tokens, 0, '(', ')') == Some(tokens.len() - 1)
+    {
+        return proven_receiver_expression_type(
+            compilation,
+            owner,
+            &tokens[1..tokens.len() - 1],
+            local_types,
+            global_types,
+            field_types,
+            by_owner_name,
+            procedures,
+        );
+    }
+    let close = tokens.len().checked_sub(1)?;
+    if !matches!(tokens.get(close)?.kind, TokenKind::Punctuation(')')) {
+        return None;
+    }
+    let open = (0..close).rev().find(|&index| {
+        matches!(tokens[index].kind, TokenKind::Punctuation('('))
+            && matching_closing(tokens, index, '(', ')') == Some(close)
+    })?;
+    let TokenKind::Identifier(selector) = &tokens.get(open.checked_sub(1)?)?.kind else {
+        return None;
+    };
+    let procedure_node = if open >= 3
+        && matches!(&tokens[open - 2].kind, TokenKind::Operator(operator) if operator == "." || operator == "?.")
+    {
+        let receiver_type = proven_receiver_expression_type(
+            compilation,
+            owner,
+            &tokens[..open - 2],
+            local_types,
+            global_types,
+            field_types,
+            by_owner_name,
+            procedures,
+        )?;
+        find_member_node(compilation, receiver_type, "proc", selector)
+    } else if open == 1 {
+        let mut current = owner;
+        let mut found = None;
+        while let Some(node) = current {
+            if let Some(procedure) = by_owner_name
+                .get(&(Some(node), selector.clone()))
+                .and_then(|id| procedures.get(id.index()))
+            {
+                found = Some(procedure.node);
+                break;
+            }
+            current = compilation
+                .code_tree()
+                .node(node)
+                .and_then(|node| node.parent_type);
+        }
+        found.or_else(|| {
+            by_owner_name
+                .get(&(None, selector.clone()))
+                .and_then(|id| procedures.get(id.index()))
+                .map(|procedure| procedure.node)
+        })
+    } else {
+        None
+    }?;
+    effective_datum_return(compilation, procedure_node)
+}
+
+fn type_is_descendant_or_same(
+    compilation: &Compilation,
+    mut candidate: NodeId,
+    expected: NodeId,
+) -> bool {
+    loop {
+        if candidate == expected {
+            return true;
+        }
+        let Some(parent) = compilation
+            .code_tree()
+            .node(candidate)
+            .and_then(|node| node.parent_type)
+        else {
+            return false;
+        };
+        candidate = parent;
+    }
+}
+
+fn static_call_selectors(definition: &dm_syntax::Definition) -> BTreeSet<String> {
+    let mut selectors = BTreeSet::new();
+    // Default argument expressions execute as part of the procedure call and
+    // therefore participate in the same static call graph as its body.
+    collect_call_selectors(&definition.header, &mut selectors);
+    for line in &definition.body {
+        collect_call_selectors(&line.tokens, &mut selectors);
+        for token in &line.tokens {
+            if let TokenKind::String(text) | TokenKind::RawString(text) = &token.kind {
+                collect_text_call_selectors(text, &mut selectors);
+            }
+        }
+    }
+    selectors
+}
+
+fn referenced_identifiers(definition: &dm_syntax::Definition) -> BTreeSet<String> {
+    fn collect(tokens: &[dm_lexer::SpannedToken], names: &mut BTreeSet<String>) {
+        for token in tokens {
+            match &token.kind {
+                TokenKind::Identifier(name) => {
+                    names.insert(name.clone());
+                }
+                TokenKind::String(text) | TokenKind::RawString(text) => {
+                    // The token stores decoded DM text without its outer
+                    // quotes. Re-lexing the whole value is unreliable when
+                    // interpolation itself contains quoted arguments (for
+                    // example `[join(values, ", ")]`). Conservatively retain
+                    // every identifier-shaped word; later binding lookup
+                    // filters this set to real src/global fields.
+                    let bytes = text.as_bytes();
+                    let mut index = 0;
+                    while index < bytes.len() {
+                        if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
+                            let start = index;
+                            index += 1;
+                            while index < bytes.len()
+                                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                            {
+                                index += 1;
+                            }
+                            names.insert(text[start..index].to_owned());
+                        } else {
+                            index += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut names = BTreeSet::new();
+    collect(&definition.header, &mut names);
+    for line in &definition.body {
+        collect(&line.tokens, &mut names);
+    }
+    names
+}
+
+fn collect_text_call_selectors(text: &str, selectors: &mut BTreeSet<String>) {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
+            let start = index;
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+            {
+                index += 1;
+            }
+            let mut next = index;
+            while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                next += 1;
+            }
+            if bytes.get(next) == Some(&b'(') {
+                selectors.insert(text[start..index].to_owned());
+            }
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn collect_call_selectors(tokens: &[dm_lexer::SpannedToken], selectors: &mut BTreeSet<String>) {
+    for index in 0..tokens.len().saturating_sub(1) {
+        if index > 0 {
+            match &tokens[index - 1].kind {
+                TokenKind::Operator(operator) if matches!(operator.as_str(), "." | "?.") => {
+                    continue;
+                }
+                TokenKind::Operator(operator)
+                    if operator == ":" && !ternary_colon(tokens, index - 1) =>
+                {
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if let (TokenKind::Identifier(name), TokenKind::Punctuation('(')) =
+            (&tokens[index].kind, &tokens[index + 1].kind)
+        {
+            selectors.insert(name.clone());
+        }
+    }
+}
+
+fn ternary_colon(tokens: &[dm_lexer::SpannedToken], colon: usize) -> bool {
+    let mut depth = 0usize;
+    let mut pending = 0usize;
+    for token in &tokens[..colon] {
+        match &token.kind {
+            TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+            TokenKind::Punctuation(')' | ']' | '}') => depth = depth.saturating_sub(1),
+            TokenKind::Operator(operator) if operator == "?" && depth == 0 => pending += 1,
+            TokenKind::Operator(operator) if operator == ":" && depth == 0 && pending > 0 => {
+                pending -= 1
+            }
+            _ => {}
+        }
+    }
+    pending > 0
 }
 
 fn direct_instance_fields(
@@ -1978,27 +3639,63 @@ fn standard_instance_fields(path: Option<&CodePath>, fields: &mut BTreeMap<Strin
             "maxx",
             "maxy",
             "maxz",
+            "params",
+            "log",
+            "name",
+            "hub",
+            "hub_password",
+            "internet_address",
+            "address",
+            "status",
+            "port",
+            "area",
+            "mob",
+            "turf",
+            "byond_version",
+            "byond_build",
+            "cache_lifespan",
+            "executor",
+            "game_state",
+            "host",
+            "loop_checks",
+            "map_format",
+            "map_cpu",
+            "movement_mode",
+            "process",
+            "reachable",
+            "sleep_offline",
+            "tick_usage",
+            "url",
+            "version",
+            "view",
+            "visibility",
         ],
         "/atom" => &[
             "alpha",
             "appearance_flags",
             "blend_mode",
             "color",
+            "contents",
             "density",
             "desc",
             "dir",
+            "gender",
             "icon",
             "icon_state",
             "invisibility",
             "layer",
             "loc",
+            "luminosity",
             "maptext",
             "maptext_height",
             "maptext_width",
+            "maptext_x",
+            "maptext_y",
             "mouse_opacity",
             "name",
             "opacity",
             "overlays",
+            "particles",
             "plane",
             "pixel_w",
             "pixel_z",
@@ -2023,6 +3720,28 @@ fn standard_instance_fields(path: Option<&CodePath>, fields: &mut BTreeMap<Strin
             "pixel_y",
             "screen_loc",
             "step_size",
+        ],
+        "/mob" => &["ckey", "client", "key", "see_invisible", "sight"],
+        "/client" => &["ckey", "key", "mob"],
+        // `/image` is an engine-owned appearance datum rather than an atom,
+        // but BYOND exposes the same mutable appearance surface used by
+        // overlays. These fields exist without user declarations.
+        "/image" => &[
+            "alpha",
+            "appearance_flags",
+            "blend_mode",
+            "color",
+            "dir",
+            "icon",
+            "icon_state",
+            "layer",
+            "loc",
+            "name",
+            "overlays",
+            "plane",
+            "transform",
+            "underlays",
+            "vis_contents",
         ],
         _ => return,
     };
@@ -2064,18 +3783,23 @@ fn implementation_id(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use dm_compiler::{Compilation, CompilerDatabase};
+    use dm_globals::VariableRegistry;
     use dm_value::TypePath;
     use dm_vm::{
         ExecutionContext, ExecutionState, Instruction, RuntimeError, Value, execute_module,
         execute_module_in_context,
     };
 
-    use super::{Procedure, ProcedureImplementationKind, ProcedureRegistry};
+    use super::{
+        Procedure, ProcedureImplementationKind, ProcedureRegistry, direct_static_fields,
+        inherited_static_fields,
+    };
 
     static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
 
@@ -2141,6 +3865,25 @@ mod tests {
             .implementation(target)
             .expect("effective implementation should have a VM identity");
         execute_module(executable.module(), entry, arguments)
+    }
+
+    #[test]
+    fn independent_body_compilation_links_known_external_calls_to_stubs() {
+        let compilation = TestProject::compile(
+            "/proc/helper()\n\treturn 1\n/proc/caller()\n\treturn \"[helper()]\"\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let caller = procedure_by_path(&registry, "/proc/caller")
+            .effective_target
+            .expect("caller implementation should exist");
+        let results = registry.compile_vm_bodies_independently(&compilation, [caller]);
+        assert_eq!(results.len(), 1);
+        results
+            .into_iter()
+            .next()
+            .expect("caller result should exist")
+            .1
+            .expect("known external call should lower through an inert inventory stub");
     }
 
     #[test]
@@ -2233,23 +3976,13 @@ mod tests {
     }
 
     #[test]
-    fn validates_proven_new_paths_against_typed_parameters_and_locals() {
+    fn typed_parameters_and_locals_allow_runtime_cross_branch_values() {
         let incompatible = TestProject::compile(
             "/proc/replace(turf/bar as turf)\n\tbar = new /obj(null)\n/proc/RunTest()\n\treturn\n",
         );
-        let error = ProcedureRegistry::build(&incompatible)
+        ProcedureRegistry::build(&incompatible)
             .compile_vm(&incompatible)
-            .expect_err("an obj cannot be assigned to a turf variable");
-        assert!(
-            error.message.contains("cannot assign /obj"),
-            "{}",
-            error.message
-        );
-        assert!(
-            error.message.contains("declared as /turf"),
-            "{}",
-            error.message
-        );
+            .expect("BYOND path annotations do not reject unrelated runtime assignments");
 
         let compatible = TestProject::compile(
             "/obj/item\n/proc/replace(obj/bar as obj)\n\tbar = new /obj/item(null)\n/proc/local()\n\tvar/obj/bar = new /obj/item\n\treturn bar\n",
@@ -2261,13 +3994,12 @@ mod tests {
 
     #[test]
     fn validates_typed_sources_and_proven_datum_return_paths() {
-        let incompatible_assignment = TestProject::compile(
-            "/datum/base\n/datum/base/child\n/obj/item\n/proc/copy()\n\tvar/datum/base/target\n\tvar/obj/item/source\n\ttarget = source\n",
+        let dynamic_assignment = TestProject::compile(
+            "/datum/base\n/obj/item\n/proc/copy()\n\tvar/datum/base/target\n\tvar/obj/item/source\n\ttarget = source\n",
         );
-        let error = ProcedureRegistry::build(&incompatible_assignment)
-            .compile_vm(&incompatible_assignment)
-            .expect_err("an obj source cannot flow into a datum/base variable");
-        assert!(error.message.contains("cannot assign /obj/item"));
+        ProcedureRegistry::build(&dynamic_assignment)
+            .compile_vm(&dynamic_assignment)
+            .expect("DreamMaker permits runtime values to flow through path annotations");
 
         let incompatible_return = TestProject::compile(
             "/datum/base\n/obj/item\n/proc/build() as /datum/base\n\treturn /obj/item\n",
@@ -2458,6 +4190,266 @@ mod tests {
     }
 
     #[test]
+    fn mutable_unannotated_locals_do_not_acquire_static_scalar_types() {
+        let compilation =
+            TestProject::compile("/datum/proc/foo() as num\n\tvar/meep = 5\n\treturn meep\n");
+        assert!(
+            ProcedureRegistry::build(&compilation)
+                .compile_vm(&compilation)
+                .expect_err("a mutable unannotated local remains dynamically typed")
+                .message
+                .contains("typed variable `return`")
+        );
+    }
+
+    #[test]
+    fn narrows_truthy_ternaries_and_invalidates_facts_on_dynamic_writes() {
+        let narrowed = TestProject::compile(
+            "/datum/test1\n/datum/test2/proc/meep() as num\n\treturn 5\n/datum/test3/proc/meep() as text\n\treturn \"bad\"\n/proc/read() as num\n\tvar/datum/test1/T1 = new\n\tvar/datum/test2/T2 = new\n\tvar/datum/test3/T3 = new\n\treturn (T1 ? T2 : T3).meep()\n",
+        );
+        ProcedureRegistry::build(&narrowed)
+            .compile_vm(&narrowed)
+            .expect("a local initialized with new is proven truthy");
+
+        let invalidated = TestProject::compile(
+            "/datum/test1\n/datum/test2/proc/meep() as num\n\treturn 5\n/datum/test3/proc/meep() as text\n\treturn \"bad\"\n/proc/read(value) as num\n\tvar/datum/test1/T1 = new\n\tvar/datum/test2/T2 = new\n\tvar/datum/test3/T3 = new\n\tT1 = value\n\treturn (T1 ? T2 : T3).meep()\n",
+        );
+        ProcedureRegistry::build(&invalidated)
+            .compile_vm(&invalidated)
+            .expect("an unknown write invalidates the truth fact and stays unchecked");
+    }
+
+    #[test]
+    fn rejects_unknown_declared_types_without_confusing_type_named_fields() {
+        let unknown = TestProject::compile(
+            "/datum/later\n\tvar/datum/laterrr/aa = new(0)\n/proc/RunTest()\n\treturn\n",
+        );
+        assert!(
+            ProcedureRegistry::build(&unknown)
+                .compile_vm(&unknown)
+                .expect_err("unknown field declaration type must be rejected")
+                .message
+                .contains("unknown declared type `/datum/laterrr`")
+        );
+
+        let name_clash = TestProject::compile(
+            "var/datum/later/later\n/datum/later\n\tvar/datum/later/later = new(0)\n/proc/RunTest()\n\treturn\n",
+        );
+        ProcedureRegistry::build(&name_clash)
+            .compile_vm(&name_clash)
+            .expect("a field may have the same name as its declared type");
+
+        let typed_list = TestProject::compile(
+            "/datum/item\n/datum/holder\n\tvar/final/list/datum/item/items = list()\n/proc/RunTest()\n\treturn\n",
+        );
+        ProcedureRegistry::build(&typed_list)
+            .compile_vm(&typed_list)
+            .expect("a typed-list element path must not be treated as a /list subtype");
+
+        let project_descendant = TestProject::compile(
+            "/obj/item/weapon\n/datum/holder\n\tvar/obj/item/weapon/gun/ballistic/owner_gun\n/proc/RunTest()\n\treturn\n",
+        );
+        ProcedureRegistry::build(&project_descendant)
+            .compile_vm(&project_descendant)
+            .expect("BYOND accepts an annotated descendant beneath a project-defined type");
+
+        let unresolved_annotation = TestProject::compile(
+            "/datum/holder\n\tvar/datum/forward_declared_later/value\n/proc/RunTest()\n\treturn\n",
+        );
+        ProcedureRegistry::build(&unresolved_annotation)
+            .compile_vm(&unresolved_annotation)
+            .expect("BYOND accepts unresolved field annotations without an initializer");
+
+        let unknown_local =
+            TestProject::compile("/proc/read()\n\tvar/datum/missing/value\n\treturn\n");
+        assert!(
+            ProcedureRegistry::build(&unknown_local)
+                .compile_vm(&unknown_local)
+                .expect_err("unknown local declaration type must be rejected")
+                .message
+                .contains("unknown declared type `/datum/missing`")
+        );
+
+        let unknown_parameter =
+            TestProject::compile("/proc/read(var/datum/missing/value)\n\treturn\n");
+        assert!(
+            ProcedureRegistry::build(&unknown_parameter)
+                .compile_vm(&unknown_parameter)
+                .expect_err("unknown parameter declaration type must be rejected")
+                .message
+                .contains("unknown declared type `/datum/missing`")
+        );
+
+        let unknown_return =
+            TestProject::compile("/proc/read() as /datum/missing\n\treturn null\n");
+        assert!(
+            ProcedureRegistry::build(&unknown_return)
+                .compile_vm(&unknown_return)
+                .expect_err("unknown procedure return type must be rejected")
+                .message
+                .contains("unknown declared procedure return type `/datum/missing`")
+        );
+    }
+
+    #[test]
+    fn accepts_remaining_declared_type_inference_shapes() {
+        let cases = [
+            (
+                "inherited typed field override",
+                "/datum/test/thing\n\tvar/list/foo = list()\n/datum/test/thing/stuff\n\tfoo = new()\n/proc/RunTest()\n\treturn\n",
+            ),
+            (
+                "nested list assignment",
+                "/proc/RunTest()\n\tvar/list/L = list()\n\tL[new()] = new()\n\treturn\n",
+            ),
+            (
+                "late derived field",
+                "/datum/later\n\tvar/datum/pointless_base/a\n/datum/pointless_base/derived/var/x = 7\n/proc/RunTest()\n\tvar/datum/later/L = new\n\tL.a = new /datum/pointless_base/derived()\n\treturn\n",
+            ),
+        ];
+        for (label, source) in cases {
+            let compilation = TestProject::compile(source);
+            ProcedureRegistry::build(&compilation)
+                .compile_vm(&compilation)
+                .unwrap_or_else(|error| panic!("{label} should compile: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn contextual_new_in_typed_list_assignment_allocates_the_list_type() {
+        let compilation = TestProject::compile(
+            "/proc/build()\n\tvar/list/L = list()\n\tL[new()] = new()\n\treturn L[1]\n",
+        );
+        let result = execute_effective(&compilation, "/proc/build", &[]);
+        assert!(matches!(result, Ok(Value::List(_))), "result: {result:?}");
+    }
+
+    #[test]
+    fn inferred_new_uses_every_statically_proven_destination_family() {
+        let cases = [
+            (
+                "typed local wrapper and ternary",
+                "/datum/item\n/proc/build(var/flag)\n\tvar/datum/item/value = (flag ? new() : new())\n\treturn value.type\n",
+            ),
+            (
+                "implicit src field",
+                "/datum/holder\n\tvar/datum/item/value\n\tproc/build()\n\t\tvalue = new()\n\t\treturn value.type\n/datum/item\n",
+            ),
+            (
+                "explicit and chained member fields",
+                "/datum/outer\n\tvar/datum/inner/child\n\tproc/build()\n\t\tchild.value = new()\n\t\treturn child.value.type\n/datum/inner\n\tvar/datum/item/value\n/datum/item\n",
+            ),
+            (
+                "typed global",
+                "/var/datum/item/shared\n/proc/build()\n\tshared = new()\n\treturn shared.type\n/datum/item\n",
+            ),
+        ];
+        for (label, source) in cases {
+            let compilation = TestProject::compile(source);
+            ProcedureRegistry::build(&compilation)
+                .compile_vm(&compilation)
+                .unwrap_or_else(|error| panic!("{label} should compile: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn inferred_new_follows_typed_global_controller_member_destination() {
+        let compilation = TestProject::compile(
+            "/datum/ghost_arena\n\tNew(var/source, var/marker)\n/datum/controller/global_vars\n\tvar/datum/ghost_arena/ghost_arena\n\tvar/first_arena_marker\n/var/global/datum/controller/global_vars/GLOB = new /datum/controller/global_vars\n/obj/effect/ghost_arena_corner/Initialize()\n\tGLOB.ghost_arena = new(src, GLOB.first_arena_marker)\n",
+        );
+        ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("typed GLOB member must qualify inferred new");
+    }
+
+    #[test]
+    fn inferred_new_uses_logical_assignment_and_compact_macro_local_context() {
+        for source in [
+            "/datum/cassette\n\tvar/datum/cassette_data/cassette_data\n\tproc/LateInitialize()\n\t\tcassette_data ||= new\n/datum/cassette_data\n",
+            "/datum/sort_instance\n/var/global/datum/sort_instance/shared_sorter = new /datum/sort_instance\n/proc/sortTim()\n\tvar/datum/sort_instance/sorter = shared_sorter; if(isnull(sorter)){ sorter = new; }\n",
+        ] {
+            let compilation = TestProject::compile(source);
+            ProcedureRegistry::build(&compilation)
+                .compile_vm(&compilation)
+                .expect("destination context must survive logical/compact assignment");
+        }
+    }
+
+    #[test]
+    fn inferred_new_uses_slash_typed_parameter_without_var_keyword() {
+        let compilation = TestProject::compile(
+            "/datum/tgui\n/proc/ui_interact(mob/user, datum/tgui/ui)\n\tif(!ui)\n\t\tui = new(user)\n",
+        );
+        ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("typed parameter destination must qualify new");
+    }
+
+    #[test]
+    fn inferred_new_uses_typed_parameter_default_and_for_receiver_field() {
+        let compilation = TestProject::compile(
+            "/datum/point\n/proc/copy_to(datum/point/p = new)\n\treturn p\n/datum/gas\n/obj/pipe\n\tvar/datum/gas/air_temporary\n/proc/store(var/list/members)\n\tfor(var/obj/pipe/member in members)\n\t\tmember.air_temporary = new\n",
+        );
+        ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("parameter defaults and typed loop receivers qualify new");
+    }
+
+    #[test]
+    fn inferred_new_rejects_contextless_and_unresolved_destinations() {
+        for source in [
+            "/proc/build()\n\treturn new()\n",
+            "/proc/build()\n\tvar/value\n\tvalue = new()\n",
+        ] {
+            let compilation = TestProject::compile(source);
+            let error = ProcedureRegistry::build(&compilation)
+                .compile_vm(&compilation)
+                .expect_err("unproven inferred new must be rejected");
+            assert!(
+                error
+                    .message
+                    .contains("no statically resolved destination type")
+            );
+        }
+    }
+
+    #[test]
+    fn typed_receiver_static_access_uses_one_inherited_qualified_slot() {
+        let compilation = TestProject::compile(
+            "/datum/base\n\tvar/static/shared = 3\n/datum/child\n\tparent_type = /datum/base\n/proc/read(var/datum/child/other)\n\tother.shared = 9\n\treturn initial(other.shared)\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let executable = registry
+            .compile_vm(&compilation)
+            .expect("typed static member access");
+        let procedure = procedure_by_path(&registry, "/proc/read")
+            .effective_target
+            .and_then(|id| executable.implementation(id))
+            .expect("read implementation");
+        let instructions = &executable
+            .module()
+            .procedure(procedure)
+            .expect("program")
+            .instructions;
+        let stores = instructions
+            .iter()
+            .filter_map(|instruction| match instruction {
+                dm_vm::Instruction::StoreGlobal(field) => Some(field.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let initials = instructions
+            .iter()
+            .filter_map(|instruction| match instruction {
+                dm_vm::Instruction::LoadInitialGlobal(field) => Some(field.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stores.len(), 1);
+        assert_eq!(initials, stores);
+    }
+
+    #[test]
     fn resolves_upward_search_path_expressions_before_vm_lowering() {
         let cases = [
             (
@@ -2517,20 +4509,21 @@ mod tests {
     #[test]
     fn multiline_macro_brace_blocks_keep_locals_visible_to_nested_children() {
         let compilation = TestProject::compile(
-            r#"#define WRAP(value) \
+            r#"#define GET_NEW_PLANE(new_value, multiplier) (blacklist?["[new_value]"] ? new_value : (new_value) - multiplier)
+#define WRAP(value) \
 	do {\
 		if(value) {\
 			var/_cached_plane = value;\
 			var/turf/_our_turf = value;\
 			if(_our_turf) {\
-				value = _cached_plane;\
+				value = GET_NEW_PLANE(_cached_plane, 1);\
 			} else if(value) {\
 				value = _cached_plane;\
 			}\
 		}\
 	} while(FALSE)
 
-/proc/run(value)
+/proc/run(value, blacklist)
 	WRAP(value)
 	return value
 "#,
@@ -2544,7 +4537,7 @@ mod tests {
     #[test]
     fn typed_global_macro_declaration_is_visible_as_a_bare_global() {
         let compilation = TestProject::compile(
-            r#"#define GLOBAL_REAL(X, Typepath) var/global##Typepath/##X
+            r#"#define GLOBAL_REAL(X, Typepath) var/global##Typepath/##X;
 
 GLOBAL_REAL(Master, /datum/controller/master)
 
@@ -2716,6 +4709,23 @@ GLOBAL_REAL(Master, /datum/controller/master)
     }
 
     #[test]
+    fn lowers_documented_image_and_mob_engine_fields() {
+        let compilation = TestProject::compile(
+            "/image/proc/update()\n\toverlays += src\n\tappearance_flags |= 1\n\tdir = 4\n\treturn overlays\n/mob/proc/update_vision()\n\tsight |= 1\n\tsee_invisible = 2\n\treturn sight + see_invisible + initial(sight) + initial(see_invisible)\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        for path in ["/image/proc/update", "/mob/proc/update_vision"] {
+            let procedure = procedure_by_path(&registry, path);
+            registry
+                .compile_vm_implementations(
+                    &compilation,
+                    [procedure.effective_target.expect("procedure body")],
+                )
+                .unwrap_or_else(|error| panic!("{path} should bind engine fields: {error:?}"));
+        }
+    }
+
+    #[test]
     fn lowers_standard_datum_type_field_for_all_datums() {
         let compilation =
             TestProject::compile("/datum/example\n\tproc/read()\n\t\treturn list(type, tag)\n");
@@ -2727,6 +4737,21 @@ GLOBAL_REAL(Master, /datum/controller/master)
                 datum.implementations.iter().map(|body| body.id),
             )
             .expect("datum type should compile as its built-in src field");
+    }
+
+    #[test]
+    fn lowers_documented_world_host_fields_as_builtin_src_fields() {
+        let compilation = TestProject::compile(
+            "/world/proc/read_host()\n\tworld.log = file(\"data/dd.log\")\n\treturn list(name, hub, hub_password, internet_address, address, status, port, params, log, area, mob, turf, byond_version, byond_build, cache_lifespan, executor, game_state, host, loop_checks, map_format, map_cpu, movement_mode, process, reachable, sleep_offline, tick_usage, url, version, view, visibility)\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let procedure = procedure_by_path(&registry, "/world/proc/read_host");
+        registry
+            .compile_vm_implementations(
+                &compilation,
+                [procedure.effective_target.expect("procedure body")],
+            )
+            .expect("documented world host fields should lower as src fields");
     }
 
     #[test]
@@ -2802,6 +4827,657 @@ GLOBAL_REAL(Master, /datum/controller/master)
     }
 
     #[test]
+    fn typed_global_member_call_links_exact_runtime_receiver_target() {
+        let compilation = TestProject::compile(
+            "var/global/datum/log_holder/logger\n/proc/entry()\n\treturn logger.Log(4)\n/datum/log_holder/proc/Log(value)\n\treturn value + 3\n/datum/unrelated/proc/Log(value)\n\treturn value + 100\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/proc/entry");
+        let entry_target = entry.effective_target.expect("entry implementation");
+        let (closure, _) = registry.implementation_closure_with_stats(&compilation, [entry_target]);
+        let log_target = procedure_by_path(&registry, "/datum/log_holder/proc/Log")
+            .effective_target
+            .expect("logger implementation");
+        let unrelated = procedure_by_path(&registry, "/datum/unrelated/proc/Log")
+            .effective_target
+            .expect("unrelated implementation");
+        assert!(closure.contains(&log_target));
+        assert!(!closure.contains(&unrelated));
+
+        let executable = registry
+            .compile_vm_implementations(&compilation, [entry_target])
+            .expect("typed member target should link");
+        let mut state = ExecutionState::new();
+        let logger = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/log_holder").unwrap());
+        state.set_global(
+            dm_value::FieldName::parse("logger").unwrap(),
+            Value::Datum(logger),
+        );
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(entry_target).unwrap(),
+                &[],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::number(7.0))
+        );
+    }
+
+    #[test]
+    fn typed_global_field_chain_links_exact_runtime_receiver_target() {
+        let compilation = TestProject::compile(
+            "var/global/datum/globals/GLOB\n/datum/globals/var/datum/log_holder/logger\n/proc/entry()\n\treturn GLOB.logger.Log(4)\n/datum/log_holder/proc/Log(value)\n\treturn value + 3\n/datum/unrelated/proc/Log(value)\n\treturn value + 100\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/proc/entry")
+            .effective_target
+            .expect("entry implementation");
+        let closure = registry.implementation_closure(&compilation, [entry]);
+        let log = procedure_by_path(&registry, "/datum/log_holder/proc/Log")
+            .effective_target
+            .expect("logger implementation");
+        let unrelated = procedure_by_path(&registry, "/datum/unrelated/proc/Log")
+            .effective_target
+            .expect("unrelated implementation");
+        assert!(closure.contains(&log));
+        assert!(!closure.contains(&unrelated));
+    }
+
+    #[test]
+    fn implicit_inherited_typed_field_member_call_links_exact_target() {
+        let compilation = TestProject::compile(
+            "/datum/base/var/datum/log_holder/logger\n/datum/child\n\tparent_type = /datum/base\n\tproc/entry()\n\t\treturn logger.Log()\n/datum/log_holder/proc/Log()\n\treturn 7\n/datum/unrelated/proc/Log()\n\treturn 100\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/datum/child/proc/entry")
+            .effective_target
+            .expect("entry implementation");
+        let closure = registry.implementation_closure(&compilation, [entry]);
+        let log = procedure_by_path(&registry, "/datum/log_holder/proc/Log")
+            .effective_target
+            .expect("logger implementation");
+        let unrelated = procedure_by_path(&registry, "/datum/unrelated/proc/Log")
+            .effective_target
+            .expect("unrelated implementation");
+        assert!(closure.contains(&log));
+        assert!(!closure.contains(&unrelated));
+    }
+
+    #[test]
+    fn proven_untyped_local_alias_narrows_until_dynamic_reassignment() {
+        let compilation = TestProject::compile(
+            "var/global/datum/globals/GLOB\n/datum/globals/var/datum/log_holder/logger\n/proc/narrowed()\n\tvar/alias = GLOB.logger\n\treturn alias.Log()\n/proc/invalidated(value)\n\tvar/alias = GLOB.logger\n\talias = value\n\treturn alias.Log()\n/datum/log_holder/proc/Log()\n\treturn 7\n/datum/unrelated/proc/Log()\n\treturn 100\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let log = procedure_by_path(&registry, "/datum/log_holder/proc/Log")
+            .effective_target
+            .unwrap();
+        let unrelated = procedure_by_path(&registry, "/datum/unrelated/proc/Log")
+            .effective_target
+            .unwrap();
+        let narrowed = procedure_by_path(&registry, "/proc/narrowed")
+            .effective_target
+            .unwrap();
+        let closure = registry.implementation_closure(&compilation, [narrowed]);
+        assert!(closure.contains(&log));
+        assert!(!closure.contains(&unrelated));
+
+        let invalidated = procedure_by_path(&registry, "/proc/invalidated")
+            .effective_target
+            .unwrap();
+        let closure = registry.implementation_closure(&compilation, [invalidated]);
+        assert!(closure.contains(&log));
+        assert!(closure.contains(&unrelated));
+    }
+
+    #[test]
+    fn typed_procedure_return_chain_narrows_member_dispatch() {
+        let compilation = TestProject::compile(
+            "/proc/get_logger() as /datum/log_holder\n\treturn null\n/datum/provider/proc/get_logger() as /datum/log_holder\n\treturn null\n/proc/from_global()\n\treturn get_logger()?.Log()\n/datum/provider/proc/from_member()\n\treturn (src.get_logger()).Log()\n/datum/log_holder/proc/Log()\n\treturn 7\n/datum/unrelated/proc/Log()\n\treturn 100\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let unrelated = procedure_by_path(&registry, "/datum/unrelated/proc/Log")
+            .effective_target
+            .unwrap();
+        for path in ["/proc/from_global", "/datum/provider/proc/from_member"] {
+            let entry = procedure_by_path(&registry, path).effective_target.unwrap();
+            let closure = registry.implementation_closure(&compilation, [entry]);
+            assert!(
+                !closure.contains(&unrelated),
+                "typed return receiver in {path} must not link unrelated Log"
+            );
+        }
+    }
+
+    #[test]
+    fn untyped_member_call_links_broad_candidates_and_dispatches_runtime_override() {
+        let compilation = TestProject::compile(
+            "/proc/entry(receiver)\n\treturn receiver.Log()\n/datum/base/proc/Log()\n\treturn 1\n/datum/child\n\tparent_type = /datum/base\n/datum/child/Log()\n\treturn 2\n/datum/other/proc/Log()\n\treturn 3\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/proc/entry");
+        let entry_target = entry.effective_target.expect("entry implementation");
+        let (closure, _) = registry.implementation_closure_with_stats(&compilation, [entry_target]);
+        for path in [
+            "/datum/base/proc/Log",
+            "/datum/child/proc/Log",
+            "/datum/other/proc/Log",
+        ] {
+            assert!(
+                closure.contains(
+                    &procedure_by_path(&registry, path)
+                        .effective_target
+                        .expect("member implementation")
+                ),
+                "untyped receiver must retain candidate {path}"
+            );
+        }
+        let executable = registry
+            .compile_vm_implementations(&compilation, [entry_target])
+            .expect("broad dynamic member closure should link");
+        let mut state = ExecutionState::new();
+        let child = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/child").unwrap());
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(entry_target).unwrap(),
+                &[Value::Datum(child)],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::number(2.0))
+        );
+    }
+
+    #[test]
+    fn untyped_member_candidates_are_symbolic_until_runtime_dispatch() {
+        let compilation = TestProject::compile(
+            "/proc/entry(receiver)\n\treturn receiver.Log()\n/datum/child/proc/Log()\n\treturn 2\n/datum/unrelated/proc/Log()\n\treturn 100\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/proc/entry")
+            .effective_target
+            .expect("entry implementation");
+        assert_eq!(
+            registry.eager_implementation_closure(&compilation, [entry]),
+            BTreeSet::from([entry]),
+            "genuinely untyped candidates must remain symbolic at the boot gate"
+        );
+        let executable = registry
+            .compile_vm_implementations_symbolic_dynamic(&compilation, [entry])
+            .expect("symbolic dynamic module should link");
+        assert_eq!(executable.module().deferred_procedure_count(), 2);
+        assert_eq!(
+            executable.module().materialized_deferred_procedure_count(),
+            0
+        );
+
+        let mut state = ExecutionState::new();
+        let child = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/child").unwrap());
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(entry).unwrap(),
+                &[Value::Datum(child)],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::number(2.0))
+        );
+        assert_eq!(
+            executable.module().materialized_deferred_procedure_count(),
+            1,
+            "only the runtime-selected override should compile"
+        );
+    }
+
+    #[test]
+    fn typed_virtual_overrides_are_symbolic_but_declared_base_is_eager() {
+        let compilation = TestProject::compile(
+            "/proc/entry(datum/base/receiver)\n\treturn receiver.Log()\n/datum/base/proc/Log()\n\treturn 1\n/datum/base/child/Log()\n\treturn expensive_helper()\n/datum/base/child/proc/expensive_helper()\n\treturn 2\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/proc/entry")
+            .effective_target
+            .unwrap();
+        let base = procedure_by_path(&registry, "/datum/base/proc/Log")
+            .effective_target
+            .unwrap();
+        let child = procedure_by_path(&registry, "/datum/base/child/proc/Log")
+            .effective_target
+            .unwrap();
+        let helper = procedure_by_path(&registry, "/datum/base/child/proc/expensive_helper")
+            .effective_target
+            .unwrap();
+        let eager = registry.eager_implementation_closure(&compilation, [entry]);
+        assert!(eager.contains(&base));
+        assert!(!eager.contains(&child));
+        assert!(!eager.contains(&helper));
+        let full = registry.implementation_closure(&compilation, [entry]);
+        assert!(full.contains(&child));
+        assert!(full.contains(&helper));
+    }
+
+    #[test]
+    fn proc_pseudo_macro_is_the_current_canonical_procedure_reference() {
+        let compilation = TestProject::compile(
+            "/datum/example/proc/reenter(again)\n\tif(again)\n\t\treturn call(src, __PROC__)(0)\n\treturn 7\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let procedure = procedure_by_path(&registry, "/datum/example/proc/reenter");
+        let target = procedure.effective_target.unwrap();
+        let executable = registry
+            .compile_vm_implementations(&compilation, [target])
+            .expect("__PROC__ should lower as a procedure reference");
+        let mut state = ExecutionState::new();
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").unwrap());
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(target).unwrap(),
+                &[Value::number(1.0)],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(datum), Value::Null),
+            ),
+            Ok(Value::number(7.0))
+        );
+    }
+
+    #[test]
+    fn caller_exposes_the_actual_calling_frame_as_a_callee_datum() {
+        let compilation = TestProject::compile(
+            "/datum/example/proc/outer()\n\treturn inner()\n/datum/example/proc/inner()\n\treturn caller.src == src && isnull(caller.caller)\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let outer = procedure_by_path(&registry, "/datum/example/proc/outer");
+        let target = outer.effective_target.unwrap();
+        let executable = registry
+            .compile_vm_implementations(&compilation, [target])
+            .expect("caller should lower as an implicit proc variable");
+        let mut state = ExecutionState::new();
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").unwrap());
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(target).unwrap(),
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(datum), Value::Null),
+            ),
+            Ok(Value::number(1.0))
+        );
+    }
+
+    #[test]
+    fn dependency_closure_uses_preindexed_dynamic_selector_candidates() {
+        let compilation = TestProject::compile(
+            "/proc/entry()\n\treturn call(src, \"register\")()\n/datum/one/proc/register()\n\treturn 1\n/datum/two/proc/register()\n\treturn 2\n/datum/irrelevant/proc/alpha()\n\treturn 3\n/datum/irrelevant/proc/beta()\n\treturn 4\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/proc/entry")
+            .effective_target
+            .expect("entry implementation");
+        let (closure, stats) = registry.implementation_closure_with_stats(&compilation, [entry]);
+
+        assert_eq!(
+            closure.len(),
+            3,
+            "entry and both matching methods are reachable"
+        );
+        assert_eq!(stats.dynamic_selectors_resolved, 1);
+        assert_eq!(
+            stats.dynamic_candidates_considered, 2,
+            "unrelated procedures must not be scanned as dynamic candidates"
+        );
+        assert_eq!(stats.bodies_visited, 3);
+    }
+
+    #[test]
+    fn typed_global_member_call_links_exact_method_not_bare_global_proc() {
+        let compilation = TestProject::compile(
+            "/datum/log_holder/proc/Log()\n\treturn 1\n/proc/Log()\n\treturn 2\n/var/global/datum/log_holder/logger = new /datum/log_holder\n/proc/log_world()\n\treturn logger.Log()\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/proc/log_world")
+            .effective_target
+            .unwrap();
+        let closure = registry.implementation_closure(&compilation, [entry]);
+        let member = procedure_by_path(&registry, "/datum/log_holder/proc/Log")
+            .effective_target
+            .unwrap();
+        let bare = procedure_by_path(&registry, "/proc/Log")
+            .effective_target
+            .unwrap();
+        assert!(closure.contains(&member));
+        assert!(
+            !closure.contains(&bare),
+            "member syntax must not become a bare static call"
+        );
+        registry
+            .compile_vm_implementations(&compilation, [entry])
+            .expect("logger.Log linked");
+    }
+
+    #[test]
+    fn ternary_false_arm_global_call_is_not_confused_with_colon_member_call() {
+        let compilation = TestProject::compile(
+            "/proc/format_text(var/x)\n\treturn x\n/proc/get_area_name(var/x, var/format_text)\n\treturn x\n/datum/holder/proc/get_area_name()\n\treturn 0\n/proc/run(var/datum/holder/A)\n\tvar/location = A ? format_text(A.name) : get_area_name(src, format_text=TRUE)\n\tA:get_area_name()\n\treturn location\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/proc/run")
+            .effective_target
+            .unwrap();
+        let closure = registry.implementation_closure(&compilation, [entry]);
+        assert!(
+            closure.contains(
+                &procedure_by_path(&registry, "/proc/get_area_name")
+                    .effective_target
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn union_as_annotation_does_not_form_a_fake_type_path() {
+        let compilation = TestProject::compile(
+            "/proc/run(var/atom/location as mob|obj|turf)\n\treturn location\n",
+        );
+        ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("DM union annotation must remain valid");
+    }
+
+    #[test]
+    fn suffix_array_local_is_a_list_not_a_fake_declared_type() {
+        let compilation = TestProject::compile(
+            "/area/misc/hilbertshotel/proc/storeRoom(roomSize)\n\tvar/storage[roomSize]\n\treturn storage\n",
+        );
+        ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("suffix array local must compile as a list");
+    }
+
+    #[test]
+    fn suffix_array_instance_fields_are_registered_and_inherited() {
+        let compilation = TestProject::compile(
+            "/datum/dna\n\tvar/mutation_index[4]\n\tproc/set_entry(index, value)\n\t\tmutation_index[index] = value\n\t\treturn mutation_index[index]\n/mob/living/carbon\n\tvar/list/overlays_standing[8]\n/mob/living/carbon/human/proc/read_overlay(index)\n\treturn overlays_standing[index]\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        for path in [
+            "/datum/dna/proc/set_entry",
+            "/mob/living/carbon/human/proc/read_overlay",
+        ] {
+            let procedure = procedure_by_path(&registry, path);
+            registry
+                .compile_vm_implementations(
+                    &compilation,
+                    [procedure.effective_target.expect("procedure body")],
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{path} should inherit suffix-array field: {error:?}")
+                });
+        }
+    }
+
+    #[test]
+    fn module_specs_copy_only_bindings_referenced_by_each_body() {
+        let compilation = TestProject::compile(
+            "var/global/used = 4\nvar/global/unused_one = 8\nvar/global/unused_two = 16\n/datum/example\n\tvar/field_used = 3\n\tvar/field_unused = 9\n\tproc/run()\n\t\treturn used + field_used\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let run = procedure_by_path(&registry, "/datum/example/proc/run");
+        let executable = registry
+            .compile_vm_implementations(
+                &compilation,
+                [run.effective_target.expect("run implementation")],
+            )
+            .expect("referenced bindings compile");
+
+        assert_eq!(executable.stats().global_field_bindings, 1);
+        assert_eq!(executable.stats().src_field_bindings, 1);
+        assert_eq!(executable.stats().static_registry_builds, 1);
+        let entry = executable
+            .implementation(run.effective_target.expect("run implementation"))
+            .expect("run is linked");
+        let mut state = ExecutionState::new();
+        state.set_global(
+            dm_value::FieldName::parse("used").unwrap(),
+            Value::number(4.0),
+        );
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(
+                datum,
+                dm_value::FieldName::parse("field_used").unwrap(),
+                Value::number(3.0),
+            )
+            .unwrap();
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                entry,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(datum), Value::Null),
+            ),
+            Ok(Value::number(7.0))
+        );
+    }
+
+    #[test]
+    fn indexed_static_fields_preserve_inheritance_shadowing_and_build_once() {
+        let compilation = TestProject::compile(
+            "/datum/base\n\tvar/static/shared = 1\n\tproc/read_base()\n\t\treturn shared\n/datum/child\n\tparent_type = /datum/base\n\tvar/static/shared = 2\n\tproc/read_child()\n\t\treturn shared\n/datum/reader/proc/read_receiver(datum/base/value)\n\treturn value.shared\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let base = procedure_by_path(&registry, "/datum/base/proc/read_base");
+        let child = procedure_by_path(&registry, "/datum/child/proc/read_child");
+        let receiver = procedure_by_path(&registry, "/datum/reader/proc/read_receiver");
+        let targets = [base, child, receiver]
+            .into_iter()
+            .map(|procedure| procedure.effective_target.expect("procedure body"));
+        let executable = registry
+            .compile_vm_implementations(&compilation, targets)
+            .expect("inherited and receiver statics should compile");
+
+        assert_eq!(executable.stats().static_registry_builds, 1);
+        assert_eq!(
+            executable.stats().global_field_bindings,
+            5,
+            "typed slash-parameter receiver contributes its qualified static binding",
+        );
+
+        let variables = VariableRegistry::build(&compilation);
+        let direct = direct_static_fields(&variables);
+        let mut cache = BTreeMap::new();
+        let child_node = compilation
+            .code_tree()
+            .find(&dm_syntax::DefinitionPath::new(vec![
+                "datum".to_owned(),
+                "child".to_owned(),
+            ]))
+            .expect("child type");
+        let inherited =
+            inherited_static_fields(&compilation, Some(child_node), &direct, &mut cache);
+        assert_eq!(
+            inherited.get("shared"),
+            Some(&dm_value::FieldName::static_storage(
+                "/datum/child/var/shared"
+            )),
+            "child static must shadow its inherited static"
+        );
+    }
+
+    #[test]
+    fn world_profile_override_parent_call_reaches_engine_native() {
+        let compilation =
+            TestProject::compile("/world/Profile(command, type, format)\n\treturn ..()\n");
+        let registry = ProcedureRegistry::build(&compilation);
+        let profile = procedure_by_path(&registry, "/world/proc/Profile");
+        let target = profile.effective_target.expect("profile override");
+        let executable = registry
+            .compile_vm_implementations(&compilation, [target])
+            .expect("native parent should link");
+        let entry = executable
+            .implementation(target)
+            .expect("override is linked");
+        let mut state = ExecutionState::new();
+        let world = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/world").unwrap());
+
+        let result = execute_module_in_context(
+            executable.module(),
+            entry,
+            &[Value::number(2.0)],
+            &mut state,
+            &ExecutionContext::new(Value::Datum(world), Value::Null),
+        )
+        .expect("native profile call should execute");
+        let Value::List(profile) = result else {
+            panic!("non-JSON profile data should be a list");
+        };
+        assert_eq!(state.heap().list(profile).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn world_config_and_open_port_overrides_reach_engine_natives() {
+        let compilation = TestProject::compile(concat!(
+            "/world/SetConfig(config_set, param, value)\n\treturn ..()\n",
+            "/world/GetConfig(config_set, param)\n\treturn ..()\n",
+            "/world/OpenPort(port)\n\treturn ..()\n",
+        ));
+        let registry = ProcedureRegistry::build(&compilation);
+        let targets = [
+            "/world/proc/SetConfig",
+            "/world/proc/GetConfig",
+            "/world/proc/OpenPort",
+        ]
+        .map(|path| procedure_by_path(&registry, path).effective_target.unwrap());
+        let executable = registry
+            .compile_vm_implementations(&compilation, targets)
+            .expect("world native parents should link");
+        let mut state = ExecutionState::new();
+        let world = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/world").unwrap());
+        let context = ExecutionContext::new(Value::Datum(world), Value::Null);
+        let execute_target = |target, arguments: &[Value], state: &mut ExecutionState| {
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(target).unwrap(),
+                arguments,
+                state,
+                &context,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            execute_target(
+                targets[0],
+                &[
+                    Value::text("env"),
+                    Value::text("DREAM64_TEST"),
+                    Value::text("set")
+                ],
+                &mut state,
+            ),
+            Value::Null
+        );
+        assert_eq!(
+            execute_target(
+                targets[1],
+                &[Value::text("env"), Value::text("DREAM64_TEST")],
+                &mut state,
+            ),
+            Value::text("set")
+        );
+        assert_eq!(
+            execute_target(targets[2], &[Value::number(4321.0)], &mut state),
+            Value::number(1.0)
+        );
+        assert_eq!(
+            state
+                .heap()
+                .datum_field(world, &dm_value::FieldName::parse("port").unwrap())
+                .unwrap(),
+            &Value::number(4321.0)
+        );
+    }
+
+    #[test]
+    fn lifecycle_bodies_bind_implicit_type_fields_on_every_datum_receiver() {
+        let compilation = TestProject::compile(
+            "/obj/example/proc/read_type()\n\treturn type\n/obj/example/proc/read_parent()\n\treturn parent_type\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let read_type = procedure_by_path(&registry, "/obj/example/proc/read_type");
+        let read_parent = procedure_by_path(&registry, "/obj/example/proc/read_parent");
+        let executable = registry
+            .compile_vm_implementations(
+                &compilation,
+                [
+                    read_type.effective_target.unwrap(),
+                    read_parent.effective_target.unwrap(),
+                ],
+            )
+            .expect("implicit datum type fields should compile");
+        assert_eq!(executable.stats().src_field_bindings, 2);
+    }
+
+    #[test]
+    fn typed_atom_fields_are_inherited_by_obj_lifecycle_bodies() {
+        let compilation = TestProject::compile(
+            "/datum/reagents\n/atom\n\tvar/datum/reagents/reagents = null\n/obj/item/example/proc/Initialize()\n\treturn reagents\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let initialize = procedure_by_path(&registry, "/obj/item/example/proc/Initialize");
+        let executable = registry
+            .compile_vm_implementations(&compilation, [initialize.effective_target.unwrap()])
+            .expect("typed /atom fields should be inherited by /obj procedures");
+        assert_eq!(executable.stats().src_field_bindings, 1);
+    }
+
+    #[test]
+    fn interpolated_text_retains_inherited_fields_with_nested_quoted_arguments() {
+        let compilation = TestProject::compile(
+            r#"/datum/reagents
+	var/reagent_list
+/atom
+	var/datum/reagents/reagents = null
+/proc/pretty(value, join_text)
+	return value
+/obj/item/example/proc/Initialize()
+	return "contents: [pretty(reagents.reagent_list, join_text = ", ")]"
+"#,
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let initialize = procedure_by_path(&registry, "/obj/item/example/proc/Initialize");
+        registry
+            .compile_vm_implementations(
+                &compilation,
+                registry
+                    .implementation_closure(&compilation, [initialize.effective_target.unwrap()]),
+            )
+            .expect("interpolated inherited receiver fields should compile");
+    }
+
+    #[test]
     fn selected_static_call_uses_object_tree_ancestor_not_lexical_path_ancestor() {
         let compilation = TestProject::compile(
             "/datum/proc/RegisterSignals()\n\treturn 42\n/area/centcom/proc/Initialize()\n\treturn RegisterSignals()\n",
@@ -2859,6 +5535,25 @@ GLOBAL_REAL(Master, /datum/controller/master)
             ),
             Ok(Value::number(9.0))
         );
+    }
+
+    #[test]
+    fn owner_bare_call_resolves_callable_verb_like_byond_proc_dispatch() {
+        let compilation = TestProject::compile(
+            "/mob/living/proc/say()\n\treturn succumb()\n/mob/living/verb/succumb()\n\treturn 5\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let say = procedure_by_path(&registry, "/mob/living/proc/say")
+            .effective_target
+            .unwrap();
+        let succumb = procedure_by_path(&registry, "/mob/living/verb/succumb")
+            .effective_target
+            .unwrap();
+        let closure = registry.implementation_closure(&compilation, [say]);
+        assert!(closure.contains(&succumb));
+        registry
+            .compile_vm_implementations(&compilation, [say])
+            .expect("verbs are callable by bare owner method name");
     }
 
     #[test]

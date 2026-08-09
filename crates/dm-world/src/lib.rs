@@ -17,7 +17,7 @@ mod allocation;
 
 pub use allocation::{
     CoordinateDatumSnapshot, WorldAllocation, WorldAllocationError, WorldAllocationStats,
-    WorldAllocationWorkItem, WorldAllocationWorkKind, allocate_world,
+    WorldAllocationWorkItem, WorldAllocationWorkKind, allocate_world, materialize_world_map_state,
 };
 
 /// One stable integer world coordinate.

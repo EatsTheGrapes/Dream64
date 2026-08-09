@@ -7,12 +7,14 @@ use std::process::ExitCode;
 
 use dm_compiler::{Compilation, CompilerDatabase};
 use dm_lifecycle::{
-    LifecycleIndex, LifecycleKind, LifecycleResolution, build_initialization_plan,
-    execute_initialization_plan, sweep_lifecycle_compatibility,
+    HeadlessReadinessProbe, LifecycleIndex, LifecycleKind, LifecycleResolution,
+    SchedulerDrainLimits, build_initialization_plan,
+    execute_initialization_plan_with_scheduler_policy, sweep_lifecycle_compatibility,
     sweep_lifecycle_compatibility_with_closures,
 };
 use dm_runtime::RuntimeImage;
 use dm_semantics::ProcedureRegistry;
+use dm_value::{FieldName, Value};
 use dm_world::allocate_world;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,6 +64,9 @@ fn main() -> ExitCode {
         eprintln!("usage: dm-lifecycle [plan|boot|sweep|sweep-closure] <world.dme> [map.dmm]");
         return ExitCode::from(2);
     }
+    if command == Command::Boot {
+        eprintln!("boot-progress: compiling project {}", environment.display());
+    }
     let compilation = match CompilerDatabase::new().compile(&environment) {
         Ok(compilation) => compilation,
         Err(error) => {
@@ -69,6 +74,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if command == Command::Boot {
+        eprintln!("boot-progress: materializing globals and type defaults");
+    }
     let mut runtime = match RuntimeImage::from_compilation(&compilation) {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -76,8 +84,14 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if command == Command::Boot {
+        eprintln!("boot-progress: indexing procedures and lifecycle dispatch");
+    }
     let procedures = ProcedureRegistry::build(&compilation);
     let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
+    if command == Command::Boot {
+        eprintln!("boot-progress: loading map");
+    }
     let (map_path, map_source) = match load_map(&compilation, requested_map.as_deref()) {
         Ok(map) => map,
         Err(error) => {
@@ -85,6 +99,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if command == Command::Boot {
+        eprintln!("boot-progress: parsing map {map_path}");
+    }
     let map = match dm_map::parse(&map_source) {
         Ok(map) => map,
         Err(error) => {
@@ -113,6 +130,37 @@ fn main() -> ExitCode {
         ));
     }
     if command == Command::Boot {
+        eprintln!("boot-progress: preflighting map initializer plans");
+        let map_types = world
+            .templates()
+            .values()
+            .flat_map(|template| template.initializers.iter())
+            .filter_map(|initializer| {
+                matches!(
+                    initializer.resolution,
+                    dm_world::InitializerResolution::Resolved { .. }
+                )
+                .then(|| dm_value::TypePath::parse(&initializer.path).ok())
+                .flatten()
+            })
+            .collect::<Vec<_>>();
+        match runtime.preflight_instance_initializers(map_types) {
+            Ok(stats) => eprintln!(
+                "boot-progress: initializer preflight complete types={} compiled={} reused={}",
+                stats.types, stats.plans_compiled, stats.plans_reused
+            ),
+            Err(errors) => {
+                eprintln!(
+                    "initializer preflight failed: {} type plan error(s)",
+                    errors.len()
+                );
+                for error in errors {
+                    eprintln!("initializer preflight: {error}");
+                }
+                return ExitCode::FAILURE;
+            }
+        }
+        eprintln!("boot-progress: allocating map world");
         let allocation = match allocate_world(&world, &mut runtime) {
             Ok(allocation) => allocation,
             Err(error) => {
@@ -120,13 +168,24 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let execution = match execute_initialization_plan(
+        let readiness = master_controller_readiness(&compilation, &runtime);
+        if let Some(probe) = &readiness {
+            eprintln!(
+                "boot-progress: readiness probe global={} fields={} expected={:?}",
+                probe.global,
+                probe.fields.len(),
+                probe.expected
+            );
+        }
+        let execution = match execute_initialization_plan_with_scheduler_policy(
             &compilation,
             &procedures,
             &index,
             &plan,
             &allocation,
             &mut runtime,
+            SchedulerDrainLimits::default(),
+            readiness.as_ref(),
         ) {
             Ok(execution) => execution,
             Err(error) => {
@@ -137,6 +196,41 @@ fn main() -> ExitCode {
         print_boot_summary(&allocation, &execution);
     }
     ExitCode::SUCCESS
+}
+
+fn master_controller_readiness(
+    compilation: &Compilation,
+    runtime: &RuntimeImage,
+) -> Option<HeadlessReadinessProbe> {
+    let has_master_type = runtime
+        .types()
+        .any(|(path, _)| path.as_str() == "/datum/controller/master");
+    let expected = compilation
+        .project()
+        .object_macro("INITSTAGE_MAX")?
+        .trim()
+        .parse::<f32>()
+        .ok()?;
+    has_master_type.then(|| HeadlessReadinessProbe {
+        qualified_storage: runtime
+            .variables()
+            .iter()
+            .find(|variable| {
+                variable.path.ends_with("/init_stage_completed")
+                    && variable.path.contains("/datum/controller/master/")
+            })
+            .map(|variable| FieldName::static_storage(&variable.path)),
+        global: FieldName::parse("Master").expect("DM global identifier is valid"),
+        fields: if runtime.variables().iter().any(|variable| {
+            variable.path.ends_with("/init_stage_completed")
+                && variable.path.contains("/datum/controller/master/")
+        }) {
+            vec![]
+        } else {
+            vec![FieldName::parse("init_stage_completed").expect("DM field identifier is valid")]
+        },
+        expected: Value::number(expected),
+    })
 }
 
 fn print_compatibility_sweep(sweep: &dm_lifecycle::LifecycleCompatibilitySweep) {
@@ -183,6 +277,7 @@ fn print_plan_summary(
     let type_counts = type_lifecycle_counts(index);
     let atom_counts = plan.map_lifecycle_counts(index);
     for kind in [
+        LifecycleKind::Genesis,
         LifecycleKind::New,
         LifecycleKind::Initialize,
         LifecycleKind::LateInitialize,
@@ -220,6 +315,17 @@ fn print_boot_summary(
     println!("lifecycle_executed={}", execution.events.len());
     println!("lifecycle_duplicates={}", execution.duplicate_map_events);
     println!("world_allocated={}", usize::from(execution.world.is_some()));
+    println!("scheduler_tick={}", execution.scheduler.final_tick);
+    println!("scheduler_rounds={}", execution.scheduler.rounds);
+    println!(
+        "scheduler_completed={}",
+        execution.scheduler.completed_tasks
+    );
+    println!("scheduler_pending={}", execution.scheduler.pending_tasks);
+    println!(
+        "scheduler_termination={:?}",
+        execution.scheduler.termination
+    );
     let mut counts = BTreeMap::new();
     for event in &execution.events {
         let dm_lifecycle::InitializationEvent::Lifecycle { kind, .. } = event.event else {
@@ -228,6 +334,7 @@ fn print_boot_summary(
         *counts.entry(kind).or_insert(0usize) += 1;
     }
     for kind in [
+        LifecycleKind::Genesis,
         LifecycleKind::New,
         LifecycleKind::Initialize,
         LifecycleKind::LateInitialize,

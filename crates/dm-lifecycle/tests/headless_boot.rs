@@ -4,8 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use dm_compiler::{Compilation, CompilerDatabase};
 use dm_lifecycle::{
-    EventSubject, InitializationEvent, InitializationExecutionError, LifecycleIndex, LifecycleKind,
+    EventSubject, HeadlessReadinessProbe, InitializationEvent, InitializationExecutionError,
+    LifecycleIndex, LifecycleKind, SchedulerDrainLimits, SchedulerDrainTermination,
     build_initialization_plan, execute_initialization_plan,
+    execute_initialization_plan_with_scheduler_limits,
 };
 use dm_map::parse;
 use dm_runtime::RuntimeImage;
@@ -178,4 +180,209 @@ fn headless_boot_keeps_runtime_errors_source_mapped() {
             .starts_with("/obj/broken/proc/New@")
     );
     assert!(error.call_stack[0].source_span.is_some());
+}
+
+#[test]
+fn headless_boot_drains_spawned_startup_work_to_stable_idle() {
+    let types = concat!(
+        "/world/New()\n",
+        "\tsrc.stage = 1\n",
+        "\tspawn(3)\n",
+        "\t\tsrc.stage = 9\n",
+        "/turf/boot\n/area/boot\n",
+    );
+    let map = "\"a\" = (/turf/boot, /area/boot)\n(1,1,1) = {\"\na\n\"}\n";
+    let (_project, compilation, map_source) = TestProject::compile(types, map);
+    let procedures = ProcedureRegistry::build(&compilation);
+    let mut runtime = RuntimeImage::from_compilation(&compilation).expect("runtime should build");
+    let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
+    let world = build_plan(&parse(&map_source).expect("map should parse"), &compilation);
+    let plan = build_initialization_plan(&runtime, &index, &world, "boot.dmm");
+    let allocation = allocate_world(&world, &mut runtime).expect("world should allocate");
+
+    let execution = execute_initialization_plan(
+        &compilation,
+        &procedures,
+        &index,
+        &plan,
+        &allocation,
+        &mut runtime,
+    )
+    .expect("scheduled startup should drain");
+
+    assert_eq!(
+        execution.scheduler.termination,
+        SchedulerDrainTermination::StableIdle
+    );
+    assert_eq!(execution.scheduler.final_tick, 3);
+    assert_eq!(execution.scheduler.rounds, 1);
+    assert_eq!(execution.scheduler.completed_tasks, 1);
+    assert_eq!(execution.scheduler.pending_tasks, 0);
+    assert_eq!(
+        runtime
+            .heap()
+            .datum_field(execution.world.unwrap(), &field("stage")),
+        Ok(&Value::number(9.0))
+    );
+}
+
+#[test]
+fn headless_boot_reports_pending_work_at_scheduler_tick_limit() {
+    let types = concat!(
+        "/world/New()\n",
+        "\tspawn(10)\n",
+        "\t\tsrc.stage = 9\n",
+        "/turf/boot\n/area/boot\n",
+    );
+    let map = "\"a\" = (/turf/boot, /area/boot)\n(1,1,1) = {\"\na\n\"}\n";
+    let (_project, compilation, map_source) = TestProject::compile(types, map);
+    let procedures = ProcedureRegistry::build(&compilation);
+    let mut runtime = RuntimeImage::from_compilation(&compilation).expect("runtime should build");
+    let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
+    let world = build_plan(&parse(&map_source).expect("map should parse"), &compilation);
+    let plan = build_initialization_plan(&runtime, &index, &world, "boot.dmm");
+    let allocation = allocate_world(&world, &mut runtime).expect("world should allocate");
+
+    let execution = execute_initialization_plan_with_scheduler_limits(
+        &compilation,
+        &procedures,
+        &index,
+        &plan,
+        &allocation,
+        &mut runtime,
+        SchedulerDrainLimits {
+            max_ticks: 2,
+            max_rounds: 10,
+        },
+    )
+    .expect("bounded scheduler drain should be a successful partial boot");
+
+    assert_eq!(
+        execution.scheduler.termination,
+        SchedulerDrainTermination::TickLimit
+    );
+    assert_eq!(execution.scheduler.final_tick, 0);
+    assert_eq!(execution.scheduler.rounds, 0);
+    assert_eq!(execution.scheduler.completed_tasks, 0);
+    assert_eq!(execution.scheduler.pending_tasks, 1);
+}
+
+#[test]
+fn headless_boot_reports_codebase_readiness_with_persistent_work() {
+    let types = concat!(
+        "var/global/startup_ready = 0\n",
+        "/proc/heartbeat()\n",
+        "\tspawn(1)\n",
+        "\t\theartbeat()\n",
+        "/world/New()\n",
+        "\tspawn(0)\n",
+        "\t\theartbeat()\n",
+        "\tspawn(2)\n",
+        "\t\tstartup_ready = 1\n",
+        "/turf/boot\n/area/boot\n",
+    );
+    let map = "\"a\" = (/turf/boot, /area/boot)\n(1,1,1) = {\"\na\n\"}\n";
+    let (_project, compilation, map_source) = TestProject::compile(types, map);
+    let procedures = ProcedureRegistry::build(&compilation);
+    let mut runtime = RuntimeImage::from_compilation(&compilation).expect("runtime should build");
+    let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
+    let world = build_plan(&parse(&map_source).expect("map should parse"), &compilation);
+    let plan = build_initialization_plan(&runtime, &index, &world, "boot.dmm");
+    let allocation = allocate_world(&world, &mut runtime).expect("world should allocate");
+    let probe = HeadlessReadinessProbe {
+        qualified_storage: None,
+        global: field("startup_ready"),
+        fields: Vec::new(),
+        expected: Value::number(1.0),
+    };
+
+    let execution = dm_lifecycle::execute_initialization_plan_with_scheduler_policy(
+        &compilation,
+        &procedures,
+        &index,
+        &plan,
+        &allocation,
+        &mut runtime,
+        SchedulerDrainLimits {
+            max_ticks: 20,
+            max_rounds: 20,
+        },
+        Some(&probe),
+    )
+    .expect("the explicit readiness marker should complete persistent startup");
+
+    assert_eq!(
+        execution.scheduler.termination,
+        SchedulerDrainTermination::HeadlessReady
+    );
+    assert_eq!(execution.scheduler.final_tick, 2);
+    assert!(execution.scheduler.pending_tasks > 0);
+}
+
+#[test]
+fn genesis_persists_logger_and_scheduled_state_into_world_new() {
+    let types = concat!(
+        "var/global/datum/logger/logger = null\n",
+        "var/global/seen = 0\n",
+        "var/global/genesis_scheduled = 0\n",
+        "/datum/logger/proc/mark()\n\treturn 9\n",
+        "/world/Genesis()\n",
+        "\tglobal.logger = new /datum/logger\n",
+        "\tspawn(2)\n",
+        "\t\tglobal.genesis_scheduled = 1\n",
+        "/world/New()\n\tglobal.seen = call(global.logger, \"mark\")()\n",
+        "/turf/boot\n/area/boot\n",
+    );
+    let map = "\"a\" = (/turf/boot, /area/boot)\n(1,1,1) = {\"\na\n\"}\n";
+    let (_project, compilation, map_source) = TestProject::compile(types, map);
+    let procedures = ProcedureRegistry::build(&compilation);
+    let mut runtime = RuntimeImage::from_compilation(&compilation).expect("runtime should build");
+    let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
+    let world = build_plan(&parse(&map_source).expect("map should parse"), &compilation);
+    let plan = build_initialization_plan(&runtime, &index, &world, "boot.dmm");
+    let allocation = allocate_world(&world, &mut runtime).expect("world should allocate");
+
+    let execution = execute_initialization_plan(
+        &compilation,
+        &procedures,
+        &index,
+        &plan,
+        &allocation,
+        &mut runtime,
+    )
+    .expect("Genesis and world/New should share runtime state");
+
+    assert!(matches!(
+        execution.events[0].event,
+        InitializationEvent::Lifecycle {
+            subject: EventSubject::World,
+            kind: LifecycleKind::Genesis,
+            ..
+        }
+    ));
+    assert!(matches!(
+        execution.events[1].event,
+        InitializationEvent::Lifecycle {
+            subject: EventSubject::World,
+            kind: LifecycleKind::New,
+            ..
+        }
+    ));
+    let global = |name: &str| {
+        runtime
+            .variables()
+            .iter()
+            .find(|variable| variable.path.ends_with(&format!("/{name}")))
+            .unwrap_or_else(|| panic!("global {name} should exist"))
+            .value
+            .clone()
+    };
+    assert!(matches!(global("logger"), Value::Datum(_)));
+    assert_eq!(global("seen"), Value::number(9.0));
+    assert_eq!(global("genesis_scheduled"), Value::number(1.0));
+    assert_eq!(execution.scheduler.final_tick, 2);
+    assert_eq!(
+        execution.scheduler.termination,
+        SchedulerDrainTermination::StableIdle
+    );
 }

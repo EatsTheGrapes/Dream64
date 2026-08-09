@@ -103,12 +103,18 @@ impl<'source> Lexer<'source> {
                 '\\' => self.lex_escaped_identifier()?,
                 '0'..='9' => self.lex_number(),
                 '@' if self.remaining().starts_with("@@") => self.lex_at_raw_string()?,
+                '@' if self.remaining().starts_with("@(") => self.lex_complex_raw_string()?,
                 '@' if self.remaining().starts_with("@{") => self.lex_braced_string(true)?,
                 // DM also accepts the compact C#-style spelling used heavily
                 // for regular expressions: `@"\\d+"`.  Unlike an ordinary
                 // quoted string its backslashes are literal, so it must not
                 // go through `scan_quoted_body` (which consumes escapes).
                 '@' if self.remaining().starts_with("@\"") => self.lex_at_quoted_raw_string()?,
+                // BYOND accepts @'...' as a raw text literal as well. Unlike a
+                // plain single-quoted literal this is text, not a resource.
+                '@' if self.remaining().starts_with("@'") => {
+                    self.lex_at_single_quoted_raw_string()?
+                }
                 '"' => self.lex_quoted('"', false)?,
                 '\'' => self.lex_quoted('\'', true)?,
                 '{' if self.remaining().starts_with("{\"") => self.lex_braced_string(false)?,
@@ -181,9 +187,24 @@ impl<'source> Lexer<'source> {
     fn skip_block_comment(&mut self) -> Result<(), LexError> {
         let start = self.offset;
         self.offset += 2;
+        let mut depth = 1_usize;
         while self.offset < self.source.len() {
+            if self.remaining().starts_with("//") {
+                self.offset += 2;
+                self.skip_line_comment();
+                continue;
+            }
+            if self.remaining().starts_with("/*") {
+                self.offset += 2;
+                depth += 1;
+                continue;
+            }
             if self.remaining().starts_with("*/") {
                 self.offset += 2;
+                depth -= 1;
+                if depth != 0 {
+                    continue;
+                }
                 if self.at_line_start {
                     let line_start = self.source[..self.offset]
                         .rfind(['\r', '\n'])
@@ -281,8 +302,24 @@ impl<'source> Lexer<'source> {
         }
 
         self.advance_while(|character| character.is_ascii_digit() || character == '_');
+        if self.remaining().starts_with("#INF") || self.remaining().starts_with("#IND") {
+            self.offset += 4;
+            self.push_range(
+                start,
+                TokenKind::Number(self.source[start..self.offset].to_owned()),
+            );
+            return;
+        }
         if self.current_char() == Some('.') {
             self.advance_char();
+            if self.remaining().starts_with("#INF") || self.remaining().starts_with("#IND") {
+                self.offset += 4;
+                self.push_range(
+                    start,
+                    TokenKind::Number(self.source[start..self.offset].to_owned()),
+                );
+                return;
+            }
             self.advance_while(|character| character.is_ascii_digit() || character == '_');
         }
         if matches!(self.current_char(), Some('e' | 'E')) {
@@ -296,6 +333,51 @@ impl<'source> Lexer<'source> {
             start,
             TokenKind::Number(self.source[start..self.offset].to_owned()),
         );
+    }
+
+    fn lex_complex_raw_string(&mut self) -> Result<(), LexError> {
+        let start = self.offset;
+        self.offset += 2;
+        let delimiter_start = self.offset;
+        let Some(relative_close) = self.remaining().find(')') else {
+            self.offset = self.source.len();
+            return Err(LexError {
+                message: "unterminated raw string delimiter".to_owned(),
+                span: SourceSpan::new(start, self.offset),
+            });
+        };
+        let delimiter_end = self.offset + relative_close;
+        let delimiter = &self.source[delimiter_start..delimiter_end];
+        if delimiter.is_empty() {
+            return Err(LexError {
+                message: "raw string delimiter cannot be empty".to_owned(),
+                span: SourceSpan::new(start, delimiter_end + 1),
+            });
+        }
+        self.offset = delimiter_end + 1;
+        if self.remaining().starts_with("\r\n") {
+            self.offset += 2;
+        } else if matches!(self.current_char(), Some('\r' | '\n')) {
+            self.advance_char();
+        }
+        let content_start = self.offset;
+        let Some(relative_end) = self.remaining().find(delimiter) else {
+            self.offset = self.source.len();
+            return Err(LexError {
+                message: "unterminated complex raw string".to_owned(),
+                span: SourceSpan::new(start, self.offset),
+            });
+        };
+        let mut content_end = self.offset + relative_end;
+        if self.source[..content_end].ends_with("\r\n") {
+            content_end -= 2;
+        } else if self.source[..content_end].ends_with(['\r', '\n']) {
+            content_end -= 1;
+        }
+        let content = self.source[content_start..content_end].to_owned();
+        self.offset += relative_end + delimiter.len();
+        self.push_range(start, TokenKind::RawString(content));
+        Ok(())
     }
 
     fn lex_quoted(&mut self, quote: char, resource: bool) -> Result<(), LexError> {
@@ -363,12 +445,20 @@ impl<'source> Lexer<'source> {
     }
 
     fn lex_at_quoted_raw_string(&mut self) -> Result<(), LexError> {
+        self.lex_at_quote_raw_string('"')
+    }
+
+    fn lex_at_single_quoted_raw_string(&mut self) -> Result<(), LexError> {
+        self.lex_at_quote_raw_string('\'')
+    }
+
+    fn lex_at_quote_raw_string(&mut self, quote: char) -> Result<(), LexError> {
         let start = self.offset;
-        // Skip the `@"` delimiter.  Raw strings deliberately do not treat a
+        // Skip the at-sign and quote delimiter. Raw strings do not treat a
         // backslash as an escape; the next quote ends the literal.
         self.offset += 2;
         let content_start = self.offset;
-        let Some(relative_end) = self.remaining().find('"') else {
+        let Some(relative_end) = self.remaining().find(quote) else {
             self.offset = self.source.len();
             return Err(LexError {
                 message: "unterminated at-quoted raw string".to_owned(),
@@ -428,9 +518,9 @@ impl<'source> Lexer<'source> {
     fn lex_operator(&mut self) -> Result<(), LexError> {
         const OPERATORS: &[&str] = &[
             "<=>", "<<=", ">>=", "&&=", "||=", "%%=", "**=", "...", "::", "?.", "?:", "?[", "==",
-            "!=", "<>", "<=", ">=", "~!", "<<", ">>", "&&", "||", "++", "--", "+=", "-=", "*=",
-            "/=", "%=", "&=", "|=", "^=", "~=", "%%", "**", "..", "/", ".", ":", "?", "=", "+",
-            "-", "*", "%", "<", ">", "!", "~", "&", "|", "^", "#", "@",
+            "!=", "<>", "<=", ">=", "~!", "<<", ">>", "&&", "||", "++", "--", ":=", "+=", "-=",
+            "*=", "/=", "%=", "&=", "|=", "^=", "~=", "%%", "**", "..", "/", ".", ":", "?", "=",
+            "+", "-", "*", "%", "<", ">", "!", "~", "&", "|", "^", "#", "@",
         ];
         let Some(operator) = OPERATORS
             .iter()
@@ -560,6 +650,15 @@ mod tests {
     }
 
     #[test]
+    fn block_comments_nest_and_line_comments_hide_closers() {
+        lex("/* outer /* inner */ outer */\nvalue\n").expect("nested comments should close");
+
+        let error = lex("/* outer\n// */\nvalue\n").expect_err("line comment hides closer");
+        assert_eq!(error.message, "unterminated block comment");
+        assert_eq!(error.span.start, 0);
+    }
+
+    #[test]
     fn retains_preprocessor_line_continuations() {
         let tokens = lex("#define FLAG value \\\r\n\t| other\n").expect("source should lex");
 
@@ -665,5 +764,23 @@ mod tests {
                 TokenKind::RawString(content) if content == "[\\n\\t]\\\\d+"
             )
         }));
+    }
+
+    #[test]
+    fn retains_single_quoted_raw_text_as_text_not_resource() {
+        let source = "value = @'^(\\d+)/(.*)$'\n";
+        let tokens = lex(source).expect("single-quoted raw text should lex");
+
+        assert!(tokens.iter().any(|token| {
+            matches!(
+                &token.kind,
+                TokenKind::RawString(content) if content == "^(\\d+)/(.*)$"
+            )
+        }));
+        assert!(
+            !tokens
+                .iter()
+                .any(|token| matches!(token.kind, TokenKind::Resource(_)))
+        );
     }
 }

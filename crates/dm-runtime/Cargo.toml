@@ -12,6 +12,7 @@ dm-core = { path = "../dm-core" }
 dm-globals = { path = "../dm-globals" }
 dm-lexer = { path = "../dm-lexer" }
 dm-object-tree = { path = "../dm-object-tree" }
+dm-semantics = { path = "../dm-semantics" }
 dm-value = { path = "../dm-value" }
 dm-vm = { path = "../dm-vm" }
 

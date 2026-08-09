@@ -186,14 +186,96 @@ fn fixture_audit(root: &Path) -> Result<FixtureAudit, String> {
             })
             .and_then(|_| preprocess_fixture(&path))
             .and_then(|mut definitions| {
+                let global_fields: BTreeMap<String, dm_value::FieldName> = definitions
+                    .iter()
+                    .filter(|definition| {
+                        matches!(
+                            definition.kind,
+                            dm_syntax::DefinitionKind::Variable
+                                | dm_syntax::DefinitionKind::VariableOverride
+                        ) && definition
+                            .path
+                            .segments()
+                            .first()
+                            .is_some_and(|segment| segment == "var")
+                            && definition.path.segments().len() == 2
+                    })
+                    .filter_map(|definition| {
+                        let name = definition.path.segments().last()?.clone();
+                        dm_value::FieldName::parse(&name)
+                            .ok()
+                            .map(|field| (name, field))
+                    })
+                    .collect();
+                let declared_src_fields = |procedure: &dm_syntax::Definition| {
+                    let segments = procedure.path.segments();
+                    let owner_end = segments
+                        .iter()
+                        .position(|segment| matches!(segment.as_str(), "proc" | "verb"))
+                        .unwrap_or_else(|| segments.len().saturating_sub(1));
+                    let owner = &segments[..owner_end];
+                    definitions
+                        .iter()
+                        .filter(|definition| {
+                            matches!(
+                                definition.kind,
+                                dm_syntax::DefinitionKind::Variable
+                                    | dm_syntax::DefinitionKind::VariableOverride
+                            )
+                        })
+                        .filter_map(|definition| {
+                            let variable = definition.path.segments();
+                            let marker = variable.iter().position(|segment| segment == "var")?;
+                            (variable[..marker] == *owner).then(|| {
+                                let name = variable.last()?.clone();
+                                dm_value::FieldName::parse(&name)
+                                    .ok()
+                                    .map(|field| (name, field))
+                            })?
+                        })
+                        .collect()
+                };
+                let mut src_fields = definitions
+                    .iter()
+                    .filter(|definition| {
+                        matches!(
+                            definition.kind,
+                            dm_syntax::DefinitionKind::Procedure
+                                | dm_syntax::DefinitionKind::ProcedureOverride
+                                | dm_syntax::DefinitionKind::Verb
+                        )
+                    })
+                    .map(&declared_src_fields)
+                    .collect::<Vec<_>>();
+                definitions.retain(|definition| {
+                    matches!(
+                        definition.kind,
+                        dm_syntax::DefinitionKind::Procedure
+                            | dm_syntax::DefinitionKind::ProcedureOverride
+                            | dm_syntax::DefinitionKind::Verb
+                    )
+                });
                 if source_uses_assert(&definitions)
                     && !definitions
                         .iter()
                         .any(|definition| definition.path.to_string() == "/proc/ASSERT")
                 {
                     definitions.push(assert_definition.clone());
+                    src_fields.push(BTreeMap::new());
                 }
-                match catch_unwind(AssertUnwindSafe(|| dm_vm::compile_module(&definitions))) {
+                let specs = definitions
+                    .iter()
+                    .zip(src_fields)
+                    .map(|(definition, src_fields)| dm_vm::ProcedureSpec {
+                        path: definition.path.to_string(),
+                        definition,
+                        parent: None,
+                        static_calls: BTreeMap::new(),
+                        src_fields,
+                        global_fields: global_fields.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                match catch_unwind(AssertUnwindSafe(|| dm_vm::compile_module_specs(&specs))) {
                     Ok(Ok(_)) => Ok(()),
                     Ok(Err(error)) => Err(AuditFailure {
                         category: format!("compile: {}", compile_error_category(&error.message)),
@@ -275,20 +357,7 @@ fn preprocess_fixture(path: &Path) -> Result<Vec<dm_syntax::Definition>, AuditFa
         let Some(syntax) = compilation.syntax(file.id) else {
             continue;
         };
-        definitions.extend(
-            syntax
-                .definitions
-                .iter()
-                .filter(|definition| {
-                    matches!(
-                        definition.kind,
-                        dm_syntax::DefinitionKind::Procedure
-                            | dm_syntax::DefinitionKind::ProcedureOverride
-                            | dm_syntax::DefinitionKind::Verb
-                    )
-                })
-                .cloned(),
-        );
+        definitions.extend(syntax.definitions.iter().cloned());
     }
     Ok(definitions)
 }
@@ -527,6 +596,10 @@ fn run_project_compile_check(arguments: &[OsString]) -> Result<(), String> {
 }
 
 fn compile_error_category(message: &str) -> String {
+    let message = message
+        .strip_prefix('/')
+        .and_then(|rest| rest.split_once(": ").map(|(_, diagnostic)| diagnostic))
+        .unwrap_or(message);
     for prefix in [
         "unknown local",
         "unknown procedure",
@@ -1180,6 +1253,300 @@ mod tests {
         assert_eq!(audit.total, 4);
         assert_eq!(audit.passed, 4);
         assert_eq!(audit.expected_compile_errors_matched, 4);
+        assert!(audit.failures.is_empty());
+    }
+
+    #[test]
+    fn fixture_audit_matches_readonly_type_member_assignments() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::create_dir_all(scratch.path().join("List")).expect("list directory");
+        for (index, value) in ["2", "/list", "/obj", "null"].into_iter().enumerate() {
+            fs::write(
+                scratch.path().join("List").join(format!("readonly{}.dm", index + 1)),
+                format!(
+                    "// COMPILE ERROR OD0501\n/proc/RunTest()\n\tvar/list/value = list()\n\tvalue.type = {value}\n"
+                ),
+            )
+            .expect("readonly fixture");
+        }
+
+        let audit = fixture_audit(scratch.path()).expect("audit");
+
+        assert_eq!(audit.total, 4);
+        assert_eq!(audit.passed, 4);
+        assert_eq!(audit.expected_compile_errors_matched, 4);
+        assert!(audit.failures.is_empty());
+    }
+
+    #[test]
+    fn fixture_audit_matches_constant_write_family() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::create_dir_all(scratch.path().join("Const")).expect("const directory");
+        for (name, source) in [
+            (
+                "global.dm",
+                "var/const/value = 1\n/proc/RunTest()\n\tvalue = 2\n",
+            ),
+            (
+                "local.dm",
+                "/proc/RunTest()\n\tvar/const/value = 1\n\tvalue = 2\n",
+            ),
+            (
+                "field.dm",
+                "/obj/var/const/value = 1\n/proc/RunTest()\n\tvar/obj/item = new\n\titem.value = 2\n",
+            ),
+            (
+                "loop_range.dm",
+                "/proc/RunTest()\n\tvar/const/value = 1\n\tfor(value in 1 to 3)\n\t\treturn\n",
+            ),
+            (
+                "loop_list.dm",
+                "/proc/RunTest()\n\tvar/const/value = 1\n\tfor(value in list(1, 2))\n\t\treturn\n",
+            ),
+        ] {
+            fs::write(
+                scratch.path().join("Const").join(name),
+                format!("// COMPILE ERROR OD0501\n{source}"),
+            )
+            .expect("const fixture");
+        }
+
+        let audit = fixture_audit(scratch.path()).expect("audit");
+
+        assert_eq!(audit.total, 5);
+        assert_eq!(audit.passed, 5);
+        assert_eq!(audit.expected_compile_errors_matched, 5);
+        assert!(audit.failures.is_empty());
+    }
+
+    #[test]
+    fn fixture_audit_matches_reference_operator_diagnostics() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::create_dir_all(scratch.path().join("Dereference")).expect("dereference directory");
+        for (name, source) in [
+            (
+                "untyped_field.dm",
+                "/proc/RunTest()\n\tvar/value = new /obj\n\treturn value.field\n",
+            ),
+            (
+                "untyped_call.dm",
+                "/proc/RunTest()\n\tvar/value = new /obj\n\treturn value.call_proc()\n",
+            ),
+            (
+                "datum_index.dm",
+                "#pragma InvalidIndexOperation error\n/proc/RunTest()\n\tvar/datum/value = new\n\treturn value[\"key\"]\n",
+            ),
+            (
+                "runtime_search.dm",
+                "#pragma RuntimeSearchOperator error\n/proc/RunTest()\n\tvar/datum/value = new\n\treturn value:call_proc()\n",
+            ),
+        ] {
+            fs::write(
+                scratch.path().join("Dereference").join(name),
+                format!("// COMPILE ERROR OD0404\n{source}"),
+            )
+            .expect("reference fixture");
+        }
+
+        let audit = fixture_audit(scratch.path()).expect("audit");
+
+        assert_eq!(audit.total, 4);
+        assert_eq!(audit.passed, 4);
+        assert_eq!(audit.expected_compile_errors_matched, 4);
+        assert!(audit.failures.is_empty());
+    }
+
+    #[test]
+    fn fixture_audit_matches_typed_variable_diagnostics() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::create_dir_all(scratch.path().join("Typemaker")).expect("typemaker directory");
+        for (name, source) in [
+            (
+                "override.dm",
+                "#pragma InvalidVarType error\n/datum/base/child\n\tvalue = \"bad\"\n/datum/base/var/value = 5 as num\n",
+            ),
+            (
+                "newpath.dm",
+                "#pragma InvalidVarType error\n/proc/RunTest()\n\tvar/turf/location\n\tlocation = new /obj\n",
+            ),
+        ] {
+            fs::write(
+                scratch.path().join("Typemaker").join(name),
+                format!("// COMPILE ERROR OD2702\n{source}"),
+            )
+            .expect("typed variable fixture");
+        }
+
+        let audit = fixture_audit(scratch.path()).expect("audit");
+
+        assert_eq!(audit.total, 2);
+        assert_eq!(audit.passed, 2);
+        assert_eq!(audit.expected_compile_errors_matched, 2);
+        assert!(audit.failures.is_empty());
+    }
+
+    #[test]
+    fn fixture_audit_accepts_suffix_arrays_and_rejects_unknown_variable_types() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::create_dir_all(scratch.path().join("Types")).expect("types directory");
+        fs::write(
+            scratch.path().join("Types/array.dm"),
+            "/proc/RunTest()\n\tvar/items[5]\n\treturn items.len\n",
+        )
+        .expect("array fixture");
+        fs::write(
+            scratch.path().join("Types/unknown.dm"),
+            "// COMPILE ERROR OD0404\n/proc/RunTest()\n\tvar/foo/value\n\treturn istype(value)\n",
+        )
+        .expect("unknown type fixture");
+        fs::write(
+            scratch.path().join("Types/unknown_field.dm"),
+            "// COMPILE ERROR OD0404\n/datum/holder\n\tvar/datum/missing/value\n",
+        )
+        .expect("unknown field type fixture");
+
+        let audit = fixture_audit(scratch.path()).expect("audit");
+
+        assert_eq!(audit.total, 3);
+        assert_eq!(audit.passed, 3);
+        assert_eq!(audit.expected_compile_errors_matched, 2);
+        assert!(audit.failures.is_empty());
+    }
+
+    #[test]
+    fn fixture_audit_matches_variable_modifier_rules() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::create_dir_all(scratch.path().join("Modifiers")).expect("modifier directory");
+        for (name, source) in [
+            (
+                "final.dm",
+                "/datum/var/final/value = 1\n/datum/child/value = 2\n",
+            ),
+            ("const.dm", "/atom/var/value = 1\n/atom/const/value = 2\n"),
+            (
+                "global.dm",
+                "/datum/var/static/value = 1\n/turf/value = 2\n",
+            ),
+        ] {
+            fs::write(
+                scratch.path().join("Modifiers").join(name),
+                format!("// COMPILE ERROR\n{source}"),
+            )
+            .expect("modifier fixture");
+        }
+        fs::write(
+            scratch.path().join("Modifiers/ordinary.dm"),
+            "/datum/var/value = 1\n/datum/child/value = 2\n",
+        )
+        .expect("ordinary override fixture");
+
+        let audit = fixture_audit(scratch.path()).expect("audit");
+
+        assert_eq!(audit.total, 4);
+        assert_eq!(audit.passed, 4);
+        assert_eq!(audit.expected_compile_errors_matched, 3);
+        assert!(audit.failures.is_empty());
+    }
+
+    #[test]
+    fn fixture_audit_matches_nameof_target_rules() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::create_dir_all(scratch.path().join("Nameof")).expect("nameof directory");
+        for (name, source) in [
+            (
+                "global_type.dm",
+                "/proc/RunTest()\n\treturn nameof(__TYPE__)\n",
+            ),
+            (
+                "index.dm",
+                "/proc/RunTest()\n\tvar/list/items = list()\n\treturn nameof(items[1])\n",
+            ),
+        ] {
+            fs::write(
+                scratch.path().join("Nameof").join(name),
+                format!("// COMPILE ERROR\n{source}"),
+            )
+            .expect("invalid nameof fixture");
+        }
+        fs::write(
+            scratch.path().join("Nameof/valid.dm"),
+            "/datum/proc/test()\n\tnameof(__TYPE__)\n\tnameof(src.name)\n\tnameof(/datum)\n",
+        )
+        .expect("valid nameof fixture");
+
+        let audit = fixture_audit(scratch.path()).expect("audit");
+
+        assert_eq!(audit.total, 3);
+        assert_eq!(audit.passed, 3);
+        assert_eq!(audit.expected_compile_errors_matched, 2);
+        assert!(audit.failures.is_empty());
+    }
+
+    #[test]
+    fn fixture_audit_matches_constant_initializer_rules() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::create_dir_all(scratch.path().join("Constants")).expect("constants directory");
+        for (name, source) in [
+            (
+                "cycle.dm",
+                "var/const/A = B\nvar/const/B = A\n/proc/RunTest()\n\treturn\n",
+            ),
+            (
+                "runtime_call.dm",
+                "/proc/value()\n\treturn 1\nvar/const/result = rgb(value(), 0, 0)\n",
+            ),
+            (
+                "local_static.dm",
+                "/proc/RunTest(var/datum/item)\n\tvar/static/value = item.type\n",
+            ),
+        ] {
+            fs::write(
+                scratch.path().join("Constants").join(name),
+                format!("// COMPILE ERROR\n{source}"),
+            )
+            .expect("invalid constant fixture");
+        }
+        fs::write(
+            scratch.path().join("Constants/valid.dm"),
+            "var/const/value = rgb(1, 2, 3)\n/proc/RunTest()\n\tvar/static/path = /datum\n",
+        )
+        .expect("valid constant fixture");
+
+        let audit = fixture_audit(scratch.path()).expect("audit");
+
+        assert_eq!(audit.total, 4);
+        assert_eq!(audit.passed, 4);
+        assert_eq!(audit.expected_compile_errors_matched, 3);
+        assert!(audit.failures.is_empty());
+    }
+
+    #[test]
+    fn fixture_audit_matches_resource_and_weighted_pick_rules() {
+        let scratch = ScratchDirectory::new().expect("scratch directory");
+        fs::create_dir_all(scratch.path().join("Expressions")).expect("expression directory");
+        fs::write(scratch.path().join("Expressions/asset.txt"), "available")
+            .expect("resource asset");
+        fs::write(
+            scratch.path().join("Expressions/missing.dm"),
+            "// COMPILE ERROR\n/proc/RunTest()\n\treturn 'missing.txt'\n",
+        )
+        .expect("missing resource fixture");
+        fs::write(
+            scratch.path().join("Expressions/weighted.dm"),
+            "// COMPILE ERROR\n/proc/RunTest()\n\treturn pick(prob(50); 1)\n",
+        )
+        .expect("invalid weighted pick fixture");
+        fs::write(
+            scratch.path().join("Expressions/valid.dm"),
+            "/proc/RunTest()\n\tvar/weight = 50\n\tvar/resource = 'asset.txt'\n\treturn pick(weight; resource, 20; 2)\n",
+        )
+        .expect("valid expression fixture");
+
+        let audit = fixture_audit(scratch.path()).expect("audit");
+
+        assert_eq!(audit.total, 3);
+        assert_eq!(audit.passed, 3);
+        assert_eq!(audit.expected_compile_errors_matched, 2);
         assert!(audit.failures.is_empty());
     }
 }

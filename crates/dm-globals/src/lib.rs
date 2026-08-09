@@ -184,6 +184,7 @@ impl VariableRegistry {
     pub fn build(compilation: &Compilation) -> Self {
         let declared_storage = declared_storage(compilation);
         let declared_modifiers = declared_modifiers(compilation);
+        let declared_types = declared_types(compilation);
         let entries = compilation
             .declarations()
             .iter()
@@ -214,7 +215,12 @@ impl VariableRegistry {
                 });
                 let initializer =
                     initializer(compilation, declaration.file_id, definition).map(|initializer| {
-                        normalize_initializer_paths(compilation, owner.as_ref(), initializer)
+                        normalize_initializer_paths(
+                            compilation,
+                            owner.as_ref(),
+                            effective_declared_type(compilation, &declared_types, declaration.node),
+                            initializer,
+                        )
                     });
                 Some(VariableEntry {
                     ordinal: declaration.ordinal,
@@ -360,6 +366,7 @@ impl VariableRegistry {
 fn normalize_initializer_paths(
     compilation: &Compilation,
     owner: Option<&VariableOwner>,
+    expected_type: Option<&DefinitionPath>,
     mut initializer: InitializerSyntax,
 ) -> InitializerSyntax {
     let anchor = owner.map(|owner| {
@@ -375,10 +382,102 @@ fn normalize_initializer_paths(
     initializer.tokens = compilation
         .code_tree()
         .normalize_upward_paths(anchor.as_ref(), &initializer.tokens);
+    qualify_implicit_new(&mut initializer.tokens, expected_type);
     initializer.evaluation = evaluate_constant(&initializer.tokens);
     initializer.class = classify_evaluation(&initializer.evaluation);
     initializer.dependencies = initializer_dependencies(&initializer.tokens);
     initializer
+}
+
+fn qualify_implicit_new(tokens: &mut Vec<SpannedToken>, expected_type: Option<&DefinitionPath>) {
+    let Some(expected_type) = expected_type else {
+        return;
+    };
+    if !matches!(tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(name)) if name == "new")
+        || matches!(tokens.get(1).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "/")
+        || matches!(
+            tokens.get(1).map(|token| &token.kind),
+            Some(TokenKind::Identifier(_))
+        )
+    {
+        return;
+    }
+    let span = tokens[0].span;
+    let mut type_tokens = Vec::new();
+    for segment in expected_type.segments() {
+        type_tokens.push(SpannedToken {
+            kind: TokenKind::Operator("/".to_owned()),
+            span,
+        });
+        type_tokens.push(SpannedToken {
+            kind: TokenKind::Identifier(segment.clone()),
+            span,
+        });
+    }
+    tokens.splice(1..1, type_tokens);
+}
+
+fn declared_types(compilation: &Compilation) -> HashMap<NodeId, DefinitionPath> {
+    let mut types = HashMap::new();
+    for declaration in compilation.declarations() {
+        let Some(definition) = compilation
+            .syntax(declaration.file_id)
+            .and_then(|syntax| syntax.definitions.get(declaration.definition_index))
+        else {
+            continue;
+        };
+        if definition.kind != DefinitionKind::Variable {
+            continue;
+        }
+        let Some(name) = compilation
+            .code_tree()
+            .node(declaration.node)
+            .and_then(|node| node.path.segments().last())
+        else {
+            continue;
+        };
+        if let Some(path) = declared_variable_type(&definition.header, name) {
+            types.entry(declaration.node).or_insert(path);
+        }
+    }
+    types
+}
+
+fn effective_declared_type<'a>(
+    compilation: &Compilation,
+    declared: &'a HashMap<NodeId, DefinitionPath>,
+    mut node: NodeId,
+) -> Option<&'a DefinitionPath> {
+    loop {
+        if let Some(path) = declared.get(&node) {
+            return Some(path);
+        }
+        node = compilation.code_tree().node(node)?.inherited_member?;
+    }
+}
+
+fn declared_variable_type(tokens: &[SpannedToken], variable_name: &str) -> Option<DefinitionPath> {
+    let assignment = tokens
+        .iter()
+        .position(|token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="))
+        .unwrap_or(tokens.len());
+    let identifiers = tokens[..assignment]
+        .iter()
+        .filter_map(|token| match &token.kind {
+            TokenKind::Identifier(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let var = identifiers.iter().position(|name| *name == "var")?;
+    let name = identifiers
+        .iter()
+        .rposition(|name| *name == variable_name)?;
+    let segments = identifiers[var + 1..name]
+        .iter()
+        .filter(|name| !matches!(**name, "global" | "static" | "tmp" | "const"))
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    (!segments.is_empty()).then(|| DefinitionPath::new(segments))
 }
 
 fn declared_storage(compilation: &Compilation) -> HashMap<NodeId, StorageClass> {
@@ -484,13 +583,32 @@ fn initializer(
         |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
     )?;
     let equals_token = &definition.header[equals];
-    let expanded_span = SourceSpan::new(equals_token.span.end, definition.span.end);
+    let initializer_start = equals + 1;
+    let mut depth = 0usize;
+    let mut initializer_end = definition.header.len();
+    for (offset, token) in definition.header[initializer_start..].iter().enumerate() {
+        match &token.kind {
+            TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+            TokenKind::Operator(operator) if operator == "?[" => depth += 1,
+            TokenKind::Punctuation(')' | ']' | '}') => depth = depth.saturating_sub(1),
+            TokenKind::Punctuation(';') if depth == 0 => {
+                initializer_end = initializer_start + offset;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let expanded_end = definition
+        .header
+        .get(initializer_end)
+        .map_or(definition.span.end, |token| token.span.start);
+    let expanded_span = SourceSpan::new(equals_token.span.end, expanded_end);
     let file = compilation.project().file(file_id)?;
     let source = file.compiler_text().ok()?;
     let text = source
         .get(expanded_span.start..expanded_span.end)?
         .to_owned();
-    let tokens = definition.header[equals + 1..].to_vec();
+    let tokens = definition.header[initializer_start..initializer_end].to_vec();
     let evaluation = evaluate_constant(&tokens);
     let class = classify_evaluation(&evaluation);
     Some(InitializerSyntax {
@@ -698,6 +816,43 @@ mod tests {
         assert_eq!(
             initializer.class,
             InitializerClass::RequiresRuntime(RuntimeBlocker::IdentifierReference)
+        );
+    }
+
+    #[test]
+    fn qualifies_implicit_new_with_the_effective_declared_field_type() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"vars.dm\"\n");
+        fixture.write(
+            "vars.dm",
+            "/datum/test/thing\n\tvar/list/foo = list()\n/datum/test/thing/stuff\n\tfoo = new()\n",
+        );
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.0.join("world.dme"))
+            .expect("fixture should compile");
+        let registry = VariableRegistry::build(&compilation);
+        let override_entry = registry
+            .entries()
+            .iter()
+            .find(|entry| entry.assignment == AssignmentKind::Override)
+            .expect("override should be indexed");
+        let kinds = override_entry
+            .initializer
+            .as_ref()
+            .expect("override should retain its initializer")
+            .tokens
+            .iter()
+            .map(|token| token.kind.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Identifier("new".to_owned()),
+                TokenKind::Operator("/".to_owned()),
+                TokenKind::Identifier("list".to_owned()),
+                TokenKind::Punctuation('('),
+                TokenKind::Punctuation(')'),
+            ]
         );
     }
 

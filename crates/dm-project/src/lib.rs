@@ -25,6 +25,7 @@ pub struct Project {
     pub includes: Vec<IncludeEdge>,
     /// Active compiler diagnostic policies in source encounter order.
     pub diagnostic_pragmas: Vec<DiagnosticPragma>,
+    object_macros: HashMap<String, String>,
 }
 
 impl Project {
@@ -58,6 +59,14 @@ impl Project {
             .rev()
             .find(|pragma| pragma.name == name)
             .map(|pragma| pragma.severity)
+    }
+
+    /// Returns the final raw replacement of an object-like preprocessor macro.
+    /// Function-like macros and macros undefined before the end of project
+    /// expansion are not exposed.
+    #[must_use]
+    pub fn object_macro(&self, name: &str) -> Option<&str> {
+        self.object_macros.get(name).map(String::as_str)
     }
 
     /// Returns the project source stream after quoted includes are spliced in.
@@ -491,11 +500,22 @@ impl Loader {
         let root_file = self.root_file.clone();
         self.load_file(&root_file)?;
         self.includes.sort_by_key(|(ordinal, _)| *ordinal);
+        let object_macros = self
+            .macros
+            .iter()
+            .filter_map(|(name, definition)| {
+                definition
+                    .parameters
+                    .is_none()
+                    .then(|| (name.clone(), definition.replacement.clone()))
+            })
+            .collect();
         Ok(Project {
             root_directory: self.root_directory,
             files: self.files,
             includes: self.includes.into_iter().map(|(_, edge)| edge).collect(),
             diagnostic_pragmas: self.diagnostic_pragmas,
+            object_macros,
         })
     }
 
@@ -1072,6 +1092,29 @@ impl CompilerSourceBuilder {
         let mut literal_start = 0usize;
         while offset < text.len() {
             if let Some(end) = protected_text_end(text, offset) {
+                if text[offset..end].starts_with('"') {
+                    let invocation = SourceSpan::new(span.start + offset, span.start + end);
+                    let expanded = expand_quoted_macro_interpolations(
+                        &text[offset..end],
+                        macros,
+                        &mut Vec::new(),
+                        &file_macro,
+                        source_line_number(source, invocation.start),
+                    )
+                    .map_err(|message| ProjectError::MacroExpansion {
+                        path: path.to_path_buf(),
+                        offset: invocation.start,
+                        message,
+                    })?;
+                    if expanded != text[offset..end] {
+                        self.append_original(
+                            source,
+                            SourceSpan::new(span.start + literal_start, span.start + offset),
+                        );
+                        self.append_replacement(&expanded, invocation);
+                        literal_start = end;
+                    }
+                }
                 offset = end;
                 continue;
             }
@@ -1366,7 +1409,14 @@ fn expand_replacement(
     let mut offset = 0usize;
     while offset < replacement.len() {
         if let Some(end) = protected_text_end(replacement, offset) {
-            output.push_str(&replacement[offset..end]);
+            let protected = &replacement[offset..end];
+            if protected.starts_with('"') {
+                output.push_str(&expand_quoted_macro_interpolations(
+                    protected, macros, stack, file_macro, line_macro,
+                )?);
+            } else {
+                output.push_str(protected);
+            }
             offset = end;
             continue;
         }
@@ -1389,7 +1439,8 @@ fn expand_replacement(
                 if definition.parameters.is_some() {
                     let open = skip_horizontal_whitespace(replacement, end);
                     if replacement.as_bytes().get(open) == Some(&b'(') {
-                        let (arguments, invocation_end) = parse_macro_arguments(replacement, open)?;
+                        let (arguments, invocation_end) = parse_macro_arguments(replacement, open)
+                            .map_err(|error| format!("while expanding {name}: {error}"))?;
                         if stack.iter().any(|active| active == name) {
                             output.push_str(&replacement[offset..invocation_end]);
                         } else {
@@ -1421,6 +1472,48 @@ fn expand_replacement(
             .chars()
             .next()
             .expect("offset is inside macro replacement text");
+        output.push(character);
+        offset += character.len_utf8();
+    }
+    Ok(output)
+}
+
+fn expand_quoted_macro_interpolations(
+    quoted: &str,
+    macros: &HashMap<String, MacroDefinition>,
+    stack: &mut Vec<String>,
+    file_macro: &str,
+    line_macro: usize,
+) -> Result<String, String> {
+    let mut output = String::with_capacity(quoted.len());
+    let mut offset = 0usize;
+    while offset < quoted.len() {
+        if quoted.as_bytes()[offset] == b'\\' {
+            let end = (offset + 2).min(quoted.len());
+            output.push_str(&quoted[offset..end]);
+            offset = end;
+            continue;
+        }
+        if quoted.as_bytes()[offset] == b'[' {
+            let end = interpolation_end(quoted, offset + 1);
+            if end > offset + 1 && quoted.as_bytes().get(end - 1) == Some(&b']') {
+                output.push('[');
+                output.push_str(&expand_replacement(
+                    &quoted[offset + 1..end - 1],
+                    macros,
+                    stack,
+                    file_macro,
+                    line_macro,
+                )?);
+                output.push(']');
+                offset = end;
+                continue;
+            }
+        }
+        let character = quoted[offset..]
+            .chars()
+            .next()
+            .expect("offset is inside quoted replacement");
         output.push(character);
         offset += character.len_utf8();
     }
@@ -1462,18 +1555,35 @@ fn substitute_function_macro(
                 .join(", "),
         );
     }
+    let expanded_substitutions = substitutions
+        .iter()
+        .map(|(parameter, argument)| {
+            expand_replacement(argument, macros, stack, file_macro, line_macro)
+                .map(|expanded| (*parameter, expanded))
+        })
+        .collect::<Result<HashMap<_, _>, _>>()?;
 
     let replacement = &definition.replacement;
     let mut substituted = String::with_capacity(replacement.len());
     let mut offset = 0usize;
+    let mut pasted_parameter = false;
     while offset < replacement.len() {
         if let Some(end) = protected_text_end(replacement, offset) {
-            substituted.push_str(&replacement[offset..end]);
+            let protected = &replacement[offset..end];
+            if protected.starts_with('"') {
+                substituted.push_str(&substitute_quoted_macro_parameters(
+                    protected,
+                    &substitutions,
+                ));
+            } else {
+                substituted.push_str(protected);
+            }
             offset = end;
             continue;
         }
         if replacement[offset..].starts_with("##") {
             offset += 2;
+            pasted_parameter = true;
             continue;
         }
         if replacement.as_bytes()[offset] == b'#' {
@@ -1503,10 +1613,19 @@ fn substitute_function_macro(
             let end = identifier_end(replacement, offset);
             let parameter = &replacement[offset..end];
             if let Some(argument) = substitutions.get(parameter) {
-                substituted.push_str(argument);
+                if pasted_parameter {
+                    substituted.push_str(argument);
+                } else {
+                    substituted.push_str(
+                        expanded_substitutions
+                            .get(parameter)
+                            .expect("every raw substitution has an expanded value"),
+                    );
+                }
             } else {
                 substituted.push_str(parameter);
             }
+            pasted_parameter = false;
             offset = end;
             continue;
         }
@@ -1515,9 +1634,115 @@ fn substitute_function_macro(
             .next()
             .expect("offset is inside function replacement text");
         substituted.push(character);
+        pasted_parameter = false;
         offset += character.len_utf8();
     }
     expand_replacement(&substituted, macros, stack, file_macro, line_macro)
+}
+
+fn substitute_quoted_macro_parameters(
+    quoted: &str,
+    substitutions: &HashMap<&str, String>,
+) -> String {
+    let mut output = String::with_capacity(quoted.len());
+    let mut offset = 0usize;
+    while offset < quoted.len() {
+        let byte = quoted.as_bytes()[offset];
+        if byte == b'\\' {
+            let end = (offset + 2).min(quoted.len());
+            output.push_str(&quoted[offset..end]);
+            offset = end;
+            continue;
+        }
+        if byte == b'[' {
+            let end = interpolation_end(quoted, offset + 1);
+            if end > offset + 1 && quoted.as_bytes().get(end - 1) == Some(&b']') {
+                output.push('[');
+                output.push_str(&substitute_macro_parameter_fragment(
+                    &quoted[offset + 1..end - 1],
+                    substitutions,
+                ));
+                output.push(']');
+                offset = end;
+                continue;
+            }
+        }
+        let character = quoted[offset..]
+            .chars()
+            .next()
+            .expect("offset is inside quoted macro text");
+        output.push(character);
+        offset += character.len_utf8();
+    }
+    output
+}
+
+fn substitute_macro_parameter_fragment(
+    fragment: &str,
+    substitutions: &HashMap<&str, String>,
+) -> String {
+    let mut output = String::with_capacity(fragment.len());
+    let mut offset = 0usize;
+    while offset < fragment.len() {
+        if let Some(end) = protected_text_end(fragment, offset) {
+            let protected = &fragment[offset..end];
+            if protected.starts_with('"') {
+                output.push_str(&substitute_quoted_macro_parameters(
+                    protected,
+                    substitutions,
+                ));
+            } else {
+                output.push_str(protected);
+            }
+            offset = end;
+            continue;
+        }
+        // DreamMaker applies the function-macro stringification operator in
+        // interpolations too.  For example `"[#value]"` expands to an outer
+        // DM string whose interpolation evaluates the quoted spelling of the
+        // argument, rather than leaving `#` for the expression lexer.
+        if fragment.as_bytes()[offset] == b'#' {
+            let parameter_start = skip_horizontal_whitespace(fragment, offset + 1);
+            if fragment
+                .as_bytes()
+                .get(parameter_start)
+                .is_some_and(|byte| is_identifier_start(*byte))
+            {
+                let parameter_end = identifier_end(fragment, parameter_start);
+                let parameter = &fragment[parameter_start..parameter_end];
+                if let Some(argument) = substitutions.get(parameter) {
+                    output.push_str("\\\"");
+                    for character in argument.chars() {
+                        if matches!(character, '\\' | '"') {
+                            output.push('\\');
+                        }
+                        output.push(character);
+                    }
+                    output.push_str("\\\"");
+                    offset = parameter_end;
+                    continue;
+                }
+            }
+        }
+        if is_identifier_start(fragment.as_bytes()[offset]) {
+            let end = identifier_end(fragment, offset);
+            let identifier = &fragment[offset..end];
+            output.push_str(
+                substitutions
+                    .get(identifier)
+                    .map_or(identifier, String::as_str),
+            );
+            offset = end;
+            continue;
+        }
+        let character = fragment[offset..]
+            .chars()
+            .next()
+            .expect("offset is inside macro interpolation");
+        output.push(character);
+        offset += character.len_utf8();
+    }
+    output
 }
 
 fn parse_macro_arguments(source: &str, open: usize) -> Result<(Vec<String>, usize), String> {
@@ -1630,6 +1855,14 @@ fn interpolation_end(source: &str, start: usize) -> usize {
     let mut depth = 1usize;
     while cursor < source.len() {
         let byte = source.as_bytes()[cursor];
+        // Quotes belonging to an expression inside a quoted DM string are
+        // escaped for the surrounding string: `"[call(\"text\")]"`.  Treat
+        // that encoded quote pair as a protected inner string so brackets
+        // and macro-looking text in it cannot terminate the interpolation.
+        if byte == b'\\' && source.as_bytes().get(cursor + 1) == Some(&b'"') {
+            cursor = escaped_interpolation_quote_end(source, cursor);
+            continue;
+        }
         if matches!(byte, b'"' | b'\'') {
             cursor = quoted_text_end(source, cursor, byte);
             continue;
@@ -1651,6 +1884,34 @@ fn interpolation_end(source: &str, start: usize) -> usize {
             .next()
             .expect("offset is inside string interpolation")
             .len_utf8();
+    }
+    source.len()
+}
+
+fn escaped_interpolation_quote_end(source: &str, start: usize) -> usize {
+    let mut cursor = start + 2;
+    while cursor < source.len() {
+        if source.as_bytes()[cursor] != b'\\' {
+            cursor += source[cursor..]
+                .chars()
+                .next()
+                .expect("offset is inside escaped interpolation string")
+                .len_utf8();
+            continue;
+        }
+        let run_start = cursor;
+        while source.as_bytes().get(cursor) == Some(&b'\\') {
+            cursor += 1;
+        }
+        if source.as_bytes().get(cursor) == Some(&b'"') {
+            let slash_count = cursor - run_start;
+            cursor += 1;
+            // After decoding the containing string, 1, 5, 9, ... slashes
+            // introduce an unescaped quote in the interpolation expression.
+            if slash_count % 4 == 1 {
+                return cursor;
+            }
+        }
     }
     source.len()
 }
@@ -2622,7 +2883,7 @@ mod tests {
     #[test]
     fn expands_function_macros_with_nested_and_variadic_arguments() {
         let scratch = ScratchDirectory::new();
-        let source = "#define ROOT /datum\n#define WRAP(first, second) list(first, second)\n#define FORWARD(arguments...) WRAP(arguments)\n#define STRINGIFY(value) #value\n#define TYPE(value) ROOT/##value\nWRAP(call(1, 2), \"comma, text\")\nFORWARD(alpha, list(beta, gamma))\nSTRINGIFY(alpha + beta)\nTYPE(example)\n";
+        let source = "#define ROOT /datum\n#define WRAP(first, second) list(first, second)\n#define FORWARD(arguments...) WRAP(arguments)\n#define STRINGIFY(value) #value\n#define INTERPOLATED_STRINGIFY(value) \"[#value]\"\n#define OUTER(value) use(\"prefix [value] suffix\")\n#define NESTED_STRINGIFY(value) OUTER(\"[copytext(#value, 1, length(#value))]\")\n#define TYPE(value) ROOT/##value\n#define INTERPOLATE(value) \"key=[value]\"\n#define AREACOORD(value) value.x\nWRAP(call(1, 2), \"comma, text\")\nFORWARD(alpha, list(beta, gamma))\nSTRINGIFY(alpha + beta)\nINTERPOLATED_STRINGIFY(alpha + beta)\nNESTED_STRINGIFY(config_error_log)\nTYPE(example)\nINTERPOLATE(1 + 2)\n\"location [AREACOORD(src)]\"\n";
         fs::write(scratch.path().join("world.dme"), source)
             .expect("function macros should be written");
 
@@ -2635,7 +2896,13 @@ mod tests {
         assert!(expanded.contains("list(call(1, 2), \"comma, text\")"));
         assert!(expanded.contains("list(alpha, list(beta, gamma))"));
         assert!(expanded.contains("\"alpha + beta\""));
+        assert!(expanded.contains("\"[\\\"alpha + beta\\\"]\""));
+        assert!(expanded.contains(
+            "use(\"prefix [\"[copytext(\\\"config_error_log\\\", 1, length(\\\"config_error_log\\\"))]\"] suffix\")"
+        ));
         assert!(expanded.contains("/datum/example"));
+        assert!(expanded.contains("\"key=[1 + 2]\""));
+        assert!(expanded.contains("\"location [src.x]\""));
         assert!(!expanded.contains("WRAP("));
         assert!(!expanded.contains("FORWARD("));
         let invocation_start = source
@@ -2650,6 +2917,31 @@ mod tests {
                 expanded_start + "/datum/example".len(),
             )),
             SourceSpan::new(invocation_start, invocation_start + "TYPE(example)".len())
+        );
+    }
+
+    #[test]
+    fn expands_object_macro_arguments_forwarded_through_token_paste() {
+        let scratch = ScratchDirectory::new();
+        let source = concat!(
+            "#define INNER(name, enabled) /proc/##name(){ if(##enabled){ return 1; } }\n",
+            "#define OUTER(name, enabled) INNER(##name, enabled)\n",
+            "#define DISABLED FALSE\n",
+            "OUTER(example, DISABLED)\n",
+            "#undef DISABLED\n",
+        );
+        fs::write(scratch.path().join("world.dme"), source)
+            .expect("macro fixture should be written");
+        let project = Project::load(scratch.path().join("world.dme"))
+            .expect("forwarded macro argument should expand");
+        let expanded = project.files[0].compiler_text().expect("expanded UTF-8");
+        assert!(
+            expanded.contains("if(FALSE)"),
+            "expanded source: {expanded}"
+        );
+        assert!(
+            !expanded.contains("DISABLED"),
+            "expanded source: {expanded}"
         );
     }
 
@@ -3082,5 +3374,21 @@ mod tests {
             .expect_err("outside include should be rejected");
 
         assert!(matches!(error, ProjectError::OutsideProject { .. }));
+    }
+
+    #[test]
+    fn retains_final_object_macro_values_for_runtime_configuration() {
+        let scratch = ScratchDirectory::new();
+        fs::write(
+            scratch.path().join("world.dme"),
+            "#define INITSTAGE_MAX 2\n#define CALL(X) X\n#undef DM_BUILD\n/world\n",
+        )
+        .expect("environment should be written");
+
+        let project = Project::load(scratch.path().join("world.dme")).expect("project should load");
+
+        assert_eq!(project.object_macro("INITSTAGE_MAX"), Some("2"));
+        assert_eq!(project.object_macro("CALL"), None);
+        assert_eq!(project.object_macro("DM_BUILD"), None);
     }
 }

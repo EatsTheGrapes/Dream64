@@ -7,6 +7,7 @@
 
 #![cfg_attr(not(test), deny(missing_docs))]
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -192,6 +193,36 @@ pub enum DiagnosticKind {
     InvalidStringInterpolation,
     /// An assignment attempts to modify a compile-time readonly member such as `type`.
     ReadOnlyAssignment,
+    /// An assignment or loop iterator attempts to write a declared constant.
+    WriteToConstant,
+    /// A statically untyped value is dereferenced with the typed member operator.
+    UntypedDereference,
+    /// A plain datum is indexed despite having no index semantics.
+    InvalidIndexOperation,
+    /// A runtime-search `:` operator use controlled by pragma.
+    RuntimeSearchOperator,
+    /// A constant initializer or assignment conflicts with a declared variable type.
+    InvalidVarType,
+    /// A variable declaration names a type path that does not exist.
+    UndefinedType,
+    /// An inherited final variable is overridden.
+    FinalVariableOverride,
+    /// Redeclarations disagree about whether a variable is constant.
+    ConflictingVariableModifier,
+    /// An inherited global/static variable is initialized again.
+    GlobalVariableReinitialization,
+    /// `nameof()` received an expression rather than a nameable reference.
+    InvalidNameofTarget,
+    /// A declaration requiring a compile-time value contains a runtime expression.
+    InvalidConstantInitializer,
+    /// A single-quoted resource literal does not resolve to a file.
+    MissingResource,
+    /// A weighted `pick()` entry uses a procedure call as its weight.
+    InvalidWeightedPick,
+    /// Macro expansion produced a numeric declaration path component.
+    InvalidExpandedDeclarationPath,
+    /// A procedure override attempts to redefine its inherited return type.
+    ReturnTypeRedefinition,
 }
 
 /// A source location with both stable identity and display path.
@@ -307,19 +338,38 @@ fn compile_project(project: Project) -> Compilation {
             .iter()
             .map(|diagnostic| map_tree_diagnostic(&project, &tree, diagnostic)),
     );
+    diagnostics.extend(variable_modifier_diagnostics(
+        &project,
+        &syntax_files,
+        &tree,
+    ));
+    diagnostics.extend(constant_cycle_diagnostics(&project, &syntax_files));
+    diagnostics.extend(procedure_return_override_diagnostics(
+        &project,
+        &syntax_files,
+        &tree,
+    ));
     for (index, syntax) in syntax_files.iter().enumerate() {
         let Some(syntax) = syntax else { continue };
         let file = &project.files[index];
+        diagnostics.extend(preprocessed_source_diagnostics(file));
         diagnostics.extend(matrix_lint_diagnostics(file, syntax));
         diagnostics.extend(proc_argument_diagnostics(file, syntax));
         diagnostics.extend(numeric_builtin_diagnostics(file, syntax));
         diagnostics.extend(builtin_arity_diagnostics(file, syntax));
         diagnostics.extend(string_interpolation_diagnostics(file, syntax));
         diagnostics.extend(readonly_member_diagnostics(file, syntax));
+        diagnostics.extend(const_write_diagnostics(file, syntax));
+        diagnostics.extend(reference_operator_diagnostics(file, syntax));
+        diagnostics.extend(variable_type_diagnostics(file, syntax));
+        diagnostics.extend(undefined_local_type_diagnostics(file, syntax, &tree));
+        diagnostics.extend(nameof_diagnostics(file, syntax));
+        diagnostics.extend(constant_initializer_diagnostics(file, syntax));
+        diagnostics.extend(resource_and_weighted_pick_diagnostics(file, syntax));
     }
     diagnostics.retain_mut(|diagnostic| {
         let Some(severity) = project.diagnostic_severity(diagnostic_pragma_name(diagnostic)) else {
-            return true;
+            return diagnostic.kind != DiagnosticKind::RuntimeSearchOperator;
         };
         match severity {
             PragmaSeverity::Disabled => false,
@@ -386,6 +436,1080 @@ fn diagnostic_pragma_name(diagnostic: &Diagnostic) -> &'static str {
         DiagnosticKind::InvalidArgumentCount => "InvalidArgumentCount",
         DiagnosticKind::InvalidStringInterpolation => "BadExpression",
         DiagnosticKind::ReadOnlyAssignment => "InvalidReference",
+        DiagnosticKind::WriteToConstant => "WriteToConstant",
+        DiagnosticKind::UntypedDereference => "InvalidReference",
+        DiagnosticKind::InvalidIndexOperation => "InvalidIndexOperation",
+        DiagnosticKind::RuntimeSearchOperator => "RuntimeSearchOperator",
+        DiagnosticKind::InvalidVarType => "InvalidVarType",
+        DiagnosticKind::UndefinedType => "UnknownType",
+        DiagnosticKind::FinalVariableOverride => "InvalidOverride",
+        DiagnosticKind::ConflictingVariableModifier => "InvalidOverride",
+        DiagnosticKind::GlobalVariableReinitialization => "InvalidOverride",
+        DiagnosticKind::InvalidNameofTarget => "BadArgument",
+        DiagnosticKind::InvalidConstantInitializer => "InvalidInitialValue",
+        DiagnosticKind::MissingResource => "MissingResource",
+        DiagnosticKind::InvalidWeightedPick => "BadArgument",
+        DiagnosticKind::InvalidExpandedDeclarationPath => "BadToken",
+        DiagnosticKind::ReturnTypeRedefinition => "InvalidReturnType",
+    }
+}
+
+fn variable_type_diagnostics(
+    file: &dm_project::ProjectFile,
+    syntax: &SyntaxFile,
+) -> Vec<Diagnostic> {
+    let mut declared_types: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for definition in &syntax.definitions {
+        if definition.kind != dm_syntax::DefinitionKind::Variable {
+            continue;
+        }
+        let Some(expected) = type_annotation(&definition.header) else {
+            continue;
+        };
+        let segments = definition.path.segments();
+        let Some(var_index) = segments.iter().position(|segment| segment == "var") else {
+            continue;
+        };
+        let owner = format!("/{}", segments[..var_index].join("/"));
+        let name = segments.last().expect("variable path has a name").clone();
+        declared_types
+            .entry(name)
+            .or_default()
+            .push((owner, expected));
+    }
+
+    let mut diagnostics = Vec::new();
+    for definition in &syntax.definitions {
+        if matches!(
+            definition.kind,
+            dm_syntax::DefinitionKind::Variable | dm_syntax::DefinitionKind::VariableOverride
+        ) {
+            let segments = definition.path.segments();
+            let Some(name) = segments.last() else {
+                continue;
+            };
+            let explicit = type_annotation(&definition.header);
+            if let Some(expected) = explicit.as_deref() {
+                if initializer_conflicts(&definition.header, expected) {
+                    push_variable_type_diagnostic(
+                        file,
+                        definition.span,
+                        DiagnosticKind::InvalidVarType,
+                        "variable initializer conflicts with its declared type",
+                        &mut diagnostics,
+                    );
+                }
+            } else if definition.kind == dm_syntax::DefinitionKind::VariableOverride {
+                let owner_end = segments
+                    .iter()
+                    .position(|segment| segment == "var")
+                    .unwrap_or(segments.len() - 1);
+                let owner = format!("/{}", segments[..owner_end].join("/"));
+                if let Some(expected) = nearest_declared_type(name, &owner, &declared_types)
+                    && initializer_conflicts(&definition.header, expected)
+                {
+                    push_variable_type_diagnostic(
+                        file,
+                        definition.span,
+                        DiagnosticKind::InvalidVarType,
+                        "variable override conflicts with inherited type",
+                        &mut diagnostics,
+                    );
+                }
+            }
+        }
+        if matches!(
+            definition.kind,
+            dm_syntax::DefinitionKind::Procedure
+                | dm_syntax::DefinitionKind::ProcedureOverride
+                | dm_syntax::DefinitionKind::Verb
+        ) {
+            lint_typed_local_new_assignments(file, definition, &mut diagnostics);
+        }
+    }
+    diagnostics
+}
+
+fn undefined_local_type_diagnostics(
+    file: &dm_project::ProjectFile,
+    syntax: &SyntaxFile,
+    tree: &CodeTree,
+) -> Vec<Diagnostic> {
+    const BUILTIN_TYPES: &[&str] = &[
+        "area",
+        "atom",
+        "client",
+        "database",
+        "datum",
+        "icon",
+        "image",
+        "list",
+        "matrix",
+        "mob",
+        "mutable_appearance",
+        "obj",
+        "regex",
+        "savefile",
+        "sound",
+        "turf",
+        "world",
+    ];
+    let mut diagnostics = Vec::new();
+    for definition in &syntax.definitions {
+        if !matches!(
+            definition.kind,
+            dm_syntax::DefinitionKind::Variable | dm_syntax::DefinitionKind::VariableOverride
+        ) {
+            continue;
+        }
+        let Some((_, _, Some(type_path))) = local_declaration(&definition.header) else {
+            continue;
+        };
+        let type_segments = type_path
+            .trim_start_matches('/')
+            .split('/')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if type_segments.is_empty()
+            || (type_segments.len() == 1 && BUILTIN_TYPES.contains(&type_segments[0].as_str()))
+            || tree
+                .find(&dm_syntax::DefinitionPath::new(type_segments.clone()))
+                .is_some()
+        {
+            continue;
+        }
+        push_reference_diagnostic(
+            file,
+            definition.span,
+            DiagnosticKind::UndefinedType,
+            DiagnosticSeverity::Error,
+            &format!("undefined variable type: /{}", type_segments.join("/")),
+            &mut diagnostics,
+        );
+    }
+    for definition in &syntax.definitions {
+        if !matches!(
+            definition.kind,
+            dm_syntax::DefinitionKind::Procedure
+                | dm_syntax::DefinitionKind::ProcedureOverride
+                | dm_syntax::DefinitionKind::Verb
+        ) {
+            continue;
+        }
+        for line in &definition.body {
+            let Some((_, _, Some(type_path))) = local_declaration(&line.tokens) else {
+                continue;
+            };
+            let segments = type_path
+                .trim_start_matches('/')
+                .split('/')
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if segments.is_empty()
+                || (segments.len() == 1 && BUILTIN_TYPES.contains(&segments[0].as_str()))
+                || tree
+                    .find(&dm_syntax::DefinitionPath::new(segments))
+                    .is_some()
+            {
+                continue;
+            }
+            let span = line.tokens.first().map_or(line.span, |token| token.span);
+            push_reference_diagnostic(
+                file,
+                span,
+                DiagnosticKind::UndefinedType,
+                DiagnosticSeverity::Error,
+                &format!("undefined variable type: {type_path}"),
+                &mut diagnostics,
+            );
+        }
+    }
+    diagnostics
+}
+
+fn constant_cycle_diagnostics(
+    project: &Project,
+    syntax_files: &[Option<SyntaxFile>],
+) -> Vec<Diagnostic> {
+    let mut declarations = HashMap::<String, (FileId, SourceSpan, Vec<String>)>::new();
+    for (file_index, syntax) in syntax_files.iter().enumerate() {
+        let Some(syntax) = syntax else { continue };
+        for definition in &syntax.definitions {
+            let segments = definition.path.segments();
+            if definition.kind != dm_syntax::DefinitionKind::Variable
+                || segments.first().is_none_or(|segment| segment != "var")
+                || !has_identifier(&definition.header, "const")
+            {
+                continue;
+            }
+            let Some(name) = segments.last().cloned() else {
+                continue;
+            };
+            let dependencies = definition
+                .header
+                .iter()
+                .skip_while(|token| {
+                    !matches!(&token.kind, TokenKind::Operator(operator) if operator == "=")
+                })
+                .skip(1)
+                .filter_map(|token| match &token.kind {
+                    TokenKind::Identifier(identifier) => Some(identifier.clone()),
+                    _ => None,
+                })
+                .collect();
+            declarations.insert(
+                name,
+                (
+                    FileId::from_index(file_index),
+                    definition.span,
+                    dependencies,
+                ),
+            );
+        }
+    }
+    let graph = declarations
+        .iter()
+        .map(|(name, (_, _, dependencies))| (name.clone(), dependencies.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut diagnostics = Vec::new();
+    for (name, (file_id, span, _)) in declarations {
+        let Some(dependencies) = graph.get(&name) else {
+            continue;
+        };
+        let cyclic = dependencies.iter().any(|dependency| {
+            dependency == &name
+                || constant_dependency_reaches(dependency, &name, &graph, &mut HashSet::new())
+        });
+        if !cyclic {
+            continue;
+        }
+        let Some(file) = project.file(file_id) else {
+            continue;
+        };
+        push_reference_diagnostic(
+            file,
+            span,
+            DiagnosticKind::InvalidConstantInitializer,
+            DiagnosticSeverity::Error,
+            "constant initializer contains a cyclic reference",
+            &mut diagnostics,
+        );
+    }
+    diagnostics
+}
+
+fn constant_dependency_reaches(
+    current: &str,
+    target: &str,
+    graph: &HashMap<String, Vec<String>>,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if !visited.insert(current.to_owned()) {
+        return false;
+    }
+    graph.get(current).is_some_and(|dependencies| {
+        dependencies.iter().any(|dependency| {
+            dependency == target || constant_dependency_reaches(dependency, target, graph, visited)
+        })
+    })
+}
+
+fn constant_initializer_diagnostics(
+    file: &dm_project::ProjectFile,
+    syntax: &SyntaxFile,
+) -> Vec<Diagnostic> {
+    const CONSTANT_CALLS: &[&str] = &[
+        "abs", "arccos", "arcsin", "arctan", "ckey", "ckeyEx", "cos", "rgb", "sin", "sqrt", "tan",
+    ];
+    let mut diagnostics = Vec::new();
+    for definition in &syntax.definitions {
+        if matches!(
+            definition.kind,
+            dm_syntax::DefinitionKind::Variable | dm_syntax::DefinitionKind::VariableOverride
+        ) && has_identifier(&definition.header, "const")
+        {
+            let invalid_call = definition.header.windows(2).any(|window| {
+                matches!(&window[0].kind, TokenKind::Identifier(name) if !CONSTANT_CALLS.contains(&name.as_str()))
+                    && window[1].kind == TokenKind::Punctuation('(')
+            });
+            if invalid_call {
+                push_reference_diagnostic(
+                    file,
+                    definition.span,
+                    DiagnosticKind::InvalidConstantInitializer,
+                    DiagnosticSeverity::Error,
+                    "constant initializer calls a runtime procedure",
+                    &mut diagnostics,
+                );
+            }
+        }
+
+        if !matches!(
+            definition.kind,
+            dm_syntax::DefinitionKind::Procedure
+                | dm_syntax::DefinitionKind::ProcedureOverride
+                | dm_syntax::DefinitionKind::Verb
+        ) {
+            continue;
+        }
+        let parameter_names = definition
+            .parameters
+            .iter()
+            .filter_map(|parameter| {
+                parameter
+                    .tokens
+                    .iter()
+                    .rev()
+                    .find_map(|token| match &token.kind {
+                        TokenKind::Identifier(name) => Some(name.clone()),
+                        _ => None,
+                    })
+            })
+            .collect::<HashSet<_>>();
+        let mut local_names = HashSet::new();
+        for line in &definition.body {
+            let Some((name, _, _)) = local_declaration(&line.tokens) else {
+                continue;
+            };
+            let is_static =
+                has_identifier(&line.tokens, "static") || has_identifier(&line.tokens, "global");
+            let equals = line.tokens.iter().position(
+                |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
+            );
+            if is_static
+                && equals.is_some_and(|equals| {
+                    line.tokens[equals + 1..].iter().any(|token| {
+                        matches!(&token.kind, TokenKind::Identifier(value) if parameter_names.contains(value) || local_names.contains(value))
+                    })
+                })
+            {
+                push_reference_diagnostic(
+                    file,
+                    line.span,
+                    DiagnosticKind::InvalidConstantInitializer,
+                    DiagnosticSeverity::Error,
+                    "static initializer references a runtime local value",
+                    &mut diagnostics,
+                );
+            }
+            local_names.insert(name);
+        }
+    }
+    diagnostics
+}
+
+fn has_identifier(tokens: &[SpannedToken], expected: &str) -> bool {
+    tokens
+        .iter()
+        .any(|token| matches!(&token.kind, TokenKind::Identifier(name) if name == expected))
+}
+
+fn resource_and_weighted_pick_diagnostics(
+    file: &dm_project::ProjectFile,
+    syntax: &SyntaxFile,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for definition in &syntax.definitions {
+        lint_resources_and_weighted_pick(file, &definition.header, &mut diagnostics);
+        for line in &definition.body {
+            lint_resources_and_weighted_pick(file, &line.tokens, &mut diagnostics);
+        }
+    }
+    diagnostics
+}
+
+fn lint_resources_and_weighted_pick(
+    file: &dm_project::ProjectFile,
+    tokens: &[SpannedToken],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for token in tokens {
+        let TokenKind::Resource(resource) = &token.kind else {
+            continue;
+        };
+        let relative = resource.replace('\\', "/");
+        let exists = file
+            .path
+            .parent()
+            .is_some_and(|parent| parent.join(relative).is_file());
+        if !exists {
+            push_reference_diagnostic(
+                file,
+                token.span,
+                DiagnosticKind::MissingResource,
+                DiagnosticSeverity::Error,
+                &format!("resource file does not exist: '{resource}'"),
+                diagnostics,
+            );
+        }
+    }
+
+    let mut index = 0usize;
+    while index + 1 < tokens.len() {
+        if !matches!(&tokens[index].kind, TokenKind::Identifier(name) if name == "pick")
+            || tokens[index + 1].kind != TokenKind::Punctuation('(')
+        {
+            index += 1;
+            continue;
+        }
+        let Some((close, _)) = call_arguments(tokens, index + 1) else {
+            index += 1;
+            continue;
+        };
+        let mut depth = 0usize;
+        let mut entry_start = index + 2;
+        for cursor in index + 2..close {
+            match tokens[cursor].kind {
+                TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+                TokenKind::Punctuation(')' | ']' | '}') => depth = depth.saturating_sub(1),
+                TokenKind::Punctuation(',') if depth == 0 => entry_start = cursor + 1,
+                TokenKind::Punctuation(';') if depth == 0 => {
+                    let weight = &tokens[entry_start..cursor];
+                    let calls_procedure = weight.windows(2).any(|window| {
+                        matches!(&window[0].kind, TokenKind::Identifier(_))
+                            && window[1].kind == TokenKind::Punctuation('(')
+                    });
+                    if calls_procedure && !weight.is_empty() {
+                        let span = SourceSpan::new(
+                            weight[0].span.start,
+                            weight.last().expect("non-empty weight").span.end,
+                        );
+                        push_reference_diagnostic(
+                            file,
+                            span,
+                            DiagnosticKind::InvalidWeightedPick,
+                            DiagnosticSeverity::Error,
+                            "weighted pick weights cannot call procedures",
+                            diagnostics,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        index = close + 1;
+    }
+}
+
+fn preprocessed_source_diagnostics(file: &dm_project::ProjectFile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    if let Ok(source) = file.text()
+        && let Err(error) = dm_lexer::lex(source)
+        && error.message == "unterminated block comment"
+    {
+        diagnostics.push(Diagnostic {
+            kind: DiagnosticKind::Syntax,
+            severity: DiagnosticSeverity::Error,
+            message: error.message,
+            location: Some(DiagnosticLocation {
+                file_id: file.id,
+                path: file.path.clone(),
+                span: Some(error.span),
+            }),
+            related: None,
+        });
+    }
+
+    let Ok(source) = file.compiler_text() else {
+        return diagnostics;
+    };
+    if let Ok(tokens) = dm_lexer::lex(source) {
+        let mut saw_var = false;
+        let mut saw_initializer = false;
+        for (index, token) in tokens.iter().enumerate() {
+            if matches!(token.kind, TokenKind::Newline) {
+                saw_var = false;
+                saw_initializer = false;
+                continue;
+            }
+            if matches!(&token.kind, TokenKind::Identifier(name) if name == "var") {
+                saw_var = true;
+            }
+            if matches!(&token.kind, TokenKind::Operator(operator) if operator == "=") {
+                saw_initializer = true;
+            }
+            if saw_var
+                && !saw_initializer
+                && matches!(&token.kind, TokenKind::Operator(operator) if operator == "/")
+                && matches!(
+                    tokens.get(index + 1).map(|token| &token.kind),
+                    Some(TokenKind::Number(_))
+                )
+            {
+                let number = &tokens[index + 1];
+                diagnostics.push(Diagnostic {
+                    kind: DiagnosticKind::InvalidExpandedDeclarationPath,
+                    severity: DiagnosticSeverity::Error,
+                    message: "numeric value cannot be used as a declaration path component"
+                        .to_owned(),
+                    location: Some(DiagnosticLocation {
+                        file_id: file.id,
+                        path: file.path.clone(),
+                        span: Some(file.original_span(number.span)),
+                    }),
+                    related: None,
+                });
+            }
+        }
+    }
+    diagnostics
+}
+
+fn procedure_return_override_diagnostics(
+    project: &Project,
+    syntax_files: &[Option<SyntaxFile>],
+    tree: &CodeTree,
+) -> Vec<Diagnostic> {
+    let definition_for = |declaration: &dm_object_tree::TreeDeclaration| {
+        syntax_files
+            .get(declaration.file_id.index())?
+            .as_ref()?
+            .definitions
+            .get(declaration.definition_index)
+    };
+    let mut diagnostics = Vec::new();
+    for node in tree
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == dm_object_tree::NodeKind::Procedure)
+    {
+        let Some(inherited) = node
+            .inherited_member
+            .and_then(|inherited| tree.node(inherited))
+        else {
+            continue;
+        };
+        let inherited_return = inherited
+            .declarations
+            .iter()
+            .filter_map(|id| tree.declaration(*id))
+            .filter_map(&definition_for)
+            .find_map(|definition| type_annotation(&definition.header));
+        let Some(inherited_return) = inherited_return else {
+            continue;
+        };
+        for declaration in node
+            .declarations
+            .iter()
+            .filter_map(|id| tree.declaration(*id))
+        {
+            let Some(definition) = definition_for(declaration) else {
+                continue;
+            };
+            let Some(current_return) = type_annotation(&definition.header) else {
+                continue;
+            };
+            if current_return != inherited_return {
+                push_tree_semantic_diagnostic(
+                    project,
+                    declaration,
+                    DiagnosticKind::ReturnTypeRedefinition,
+                    "procedure return type cannot be redefined from parent",
+                    &mut diagnostics,
+                );
+            }
+        }
+    }
+    diagnostics
+}
+
+fn variable_modifier_diagnostics(
+    project: &Project,
+    syntax_files: &[Option<SyntaxFile>],
+    tree: &CodeTree,
+) -> Vec<Diagnostic> {
+    let definition_for = |declaration: &dm_object_tree::TreeDeclaration| {
+        syntax_files
+            .get(declaration.file_id.index())?
+            .as_ref()?
+            .definitions
+            .get(declaration.definition_index)
+    };
+    let has_modifier = |definition: &dm_syntax::Definition, modifier: &str| {
+        definition
+            .header
+            .iter()
+            .any(|token| matches!(&token.kind, TokenKind::Identifier(name) if name == modifier))
+    };
+    let initialized = |definition: &dm_syntax::Definition| {
+        definition
+            .header
+            .iter()
+            .any(|token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="))
+    };
+    let mut diagnostics = Vec::new();
+
+    let mut const_state = HashMap::<Vec<String>, bool>::new();
+    for (file_index, syntax) in syntax_files.iter().enumerate() {
+        let Some(syntax) = syntax else { continue };
+        let Some(file) = project.files.get(file_index) else {
+            continue;
+        };
+        for definition in &syntax.definitions {
+            if !matches!(
+                definition.kind,
+                dm_syntax::DefinitionKind::Variable | dm_syntax::DefinitionKind::VariableOverride
+            ) {
+                continue;
+            }
+            let segments = definition.path.segments();
+            let Some(name) = segments.last() else {
+                continue;
+            };
+            let mut key = segments[..segments.len() - 1]
+                .iter()
+                .filter(|segment| {
+                    !matches!(
+                        segment.as_str(),
+                        "var" | "const" | "static" | "global" | "tmp" | "final"
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            key.push(name.clone());
+            let is_const = has_modifier(definition, "const")
+                || segments.iter().any(|segment| segment == "const");
+            if let Some(previous) = const_state.insert(key, is_const)
+                && previous != is_const
+            {
+                diagnostics.push(Diagnostic {
+                    kind: DiagnosticKind::ConflictingVariableModifier,
+                    severity: DiagnosticSeverity::Error,
+                    message: "variable redeclaration changes its const modifier".to_owned(),
+                    location: Some(DiagnosticLocation {
+                        file_id: file.id,
+                        path: file.path.clone(),
+                        span: Some(file.original_span(definition.span)),
+                    }),
+                    related: None,
+                });
+            }
+        }
+    }
+
+    for node in tree
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == dm_object_tree::NodeKind::Variable)
+    {
+        let declarations = node
+            .declarations
+            .iter()
+            .filter_map(|id| tree.declaration(*id))
+            .collect::<Vec<_>>();
+
+        let Some(inherited_id) = node.inherited_member else {
+            continue;
+        };
+        let Some(inherited) = tree.node(inherited_id) else {
+            continue;
+        };
+        let inherited_definitions = inherited
+            .declarations
+            .iter()
+            .filter_map(|id| tree.declaration(*id))
+            .filter_map(&definition_for)
+            .collect::<Vec<_>>();
+        let inherited_final = inherited_definitions
+            .iter()
+            .any(|definition| has_modifier(definition, "final"));
+        let inherited_global = inherited_definitions.iter().any(|definition| {
+            ["const", "global", "static"]
+                .iter()
+                .any(|modifier| has_modifier(definition, modifier))
+        });
+        for declaration in declarations {
+            let Some(definition) = definition_for(declaration) else {
+                continue;
+            };
+            if inherited_final {
+                push_tree_semantic_diagnostic(
+                    project,
+                    declaration,
+                    DiagnosticKind::FinalVariableOverride,
+                    "final variable cannot be overridden",
+                    &mut diagnostics,
+                );
+            } else if inherited_global && initialized(definition) {
+                push_tree_semantic_diagnostic(
+                    project,
+                    declaration,
+                    DiagnosticKind::GlobalVariableReinitialization,
+                    "inherited global variable cannot be reinitialized",
+                    &mut diagnostics,
+                );
+            }
+        }
+    }
+    diagnostics
+}
+
+fn push_tree_semantic_diagnostic(
+    project: &Project,
+    declaration: &dm_object_tree::TreeDeclaration,
+    kind: DiagnosticKind,
+    message: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(file) = project.file(declaration.file_id) else {
+        return;
+    };
+    diagnostics.push(Diagnostic {
+        kind,
+        severity: DiagnosticSeverity::Error,
+        message: message.to_owned(),
+        location: Some(DiagnosticLocation {
+            file_id: file.id,
+            path: file.path.clone(),
+            span: Some(file.original_span(declaration.span)),
+        }),
+        related: None,
+    });
+}
+
+fn type_annotation(tokens: &[SpannedToken]) -> Option<String> {
+    let index = tokens
+        .iter()
+        .rposition(|token| matches!(&token.kind, TokenKind::Identifier(name) if name == "as"))?;
+    match tokens.get(index + 1).map(|token| &token.kind) {
+        Some(TokenKind::Identifier(name)) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+fn initializer_conflicts(tokens: &[SpannedToken], expected: &str) -> bool {
+    let Some(equal) = tokens
+        .iter()
+        .position(|token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="))
+    else {
+        return false;
+    };
+    match tokens.get(equal + 1).map(|token| &token.kind) {
+        Some(TokenKind::String(_) | TokenKind::RawString(_) | TokenKind::TextBlock(_)) => {
+            expected == "num"
+        }
+        Some(TokenKind::Number(_)) => expected == "text",
+        _ => false,
+    }
+}
+
+fn nearest_declared_type<'a>(
+    name: &str,
+    owner: &str,
+    declarations: &'a HashMap<String, Vec<(String, String)>>,
+) -> Option<&'a str> {
+    declarations
+        .get(name)?
+        .iter()
+        .filter(|(candidate, _)| owner == candidate || owner.starts_with(&format!("{candidate}/")))
+        .max_by_key(|(candidate, _)| candidate.len())
+        .map(|(_, expected)| expected.as_str())
+}
+
+fn lint_typed_local_new_assignments(
+    file: &dm_project::ProjectFile,
+    definition: &dm_syntax::Definition,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut local_types = HashMap::new();
+    for line in &definition.body {
+        if let Some((name, _, Some(type_path))) = local_declaration(&line.tokens) {
+            local_types.insert(name, type_path);
+        }
+        for (index, token) in line.tokens.iter().enumerate() {
+            let TokenKind::Identifier(name) = &token.kind else {
+                continue;
+            };
+            let Some(expected) = local_types.get(name) else {
+                continue;
+            };
+            if !matches!(line.tokens.get(index + 1).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "=")
+                || !matches!(line.tokens.get(index + 2).map(|token| &token.kind), Some(TokenKind::Identifier(word)) if word == "new")
+                || !matches!(line.tokens.get(index + 3).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "/")
+            {
+                continue;
+            }
+            let Some(TokenKind::Identifier(actual)) =
+                line.tokens.get(index + 4).map(|token| &token.kind)
+            else {
+                continue;
+            };
+            if expected != &format!("/{actual}")
+                && !format!("/{actual}").starts_with(&format!("{expected}/"))
+            {
+                push_variable_type_diagnostic(
+                    file,
+                    token.span,
+                    DiagnosticKind::InvalidVarType,
+                    "new path conflicts with local variable type",
+                    diagnostics,
+                );
+            }
+        }
+    }
+}
+
+fn push_variable_type_diagnostic(
+    file: &dm_project::ProjectFile,
+    span: SourceSpan,
+    kind: DiagnosticKind,
+    message: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    diagnostics.push(Diagnostic {
+        kind,
+        severity: DiagnosticSeverity::Warning,
+        message: message.to_owned(),
+        location: Some(DiagnosticLocation {
+            file_id: file.id,
+            path: file.path.clone(),
+            span: Some(file.original_span(span)),
+        }),
+        related: None,
+    });
+}
+
+fn reference_operator_diagnostics(
+    file: &dm_project::ProjectFile,
+    syntax: &SyntaxFile,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for definition in &syntax.definitions {
+        if !matches!(
+            definition.kind,
+            dm_syntax::DefinitionKind::Procedure
+                | dm_syntax::DefinitionKind::ProcedureOverride
+                | dm_syntax::DefinitionKind::Verb
+        ) {
+            continue;
+        }
+        let mut untyped = HashSet::new();
+        let mut local_types = HashMap::new();
+        for line in &definition.body {
+            if let Some((name, _, type_path)) = local_declaration(&line.tokens) {
+                if let Some(type_path) = type_path {
+                    local_types.insert(name, type_path);
+                } else {
+                    untyped.insert(name);
+                }
+            }
+            for (index, token) in line.tokens.iter().enumerate() {
+                let TokenKind::Identifier(name) = &token.kind else {
+                    continue;
+                };
+                if untyped.contains(name)
+                    && matches!(line.tokens.get(index + 1).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == ".")
+                {
+                    push_reference_diagnostic(
+                        file,
+                        token.span,
+                        DiagnosticKind::UntypedDereference,
+                        DiagnosticSeverity::Error,
+                        "typed member access requires a statically typed value",
+                        &mut diagnostics,
+                    );
+                }
+                if local_types.get(name).is_some_and(|path| path == "/datum")
+                    && matches!(
+                        line.tokens.get(index + 1).map(|token| &token.kind),
+                        Some(TokenKind::Punctuation('['))
+                    )
+                {
+                    push_reference_diagnostic(
+                        file,
+                        token.span,
+                        DiagnosticKind::InvalidIndexOperation,
+                        DiagnosticSeverity::Warning,
+                        "plain datum values cannot be indexed",
+                        &mut diagnostics,
+                    );
+                }
+            }
+            for token in &line.tokens {
+                if matches!(&token.kind, TokenKind::Operator(operator) if operator == ":") {
+                    push_reference_diagnostic(
+                        file,
+                        token.span,
+                        DiagnosticKind::RuntimeSearchOperator,
+                        DiagnosticSeverity::Warning,
+                        "runtime-search operator defers member validation until runtime",
+                        &mut diagnostics,
+                    );
+                }
+            }
+        }
+    }
+    diagnostics
+}
+
+fn push_reference_diagnostic(
+    file: &dm_project::ProjectFile,
+    span: SourceSpan,
+    kind: DiagnosticKind,
+    severity: DiagnosticSeverity,
+    message: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    diagnostics.push(Diagnostic {
+        kind,
+        severity,
+        message: message.to_owned(),
+        location: Some(DiagnosticLocation {
+            file_id: file.id,
+            path: file.path.clone(),
+            span: Some(file.original_span(span)),
+        }),
+        related: None,
+    });
+}
+
+fn const_write_diagnostics(file: &dm_project::ProjectFile, syntax: &SyntaxFile) -> Vec<Diagnostic> {
+    let mut global_consts = HashSet::new();
+    let mut field_consts: HashMap<String, HashSet<String>> = HashMap::new();
+    for definition in &syntax.definitions {
+        if !definition
+            .header
+            .iter()
+            .any(|token| matches!(&token.kind, TokenKind::Identifier(name) if name == "const"))
+        {
+            continue;
+        }
+        let segments = definition.path.segments();
+        let Some(name) = segments.last().cloned() else {
+            continue;
+        };
+        if segments.first().is_some_and(|segment| segment == "var") {
+            global_consts.insert(name);
+        } else if let Some(var_index) = segments.iter().position(|segment| segment == "var") {
+            let owner = format!("/{}", segments[..var_index].join("/"));
+            field_consts.entry(owner).or_default().insert(name);
+        }
+    }
+
+    let mut diagnostics = Vec::new();
+    for definition in &syntax.definitions {
+        if !matches!(
+            definition.kind,
+            dm_syntax::DefinitionKind::Procedure
+                | dm_syntax::DefinitionKind::ProcedureOverride
+                | dm_syntax::DefinitionKind::Verb
+        ) {
+            continue;
+        }
+        let mut locals = HashSet::new();
+        let mut local_types = HashMap::new();
+        for line in &definition.body {
+            if let Some((name, is_const, type_path)) = local_declaration(&line.tokens) {
+                if is_const {
+                    locals.insert(name.clone());
+                }
+                if let Some(type_path) = type_path {
+                    local_types.insert(name, type_path);
+                }
+            }
+            lint_const_writes(
+                file,
+                &line.tokens,
+                &locals,
+                &local_types,
+                &global_consts,
+                &field_consts,
+                &mut diagnostics,
+            );
+        }
+    }
+    diagnostics
+}
+
+fn local_declaration(tokens: &[SpannedToken]) -> Option<(String, bool, Option<String>)> {
+    let var_index = tokens
+        .iter()
+        .position(|token| matches!(&token.kind, TokenKind::Identifier(name) if name == "var"))?;
+    let mut segments = Vec::new();
+    let mut index = var_index + 1;
+    while index + 1 < tokens.len()
+        && matches!(&tokens[index].kind, TokenKind::Operator(operator) if operator == "/")
+    {
+        let TokenKind::Identifier(segment) = &tokens[index + 1].kind else {
+            break;
+        };
+        segments.push(segment.clone());
+        index += 2;
+    }
+    let name = segments.last()?.clone();
+    let is_const = segments.iter().any(|segment| segment == "const");
+    let type_segments: Vec<_> = segments[..segments.len() - 1]
+        .iter()
+        .filter(|segment| {
+            !matches!(
+                segment.as_str(),
+                "const" | "static" | "global" | "tmp" | "final"
+            )
+        })
+        .cloned()
+        .collect();
+    // BYOND's suffix array declaration syntax (`var/name[]`, `var/name[5]`,
+    // and typed variants) declares a list value even though `list` is not a
+    // path segment before the variable name.
+    let is_array = matches!(
+        tokens.get(index).map(|token| &token.kind),
+        Some(TokenKind::Punctuation('['))
+    );
+    let type_path = if is_array {
+        Some("/list".to_owned())
+    } else {
+        (!type_segments.is_empty()).then(|| format!("/{}", type_segments.join("/")))
+    };
+    Some((name, is_const, type_path))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lint_const_writes(
+    file: &dm_project::ProjectFile,
+    tokens: &[SpannedToken],
+    locals: &HashSet<String>,
+    local_types: &HashMap<String, String>,
+    globals: &HashSet<String>,
+    fields: &HashMap<String, HashSet<String>>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    const ASSIGNMENTS: &[&str] = &[
+        "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "&&=", "||=", "%%=",
+        "**=",
+    ];
+    for (index, token) in tokens.iter().enumerate() {
+        let TokenKind::Identifier(name) = &token.kind else {
+            continue;
+        };
+        let declaration = tokens[..index]
+            .iter()
+            .any(|token| matches!(&token.kind, TokenKind::Identifier(word) if word == "var"));
+        let assigned = tokens.get(index + 1).is_some_and(|token| matches!(&token.kind, TokenKind::Operator(operator) if ASSIGNMENTS.contains(&operator.as_str())));
+        let loop_write = tokens.get(index + 1).is_some_and(
+            |token| matches!(&token.kind, TokenKind::Identifier(word) if word == "in"),
+        ) && tokens[..index]
+            .iter()
+            .any(|token| matches!(&token.kind, TokenKind::Identifier(word) if word == "for"));
+        let bare_const = !declaration
+            && (assigned || loop_write)
+            && (locals.contains(name) || globals.contains(name));
+        let field_const = assigned
+            && index >= 2
+            && matches!(&tokens[index - 1].kind, TokenKind::Operator(operator) if operator == ".")
+            && matches!(&tokens[index - 2].kind, TokenKind::Identifier(receiver) if local_types.get(receiver).is_some_and(|owner| fields.get(owner).is_some_and(|names| names.contains(name))));
+        if bare_const || field_const {
+            diagnostics.push(Diagnostic {
+                kind: DiagnosticKind::WriteToConstant,
+                severity: DiagnosticSeverity::Error,
+                message: format!("cannot write to constant {name}"),
+                location: Some(DiagnosticLocation {
+                    file_id: file.id,
+                    path: file.path.clone(),
+                    span: Some(file.original_span(token.span)),
+                }),
+                related: None,
+            });
+        }
     }
 }
 
@@ -394,15 +1518,16 @@ fn readonly_member_diagnostics(
     syntax: &SyntaxFile,
 ) -> Vec<Diagnostic> {
     const ASSIGNMENTS: &[&str] = &[
-        "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "&&=",
-        "||=", "%%=", "**=",
+        "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "&&=", "||=", "%%=",
+        "**=",
     ];
     let mut diagnostics = Vec::new();
     for definition in &syntax.definitions {
         for line in &definition.body {
             for window in line.tokens.windows(3) {
                 let member_access = matches!(&window[0].kind, TokenKind::Operator(operator) if matches!(operator.as_str(), "." | "?." | ":" | "?:"));
-                let readonly = matches!(&window[1].kind, TokenKind::Identifier(name) if name == "type");
+                let readonly =
+                    matches!(&window[1].kind, TokenKind::Identifier(name) if name == "type");
                 let assignment = matches!(&window[2].kind, TokenKind::Operator(operator) if ASSIGNMENTS.contains(&operator.as_str()));
                 if !(member_access && readonly && assignment) {
                     continue;
@@ -623,6 +1748,79 @@ fn builtin_arity_diagnostics(
         }
     }
     diagnostics
+}
+
+fn nameof_diagnostics(file: &dm_project::ProjectFile, syntax: &SyntaxFile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for definition in &syntax.definitions {
+        if !matches!(
+            definition.kind,
+            dm_syntax::DefinitionKind::Procedure
+                | dm_syntax::DefinitionKind::ProcedureOverride
+                | dm_syntax::DefinitionKind::Verb
+        ) {
+            continue;
+        }
+        let segments = definition.path.segments();
+        let global_context = segments
+            .iter()
+            .position(|segment| matches!(segment.as_str(), "proc" | "verb"))
+            .is_some_and(|index| index == 0);
+        for line in &definition.body {
+            let mut index = 0usize;
+            while index + 1 < line.tokens.len() {
+                if !matches!(&line.tokens[index].kind, TokenKind::Identifier(name) if name == "nameof")
+                    || line.tokens[index + 1].kind != TokenKind::Punctuation('(')
+                {
+                    index += 1;
+                    continue;
+                }
+                let Some((close, arguments)) = call_arguments(&line.tokens, index + 1) else {
+                    index += 1;
+                    continue;
+                };
+                let valid =
+                    arguments.len() == 1 && valid_nameof_target(arguments[0], global_context);
+                if !valid {
+                    let span =
+                        SourceSpan::new(line.tokens[index].span.start, line.tokens[close].span.end);
+                    push_reference_diagnostic(
+                        file,
+                        span,
+                        DiagnosticKind::InvalidNameofTarget,
+                        DiagnosticSeverity::Error,
+                        "nameof() requires a variable, member, procedure reference, or type path",
+                        &mut diagnostics,
+                    );
+                }
+                index = close + 1;
+            }
+        }
+    }
+    diagnostics
+}
+
+fn valid_nameof_target(tokens: &[SpannedToken], global_context: bool) -> bool {
+    if tokens.len() == 1 {
+        return matches!(&tokens[0].kind, TokenKind::Identifier(name) if name != "__TYPE__" || !global_context);
+    }
+    let path = matches!(tokens.first().map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "/");
+    if path {
+        return tokens.iter().enumerate().all(|(index, token)| {
+            if index % 2 == 0 {
+                matches!(&token.kind, TokenKind::Operator(operator) if operator == "/")
+            } else {
+                matches!(&token.kind, TokenKind::Identifier(_))
+            }
+        });
+    }
+    tokens.iter().enumerate().all(|(index, token)| {
+        if index % 2 == 0 {
+            matches!(&token.kind, TokenKind::Identifier(_))
+        } else {
+            matches!(&token.kind, TokenKind::Operator(operator) if operator == ".")
+        }
+    })
 }
 
 fn lint_builtin_arities(
@@ -1598,6 +2796,414 @@ mod tests {
     }
 
     #[test]
+    fn validates_typed_variable_initialization_overrides_and_new_paths() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            concat!(
+                "#pragma InvalidVarType error\n",
+                "/datum/base\n",
+                "\tvar/value = 5 as num\n",
+                "\tvar/optional = null as num\n",
+                "\tvar/text_value = \"ok\" as text\n",
+                "/datum/base/child\n",
+                "\tvalue = \"bad\"\n",
+                "/proc/run()\n",
+                "\tvar/turf/location\n",
+                "\tlocation = new /obj\n",
+                "\tvar/obj/item\n",
+                "\titem = new /obj\n",
+            ),
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("typed variable diagnostics should be recoverable");
+
+        assert_eq!(
+            compilation
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.kind == DiagnosticKind::InvalidVarType)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn validates_typed_untyped_index_and_runtime_search_reference_operators() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            concat!(
+                "#pragma InvalidIndexOperation error\n",
+                "#pragma RuntimeSearchOperator error\n",
+                "/proc/run()\n",
+                "\tvar/untyped = new /obj\n",
+                "\tvar/datum/plain = new\n",
+                "\tvar/list/items = list()\n",
+                "\tvar/obj/typed = new\n",
+                "\tuntyped.value\n",
+                "\tplain[\"key\"]\n",
+                "\ttyped:dynamic_proc()\n",
+                "\ttyped.value\n",
+                "\titems[1]\n",
+            ),
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("reference diagnostics should be recoverable");
+
+        for kind in [
+            DiagnosticKind::UntypedDereference,
+            DiagnosticKind::InvalidIndexOperation,
+            DiagnosticKind::RuntimeSearchOperator,
+        ] {
+            assert_eq!(
+                compilation
+                    .diagnostics()
+                    .iter()
+                    .filter(|diagnostic| diagnostic.kind == kind)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn suffix_array_declarations_are_statically_lists() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            concat!(
+                "/proc/run()\n",
+                "\tvar/untyped = new /obj\n",
+                "\tvar/array[5]\n",
+                "\tvar/datum/typed_array[]\n",
+                "\tuntyped.value\n",
+                "\tarray.len\n",
+                "\ttyped_array.len\n",
+            ),
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("array declarations should compile");
+
+        assert_eq!(
+            compilation
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.kind == DiagnosticKind::UntypedDereference)
+                .count(),
+            1,
+            "only the genuinely untyped value should be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_undefined_local_type_paths_without_flagging_real_types() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            concat!(
+                "/datum/known\n",
+                "/datum/holder\n",
+                "\tvar/datum/missing/field\n",
+                "/proc/run()\n",
+                "\tvar/datum/absent/bad\n",
+                "\tvar/datum/known/good\n",
+                "\tvar/obj/builtin\n",
+            ),
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("undefined type diagnostics should be recoverable");
+
+        let diagnostics = compilation
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.kind == DiagnosticKind::UndefinedType)
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 2);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("/datum/missing"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("/datum/absent"))
+        );
+    }
+
+    #[test]
+    fn enforces_inherited_variable_modifiers() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            concat!(
+                "/datum\n",
+                "\tvar/final/final_value = 1\n",
+                "\tvar/ordinary = 1\n",
+                "/datum/child\n",
+                "\tfinal_value = 2\n",
+                "\tordinary = 2\n",
+                "/atom/var/a = 5\n",
+                "/atom/const/a = 4\n",
+                "/datum/var/const/global_value = 5\n",
+                "/turf/global_value = 4\n",
+            ),
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("modifier diagnostics should be recoverable");
+
+        for kind in [
+            DiagnosticKind::FinalVariableOverride,
+            DiagnosticKind::ConflictingVariableModifier,
+            DiagnosticKind::GlobalVariableReinitialization,
+        ] {
+            assert_eq!(
+                compilation
+                    .diagnostics()
+                    .iter()
+                    .filter(|diagnostic| diagnostic.kind == kind)
+                    .count(),
+                1,
+                "expected exactly one {kind:?} diagnostic"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_nameof_targets_by_syntax_and_scope() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            concat!(
+                "/datum/proc/scoped()\n",
+                "\tnameof(__TYPE__)\n",
+                "\tnameof(src.name)\n",
+                "/proc/run()\n",
+                "\tvar/list/items = list()\n",
+                "\tnameof(__TYPE__)\n",
+                "\tnameof(items[1])\n",
+                "\tnameof(items)\n",
+                "\tnameof(/datum)\n",
+                "\tnameof(/proc/run)\n",
+            ),
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("nameof diagnostics should be recoverable");
+
+        assert_eq!(
+            compilation
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.kind == DiagnosticKind::InvalidNameofTarget)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn rejects_cyclic_and_runtime_constant_initializers() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            concat!(
+                "var/const/A = B\n",
+                "var/const/B = A\n",
+                "/proc/runtime_value()\n",
+                "\treturn 1\n",
+                "var/const/bad_call = rgb(runtime_value(), 0, 0)\n",
+                "var/const/good_call = rgb(1, 2, 3)\n",
+                "/proc/run(var/datum/item)\n",
+                "\tvar/static/bad_static = item.type\n",
+                "\tvar/static/good_static = /datum\n",
+            ),
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("constant diagnostics should be recoverable");
+
+        assert_eq!(
+            compilation
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.kind == DiagnosticKind::InvalidConstantInitializer
+                })
+                .count(),
+            4,
+            "two cycle members, one runtime call, and one local static initializer"
+        );
+    }
+
+    #[test]
+    fn validates_resource_literals_and_weighted_pick_weights() {
+        let fixture = TestProject::new();
+        fixture.write("asset.txt", "available");
+        fixture.write(
+            "world.dme",
+            concat!(
+                "/proc/run()\n",
+                "\tvar/weight = 50\n",
+                "\tvar/good_resource = 'asset.txt'\n",
+                "\tvar/bad_resource = 'missing.txt'\n",
+                "\tvar/good_pick = pick(weight; 1, 20; 2)\n",
+                "\tvar/bad_pick = pick(prob(50); 1)\n",
+            ),
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("resource and pick diagnostics should be recoverable");
+
+        for kind in [
+            DiagnosticKind::MissingResource,
+            DiagnosticKind::InvalidWeightedPick,
+        ] {
+            assert_eq!(
+                compilation
+                    .diagnostics()
+                    .iter()
+                    .filter(|diagnostic| diagnostic.kind == kind)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_preprocessed_paths_comments_and_return_type_redefinitions() {
+        let macro_fixture = TestProject::new();
+        macro_fixture.write(
+            "world.dme",
+            "#define NAME 1\nvar/const/NAME = 5\n/proc/run()\n\tvar/const/NAME = 6\n",
+        );
+        let macro_compilation = CompilerDatabase::new()
+            .compile(macro_fixture.path("world.dme"))
+            .expect("expanded path diagnostics should be recoverable");
+        assert_eq!(
+            macro_compilation
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.kind == DiagnosticKind::InvalidExpandedDeclarationPath
+                })
+                .count(),
+            2
+        );
+
+        let comment_fixture = TestProject::new();
+        comment_fixture.write(
+            "world.dme",
+            "/*\n/*\n*/\n*/\n/*\n// */\n/proc/run()\n\treturn\n",
+        );
+        let comment_compilation = CompilerDatabase::new()
+            .compile(comment_fixture.path("world.dme"))
+            .expect("comment diagnostics should be recoverable");
+        assert!(
+            comment_compilation.diagnostics().iter().any(|diagnostic| {
+                diagnostic.kind == DiagnosticKind::Syntax
+                    && diagnostic.message.starts_with("unterminated block comment")
+            }),
+            "diagnostics: {:?}",
+            comment_compilation.diagnostics()
+        );
+
+        let return_fixture = TestProject::new();
+        return_fixture.write(
+            "world.dme",
+            concat!(
+                "/datum/proc/value() as num\n",
+                "\treturn 1\n",
+                "/datum/child/value() as text\n",
+                "\treturn \"bad\"\n",
+                "/datum/valid/value()\n",
+                "\treturn \"inherited annotation\"\n",
+            ),
+        );
+        let return_compilation = CompilerDatabase::new()
+            .compile(return_fixture.path("world.dme"))
+            .expect("return override diagnostics should be recoverable");
+        assert_eq!(
+            return_compilation
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.kind == DiagnosticKind::ReturnTypeRedefinition)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn runtime_search_lint_is_disabled_without_pragma() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            "/proc/run(obj/value)\n\tvalue:dynamic_proc()\n",
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("disabled lint should compile");
+
+        assert!(
+            compilation
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.kind != DiagnosticKind::RuntimeSearchOperator)
+        );
+    }
+
+    #[test]
+    fn rejects_const_writes_and_loop_reuse_without_flagging_initializers() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            concat!(
+                "var/const/global_value = 1\n",
+                "/obj/var/const/fixed = 2\n",
+                "/obj/var/mutable = 3\n",
+                "/datum/var/fixed = 4\n",
+                "/proc/run()\n",
+                "\tvar/const/local_value = 5\n",
+                "\tglobal_value = 2\n",
+                "\tlocal_value = 6\n",
+                "\tfor(local_value in 1 to 3)\n",
+                "\t\treturn\n",
+                "\tvar/obj/object = new\n",
+                "\tobject.fixed = 7\n",
+                "\tobject.mutable = 8\n",
+                "\tvar/datum/other = new\n",
+                "\tother.fixed = 9\n",
+            ),
+        );
+
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("constant diagnostics should be recoverable");
+        assert_eq!(
+            compilation
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.kind == DiagnosticKind::WriteToConstant)
+                .count(),
+            4
+        );
+    }
+
+    #[test]
     fn rejects_type_member_writes_without_rejecting_reads_or_mutable_members() {
         let fixture = TestProject::new();
         fixture.write(
@@ -1622,11 +3228,13 @@ mod tests {
             .collect();
 
         assert_eq!(diagnostics.len(), 2);
-        assert!(
-            diagnostics
-                .iter()
-                .all(|diagnostic| diagnostic.location.as_ref().and_then(|item| item.span).is_some())
-        );
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic
+                .location
+                .as_ref()
+                .and_then(|item| item.span)
+                .is_some()
+        }));
     }
 
     #[test]

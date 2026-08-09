@@ -4,21 +4,23 @@
 
 mod builtins;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use builtins::{
-    execute_list_binary_operator, execute_list_compound_operator, execute_list_method,
-    execute_standard_builtin, is_subtype, standard_builtin_arity,
+    execute_external_call, execute_list_binary_operator, execute_list_compound_operator,
+    execute_list_method, execute_output, execute_standard_builtin, is_subtype,
+    standard_builtin_arity,
 };
 
 use dm_core::{DmNumberBits, SourceSpan};
-use dm_lexer::{SpannedToken, TokenKind};
+use dm_lexer::{SpannedToken, TokenKind, lex};
 use dm_syntax::{Definition, DefinitionKind, SourceLine};
 pub use dm_value::Value;
-use dm_value::{DatumId, FieldName, ListId, TypePath, ValueError, ValueHeap};
+use dm_value::{DatumId, FieldName, ListId, ModifiedTypePath, TypePath, ValueError, ValueHeap};
 
 /// One instruction in the portable reference bytecode.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,6 +33,11 @@ pub enum Instruction {
     PushText(String),
     /// Pushes a canonical absolute DM type path.
     PushTypePath(TypePath),
+    /// Builds a first-class modified type path from evaluated override values.
+    MakeModifiedTypePath {
+        /// Override field names in source order.
+        fields: Arc<[FieldName]>,
+    },
     /// Pops constructor arguments followed by a type path, allocates a datum,
     /// and pushes its stable handle. Constructor dispatch is intentionally
     /// deferred to the lifecycle layer; this establishes allocation identity.
@@ -66,6 +73,11 @@ pub enum Instruction {
         /// Number of constructor arguments.
         argument_count: u8,
     },
+    /// Constructs BYOND's built-in three-component `/vector` datum.
+    MakeVector {
+        /// Number of constructor arguments (zero through three).
+        argument_count: u8,
+    },
     /// Replaces every matching text fragment in a bounded 1-based region.
     ///
     /// This implements the `replacetext` builtin family. `exact` selects
@@ -93,6 +105,34 @@ pub enum Instruction {
         /// Number of already-evaluated arguments.
         argument_count: u16,
     },
+    /// Calls an engine-native method on the current `src` datum.
+    NativeSrcMethod {
+        /// BYOND method selector.
+        name: String,
+        /// Positional argument count.
+        argument_count: u16,
+    },
+    /// Sends a value to a file/log/output destination.
+    Output,
+    /// Invokes a function exported by an external BYOND-compatible library.
+    /// Headless execution reports that no external-call host is installed.
+    ExternalCall {
+        /// Number of call arguments following the library and function selectors.
+        argument_count: u16,
+    },
+    /// Applies one headless `animate()` step. Named appearance variables are
+    /// retained because their names are part of the procedure's semantics.
+    Animate {
+        /// Name of each argument, or `None` for a positional argument.
+        argument_names: Vec<Option<String>>,
+    },
+    /// Constructs a `/dm_filter` while retaining keyword property names.
+    MakeFilter {
+        /// Name of each argument, or `None` for a positional argument.
+        argument_names: Vec<Option<String>>,
+        /// Source argument positions supplied through `arglist()`.
+        expanded_indices: Vec<u16>,
+    },
     /// Reads a field's compile-time initial value from a datum or type path.
     InitialField(FieldName),
     /// Enumerates every materialized turf in an inclusive 3D rectangular block.
@@ -103,6 +143,11 @@ pub enum Instruction {
     /// Produces a deterministic pseudo-random integer in an inclusive range.
     Rand {
         /// Number of supplied bounds (one or two).
+        argument_count: u8,
+    },
+    /// Rolls one or more dice using BYOND's numeric or `NdS+offset` forms.
+    Roll {
+        /// Number of supplied arguments (one or two).
         argument_count: u8,
     },
     /// Selects one deterministic pseudo-random candidate, optionally using
@@ -132,6 +177,8 @@ pub enum Instruction {
     /// `y`, and `z` fields, so this instruction searches the live turf set
     /// deterministically rather than requiring a renderer or map facade.
     GetStep,
+    /// Returns the adjacent turf in the direction of a target atom.
+    GetStepTowards,
     /// Returns every materialized atom in BYOND tile range around a center.
     ///
     /// Range uses Chebyshev distance and includes the center tile.  The
@@ -164,6 +211,8 @@ pub enum Instruction {
     ///
     /// Values retain their original source order in 1-based list positions.
     MakeList(u16),
+    /// Allocates a suffix-declared DM array from evaluated dimension sizes.
+    MakeArray(u8),
     /// Allocates the current procedure's implicit `args` list.
     ///
     /// The list contains every value supplied to this call in positional
@@ -171,6 +220,8 @@ pub enum Instruction {
     MakeArgs,
     /// Builds a list whose positional values and associative keys may intermix.
     MakeListEntries(Vec<ListEntryKind>),
+    /// Builds a BYOND `/alist`, whose constructor entries are key/value pairs.
+    MakeAssociativeListEntries(Vec<ListEntryKind>),
     /// Pops a numeric 1-based index and a list handle, then pushes the entry.
     IndexList,
     /// Pops a value, index/key, and list handle and updates that list.
@@ -189,8 +240,14 @@ pub enum Instruction {
     StoreLocal(u16),
     /// Pushes the current frame's `src` value.
     LoadSrc,
+    /// Pops and replaces the current frame's `src` value.
+    StoreSrc,
     /// Pushes the current frame's `usr` value.
     LoadUsr,
+    /// Pops and replaces the current frame's `usr` value.
+    StoreUsr,
+    /// Pushes a `/callee` snapshot for the calling frame, or null at the root.
+    LoadCaller,
     /// Pops a datum receiver and pushes one named field.
     LoadField(FieldName),
     /// Pops a value and datum receiver, then writes one named field.
@@ -199,6 +256,10 @@ pub enum Instruction {
     StoreFieldKeep(FieldName),
     /// Pushes one persistent runtime global.
     LoadGlobal(FieldName),
+    /// Pushes BYOND's live associative `global.vars` namespace.
+    LoadGlobalVars,
+    /// Pushes the declaration-time value of a persistent global/static slot.
+    LoadInitialGlobal(FieldName),
     /// Pops and stores one persistent runtime global.
     StoreGlobal(FieldName),
     /// Mutates a local by one and pushes either its old or new value.
@@ -381,6 +442,10 @@ pub enum Instruction {
     CallDynamic {
         /// Number of positional values supplied by the caller.
         argument_count: u16,
+        /// Whether a null receiver denotes the global `/proc` namespace.
+        /// This is true only for the one-selector `call(proc)(...)` form;
+        /// ordinary `datum.proc(...)` calls must diagnose a null datum.
+        null_receiver_is_global: bool,
     },
     /// Expands `arglist(list)` entries in a pending call argument vector.
     ///
@@ -501,7 +566,7 @@ pub enum InitializerBinding {
 }
 
 /// Stable procedure identity within one compiled module.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProcedureId(u32);
 
 impl ProcedureId {
@@ -519,6 +584,9 @@ impl ProcedureId {
 /// A compiled procedure body.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Program {
+    /// Whether callers wait when this procedure's call chain sleeps.
+    /// `set waitfor = FALSE` clears this flag.
+    pub wait_for: bool,
     /// Declared positional parameter count.
     pub parameter_count: usize,
     /// Number of local slots, including parameters.
@@ -535,6 +603,18 @@ pub struct Module {
     procedures: Vec<Program>,
     paths: Vec<String>,
     names: HashMap<String, ProcedureId>,
+    deferred: HashMap<ProcedureId, DeferredProcedure>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeferredProcedure {
+    definition: Definition,
+    targets: HashMap<String, ProcedureId>,
+    src_fields: BTreeMap<String, FieldName>,
+    global_fields: BTreeMap<String, FieldName>,
+    global_types: BTreeMap<String, TypePath>,
+    preflight_error: Option<CompileError>,
+    compiled: OnceLock<Result<Program, CompileError>>,
 }
 
 /// An initializer expression linked as an entry point in a VM module.
@@ -559,6 +639,30 @@ impl InitializerProgram {
 }
 
 impl Module {
+    fn resolve_procedure(&self, procedure: ProcedureId) -> Result<&Program, String> {
+        if let Some(deferred) = self.deferred.get(&procedure) {
+            return deferred
+                .compiled
+                .get_or_init(|| {
+                    if let Some(error) = &deferred.preflight_error {
+                        return Err(error.clone());
+                    }
+                    compile_procedure_with_resolver_and_fields(
+                        &deferred.definition,
+                        &deferred.targets,
+                        &deferred.src_fields,
+                        &deferred.global_fields,
+                        &deferred.global_types,
+                    )
+                })
+                .as_ref()
+                .map_err(|error| error.message.clone());
+        }
+        self.procedures
+            .get(procedure.index())
+            .ok_or_else(|| format!("invalid procedure {}", procedure.index()))
+    }
+
     /// Looks up a procedure by canonical path, such as `/proc/main`.
     #[must_use]
     pub fn procedure_id(&self, path: &str) -> Option<ProcedureId> {
@@ -568,7 +672,22 @@ impl Module {
     /// Returns a compiled procedure by module-local identity.
     #[must_use]
     pub fn procedure(&self, procedure: ProcedureId) -> Option<&Program> {
-        self.procedures.get(procedure.index())
+        self.resolve_procedure(procedure).ok()
+    }
+
+    /// Number of symbolically linked procedure bodies not compiled eagerly.
+    #[must_use]
+    pub fn deferred_procedure_count(&self) -> usize {
+        self.deferred.len()
+    }
+
+    /// Number of deferred bodies materialized by execution or inspection.
+    #[must_use]
+    pub fn materialized_deferred_procedure_count(&self) -> usize {
+        self.deferred
+            .values()
+            .filter(|procedure| procedure.compiled.get().is_some())
+            .count()
     }
 
     /// Returns the canonical path associated with a procedure.
@@ -656,6 +775,19 @@ impl fmt::Display for RuntimeError {
         if let Some(span) = self.source_span {
             write!(formatter, " (source {}..{})", span.start, span.end)?;
         }
+        if !self.call_stack.is_empty() {
+            formatter.write_str("\ncall stack:")?;
+            for trace in self.call_stack.iter().rev() {
+                write!(
+                    formatter,
+                    "\n  {} at instruction {}",
+                    trace.procedure, trace.instruction
+                )?;
+                if let Some(span) = trace.source_span {
+                    write!(formatter, " (source {}..{})", span.start, span.end)?;
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -693,20 +825,34 @@ pub fn compile_initializer(
     bindings: &BTreeMap<String, InitializerBinding>,
     procedures: Option<&Module>,
 ) -> Result<InitializerProgram, CompileError> {
-    let mut expression = ExpressionParser::new(tokens).parse()?;
-    bind_initializer_expression(&mut expression, bindings)?;
-
     let mut module = procedures.cloned().unwrap_or_else(|| Module {
         procedures: Vec::new(),
         paths: Vec::new(),
         names: HashMap::new(),
+        deferred: HashMap::new(),
     });
+    let entry = compile_initializer_into_module(tokens, bindings, &mut module)?;
+    Ok(InitializerProgram { module, entry })
+}
+
+/// Appends one initializer entry point to an existing linked module without
+/// cloning or recompiling its project procedures.
+pub fn compile_initializer_into_module(
+    tokens: &[SpannedToken],
+    bindings: &BTreeMap<String, InitializerBinding>,
+    module: &mut Module,
+) -> Result<ProcedureId, CompileError> {
+    let mut expression = ExpressionParser::new(tokens).parse()?;
+    bind_initializer_expression(&mut expression, bindings)?;
     let mut call_names = HashMap::new();
     for (path, procedure) in &module.names {
         if let Some(name) = path.strip_prefix("/proc/")
             && !name.contains('/')
         {
-            call_names.insert(name.to_owned(), *procedure);
+            call_names.insert(
+                name.split('@').next().unwrap_or(name).to_owned(),
+                *procedure,
+            );
         }
     }
     let mut instructions = Vec::new();
@@ -722,6 +868,7 @@ pub fn compile_initializer(
         _ => return Err(compile_error("expected an initializer expression")),
     };
     let program = Program {
+        wait_for: true,
         parameter_count: 0,
         local_count: 0,
         source_spans: vec![source_span; instructions.len()],
@@ -730,7 +877,7 @@ pub fn compile_initializer(
     let entry = ProcedureId::from_index(module.procedures.len())?;
     module.procedures.push(program);
     module.paths.push("<initializer>".to_owned());
-    Ok(InitializerProgram { module, entry })
+    Ok(entry)
 }
 
 /// Compiles a deterministic module from procedure definitions in source order.
@@ -744,6 +891,16 @@ pub fn compile_initializer(
 /// Returns [`CompileError`] when a definition is not executable, a canonical
 /// procedure path is duplicated, or any procedure body cannot be compiled.
 pub fn compile_module(definitions: &[Definition]) -> Result<Module, CompileError> {
+    compile_module_with_global_fields(definitions, &BTreeMap::new())
+}
+
+/// Compiles a module with an explicit registry of bare global variable names.
+/// This is useful for syntax-only consumers that retain procedure definitions
+/// separately from the declaration tree while preserving strict name checks.
+pub fn compile_module_with_global_fields(
+    definitions: &[Definition],
+    global_fields: &BTreeMap<String, FieldName>,
+) -> Result<Module, CompileError> {
     let mut names = HashMap::new();
     let mut call_names = HashMap::new();
     let mut paths = Vec::with_capacity(definitions.len());
@@ -777,12 +934,21 @@ pub fn compile_module(definitions: &[Definition]) -> Result<Module, CompileError
 
     let procedures = definitions
         .iter()
-        .map(|definition| compile_procedure_with_resolver(definition, &call_names))
+        .map(|definition| {
+            compile_procedure_with_resolver_and_fields(
+                definition,
+                &call_names,
+                &BTreeMap::new(),
+                global_fields,
+                &BTreeMap::new(),
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Module {
         procedures,
         paths,
         names,
+        deferred: HashMap::new(),
     })
 }
 
@@ -800,6 +966,21 @@ pub fn compile_module(definitions: &[Definition]) -> Result<Module, CompileError
 /// Returns [`CompileError`] for duplicate paths, invalid parent indices, or
 /// procedure bodies outside the supported executable subset.
 pub fn compile_module_specs(specs: &[ProcedureSpec<'_>]) -> Result<Module, CompileError> {
+    let global_types = vec![BTreeMap::new(); specs.len()];
+    compile_module_specs_with_global_types(specs, &global_types)
+}
+
+/// Compiles procedure specs with declared global types used to infer bare
+/// `new` expressions from their assignment destinations.
+pub fn compile_module_specs_with_global_types(
+    specs: &[ProcedureSpec<'_>],
+    global_types: &[BTreeMap<String, TypePath>],
+) -> Result<Module, CompileError> {
+    if specs.len() != global_types.len() {
+        return Err(compile_error(
+            "procedure spec/global type table length mismatch",
+        ));
+    }
     let mut names = HashMap::new();
     let mut paths = Vec::with_capacity(specs.len());
     for (index, spec) in specs.iter().enumerate() {
@@ -818,15 +999,21 @@ pub fn compile_module_specs(specs: &[ProcedureSpec<'_>]) -> Result<Module, Compi
         }
         paths.push(spec.path.clone());
     }
+    let call_index = SpecCallIndex::build(&paths)?;
 
     let procedures = specs
         .iter()
-        .map(|spec| {
+        .zip(global_types)
+        .map(|(spec, global_types)| {
             let mut targets = HashMap::new();
             if let Some(parent) = spec.parent {
                 targets.insert("..".to_owned(), ProcedureId::from_index(parent)?);
             }
-            targets.extend(static_call_targets(&spec.path, &paths));
+            targets.extend(static_call_targets(
+                &spec.path,
+                &call_index,
+                referenced_static_call_names(spec.definition),
+            ));
             for (selector, target) in &spec.static_calls {
                 targets.insert(selector.clone(), ProcedureId::from_index(*target)?);
             }
@@ -835,6 +1022,7 @@ pub fn compile_module_specs(specs: &[ProcedureSpec<'_>]) -> Result<Module, Compi
                 &targets,
                 &spec.src_fields,
                 &spec.global_fields,
+                global_types,
             )
             .map_err(|error| compile_error(format!("{}: {}", spec.path, error.message)))
         })
@@ -843,22 +1031,159 @@ pub fn compile_module_specs(specs: &[ProcedureSpec<'_>]) -> Result<Module, Compi
         procedures,
         paths,
         names,
+        deferred: HashMap::new(),
     })
 }
 
-fn static_call_targets(path: &str, paths: &[String]) -> HashMap<String, ProcedureId> {
+/// Symbolically links every procedure spec while compiling only the requested
+/// eager indices. Deferred bodies retain stable module-local identities and
+/// are lowered exactly once when execution first dispatches to them.
+///
+/// This is intended for genuinely dynamic DM calls whose runtime receiver
+/// cannot be proven statically. Linking all candidate symbols preserves
+/// virtual dispatch without making cold boot compile every same-name body.
+///
+/// # Errors
+///
+/// Returns [`CompileError`] for an invalid spec table or an eager body that
+/// cannot be lowered. A deferred-body lowering failure is reported when that
+/// body is first selected.
+pub fn compile_module_specs_selective(
+    specs: &[ProcedureSpec<'_>],
+    global_types: &[BTreeMap<String, TypePath>],
+    eager_indices: &BTreeSet<usize>,
+) -> Result<Module, CompileError> {
+    compile_module_specs_selective_with_errors(specs, global_types, eager_indices, &BTreeMap::new())
+}
+
+/// Selective symbolic linking with source-aware semantic failures retained on
+/// deferred symbols and raised only if runtime dispatch materializes them.
+pub fn compile_module_specs_selective_with_errors(
+    specs: &[ProcedureSpec<'_>],
+    global_types: &[BTreeMap<String, TypePath>],
+    eager_indices: &BTreeSet<usize>,
+    deferred_errors: &BTreeMap<usize, CompileError>,
+) -> Result<Module, CompileError> {
+    if specs.len() != global_types.len() {
+        return Err(compile_error(
+            "procedure spec/global type table length mismatch",
+        ));
+    }
+    let mut names = HashMap::new();
+    let mut paths = Vec::with_capacity(specs.len());
+    for (index, spec) in specs.iter().enumerate() {
+        let procedure = ProcedureId::from_index(index)?;
+        if names.insert(spec.path.clone(), procedure).is_some() {
+            return Err(compile_error(format!(
+                "duplicate procedure spec path {:?}",
+                spec.path
+            )));
+        }
+        if spec.parent.is_some_and(|parent| parent >= specs.len()) {
+            return Err(compile_error(format!(
+                "procedure spec {:?} has invalid parent index {:?}",
+                spec.path, spec.parent
+            )));
+        }
+        paths.push(spec.path.clone());
+    }
+    let call_index = SpecCallIndex::build(&paths)?;
+    let mut procedures = Vec::with_capacity(specs.len());
+    let mut deferred = HashMap::new();
+    for (index, (spec, global_types)) in specs.iter().zip(global_types).enumerate() {
+        let targets = resolved_spec_targets(spec, &call_index)?;
+        if eager_indices.contains(&index) {
+            procedures.push(
+                compile_procedure_with_resolver_and_fields(
+                    spec.definition,
+                    &targets,
+                    &spec.src_fields,
+                    &spec.global_fields,
+                    global_types,
+                )
+                .map_err(|error| compile_error(format!("{}: {}", spec.path, error.message)))?,
+            );
+        } else {
+            let procedure = ProcedureId::from_index(index)?;
+            procedures.push(Program {
+                wait_for: true,
+                parameter_count: 0,
+                local_count: 0,
+                instructions: Vec::new(),
+                source_spans: Vec::new(),
+            });
+            deferred.insert(
+                procedure,
+                DeferredProcedure {
+                    definition: spec.definition.clone(),
+                    targets,
+                    src_fields: spec.src_fields.clone(),
+                    global_fields: spec.global_fields.clone(),
+                    global_types: global_types.clone(),
+                    preflight_error: deferred_errors.get(&index).cloned(),
+                    compiled: OnceLock::new(),
+                },
+            );
+        }
+    }
+    Ok(Module {
+        procedures,
+        paths,
+        names,
+        deferred,
+    })
+}
+
+fn resolved_spec_targets(
+    spec: &ProcedureSpec<'_>,
+    call_index: &SpecCallIndex,
+) -> Result<HashMap<String, ProcedureId>, CompileError> {
+    let mut targets = HashMap::new();
+    if let Some(parent) = spec.parent {
+        targets.insert("..".to_owned(), ProcedureId::from_index(parent)?);
+    }
+    targets.extend(static_call_targets(
+        &spec.path,
+        call_index,
+        referenced_static_call_names(spec.definition),
+    ));
+    for (selector, target) in &spec.static_calls {
+        targets.insert(selector.clone(), ProcedureId::from_index(*target)?);
+    }
+    Ok(targets)
+}
+
+struct SpecCallIndex {
+    latest_by_base_path: HashMap<String, ProcedureId>,
+}
+
+impl SpecCallIndex {
+    fn build(paths: &[String]) -> Result<Self, CompileError> {
+        let mut latest_by_base_path = HashMap::new();
+        for (position, path) in paths.iter().enumerate() {
+            let Some((_, _)) = path.rsplit_once("/proc/") else {
+                continue;
+            };
+            let base_path = path.split_once('@').map_or(path.as_str(), |(base, _)| base);
+            // Match the old reverse scan: the last spec for a base path wins.
+            latest_by_base_path.insert(base_path.to_owned(), ProcedureId::from_index(position)?);
+        }
+        Ok(Self {
+            latest_by_base_path,
+        })
+    }
+}
+
+fn static_call_targets(
+    path: &str,
+    index: &SpecCallIndex,
+    selectors: impl IntoIterator<Item = String>,
+) -> HashMap<String, ProcedureId> {
     let Some((owner, _)) = path.rsplit_once("/proc/") else {
         return HashMap::new();
     };
     let mut targets = HashMap::new();
-    for candidate in paths {
-        let Some((_, name)) = candidate.rsplit_once("/proc/") else {
-            continue;
-        };
-        let name = name.split('@').next().unwrap_or(name);
-        if targets.contains_key(name) {
-            continue;
-        }
+    for name in selectors {
         let mut current_owner = owner;
         loop {
             let expected = if current_owner.is_empty() {
@@ -866,12 +1191,8 @@ fn static_call_targets(path: &str, paths: &[String]) -> HashMap<String, Procedur
             } else {
                 format!("{current_owner}/proc/{name}")
             };
-            if let Some((index, _)) = paths.iter().enumerate().rev().find(|(_, candidate)| {
-                *candidate == &expected || candidate.starts_with(&format!("{expected}@"))
-            }) {
-                if let Ok(procedure) = ProcedureId::from_index(index) {
-                    targets.insert(name.to_owned(), procedure);
-                }
+            if let Some(procedure) = index.latest_by_base_path.get(&expected) {
+                targets.insert(name.clone(), *procedure);
                 break;
             }
             let Some((parent, _)) = current_owner.rsplit_once('/') else {
@@ -883,6 +1204,40 @@ fn static_call_targets(path: &str, paths: &[String]) -> HashMap<String, Procedur
     targets
 }
 
+fn referenced_static_call_names(definition: &Definition) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    let token_groups = std::iter::once(&definition.header)
+        .chain(
+            definition
+                .parameters
+                .iter()
+                .map(|parameter| &parameter.tokens),
+        )
+        .chain(definition.body.iter().map(|line| &line.tokens));
+    for tokens in token_groups {
+        for pair in tokens.windows(2) {
+            if let [
+                SpannedToken {
+                    kind: TokenKind::Identifier(name),
+                    ..
+                },
+                SpannedToken {
+                    kind: TokenKind::Punctuation('('),
+                    ..
+                },
+            ] = pair
+                && !matches!(
+                    name.as_str(),
+                    "if" | "for" | "while" | "switch" | "catch" | "spawn" | "new"
+                )
+            {
+                names.insert(name.clone());
+            }
+        }
+    }
+    names
+}
+
 fn compile_procedure_with_resolver(
     definition: &Definition,
     procedures: &HashMap<String, ProcedureId>,
@@ -890,6 +1245,7 @@ fn compile_procedure_with_resolver(
     compile_procedure_with_resolver_and_fields(
         definition,
         procedures,
+        &BTreeMap::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
     )
@@ -900,6 +1256,7 @@ fn compile_procedure_with_resolver_and_fields(
     procedures: &HashMap<String, ProcedureId>,
     src_fields: &BTreeMap<String, FieldName>,
     global_fields: &BTreeMap<String, FieldName>,
+    global_types: &BTreeMap<String, TypePath>,
 ) -> Result<Program, CompileError> {
     if !matches!(
         definition.kind,
@@ -908,7 +1265,7 @@ fn compile_procedure_with_resolver_and_fields(
         return Err(compile_error("definition is not executable"));
     }
 
-    let mut locals = LocalTable::with_fields(src_fields.clone(), global_fields.clone());
+    let mut locals = LocalTable::with_fields(src_fields, global_fields, global_types);
     for (index, parameter) in definition.parameters.iter().enumerate() {
         // BYOND permits an unnamed trailing `...` parameter.  It still
         // occupies an argument position, but cannot be referenced by name.
@@ -949,7 +1306,14 @@ fn compile_procedure_with_resolver_and_fields(
     // helper, for example, becomes `qdel(x); x = null`.  Keep statement
     // separators out of the expression parser by turning only top-level
     // semicolons into ordinary logical lines before lowering the body.
-    let body = split_top_level_semicolon_statements(&definition.body);
+    let mut body = normalize_labeled_loops(split_top_level_semicolon_statements(&definition.body));
+    if definition.kind == DefinitionKind::Verb {
+        // `set hidden/category/name/...` lines on verbs are declaration
+        // metadata, not executable assignments.
+        body.retain(|line| {
+            !matches!(line.tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(keyword)) if keyword == "set")
+        });
+    }
     let falls_through = if let Some(first_line) = body.first() {
         let block_indentation = indentation(first_line);
         let (next_line, falls_through) = compile_block(
@@ -985,6 +1349,7 @@ fn compile_procedure_with_resolver_and_fields(
     }
 
     Ok(Program {
+        wait_for: procedure_wait_for(definition),
         parameter_count: definition.parameters.len(),
         local_count: locals.slot_count,
         instructions,
@@ -1002,11 +1367,31 @@ fn compile_procedure_with_resolver_and_fields(
 /// their punctuation unchanged. Empty statements (including a physical line
 /// containing only `}`) are legal and discarded.
 fn split_top_level_semicolon_statements(lines: &[SourceLine]) -> Vec<SourceLine> {
+    fn ends_with_type_path(tokens: &[SpannedToken]) -> bool {
+        let mut index = tokens.len();
+        let mut segments = 0usize;
+        while index >= 2 {
+            if !matches!(tokens[index - 1].kind, TokenKind::Identifier(_))
+                || !matches!(&tokens[index - 2].kind, TokenKind::Operator(operator) if operator == "/")
+            {
+                break;
+            }
+            segments += 1;
+            index -= 2;
+        }
+        segments > 0
+    }
+
     let mut result = Vec::with_capacity(lines.len());
+    // A preprocessor expansion may contain a backslash-continued compact
+    // brace body. The syntax layer preserves those continuations as separate
+    // physical SourceLines, so brace nesting must survive the line boundary.
+    // Resetting it per line incorrectly made declarations from the opening
+    // line unavailable to an `else` branch emitted on the following line.
+    let mut brace_depth = 0usize;
     for line in lines {
         let mut statement = Vec::new();
         let mut grouping_depth = 0usize;
-        let mut brace_depth = 0usize;
         let base_indentation = indentation(line);
         let mut emit = |tokens: &mut Vec<SpannedToken>, brace_depth: usize| {
             if tokens.is_empty() {
@@ -1028,6 +1413,24 @@ fn split_top_level_semicolon_statements(lines: &[SourceLine]) -> Vec<SourceLine>
                     grouping_depth = grouping_depth.saturating_sub(1);
                     statement.push(token.clone());
                 }
+                TokenKind::Punctuation('{') if grouping_depth > 0 => {
+                    grouping_depth += 1;
+                    statement.push(token.clone());
+                }
+                TokenKind::Punctuation('{')
+                    if grouping_depth == 0
+                        && statement.iter().any(
+                            |token| matches!(&token.kind, TokenKind::Identifier(name) if name == "new"),
+                        )
+                        || grouping_depth == 0 && ends_with_type_path(&statement) =>
+                {
+                    grouping_depth += 1;
+                    statement.push(token.clone());
+                }
+                TokenKind::Punctuation('}') if grouping_depth > 0 => {
+                    grouping_depth -= 1;
+                    statement.push(token.clone());
+                }
                 TokenKind::Punctuation('{') if grouping_depth == 0 => {
                     emit(&mut statement, brace_depth);
                     brace_depth += 1;
@@ -1047,23 +1450,101 @@ fn split_top_level_semicolon_statements(lines: &[SourceLine]) -> Vec<SourceLine>
     result
 }
 
-#[derive(Default)]
-struct LocalTable {
+fn normalize_labeled_loops(mut lines: Vec<SourceLine>) -> Vec<SourceLine> {
+    let mut index = 0;
+    while index + 1 < lines.len() {
+        let label = match lines[index].tokens.as_slice() {
+            [
+                SpannedToken {
+                    kind: TokenKind::Identifier(label),
+                    ..
+                },
+                SpannedToken {
+                    kind: TokenKind::Operator(colon),
+                    ..
+                },
+            ] if colon == ":" => label.clone(),
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        let base = indentation(&lines[index]);
+        let is_loop = matches!(
+            lines[index + 1].tokens.first().map(|token| &token.kind),
+            Some(TokenKind::Identifier(keyword)) if matches!(keyword.as_str(), "for" | "while" | "do")
+        );
+        if !is_loop || indentation(&lines[index + 1]) < base {
+            index += 1;
+            continue;
+        }
+        let indentation_delta = indentation(&lines[index + 1]) - base;
+        lines.remove(index);
+        lines[index].indentation.tabs = 0;
+        lines[index].indentation.spaces = base;
+        let mut active_loop_indents = vec![base];
+        let mut cursor = index + 1;
+        while cursor < lines.len() && indentation(&lines[cursor]) > base {
+            lines[cursor].indentation.tabs = 0;
+            lines[cursor].indentation.spaces =
+                indentation(&lines[cursor]).saturating_sub(indentation_delta);
+            let current_indent = indentation(&lines[cursor]);
+            while active_loop_indents
+                .last()
+                .is_some_and(|indent| *indent >= current_indent)
+            {
+                active_loop_indents.pop();
+            }
+            if matches!(
+                lines[cursor].tokens.first().map(|token| &token.kind),
+                Some(TokenKind::Identifier(keyword)) if matches!(keyword.as_str(), "for" | "while" | "do")
+            ) {
+                active_loop_indents.push(current_indent);
+            }
+            if matches!(
+                lines[cursor].tokens.as_slice(),
+                [SpannedToken { kind: TokenKind::Identifier(keyword), .. }, SpannedToken { kind: TokenKind::Identifier(target), .. }]
+                    if keyword == "break" && target == &label
+            ) {
+                lines[cursor].tokens[1].kind =
+                    TokenKind::Number(active_loop_indents.len().to_string());
+            }
+            cursor += 1;
+        }
+        index = cursor;
+    }
+    lines
+}
+
+struct LocalTable<'fields> {
     names: HashMap<String, u16>,
-    src_fields: BTreeMap<String, FieldName>,
-    global_fields: BTreeMap<String, FieldName>,
+    src_fields: &'fields BTreeMap<String, FieldName>,
+    global_fields: &'fields BTreeMap<String, FieldName>,
+    global_types: &'fields BTreeMap<String, TypePath>,
     slot_count: usize,
 }
 
-impl LocalTable {
+impl Default for LocalTable<'static> {
+    fn default() -> Self {
+        static EMPTY: std::sync::LazyLock<BTreeMap<String, FieldName>> =
+            std::sync::LazyLock::new(BTreeMap::new);
+        static EMPTY_TYPES: std::sync::LazyLock<BTreeMap<String, TypePath>> =
+            std::sync::LazyLock::new(BTreeMap::new);
+        Self::with_fields(&EMPTY, &EMPTY, &EMPTY_TYPES)
+    }
+}
+
+impl<'fields> LocalTable<'fields> {
     fn with_fields(
-        src_fields: BTreeMap<String, FieldName>,
-        global_fields: BTreeMap<String, FieldName>,
+        src_fields: &'fields BTreeMap<String, FieldName>,
+        global_fields: &'fields BTreeMap<String, FieldName>,
+        global_types: &'fields BTreeMap<String, TypePath>,
     ) -> Self {
         Self {
             names: HashMap::new(),
             src_fields,
             global_fields,
+            global_types,
             slot_count: 0,
         }
     }
@@ -1106,6 +1587,20 @@ impl LocalTable {
 
     fn global_field(&self, name: &str) -> Option<&FieldName> {
         self.global_fields.get(name)
+    }
+
+    fn global_type(&self, name: &str) -> Option<&TypePath> {
+        self.global_types.get(name)
+    }
+
+    fn receiver_static(&self, receiver: &Expression, name: &FieldName) -> Option<&FieldName> {
+        let receiver = match receiver {
+            Expression::Src => "src",
+            Expression::Local(receiver) => receiver.as_str(),
+            _ => return None,
+        };
+        self.global_fields
+            .get(&format!("{receiver}.{}", name.as_str()))
     }
 
     fn remove(&mut self, name: &str) {
@@ -1314,10 +1809,23 @@ fn compile_block_inner(
                 return Err(compile_error("else without a matching if"));
             }
             TokenKind::Identifier(keyword) if keyword == "break" => {
-                if line.tokens.len() != 1 {
+                let depth = match line.tokens.as_slice() {
+                    [_] => 1,
+                    [_, SpannedToken { kind: TokenKind::Number(depth), .. }] => depth
+                        .parse::<usize>()
+                        .map_err(|_| compile_error("invalid labeled break depth"))?,
+                    _ => {
+                        return Err(compile_error("break does not accept an expression"));
+                    }
+                };
+                if loops.is_empty() {
+                    return Err(compile_error("break outside a loop"));
+                }
+                if depth == 0 || depth > loops.len() {
                     return Err(compile_error("break does not accept an expression"));
                 }
-                let Some(loop_context) = loops.last_mut() else {
+                let target_loop = loops.len() - depth;
+                let Some(loop_context) = loops.get_mut(target_loop) else {
                     return Err(compile_error("break outside a loop"));
                 };
                 let jump = instructions.len();
@@ -1386,15 +1894,21 @@ fn compile_block_inner(
                 ));
                 falls_through = false;
             }
-            // `waitfor` controls BYOND's cooperative scheduling of a procedure.
-            // Dream64's current headless executor is synchronous and has no
-            // sleeping instructions, so the declaration is intentionally a
-            // compile-time no-op rather than an executable assignment.
+            // `waitfor` is procedure metadata captured on `Program`; it has no
+            // executable assignment at the declaration site.
             TokenKind::Identifier(keyword)
                 if keyword == "set" && is_waitfor_directive(&line.tokens) => {}
+            TokenKind::Identifier(keyword)
+                if keyword == "set"
+                    && matches!(line.tokens.get(1).map(|token| &token.kind), Some(TokenKind::Identifier(name)) if name == "name")
+                    && matches!(line.tokens.get(2).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "=") =>
+            {
+                // Procedure display names are declaration metadata and do not
+                // execute when the procedure is called.
+            }
             TokenKind::Identifier(keyword) if keyword == "var" => {
                 let first_instruction = instructions.len();
-                let _ = compile_local(&line.tokens, locals, instructions, procedures)?;
+                compile_local_declarations(&line.tokens, locals, instructions, procedures)?;
                 source_spans.extend(std::iter::repeat_n(
                     line.span,
                     instructions.len() - first_instruction,
@@ -1403,6 +1917,17 @@ fn compile_block_inner(
             TokenKind::Identifier(_) if top_level_assignment(&line.tokens).is_some() => {
                 let first_instruction = instructions.len();
                 compile_assignment_statement(&line.tokens, locals, instructions, procedures)?;
+                source_spans.extend(std::iter::repeat_n(
+                    line.span,
+                    instructions.len() - first_instruction,
+                ));
+            }
+            TokenKind::Identifier(_) if top_level_output(&line.tokens).is_some() => {
+                let first_instruction = instructions.len();
+                let output = top_level_output(&line.tokens).expect("output index was checked");
+                compile_expression(&line.tokens[..output], locals, instructions, procedures)?;
+                compile_expression(&line.tokens[output + 1..], locals, instructions, procedures)?;
+                instructions.push(Instruction::Output);
                 source_spans.extend(std::iter::repeat_n(
                     line.span,
                     instructions.len() - first_instruction,
@@ -1426,9 +1951,33 @@ fn compile_block_inner(
                     instructions.len() - first_instruction,
                 ));
             }
+            TokenKind::Operator(operator) if matches!(operator.as_str(), "++" | "--") => {
+                let first_instruction = instructions.len();
+                compile_expression(&line.tokens, locals, instructions, procedures)?;
+                instructions.push(Instruction::Pop);
+                source_spans.extend(std::iter::repeat_n(
+                    line.span,
+                    instructions.len() - first_instruction,
+                ));
+            }
             TokenKind::Operator(operator) if operator == "." => {
                 let first_instruction = instructions.len();
-                compile_result_assignment(&line.tokens, locals, instructions, procedures)?;
+                if top_level_assignment(&line.tokens).is_some_and(|(index, _)| index == 1) {
+                    compile_result_assignment(&line.tokens, locals, instructions, procedures)?;
+                } else if top_level_assignment(&line.tokens).is_some() {
+                    // The special result is also a regular expression value,
+                    // so indexed writes such as `.[key] = value` use the same
+                    // list-assignment lowering as any other expression.
+                    compile_assignment_statement(
+                        &line.tokens,
+                        locals,
+                        instructions,
+                        procedures,
+                    )?;
+                } else {
+                    compile_expression(&line.tokens, locals, instructions, procedures)?;
+                    instructions.push(Instruction::Pop);
+                }
                 source_spans.extend(std::iter::repeat_n(
                     line.span,
                     instructions.len() - first_instruction,
@@ -1586,6 +2135,19 @@ fn compile_block_inner(
                     instructions.len() - first_instruction,
                 ));
             }
+            TokenKind::Identifier(_)
+                if line.tokens.iter().any(|token| {
+                    matches!(&token.kind, TokenKind::Operator(operator) if operator == "++" || operator == "--")
+                }) =>
+            {
+                let first_instruction = instructions.len();
+                compile_expression(&line.tokens, locals, instructions, procedures)?;
+                instructions.push(Instruction::Pop);
+                source_spans.extend(std::iter::repeat_n(
+                    line.span,
+                    instructions.len() - first_instruction,
+                ));
+            }
             _ => {
                 return Err(compile_error(format!(
                     "unsupported statement beginning with {:?}",
@@ -1648,6 +2210,28 @@ fn is_waitfor_directive(tokens: &[SpannedToken]) -> bool {
     )
 }
 
+fn procedure_wait_for(definition: &Definition) -> bool {
+    !definition.body.iter().any(|line| {
+        matches!(
+            line.tokens.as_slice(),
+            [
+                SpannedToken { kind: TokenKind::Identifier(set), .. },
+                SpannedToken { kind: TokenKind::Identifier(name), .. },
+                SpannedToken { kind: TokenKind::Operator(operator), .. },
+                SpannedToken { kind: TokenKind::Identifier(value), .. }
+            ] if set == "set" && name == "waitfor" && operator == "=" && value == "FALSE"
+        ) || matches!(
+            line.tokens.as_slice(),
+            [
+                SpannedToken { kind: TokenKind::Identifier(set), .. },
+                SpannedToken { kind: TokenKind::Identifier(name), .. },
+                SpannedToken { kind: TokenKind::Operator(operator), .. },
+                SpannedToken { kind: TokenKind::Number(value), .. }
+            ] if set == "set" && name == "waitfor" && operator == "=" && value == "0"
+        )
+    })
+}
+
 fn compile_crash_statement(
     tokens: &[SpannedToken],
     locals: &LocalTable,
@@ -1687,11 +2271,13 @@ fn top_level_assignment(tokens: &[SpannedToken]) -> Option<(usize, &str)> {
     for (index, token) in tokens.iter().enumerate() {
         match &token.kind {
             TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+            TokenKind::Operator(operator) if operator == "?[" => depth += 1,
             TokenKind::Punctuation(')' | ']' | '}') => depth = depth.saturating_sub(1),
             TokenKind::Operator(operator)
                 if matches!(
                     operator.as_str(),
-                    "=" | "+="
+                    "=" | ":="
+                        | "+="
                         | "-="
                         | "*="
                         | "/="
@@ -1714,6 +2300,22 @@ fn top_level_assignment(tokens: &[SpannedToken]) -> Option<(usize, &str)> {
     None
 }
 
+fn top_level_output(tokens: &[SpannedToken]) -> Option<usize> {
+    let mut depth = 0_usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match &token.kind {
+            TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+            TokenKind::Operator(operator) if operator == "?[" => depth += 1,
+            TokenKind::Punctuation(')' | ']' | '}') => depth = depth.saturating_sub(1),
+            TokenKind::Operator(operator) if operator == "<<" && depth == 0 => {
+                return Some(index);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[allow(clippy::too_many_lines)]
 fn compile_assignment_statement(
     tokens: &[SpannedToken],
@@ -1723,6 +2325,7 @@ fn compile_assignment_statement(
 ) -> Result<(), CompileError> {
     let (assignment, operator) = top_level_assignment(tokens)
         .ok_or_else(|| compile_error("assignment statement requires '='"))?;
+    let operator = if operator == ":=" { "=" } else { operator };
     if matches!(operator, "||=" | "&&=") {
         compile_expression(tokens, locals, instructions, procedures)?;
         instructions.push(Instruction::Pop);
@@ -1745,12 +2348,14 @@ fn compile_assignment_statement(
                     if operator != "=" {
                         instructions.push(Instruction::LoadGlobal(global.clone()));
                     }
-                    compile_expression(
-                        &tokens[assignment + 1..],
-                        locals,
-                        instructions,
-                        procedures,
-                    )?;
+                    let mut value = ExpressionParser::new(&tokens[assignment + 1..]).parse()?;
+                    if let Expression::New { type_path, .. } = &mut value
+                        && type_path.is_none()
+                        && let Some(inferred) = locals.global_type(&name)
+                    {
+                        *type_path = Some(Box::new(Expression::TypePath(inferred.clone())));
+                    }
+                    emit_expression(&value, locals, instructions, procedures)?;
                     if operator != "=" {
                         instructions.push(compound_instruction(operator)?);
                     }
@@ -1817,6 +2422,24 @@ fn compile_assignment_statement(
             instructions[end_jump] = Instruction::Jump(end);
         }
         Expression::Field { receiver, name } => {
+            if let Some(storage) = locals
+                .receiver_static(receiver.as_ref(), &name)
+                .or_else(|| {
+                    matches!(receiver.as_ref(), Expression::Src)
+                        .then(|| locals.global_field(name.as_str()))
+                        .flatten()
+                })
+            {
+                if operator != "=" {
+                    instructions.push(Instruction::LoadGlobal(storage.clone()));
+                }
+                compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
+                if operator != "=" {
+                    instructions.push(compound_instruction(operator)?);
+                }
+                instructions.push(Instruction::StoreGlobal(storage.clone()));
+                return Ok(());
+            }
             emit_expression(&receiver, locals, instructions, procedures)?;
             if operator != "=" {
                 instructions.push(Instruction::Duplicate);
@@ -1859,6 +2482,30 @@ fn compile_assignment_statement(
                 instructions.push(compound_instruction(operator)?);
             }
             instructions.push(Instruction::StoreGlobal(name));
+        }
+        Expression::Src => {
+            if operator != "=" {
+                return Err(compile_error("src only supports direct assignment"));
+            }
+            compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
+            instructions.push(Instruction::StoreSrc);
+        }
+        Expression::Usr => {
+            if operator != "=" {
+                return Err(compile_error("usr only supports direct assignment"));
+            }
+            compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
+            instructions.push(Instruction::StoreUsr);
+        }
+        Expression::Result => {
+            if operator != "=" {
+                instructions.push(Instruction::LoadResult);
+            }
+            compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
+            if operator != "=" {
+                instructions.push(compound_instruction(operator)?);
+            }
+            instructions.push(Instruction::StoreResult);
         }
         _ => return Err(compile_error("assignment target is not writable")),
     }
@@ -1935,30 +2582,45 @@ fn compile_while(
         line.span,
     );
 
-    let child_index = line_index + 1;
-    let child = lines
-        .get(child_index)
-        .ok_or_else(|| compile_error("while statement requires an indented body"))?;
-    let child_indentation = indentation(child);
-    if child_indentation <= block_indentation {
-        return Err(compile_error("while statement requires an indented body"));
-    }
-
     loops.push(LoopContext {
         continue_target: Some(condition_target),
         continue_jumps: Vec::new(),
         break_jumps: Vec::new(),
     });
-    let body = compile_block(
-        lines,
-        child_index,
-        child_indentation,
-        locals,
-        instructions,
-        source_spans,
-        procedures,
-        loops,
-    );
+    let body = if let Some(body) = inline_conditional_body(&line.tokens) {
+        let mut inline_line = line.clone();
+        inline_line.tokens = body.to_vec();
+        compile_block(
+            std::slice::from_ref(&inline_line),
+            0,
+            block_indentation,
+            locals,
+            instructions,
+            source_spans,
+            procedures,
+            loops,
+        )
+        .map(|(_, falls_through)| (line_index + 1, falls_through))
+    } else {
+        let child_index = line_index + 1;
+        let child = lines
+            .get(child_index)
+            .ok_or_else(|| compile_error("while statement requires an indented body"))?;
+        let child_indentation = indentation(child);
+        if child_indentation <= block_indentation {
+            return Err(compile_error("while statement requires an indented body"));
+        }
+        compile_block(
+            lines,
+            child_index,
+            child_indentation,
+            locals,
+            instructions,
+            source_spans,
+            procedures,
+            loops,
+        )
+    };
     let loop_context = loops.pop().expect("the active while context was pushed");
     let (after_body, _) = body?;
     push_instruction(
@@ -2534,29 +3196,45 @@ fn compile_for_in(
         );
     }
 
-    let child_index = line_index + 1;
-    let child = lines
-        .get(child_index)
-        .ok_or_else(|| compile_error("for-in statement requires an indented body"))?;
-    let child_indentation = indentation(child);
-    if child_indentation <= block_indentation {
-        return Err(compile_error("for-in statement requires an indented body"));
-    }
     loops.push(LoopContext {
         continue_target: None,
         continue_jumps: Vec::new(),
         break_jumps: Vec::new(),
     });
-    let body = compile_block(
-        lines,
-        child_index,
-        child_indentation,
-        locals,
-        instructions,
-        source_spans,
-        procedures,
-        loops,
-    );
+    let body = if let Some(body) = inline_conditional_body(&line.tokens) {
+        let mut inline_line = line.clone();
+        inline_line.tokens = body.to_vec();
+        compile_block(
+            std::slice::from_ref(&inline_line),
+            0,
+            block_indentation,
+            locals,
+            instructions,
+            source_spans,
+            procedures,
+            loops,
+        )
+        .map(|(_, falls_through)| (line_index + 1, falls_through))
+    } else {
+        let child_index = line_index + 1;
+        let child = lines
+            .get(child_index)
+            .ok_or_else(|| compile_error("for-in statement requires an indented body"))?;
+        let child_indentation = indentation(child);
+        if child_indentation <= block_indentation {
+            return Err(compile_error("for-in statement requires an indented body"));
+        }
+        compile_block(
+            lines,
+            child_index,
+            child_indentation,
+            locals,
+            instructions,
+            source_spans,
+            procedures,
+            loops,
+        )
+    };
     let loop_context = loops.pop().expect("the active for-in context was pushed");
     let (after_body, _) = body?;
 
@@ -2823,7 +3501,7 @@ fn for_assoc_parts(
     let mut depth = 0usize;
     let mut comma = None;
     for (index, token) in targets.iter().enumerate() {
-        match token.kind {
+        match &token.kind {
             TokenKind::Punctuation('(' | '[') => depth += 1,
             TokenKind::Punctuation(')' | ']') => depth = depth.saturating_sub(1),
             TokenKind::Punctuation(',') if depth == 0 => comma = Some(index),
@@ -2855,13 +3533,28 @@ fn for_in_parts(
     if !matches!(
         header.first().map(|token| &token.kind),
         Some(TokenKind::Punctuation('('))
-    ) || !matches!(
-        header.last().map(|token| &token.kind),
-        Some(TokenKind::Punctuation(')'))
     ) {
         return Ok(None);
     }
-    let clauses = &header[1..header.len() - 1];
+    let mut depth = 0usize;
+    let mut closing = None;
+    for (index, token) in header.iter().enumerate() {
+        match token.kind {
+            TokenKind::Punctuation('(') => depth += 1,
+            TokenKind::Punctuation(')') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    closing = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(closing) = closing else {
+        return Ok(None);
+    };
+    let clauses = &header[1..closing];
     let clauses = if matches!(
         clauses.last().map(|token| &token.kind),
         Some(TokenKind::Punctuation(';'))
@@ -3019,6 +3712,7 @@ fn top_level_keyword_positions(tokens: &[SpannedToken], keyword: &str) -> Vec<us
     for (index, token) in tokens.iter().enumerate() {
         match &token.kind {
             TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+            TokenKind::Operator(operator) if operator == "?[" => depth += 1,
             TokenKind::Punctuation(')' | ']' | '}') => depth = depth.saturating_sub(1),
             TokenKind::Identifier(identifier) if depth == 0 && identifier == keyword => {
                 positions.push(index);
@@ -3044,8 +3738,9 @@ fn for_clauses(tokens: &[SpannedToken]) -> Result<[&[SpannedToken]; 3], CompileE
     let mut separators = Vec::new();
     let mut depth = 0_usize;
     for (index, token) in clauses.iter().enumerate() {
-        match token.kind {
+        match &token.kind {
             TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+            TokenKind::Operator(operator) if operator == "?[" => depth += 1,
             TokenKind::Punctuation(')' | ']' | '}') => depth = depth.saturating_sub(1),
             TokenKind::Punctuation(';' | ',') if depth == 0 => separators.push(index),
             _ => {}
@@ -3379,7 +4074,26 @@ fn compile_if(
     // deliberately also preserves `break`/`continue` loop context and all
     // ordinary statement lowering instead of special-casing return here.
     let (after_then, then_falls_through) = if let Some(body) = inline_conditional_body(&line.tokens)
+        && matches!(body.first().map(|token| &token.kind), Some(TokenKind::Identifier(keyword)) if keyword == "do")
     {
+        // Macro expansions frequently produce `if(condition) do { ... }
+        // while(0)`. The brace normalizer has already placed the compact do
+        // body on subsequent logical lines, so retain that tail while
+        // replacing only the leading conditional with its inline statement.
+        let mut inline_lines = lines[line_index..].to_vec();
+        inline_lines[0].tokens = body.to_vec();
+        let consumed = compile_do_while(
+            &inline_lines,
+            0,
+            block_indentation,
+            locals,
+            instructions,
+            source_spans,
+            procedures,
+            loops,
+        )?;
+        (line_index + consumed, true)
+    } else if let Some(body) = inline_conditional_body(&line.tokens) {
         let mut inline_line = line.clone();
         inline_line.tokens = body.to_vec();
         let (_, falls_through) = compile_block(
@@ -3559,11 +4273,6 @@ fn compile_switch(
             return Err(compile_error("switch case cannot follow an else default"));
         }
         if is_default {
-            if case_line.tokens.len() != 1 {
-                return Err(compile_error(
-                    "switch else default does not accept a condition",
-                ));
-            }
             saw_default = true;
         } else {
             let condition_start = instructions.len();
@@ -3591,24 +4300,48 @@ fn compile_switch(
         } else {
             None
         };
-        let body_index = next_case_index + 1;
-        let body_line = lines
-            .get(body_index)
-            .ok_or_else(|| compile_error("switch case requires an indented body"))?;
-        let body_indentation = indentation(body_line);
-        if body_indentation <= case_indentation {
-            return Err(compile_error("switch case requires an indented body"));
-        }
-        let (after_body, _) = compile_block(
-            lines,
-            body_index,
-            body_indentation,
-            locals,
-            instructions,
-            source_spans,
-            procedures,
-            loops,
-        )?;
+        let inline_case_body = if is_default && case_line.tokens.len() > 1 {
+            Some(&case_line.tokens[1..])
+        } else {
+            inline_conditional_body(&case_line.tokens)
+        };
+        let after_body = if let Some(body) = inline_case_body {
+            let mut inline_line = case_line.clone();
+            inline_line.tokens = body.to_vec();
+            compile_block(
+                std::slice::from_ref(&inline_line),
+                0,
+                case_indentation,
+                locals,
+                instructions,
+                source_spans,
+                procedures,
+                loops,
+            )?;
+            next_case_index + 1
+        } else {
+            let body_index = next_case_index + 1;
+            let body_indentation = lines.get(body_index).map(indentation);
+            if body_indentation.is_some_and(|indent| indent > case_indentation) {
+                compile_block(
+                    lines,
+                    body_index,
+                    body_indentation.expect("checked"),
+                    locals,
+                    instructions,
+                    source_spans,
+                    procedures,
+                    loops,
+                )?
+                .0
+            } else {
+                // A macro may deliberately expand a case body to a lone
+                // semicolon (`EMPTY_BLOCK_GUARD`). The syntax normalizer
+                // removes that empty statement; the case remains a valid
+                // no-op and falls through to the end of the switch.
+                body_index
+            }
+        };
         if !saw_default {
             let end_jump = instructions.len();
             push_instruction(
@@ -3688,14 +4421,15 @@ fn split_switch_tokens(
     let mut start = 0;
     let mut depth = 0usize;
     for (index, token) in tokens.iter().enumerate() {
-        match token.kind {
+        match &token.kind {
             TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+            TokenKind::Operator(operator) if operator == "?[" => depth += 1,
             TokenKind::Punctuation(')' | ']' | '}') => {
                 depth = depth.checked_sub(1).ok_or_else(|| {
                     compile_error("switch case contains unmatched closing punctuation")
                 })?;
             }
-            TokenKind::Punctuation(punctuation) if punctuation == separator && depth == 0 => {
+            TokenKind::Punctuation(punctuation) if *punctuation == separator && depth == 0 => {
                 groups.push(&tokens[start..index]);
                 start = index + 1;
             }
@@ -3721,6 +4455,7 @@ fn split_switch_keyword<'a>(
     for (index, token) in tokens.iter().enumerate() {
         match &token.kind {
             TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+            TokenKind::Operator(operator) if operator == "?[" => depth += 1,
             TokenKind::Punctuation(')' | ']' | '}') => {
                 depth = depth.checked_sub(1).ok_or_else(|| {
                     compile_error("switch range contains unmatched closing punctuation")
@@ -3798,7 +4533,7 @@ fn inline_conditional_body(tokens: &[SpannedToken]) -> Option<&[SpannedToken]> {
     }
     let mut depth = 0usize;
     for (index, token) in expression.iter().enumerate() {
-        match token.kind {
+        match &token.kind {
             TokenKind::Punctuation('(') => depth += 1,
             TokenKind::Punctuation(')') => {
                 depth = depth.checked_sub(1)?;
@@ -3951,7 +4686,11 @@ fn compile_local(
         .iter()
         .position(|token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="));
     let declaration_end = assignment.unwrap_or(tokens.len());
-    let name = tokens[1..declaration_end]
+    let suffix = tokens[1..declaration_end]
+        .iter()
+        .position(|token| matches!(token.kind, TokenKind::Punctuation('[')))
+        .map_or(declaration_end, |offset| 1 + offset);
+    let name = tokens[1..suffix]
         .iter()
         .rev()
         .find_map(|token| match &token.kind {
@@ -3961,7 +4700,42 @@ fn compile_local(
         .ok_or_else(|| compile_error("local declaration has no name"))?;
     let slot = locals.declare(name.clone())?;
     if let Some(assignment) = assignment {
-        compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
+        let mut value = ExpressionParser::new(&tokens[assignment + 1..]).parse()?;
+        if let Expression::New { type_path, .. } = &mut value
+            && type_path.is_none()
+            && let Some(inferred) = declared_local_type(tokens, &name)
+        {
+            *type_path = Some(Box::new(Expression::TypePath(inferred)));
+        }
+        emit_expression(&value, locals, instructions, procedures)?;
+    } else if suffix < declaration_end {
+        let mut dimensions = 0u8;
+        let mut cursor = suffix;
+        while cursor < declaration_end {
+            if !matches!(tokens[cursor].kind, TokenKind::Punctuation('[')) {
+                cursor += 1;
+                continue;
+            }
+            let mut bracket_depth = 1usize;
+            let close = (cursor + 1..declaration_end)
+                .find(|&index| {
+                    match tokens[index].kind {
+                        TokenKind::Punctuation('[') => bracket_depth += 1,
+                        TokenKind::Punctuation(']') => {
+                            bracket_depth = bracket_depth.saturating_sub(1)
+                        }
+                        _ => {}
+                    }
+                    bracket_depth == 0
+                })
+                .ok_or_else(|| compile_error("array declaration has an unclosed dimension"))?;
+            compile_expression(&tokens[cursor + 1..close], locals, instructions, procedures)?;
+            dimensions = dimensions
+                .checked_add(1)
+                .ok_or_else(|| compile_error("too many array dimensions"))?;
+            cursor = close + 1;
+        }
+        instructions.push(Instruction::MakeArray(dimensions));
     } else {
         // Typed and untyped local declarations without an initializer begin
         // as null in DM.
@@ -3969,6 +4743,63 @@ fn compile_local(
     }
     instructions.push(Instruction::StoreLocal(slot));
     Ok(name)
+}
+
+fn declared_local_type(tokens: &[SpannedToken], name: &str) -> Option<TypePath> {
+    let name_index = tokens.iter().rposition(
+        |token| matches!(&token.kind, TokenKind::Identifier(identifier) if identifier == name),
+    )?;
+    let var_index = tokens[..name_index].iter().position(
+        |token| matches!(&token.kind, TokenKind::Identifier(identifier) if identifier == "var"),
+    )?;
+    let segments = tokens[var_index + 1..name_index]
+        .iter()
+        .filter_map(|token| match &token.kind {
+            TokenKind::Identifier(identifier)
+                if !matches!(identifier.as_str(), "static" | "global" | "tmp" | "final") =>
+            {
+                Some(identifier.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    (!segments.is_empty())
+        .then(|| TypePath::parse(&format!("/{}", segments.join("/"))).ok())
+        .flatten()
+}
+
+fn compile_local_declarations(
+    tokens: &[SpannedToken],
+    locals: &mut LocalTable,
+    instructions: &mut Vec<Instruction>,
+    procedures: &HashMap<String, ProcedureId>,
+) -> Result<(), CompileError> {
+    let mut depth = 0_usize;
+    let mut start = 1_usize;
+    let mut parts = Vec::new();
+    for (index, token) in tokens.iter().enumerate().skip(1) {
+        match &token.kind {
+            TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+            TokenKind::Operator(operator) if operator == "?[" => depth += 1,
+            TokenKind::Punctuation(')' | ']' | '}') => depth = depth.saturating_sub(1),
+            TokenKind::Punctuation(',') if depth == 0 => {
+                parts.push(&tokens[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&tokens[start..]);
+    for part in parts {
+        if part.is_empty() {
+            return Err(compile_error("local declaration after ',' is empty"));
+        }
+        let mut declaration = Vec::with_capacity(part.len() + 1);
+        declaration.push(tokens[0].clone());
+        declaration.extend_from_slice(part);
+        compile_local(&declaration, locals, instructions, procedures)?;
+    }
+    Ok(())
 }
 
 fn parameter_name(tokens: &[SpannedToken]) -> Option<&str> {
@@ -4005,9 +4836,14 @@ enum Expression {
     Number(DmNumberBits),
     Text(String),
     TypePath(TypePath),
+    ModifiedTypePath {
+        base: TypePath,
+        overrides: Vec<(FieldName, Self)>,
+    },
     New {
         type_path: Option<Box<Self>>,
         arguments: Vec<Self>,
+        overrides: Vec<(FieldName, Self)>,
     },
     Regex {
         arguments: Vec<Self>,
@@ -4016,6 +4852,9 @@ enum Expression {
         arguments: Vec<Self>,
     },
     Matrix {
+        arguments: Vec<Self>,
+    },
+    Vector {
         arguments: Vec<Self>,
     },
     ReplaceText {
@@ -4031,12 +4870,31 @@ enum Expression {
         name: String,
         arguments: Vec<Self>,
     },
+    NativeSrcMethod {
+        name: String,
+        arguments: Vec<Self>,
+    },
+    ExternalCall {
+        library: Box<Self>,
+        function: Box<Self>,
+        arguments: Vec<Self>,
+    },
+    Animate {
+        arguments: Vec<(Option<String>, Self)>,
+    },
+    Filter {
+        arguments: Vec<(Option<String>, Self)>,
+    },
+    Crash(Box<Self>),
     Sleep(Box<Self>),
     Initial(Box<Self>),
     Block {
         arguments: Vec<Self>,
     },
     Rand {
+        arguments: Vec<Self>,
+    },
+    Roll {
         arguments: Vec<Self>,
     },
     Pick {
@@ -4056,6 +4914,10 @@ enum Expression {
         source: Box<Self>,
         direction: Box<Self>,
     },
+    GetStepTowards {
+        source: Box<Self>,
+        target: Box<Self>,
+    },
     Range {
         arguments: Vec<Self>,
     },
@@ -4069,6 +4931,7 @@ enum Expression {
     Local(String),
     Src,
     Usr,
+    Caller,
     World,
     GlobalNamespace,
     Field {
@@ -4105,6 +4968,7 @@ enum Expression {
         target: Box<Self>,
         procedure: Box<Self>,
         arguments: Vec<Self>,
+        null_receiver_is_global: bool,
     },
     SafeDynamicCall {
         target: Box<Self>,
@@ -4112,6 +4976,7 @@ enum Expression {
         arguments: Vec<Self>,
     },
     List(Vec<ListExpressionEntry>),
+    AssociativeList(Vec<ListExpressionEntry>),
     Index {
         list: Box<Self>,
         index: Box<Self>,
@@ -4170,32 +5035,93 @@ fn dm_builtin_text_constant(identifier: &str) -> Option<&'static str> {
 
 fn dm_builtin_numeric_constant(identifier: &str) -> Option<f32> {
     match identifier {
-        "FALSE" | "BLEND_DEFAULT" | "MATRIX_COPY" => Some(0.0),
-        "TRUE" | "BLEND_OVERLAY" | "KEEP_TOGETHER" | "NORTH" => Some(1.0),
-        "BLEND_ADD" | "KEEP_APART" | "SOUTH" => Some(2.0),
-        "BLEND_SUBTRACT" => Some(3.0),
-        "BLEND_MULTIPLY" | "LONG_GLIDE" | "EAST" | "MATRIX_INVERT" => Some(4.0),
-        "BLEND_INSET_OVERLAY" | "NORTHEAST" | "MATRIX_ROTATE" => Some(5.0),
-        "SOUTHEAST" | "MATRIX_SCALE" => Some(6.0),
-        "MATRIX_TRANSLATE" => Some(7.0),
-        "WEST" | "RESET_TRANSFORM" => Some(8.0),
+        "FALSE"
+        | "BLEND_DEFAULT"
+        | "MATRIX_COPY"
+        | "MOB_PERSPECTIVE"
+        | "TOPDOWN_MAP"
+        | "LINEAR_EASING"
+        | "COLORSPACE_RGB"
+        | "MOUSE_INACTIVE_POINTER"
+        | "NO_STEPS"
+        | "PROFILE_START"
+        | "PROFILE_REFRESH"
+        | "FILTER_OVERLAY"
+        | "ICON_ADD" => Some(0.0),
+        "FLOAT_LAYER" => Some(-1.0),
+        "TRUE"
+        | "MASK_INVERSE"
+        | "ICON_SUBTRACT"
+        | "BLEND_OVERLAY"
+        | "KEEP_TOGETHER"
+        | "NORTH"
+        | "EYE_PERSPECTIVE"
+        | "AREA_LAYER"
+        | "SINE_EASING"
+        | "ANIMATION_END_NOW"
+        | "COLORSPACE_HSV"
+        | "VIS_INHERIT_ICON"
+        | "MOUSE_ACTIVE_POINTER"
+        | "FORWARD_STEPS"
+        | "BLIND"
+        | "PROFILE_STOP" => Some(1.0),
+        "JSON_PRETTY_PRINT" => Some(1.0),
+        "BLEND_ADD"
+        | "KEEP_APART"
+        | "SOUTH"
+        | "EDGE_PERSPECTIVE"
+        | "TURF_LAYER"
+        | "CIRCULAR_EASING"
+        | "ANIMATION_LINEAR_TRANSFORM"
+        | "COLORSPACE_HSL"
+        | "VIS_INHERIT_ICON_STATE"
+        | "SLIDE_STEPS"
+        | "PROFILE_CLEAR"
+        | "PROFILE_RESTART"
+        | "ICON_MULTIPLY" => Some(2.0),
+        "BLEND_SUBTRACT" | "OBJ_LAYER" | "CUBIC_EASING" | "COLORSPACE_HCY"
+        | "MOUSE_DRAG_POINTER" | "SYNC_STEPS" | "ICON_OVERLAY" => Some(3.0),
+        "BLEND_MULTIPLY" | "LONG_GLIDE" | "EAST" | "MATRIX_INVERT" | "MOB_LAYER"
+        | "BOUNCE_EASING" | "ANIMATION_PARALLEL" | "VIS_INHERIT_DIR" | "MOUSE_DROP_POINTER"
+        | "SEE_MOBS" | "SEEMOBS" | "PROFILE_AVERAGE" => Some(4.0),
+        "BLEND_INSET_OVERLAY"
+        | "NORTHEAST"
+        | "MATRIX_ROTATE"
+        | "FLY_LAYER"
+        | "ELASTIC_EASING"
+        | "MOUSE_ARROW_POINTER"
+        | "ICON_OR" => Some(5.0),
+        "SOUTHEAST"
+        | "MATRIX_SCALE"
+        | "BACK_EASING"
+        | "MOUSE_CROSSHAIRS_POINTER"
+        | "ICON_UNDERLAY" => Some(6.0),
+        "MATRIX_TRANSLATE" | "QUAD_EASING" | "MOUSE_HAND_POINTER" => Some(7.0),
+        "WEST" | "RESET_TRANSFORM" | "JUMP_EASING" | "ANIMATION_SLICE" | "VIS_INHERIT_LAYER"
+        | "SEE_OBJS" | "SEEOBJS" => Some(8.0),
         "NORTHWEST" => Some(9.0),
         "SOUTHWEST" => Some(10.0),
-        "UP" | "RESET_COLOR" => Some(16.0),
-        "DOWN" | "RESET_ALPHA" => Some(32.0),
+        "UP" | "RESET_COLOR" | "ANIMATION_END_LOOP" | "VIS_INHERIT_PLANE" | "SEE_TURFS"
+        | "SEETURFS" => Some(16.0),
+        "DOWN" | "RESET_ALPHA" | "VIS_INHERIT_ID" | "SEE_SELF" => Some(32.0),
         // Appearance flags are BYOND bitflags. Keep the complete contiguous
         // built-in flag family here rather than teaching project code about
         // individual flags as each one is encountered.
         // These make an overlay/image ignore the corresponding value
         // inherited from its parent.
-        "PIXEL_SCALE" => Some(64.0),
-        "TILE_BOUND" | "MATRIX_MODIFY" => Some(128.0),
-        "INHERIT_ID" => Some(256.0),
-        "NO_CLIENT_COLOR" => Some(512.0),
-        "RESET_CONTENTS" => Some(1024.0),
+        "PIXEL_SCALE" | "EASE_IN" | "VIS_UNDERLAY" | "SEE_INFRA" => Some(64.0),
+        "TILE_BOUND" | "MATRIX_MODIFY" | "EASE_OUT" | "VIS_HIDE" => Some(128.0),
+        "INHERIT_ID" | "ANIMATION_RELATIVE" | "SEE_PIXELS" => Some(256.0),
+        "NO_CLIENT_COLOR" | "ANIMATION_CONTINUE" | "SEE_THRU" => Some(512.0),
+        "RESET_CONTENTS" | "SEE_BLACKNESS" => Some(1024.0),
         "PLANE_MASTER" => Some(2048.0),
         "PASS_MOUSE" => Some(4096.0),
         "TILE_MOVER" => Some(8192.0),
+        "EFFECTS_LAYER" => Some(5000.0),
+        "TOPDOWN_LAYER" => Some(10000.0),
+        "BACKGROUND_LAYER" => Some(20000.0),
+        "FLOAT_PLANE" => Some(-32767.0),
+        "TILED_ICON_MAP" => Some(32768.0),
         _ => None,
     }
 }
@@ -4203,11 +5129,20 @@ fn dm_builtin_numeric_constant(identifier: &str) -> Option<f32> {
 struct ExpressionParser<'a> {
     tokens: &'a [SpannedToken],
     index: usize,
+    /// While parsing the true arm of `?:`, a bare colon terminates that arm
+    /// instead of selecting a dynamic field.  Outside that one context DM's
+    /// `datum:field` syntax remains a normal postfix operation, including in
+    /// the false arm (`condition ? datum : datum:type`).
+    conditional_true_arm: bool,
 }
 
 impl<'a> ExpressionParser<'a> {
     const fn new(tokens: &'a [SpannedToken]) -> Self {
-        Self { tokens, index: 0 }
+        Self {
+            tokens,
+            index: 0,
+            conditional_true_arm: false,
+        }
     }
 
     fn parse(mut self) -> Result<Expression, CompileError> {
@@ -4233,7 +5168,8 @@ impl<'a> ExpressionParser<'a> {
         };
         if !matches!(
             operator.as_str(),
-            "=" | "+="
+            "=" | ":="
+                | "+="
                 | "-="
                 | "*="
                 | "/="
@@ -4249,7 +5185,11 @@ impl<'a> ExpressionParser<'a> {
         ) {
             return Ok(target);
         }
-        let operator = operator.clone();
+        let operator = if operator == ":=" {
+            "=".to_owned()
+        } else {
+            operator.clone()
+        };
         self.index += 1;
         let value = self.parse_assignment()?;
         if operator == "||=" {
@@ -4295,11 +5235,17 @@ impl<'a> ExpressionParser<'a> {
             return Ok(condition);
         }
         self.index += 1;
+        let enclosing_true_arm = self.conditional_true_arm;
+        self.conditional_true_arm = true;
         let when_true = self.parse_assignment()?;
         match self.tokens.get(self.index).map(|token| &token.kind) {
             Some(TokenKind::Operator(operator)) if operator == ":" => self.index += 1,
             _ => return Err(compile_error("expected ':' in conditional expression")),
         }
+        // The false arm is still inside an enclosing true arm, if there is
+        // one.  In `a ? b ? c : d : e`, that outer colon must terminate the
+        // nested expression rather than becoming dynamic access `d:e`.
+        self.conditional_true_arm = enclosing_true_arm;
         let when_false = self.parse_assignment()?;
         Ok(Expression::Conditional {
             condition: Box::new(condition),
@@ -4326,16 +5272,41 @@ impl<'a> ExpressionParser<'a> {
             };
             let right = self.parse_binary(right_precedence)?;
             left = if operator == "in" {
-                match left {
-                    Expression::Locate { arguments } => Expression::LocateIn {
-                        arguments,
-                        container: Box::new(right),
-                    },
-                    left => Expression::Binary {
-                        operator,
-                        left: Box::new(left),
-                        right: Box::new(right),
-                    },
+                // `value in lower to upper` is BYOND's inclusive range
+                // predicate. `to` is a keyword delimiter rather than a
+                // general arithmetic operator, so lower it directly to the
+                // two comparisons while the left operand is still available.
+                if matches!(
+                    self.tokens.get(self.index).map(|token| &token.kind),
+                    Some(TokenKind::Identifier(keyword)) if keyword == "to"
+                ) {
+                    self.index += 1;
+                    let upper = self.parse_binary(right_precedence)?;
+                    Expression::Binary {
+                        operator: "&&".to_owned(),
+                        left: Box::new(Expression::Binary {
+                            operator: ">=".to_owned(),
+                            left: Box::new(left.clone()),
+                            right: Box::new(right),
+                        }),
+                        right: Box::new(Expression::Binary {
+                            operator: "<=".to_owned(),
+                            left: Box::new(left),
+                            right: Box::new(upper),
+                        }),
+                    }
+                } else {
+                    match left {
+                        Expression::Locate { arguments } => Expression::LocateIn {
+                            arguments,
+                            container: Box::new(right),
+                        },
+                        left => Expression::Binary {
+                            operator,
+                            left: Box::new(left),
+                            right: Box::new(right),
+                        },
+                    }
                 }
             } else {
                 Expression::Binary {
@@ -4380,7 +5351,12 @@ impl<'a> ExpressionParser<'a> {
             ) || safe_list_index;
             if starts_list_index {
                 self.index += 1;
-                let index = self.parse_binary(1)?;
+                // An index is a full DM expression. In particular, ternaries
+                // and assignments are legal here (`values[flag ? a : b]`).
+                // Parsing only the binary-precedence layer left the `?` in
+                // front of the closing bracket and produced a misleading
+                // "expected ']'" diagnostic.
+                let index = self.parse_assignment()?;
                 if !matches!(
                     self.tokens.get(self.index).map(|token| &token.kind),
                     Some(TokenKind::Punctuation(']'))
@@ -4410,7 +5386,12 @@ impl<'a> ExpressionParser<'a> {
                 };
                 let qualified = qualified.clone();
                 self.index += 1;
-                if matches!(
+                if qualified == "name"
+                    && let Expression::TypePath(path) = &expression
+                    && let Some((_, procedure_name)) = path.as_str().rsplit_once("/proc/")
+                {
+                    expression = Expression::Text(procedure_name.to_owned());
+                } else if matches!(
                     self.tokens.get(self.index).map(|token| &token.kind),
                     Some(TokenKind::Punctuation('('))
                 ) {
@@ -4430,9 +5411,7 @@ impl<'a> ExpressionParser<'a> {
             }
             if matches!(self.current_operator(), Some("." | "?." | "?:"))
                 || (matches!(self.current_operator(), Some(":"))
-                    && !self.tokens[..self.index].iter().any(
-                        |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "?")
-                    )
+                    && (!self.conditional_true_arm || self.colon_member_is_lexically_attached())
                     && matches!(
                         self.tokens.get(self.index + 1).map(|token| &token.kind),
                         Some(TokenKind::Identifier(_))
@@ -4463,6 +5442,29 @@ impl<'a> ExpressionParser<'a> {
                 };
                 continue;
             }
+            // `input(...) as null|anything in choices` is an input-picker
+            // suffix, not a cast of the call expression. The type union is UI
+            // metadata and `in choices` supplies the displayed candidates;
+            // the native input call already represents the selected value in
+            // headless execution. Parse and consume both parts here.
+            if matches!(
+                self.tokens.get(self.index).map(|token| &token.kind),
+                Some(TokenKind::Identifier(keyword)) if keyword == "as"
+            ) {
+                self.index += 1;
+                while !matches!(
+                    self.tokens.get(self.index).map(|token| &token.kind),
+                    Some(TokenKind::Identifier(keyword)) if keyword == "in"
+                ) {
+                    if self.index >= self.tokens.len() {
+                        return Ok(expression);
+                    }
+                    self.index += 1;
+                }
+                self.index += 1;
+                let _choices = self.parse_assignment()?;
+                continue;
+            }
             // A datum procedure call is a postfix operation in DM.  The
             // regular `name(...)` arm in `parse_primary` handles static
             // calls, while `receiver.name(...)` must retain both the datum
@@ -4480,6 +5482,7 @@ impl<'a> ExpressionParser<'a> {
                             target: receiver,
                             procedure: Box::new(Expression::Text(name.as_str().to_owned())),
                             arguments,
+                            null_receiver_is_global: false,
                         }
                     }
                     Expression::SafeField { receiver, name } => {
@@ -4490,10 +5493,16 @@ impl<'a> ExpressionParser<'a> {
                             arguments,
                         }
                     }
-                    other => {
-                        expression = other;
-                        break;
-                    }
+                    // A second argument list invokes the procedure selector
+                    // produced by the preceding expression.  DreamMaker uses
+                    // this for `call_ext(library, function)(arguments)` as
+                    // well as ordinary `call(...)(...)` selectors.
+                    other => Expression::DynamicCall {
+                        target: Box::new(Expression::Null),
+                        procedure: Box::new(other),
+                        arguments: self.parse_call_arguments()?,
+                        null_receiver_is_global: true,
+                    },
                 };
                 continue;
             }
@@ -4510,6 +5519,16 @@ impl<'a> ExpressionParser<'a> {
             break;
         }
         Ok(expression)
+    }
+
+    fn colon_member_is_lexically_attached(&self) -> bool {
+        let Some(colon) = self.tokens.get(self.index) else {
+            return false;
+        };
+        let Some(name) = self.tokens.get(self.index + 1) else {
+            return false;
+        };
+        colon.span.end == name.span.start
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4531,6 +5550,13 @@ impl<'a> ExpressionParser<'a> {
                     let Some(TokenKind::Identifier(segment)) =
                         self.tokens.get(self.index).map(|token| &token.kind)
                     else {
+                        // BYOND accepts a canonical type path with a trailing
+                        // slash (commonly used as an associative-list key).
+                        // The slash has already been consumed; canonicalize it
+                        // away once at least one real segment was collected.
+                        if !path.is_empty() {
+                            break;
+                        }
                         return Err(compile_error("expected a type path segment after '/'"));
                     };
                     path.push('/');
@@ -4541,9 +5567,14 @@ impl<'a> ExpressionParser<'a> {
                     }
                     self.index += 1;
                 }
-                TypePath::parse(&path)
-                    .map(Expression::TypePath)
-                    .map_err(|error| compile_error(error.to_string()))
+                let base =
+                    TypePath::parse(&path).map_err(|error| compile_error(error.to_string()))?;
+                let overrides = self.parse_modified_type_overrides()?;
+                if overrides.is_empty() {
+                    Ok(Expression::TypePath(base))
+                } else {
+                    Ok(Expression::ModifiedTypePath { base, overrides })
+                }
             }
             TokenKind::Operator(operator)
                 if operator == ".."
@@ -4583,10 +5614,19 @@ impl<'a> ExpressionParser<'a> {
             // has no asset loader, so preserve its canonical path as text;
             // this allows resource-valued arguments and field assignments to
             // compile while retaining a deterministic value for inspection.
-            TokenKind::String(text)
-            | TokenKind::RawString(text)
-            | TokenKind::TextBlock(text)
-            | TokenKind::Resource(text) => Ok(Expression::Text(text.clone())),
+            TokenKind::String(text) => parse_interpolated_string(text),
+            TokenKind::RawString(text) | TokenKind::TextBlock(text) => {
+                Ok(Expression::Text(text.clone()))
+            }
+            TokenKind::Resource(text) => {
+                let normalized = text.replace('\\', "/");
+                Ok(Expression::Text(
+                    normalized
+                        .strip_prefix("./")
+                        .unwrap_or(&normalized)
+                        .to_owned(),
+                ))
+            }
             TokenKind::Identifier(identifier) if identifier == "null" => Ok(Expression::Null),
             TokenKind::Identifier(identifier)
                 if let Some(value) = dm_builtin_numeric_constant(identifier) =>
@@ -4622,6 +5662,7 @@ impl<'a> ExpressionParser<'a> {
             }
             TokenKind::Identifier(identifier) if identifier == "src" => Ok(Expression::Src),
             TokenKind::Identifier(identifier) if identifier == "usr" => Ok(Expression::Usr),
+            TokenKind::Identifier(identifier) if identifier == "caller" => Ok(Expression::Caller),
             TokenKind::Identifier(identifier) if identifier == "world" => Ok(Expression::World),
             TokenKind::Identifier(identifier) if identifier == "locs" => Ok(Expression::Field {
                 receiver: Box::new(Expression::Src),
@@ -4691,6 +5732,7 @@ impl<'a> ExpressionParser<'a> {
                 // headless VM currently only establishes object identity.
                 if matches!(self.current_operator(), Some("/")) {
                     let type_path = self.parse_primary()?;
+                    let overrides = self.parse_modified_type_overrides()?;
                     let arguments = if matches!(
                         self.tokens.get(self.index).map(|token| &token.kind),
                         Some(TokenKind::Punctuation('('))
@@ -4702,6 +5744,7 @@ impl<'a> ExpressionParser<'a> {
                     Ok(Expression::New {
                         type_path: Some(Box::new(type_path)),
                         arguments,
+                        overrides,
                     })
                 } else if matches!(
                     self.tokens.get(self.index).map(|token| &token.kind),
@@ -4710,6 +5753,7 @@ impl<'a> ExpressionParser<'a> {
                     Ok(Expression::New {
                         type_path: None,
                         arguments: self.parse_call_arguments()?,
+                        overrides: Vec::new(),
                     })
                 } else if let Some(TokenKind::Identifier(type_name)) =
                     self.tokens.get(self.index).map(|token| &token.kind)
@@ -4734,19 +5778,40 @@ impl<'a> ExpressionParser<'a> {
                     Ok(Expression::New {
                         type_path: Some(Box::new(type_path)),
                         arguments,
+                        overrides: Vec::new(),
                     })
                 } else {
                     Ok(Expression::New {
                         type_path: None,
                         arguments: Vec::new(),
+                        overrides: Vec::new(),
                     })
                 }
             }
+            TokenKind::Identifier(identifier) if identifier == "call_ext" => {
+                let selectors = self.parse_call_arguments()?;
+                let [library, function] = selectors.as_slice() else {
+                    return Err(compile_error(
+                        "call_ext requires a library and exported function selector",
+                    ));
+                };
+                if !matches!(
+                    self.tokens.get(self.index).map(|token| &token.kind),
+                    Some(TokenKind::Punctuation('('))
+                ) {
+                    return Err(compile_error("call_ext selector requires an argument list"));
+                }
+                Ok(Expression::ExternalCall {
+                    library: Box::new(library.clone()),
+                    function: Box::new(function.clone()),
+                    arguments: self.parse_call_arguments()?,
+                })
+            }
             TokenKind::Identifier(identifier) if identifier == "call" => {
                 let selectors = self.parse_call_arguments()?;
-                let (target, procedure) = match selectors.as_slice() {
-                    [procedure] => (Expression::Null, procedure.clone()),
-                    [target, procedure] => (target.clone(), procedure.clone()),
+                let (target, procedure, null_receiver_is_global) = match selectors.as_slice() {
+                    [procedure] => (Expression::Null, procedure.clone(), true),
+                    [target, procedure] => (target.clone(), procedure.clone(), false),
                     _ => {
                         return Err(compile_error(
                             "call requires a procedure or a receiver and procedure",
@@ -4763,6 +5828,7 @@ impl<'a> ExpressionParser<'a> {
                     target: Box::new(target),
                     procedure: Box::new(procedure),
                     arguments: self.parse_call_arguments()?,
+                    null_receiver_is_global,
                 })
             }
             TokenKind::Identifier(identifier)
@@ -4771,8 +5837,21 @@ impl<'a> ExpressionParser<'a> {
                     Some(TokenKind::Punctuation('('))
                 ) =>
             {
-                if identifier == "list" {
+                if identifier == "CRASH" {
+                    let mut arguments = self.parse_call_arguments()?;
+                    if arguments.len() != 1 {
+                        return Err(compile_error(format!(
+                            "CRASH requires exactly one argument, received {}",
+                            arguments.len()
+                        )));
+                    }
+                    Ok(Expression::Crash(Box::new(
+                        arguments.pop().expect("CRASH argument count was validated"),
+                    )))
+                } else if identifier == "list" {
                     Ok(Expression::List(self.parse_list_arguments()?))
+                } else if identifier == "alist" {
+                    Ok(Expression::AssociativeList(self.parse_list_arguments()?))
                 } else if identifier == "arglist" {
                     let mut arguments = self.parse_call_arguments()?;
                     if arguments.len() != 1 {
@@ -4834,6 +5913,12 @@ impl<'a> ExpressionParser<'a> {
                         return Err(compile_error("matrix accepts at most six arguments"));
                     }
                     Ok(Expression::Matrix { arguments })
+                } else if identifier == "vector" {
+                    let arguments = self.parse_call_arguments()?;
+                    if arguments.len() > 3 {
+                        return Err(compile_error("vector accepts at most three arguments"));
+                    }
+                    Ok(Expression::Vector { arguments })
                 } else if let Some((exact, character_indices)) = replacetext_kind(identifier) {
                     let arguments = self.parse_call_arguments()?;
                     if !(3..=5).contains(&arguments.len()) {
@@ -4903,6 +5988,20 @@ impl<'a> ExpressionParser<'a> {
                         source: Box::new(source),
                         direction: Box::new(direction),
                     })
+                } else if identifier == "get_step_towards" {
+                    let mut arguments = self.parse_call_arguments()?;
+                    if arguments.len() != 2 {
+                        return Err(compile_error(format!(
+                            "get_step_towards requires exactly a source and target, received {} arguments",
+                            arguments.len()
+                        )));
+                    }
+                    let target = arguments.pop().expect("argument count validated");
+                    let source = arguments.pop().expect("argument count validated");
+                    Ok(Expression::GetStepTowards {
+                        source: Box::new(source),
+                        target: Box::new(target),
+                    })
                 } else if identifier == "range" {
                     let arguments = self.parse_call_arguments()?;
                     if !(1..=2).contains(&arguments.len()) {
@@ -4938,13 +6037,22 @@ impl<'a> ExpressionParser<'a> {
                     })
                 } else if identifier == "rand" {
                     let arguments = self.parse_call_arguments()?;
-                    if !(1..=2).contains(&arguments.len()) {
+                    if arguments.len() > 2 {
                         return Err(compile_error(format!(
-                            "rand requires one or two numeric bounds, received {} arguments",
+                            "rand accepts zero, one, or two numeric bounds, received {} arguments",
                             arguments.len()
                         )));
                     }
                     Ok(Expression::Rand { arguments })
+                } else if identifier == "roll" {
+                    let arguments = self.parse_call_arguments()?;
+                    if !(1..=2).contains(&arguments.len()) {
+                        return Err(compile_error(format!(
+                            "roll requires dice or a dice count and side count, received {} arguments",
+                            arguments.len()
+                        )));
+                    }
+                    Ok(Expression::Roll { arguments })
                 } else if identifier == "pick" {
                     Ok(Expression::Pick {
                         entries: self.parse_pick_arguments()?,
@@ -4982,8 +6090,24 @@ impl<'a> ExpressionParser<'a> {
                     Ok(Expression::Locate {
                         arguments: self.parse_call_arguments()?,
                     })
+                } else if identifier == "animate" {
+                    Ok(Expression::Animate {
+                        arguments: self.parse_named_call_arguments()?,
+                    })
+                } else if identifier == "filter" {
+                    Ok(Expression::Filter {
+                        arguments: self.parse_named_call_arguments()?,
+                    })
                 } else if identifier == "nameof" {
                     self.parse_nameof_expression()
+                } else if matches!(
+                    identifier.as_str(),
+                    "MapColors" | "Blend" | "SetIntensity" | "Turn"
+                ) {
+                    Ok(Expression::NativeSrcMethod {
+                        name: identifier.clone(),
+                        arguments: self.parse_call_arguments()?,
+                    })
                 } else if let Some((minimum, maximum)) = standard_builtin_arity(identifier) {
                     let arguments = self.parse_call_arguments()?;
                     if arguments.len() < minimum || arguments.len() > maximum {
@@ -5066,6 +6190,16 @@ impl<'a> ExpressionParser<'a> {
     }
 
     fn parse_call_arguments(&mut self) -> Result<Vec<Expression>, CompileError> {
+        Ok(self
+            .parse_named_call_arguments()?
+            .into_iter()
+            .map(|(_, expression)| expression)
+            .collect())
+    }
+
+    fn parse_named_call_arguments(
+        &mut self,
+    ) -> Result<Vec<(Option<String>, Expression)>, CompileError> {
         if !matches!(
             self.tokens.get(self.index).map(|token| &token.kind),
             Some(TokenKind::Punctuation('('))
@@ -5079,6 +6213,24 @@ impl<'a> ExpressionParser<'a> {
             Some(TokenKind::Punctuation(')'))
         ) {
             loop {
+                // Empty positional slots are legal DM and mean that the
+                // callee's default value should be used.  The VM represents
+                // an omitted interior slot as null until its call ABI carries
+                // a distinct omission marker.
+                if matches!(
+                    self.tokens.get(self.index).map(|token| &token.kind),
+                    Some(TokenKind::Punctuation(','))
+                ) {
+                    arguments.push((None, Expression::Null));
+                    self.index += 1;
+                    if matches!(
+                        self.tokens.get(self.index).map(|token| &token.kind),
+                        Some(TokenKind::Punctuation(')'))
+                    ) {
+                        break;
+                    }
+                    continue;
+                }
                 // BYOND permits keyword-style call arguments, e.g.
                 // `do_after(user, 4 SECONDS, target = src)`.  The current
                 // execution ABI is positional, but retaining the source
@@ -5086,19 +6238,21 @@ impl<'a> ExpressionParser<'a> {
                 // subset and, importantly, lets the compiler continue on to
                 // report the next unsupported construct instead of rejecting
                 // the call syntax itself.
-                if matches!(
-                    (
-                        self.tokens.get(self.index).map(|token| &token.kind),
-                        self.tokens.get(self.index + 1).map(|token| &token.kind),
-                    ),
-                    (
-                        Some(TokenKind::Identifier(_)),
-                        Some(TokenKind::Operator(operator)),
-                    ) if operator == "="
+                let name = match (
+                    self.tokens.get(self.index).map(|token| &token.kind),
+                    self.tokens.get(self.index + 1).map(|token| &token.kind),
                 ) {
+                    (Some(TokenKind::Identifier(name)), Some(TokenKind::Operator(operator)))
+                        if operator == "=" =>
+                    {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                };
+                if name.is_some() {
                     self.index += 2;
                 }
-                arguments.push(self.parse_assignment()?);
+                arguments.push((name, self.parse_assignment()?));
                 match self.tokens.get(self.index).map(|token| &token.kind) {
                     // DM's weighted `pick()` syntax separates a weight from
                     // its candidate with `;`, e.g. `pick(10; red, 1; blue)`.
@@ -5120,9 +6274,10 @@ impl<'a> ExpressionParser<'a> {
                     }
                     Some(TokenKind::Punctuation(')')) => break,
                     _ => {
-                        return Err(compile_error(
-                            "expected ',' or ')' after procedure argument",
-                        ));
+                        return Err(compile_error(format!(
+                            "expected ',' or ')' after procedure argument, received {:?}",
+                            self.tokens.get(self.index).map(|token| &token.kind)
+                        )));
                     }
                 }
             }
@@ -5167,6 +6322,60 @@ impl<'a> ExpressionParser<'a> {
         }
         self.index += 1;
         Ok(entries)
+    }
+
+    fn parse_modified_type_overrides(
+        &mut self,
+    ) -> Result<Vec<(FieldName, Expression)>, CompileError> {
+        if !matches!(
+            self.tokens.get(self.index).map(|token| &token.kind),
+            Some(TokenKind::Punctuation('{'))
+        ) {
+            return Ok(Vec::new());
+        }
+        self.index += 1;
+        let mut overrides = Vec::new();
+        loop {
+            if matches!(
+                self.tokens.get(self.index).map(|token| &token.kind),
+                Some(TokenKind::Punctuation('}'))
+            ) {
+                self.index += 1;
+                return Ok(overrides);
+            }
+            let Some(TokenKind::Identifier(name)) =
+                self.tokens.get(self.index).map(|token| &token.kind)
+            else {
+                return Err(compile_error("modified type requires a field name"));
+            };
+            let name = FieldName::parse(name).map_err(|error| compile_error(error.to_string()))?;
+            self.index += 1;
+            if !matches!(self.current_operator(), Some("=")) {
+                return Err(compile_error("modified type field requires '='"));
+            }
+            self.index += 1;
+            let start = self.index;
+            let mut depth = 0_usize;
+            while let Some(token) = self.tokens.get(self.index) {
+                match token.kind {
+                    TokenKind::Punctuation('(' | '[') => depth += 1,
+                    TokenKind::Punctuation(')' | ']') => depth = depth.saturating_sub(1),
+                    TokenKind::Punctuation('}' | ';') if depth == 0 => break,
+                    _ => {}
+                }
+                self.index += 1;
+            }
+            if start == self.index {
+                return Err(compile_error("modified type field value is empty"));
+            }
+            let value = ExpressionParser::new(&self.tokens[start..self.index]).parse()?;
+            overrides.push((name, value));
+            match self.tokens.get(self.index).map(|token| &token.kind) {
+                Some(TokenKind::Punctuation(';')) => self.index += 1,
+                Some(TokenKind::Punctuation('}')) => {}
+                _ => return Err(compile_error("modified type requires ';' or '}'")),
+            }
+        }
     }
 
     fn parse_list_arguments(&mut self) -> Result<Vec<ListExpressionEntry>, CompileError> {
@@ -5251,7 +6460,11 @@ fn type_predicate_kind(identifier: &str) -> Option<TypePredicateKind> {
 
 fn parse_number(spelling: &str) -> Result<DmNumberBits, CompileError> {
     let normalized = spelling.replace('_', "");
-    let value = if let Some(hexadecimal) = normalized
+    let value = if matches!(normalized.as_str(), "1#INF" | "1.#INF") {
+        f32::INFINITY
+    } else if matches!(normalized.as_str(), "1#IND" | "1.#IND") {
+        f32::NAN
+    } else if let Some(hexadecimal) = normalized
         .strip_prefix("0x")
         .or_else(|| normalized.strip_prefix("0X"))
     {
@@ -5267,6 +6480,86 @@ fn parse_number(spelling: &str) -> Result<DmNumberBits, CompileError> {
             .map_err(|error| compile_error(format!("invalid number {spelling:?}: {error}")))?
     };
     Ok(DmNumberBits::from_f32(value))
+}
+
+fn parse_interpolated_string(text: &str) -> Result<Expression, CompileError> {
+    let mut arguments = Vec::new();
+    let mut cursor = 0_usize;
+    while let Some(relative_open) = text[cursor..].find('[') {
+        let open = cursor + relative_open;
+        if open > 0 && text.as_bytes()[open - 1] == b'\\' {
+            cursor = open + 1;
+            continue;
+        }
+        let Some(close) = interpolated_expression_close(text, open + 1) else {
+            break;
+        };
+        if text[open + 1..close].trim().is_empty() {
+            cursor = close + 1;
+            continue;
+        }
+        if open > cursor {
+            arguments.push(Expression::Text(text[cursor..open].to_owned()));
+        }
+        let tokens = lex(&text[open + 1..close])
+            .map_err(|error| {
+                compile_error(format!("invalid embedded expression: {}", error.message))
+            })?
+            .into_iter()
+            .filter(|token| !matches!(token.kind, TokenKind::LineStart { .. } | TokenKind::Newline))
+            .collect::<Vec<_>>();
+        arguments.push(Expression::StandardBuiltin {
+            name: "text".to_owned(),
+            arguments: vec![
+                Expression::Text("[]".to_owned()),
+                ExpressionParser::new(&tokens).parse()?,
+            ],
+        });
+        cursor = close + 1;
+    }
+    if arguments.is_empty() {
+        return Ok(Expression::Text(text.to_owned()));
+    }
+    if cursor < text.len() {
+        arguments.push(Expression::Text(text[cursor..].to_owned()));
+    }
+    Ok(Expression::StandardBuiltin {
+        name: "addtext".to_owned(),
+        arguments,
+    })
+}
+
+fn interpolated_expression_close(text: &str, start: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut cursor = start;
+    let mut quote = None;
+    let mut escaped = false;
+    while cursor < text.len() {
+        let character = text[cursor..].chars().next()?;
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == delimiter {
+                quote = None;
+            }
+        } else {
+            match character {
+                '"' | '\'' => quote = Some(character),
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(cursor);
+                    }
+                }
+                _ => {}
+            }
+        }
+        cursor += character.len_utf8();
+    }
+    None
 }
 
 const fn binary_precedence(operator: &str) -> Option<u8> {
@@ -5298,11 +6591,10 @@ fn emit_associative_list_key(
     instructions: &mut Vec<Instruction>,
     procedures: &HashMap<String, ProcedureId>,
 ) -> Result<(), CompileError> {
-    if let Expression::Local(name) = key
-        && locals.get(name).is_none()
-        && locals.src_field(name).is_none()
-        && locals.global_field(name).is_none()
-    {
+    // In DM's list-constructor grammar, a bare identifier to the left of `=`
+    // is a named/text key even when a local, field, or global with the same
+    // spelling exists. Dynamic keys use an explicit expression instead.
+    if let Expression::Local(name) = key {
         instructions.push(Instruction::PushText(name.clone()));
         return Ok(());
     }
@@ -5358,19 +6650,37 @@ fn emit_expression(
         Expression::Number(number) => instructions.push(Instruction::PushNumber(*number)),
         Expression::Text(text) => instructions.push(Instruction::PushText(text.clone())),
         Expression::TypePath(path) => instructions.push(Instruction::PushTypePath(path.clone())),
+        Expression::ModifiedTypePath { base, overrides } => {
+            instructions.push(Instruction::PushTypePath(base.clone()));
+            for (_, value) in overrides {
+                emit_expression(value, locals, instructions, procedures)?;
+            }
+            instructions.push(Instruction::MakeModifiedTypePath {
+                fields: overrides
+                    .iter()
+                    .map(|(field, _)| field.clone())
+                    .collect::<Vec<_>>()
+                    .into(),
+            });
+        }
         Expression::New {
             type_path,
             arguments,
+            overrides,
         } => {
-            if let Some(type_path) = type_path {
-                emit_expression(type_path, locals, instructions, procedures)?;
-            }
+            let Some(type_path) = type_path else {
+                return Err(compile_error(
+                    "inferred new has no statically resolved destination type",
+                ));
+            };
+            emit_expression(type_path, locals, instructions, procedures)?;
             let argument_count = emit_call_arguments(arguments, locals, instructions, procedures)?;
-            instructions.push(if type_path.is_some() {
-                Instruction::AllocateDatum { argument_count }
-            } else {
-                Instruction::AllocateCurrentDatum { argument_count }
-            });
+            instructions.push(Instruction::AllocateDatum { argument_count });
+            for (name, value) in overrides {
+                instructions.push(Instruction::Duplicate);
+                emit_expression(value, locals, instructions, procedures)?;
+                instructions.push(Instruction::StoreField(name.clone()));
+            }
         }
         Expression::Regex { arguments } => {
             for argument in arguments {
@@ -5398,6 +6708,15 @@ fn emit_expression(
             instructions.push(Instruction::MakeMatrix {
                 argument_count: u8::try_from(arguments.len())
                     .expect("matrix argument count was validated"),
+            });
+        }
+        Expression::Vector { arguments } => {
+            for argument in arguments {
+                emit_expression(argument, locals, instructions, procedures)?;
+            }
+            instructions.push(Instruction::MakeVector {
+                argument_count: u8::try_from(arguments.len())
+                    .expect("vector argument count was validated"),
             });
         }
         Expression::ReplaceText {
@@ -5450,6 +6769,11 @@ fn emit_expression(
             emit_expression(direction, locals, instructions, procedures)?;
             instructions.push(Instruction::GetStep);
         }
+        Expression::GetStepTowards { source, target } => {
+            emit_expression(source, locals, instructions, procedures)?;
+            emit_expression(target, locals, instructions, procedures)?;
+            instructions.push(Instruction::GetStepTowards);
+        }
         Expression::Range { arguments } => {
             for argument in arguments {
                 emit_expression(argument, locals, instructions, procedures)?;
@@ -5470,6 +6794,15 @@ fn emit_expression(
             instructions.push(Instruction::Rand {
                 argument_count: u8::try_from(arguments.len())
                     .expect("rand argument count was validated by the parser"),
+            });
+        }
+        Expression::Roll { arguments } => {
+            for argument in arguments {
+                emit_expression(argument, locals, instructions, procedures)?;
+            }
+            instructions.push(Instruction::Roll {
+                argument_count: u8::try_from(arguments.len())
+                    .expect("roll argument count was validated by the parser"),
             });
         }
         Expression::Pick { entries } => {
@@ -5520,6 +6853,7 @@ fn emit_expression(
         }
         Expression::Src => instructions.push(Instruction::LoadSrc),
         Expression::Usr => instructions.push(Instruction::LoadUsr),
+        Expression::Caller => instructions.push(Instruction::LoadCaller),
         Expression::World => instructions.push(Instruction::LoadGlobal(
             FieldName::parse("world").expect("built-in world global name is valid"),
         )),
@@ -5527,8 +6861,16 @@ fn emit_expression(
             return Err(compile_error("global namespace requires a field name"));
         }
         Expression::Field { receiver, name } => {
-            emit_expression(receiver, locals, instructions, procedures)?;
-            instructions.push(Instruction::LoadField(name.clone()));
+            if let Some(storage) = locals.receiver_static(receiver.as_ref(), name).or_else(|| {
+                matches!(receiver.as_ref(), Expression::Src)
+                    .then(|| locals.global_field(name.as_str()))
+                    .flatten()
+            }) {
+                instructions.push(Instruction::LoadGlobal(storage.clone()));
+            } else {
+                emit_expression(receiver, locals, instructions, procedures)?;
+                instructions.push(Instruction::LoadField(name.clone()));
+            }
         }
         Expression::SafeField { receiver, name } => {
             emit_expression(receiver, locals, instructions, procedures)?;
@@ -5540,7 +6882,11 @@ fn emit_expression(
             instructions[null_jump] = Instruction::JumpIfNull(end);
         }
         Expression::GlobalField(name) => {
-            instructions.push(Instruction::LoadGlobal(name.clone()));
+            if name.as_str() == "vars" {
+                instructions.push(Instruction::LoadGlobalVars);
+            } else {
+                instructions.push(Instruction::LoadGlobal(name.clone()));
+            }
         }
         Expression::Result => instructions.push(Instruction::LoadResult),
         Expression::ArgList(_) => {
@@ -5554,10 +6900,76 @@ fn emit_expression(
             for argument in arguments {
                 emit_expression(argument, locals, instructions, procedures)?;
             }
-            instructions.push(Instruction::StandardBuiltin {
+            // DM source may deliberately replace a global procedure whose name
+            // also has an engine fallback (tgstation's /proc/qdel is the
+            // important case). A real project procedure wins over the native
+            // fallback exactly like any other global proc declaration.
+            if let Some(procedure) = procedures.get(name).copied() {
+                instructions.push(Instruction::Call {
+                    procedure,
+                    argument_count,
+                });
+            } else {
+                instructions.push(Instruction::StandardBuiltin {
+                    name: name.clone(),
+                    argument_count,
+                });
+            }
+        }
+        Expression::NativeSrcMethod { name, arguments } => {
+            let argument_count = u16::try_from(arguments.len())
+                .map_err(|_| compile_error("native method has more than 65535 arguments"))?;
+            for argument in arguments {
+                emit_expression(argument, locals, instructions, procedures)?;
+            }
+            instructions.push(Instruction::NativeSrcMethod {
                 name: name.clone(),
                 argument_count,
             });
+        }
+        Expression::ExternalCall {
+            library,
+            function,
+            arguments,
+        } => {
+            emit_expression(library, locals, instructions, procedures)?;
+            emit_expression(function, locals, instructions, procedures)?;
+            for argument in arguments {
+                emit_expression(argument, locals, instructions, procedures)?;
+            }
+            instructions.push(Instruction::ExternalCall {
+                argument_count: u16::try_from(arguments.len())
+                    .map_err(|_| compile_error("external call has more than 65535 arguments"))?,
+            });
+        }
+        Expression::Animate { arguments } => {
+            for (_, argument) in arguments {
+                emit_expression(argument, locals, instructions, procedures)?;
+            }
+            instructions.push(Instruction::Animate {
+                argument_names: arguments.iter().map(|(name, _)| name.clone()).collect(),
+            });
+        }
+        Expression::Filter { arguments } => {
+            let mut expanded_indices = Vec::new();
+            for (index, (_, argument)) in arguments.iter().enumerate() {
+                if let Expression::ArgList(value) = argument {
+                    expanded_indices.push(to_local_index(index)?);
+                    emit_expression(value, locals, instructions, procedures)?;
+                } else {
+                    emit_expression(argument, locals, instructions, procedures)?;
+                }
+            }
+            instructions.push(Instruction::MakeFilter {
+                argument_names: arguments.iter().map(|(name, _)| name.clone()).collect(),
+                expanded_indices,
+            });
+        }
+        Expression::Crash(message) => {
+            emit_expression(message, locals, instructions, procedures)?;
+            instructions.push(Instruction::Crash);
+            // Keep expression stack shape valid for unreachable continuation.
+            instructions.push(Instruction::PushNull);
         }
         Expression::Sleep(delay) => {
             emit_expression(delay, locals, instructions, procedures)?;
@@ -5565,8 +6977,14 @@ fn emit_expression(
         }
         Expression::Initial(reference) => match reference.as_ref() {
             Expression::Field { receiver, name } => {
-                emit_expression(receiver, locals, instructions, procedures)?;
-                instructions.push(Instruction::InitialField(name.clone()));
+                if let Some(storage) = locals.receiver_static(receiver, name) {
+                    // Static initialization is materialized before procedures
+                    // run and occupies its qualified persistent slot.
+                    instructions.push(Instruction::LoadInitialGlobal(storage.clone()));
+                } else {
+                    emit_expression(receiver, locals, instructions, procedures)?;
+                    instructions.push(Instruction::InitialField(name.clone()));
+                }
             }
             Expression::Local(name) => {
                 let field = locals.src_field(name).ok_or_else(|| {
@@ -5644,11 +7062,15 @@ fn emit_expression(
             target,
             procedure,
             arguments,
+            null_receiver_is_global,
         } => {
             emit_expression(target, locals, instructions, procedures)?;
             emit_expression(procedure, locals, instructions, procedures)?;
             let argument_count = emit_call_arguments(arguments, locals, instructions, procedures)?;
-            instructions.push(Instruction::CallDynamic { argument_count });
+            instructions.push(Instruction::CallDynamic {
+                argument_count,
+                null_receiver_is_global: *null_receiver_is_global,
+            });
         }
         Expression::SafeDynamicCall {
             target,
@@ -5661,7 +7083,10 @@ fn emit_expression(
             instructions.push(Instruction::JumpIfNull(usize::MAX));
             emit_expression(procedure, locals, instructions, procedures)?;
             let argument_count = emit_call_arguments(arguments, locals, instructions, procedures)?;
-            instructions.push(Instruction::CallDynamic { argument_count });
+            instructions.push(Instruction::CallDynamic {
+                argument_count,
+                null_receiver_is_global: false,
+            });
             let end = instructions.len();
             instructions[null_jump] = Instruction::JumpIfNull(end);
         }
@@ -5681,6 +7106,23 @@ fn emit_expression(
                 }
             }
             instructions.push(Instruction::MakeListEntries(kinds));
+        }
+        Expression::AssociativeList(entries) => {
+            let mut kinds = Vec::with_capacity(entries.len());
+            for entry in entries {
+                match entry {
+                    ListExpressionEntry::Positional(value) => {
+                        emit_expression(value, locals, instructions, procedures)?;
+                        kinds.push(ListEntryKind::Positional);
+                    }
+                    ListExpressionEntry::Associative { key, value } => {
+                        emit_associative_list_key(key, locals, instructions, procedures)?;
+                        emit_expression(value, locals, instructions, procedures)?;
+                        kinds.push(ListEntryKind::Associative);
+                    }
+                }
+            }
+            instructions.push(Instruction::MakeAssociativeListEntries(kinds));
         }
         Expression::Index { list, index } => {
             emit_expression(list, locals, instructions, procedures)?;
@@ -5870,6 +7312,25 @@ fn emit_assignment_expression(
     procedures: &HashMap<String, ProcedureId>,
 ) -> Result<(), CompileError> {
     match target {
+        Expression::Result => {
+            if operator != "=" {
+                instructions.push(Instruction::LoadResult);
+            }
+            emit_expression(value, locals, instructions, procedures)?;
+            if operator != "=" {
+                instructions.push(compound_instruction(operator)?);
+            }
+            instructions.push(Instruction::Duplicate);
+            instructions.push(Instruction::StoreResult);
+        }
+        Expression::Usr => {
+            if operator != "=" {
+                return Err(compile_error("usr only supports direct assignment"));
+            }
+            emit_expression(value, locals, instructions, procedures)?;
+            instructions.push(Instruction::Duplicate);
+            instructions.push(Instruction::StoreUsr);
+        }
         Expression::Local(name) => {
             if let Some(slot) = locals.get(name) {
                 if operator != "=" {
@@ -5917,6 +7378,14 @@ fn emit_assignment_expression(
             }
             instructions.push(Instruction::Duplicate);
             instructions.push(Instruction::StoreGlobal(name.clone()));
+        }
+        Expression::Src => {
+            if operator != "=" {
+                return Err(compile_error("src only supports direct assignment"));
+            }
+            emit_expression(value, locals, instructions, procedures)?;
+            instructions.push(Instruction::Duplicate);
+            instructions.push(Instruction::StoreSrc);
         }
         Expression::Field { receiver, name } => {
             emit_expression(receiver, locals, instructions, procedures)?;
@@ -6009,13 +7478,16 @@ fn bind_initializer_expression(
         }
         Expression::Call { arguments, .. }
         | Expression::StandardBuiltin { arguments, .. }
+        | Expression::NativeSrcMethod { arguments, .. }
         | Expression::Regex { arguments }
         | Expression::MutableAppearance { arguments }
         | Expression::Matrix { arguments }
+        | Expression::Vector { arguments }
         | Expression::ReplaceText { arguments, .. }
         | Expression::CopyText { arguments, .. }
         | Expression::Block { arguments }
         | Expression::Rand { arguments }
+        | Expression::Roll { arguments }
         | Expression::Round { arguments }
         | Expression::Range { arguments }
         | Expression::TypePredicate { arguments, .. }
@@ -6024,17 +7496,43 @@ fn bind_initializer_expression(
                 bind_initializer_expression(argument, bindings)?;
             }
         }
+        Expression::ExternalCall {
+            library,
+            function,
+            arguments,
+        } => {
+            bind_initializer_expression(library, bindings)?;
+            bind_initializer_expression(function, bindings)?;
+            for argument in arguments {
+                bind_initializer_expression(argument, bindings)?;
+            }
+        }
+        Expression::Animate { arguments } => {
+            for (_, argument) in arguments {
+                bind_initializer_expression(argument, bindings)?;
+            }
+        }
+        Expression::Filter { arguments } => {
+            for (_, argument) in arguments {
+                bind_initializer_expression(argument, bindings)?;
+            }
+        }
         Expression::Length { value }
         | Expression::Ref { value }
         | Expression::TypesOf { value }
         | Expression::Initial(value)
-        | Expression::Sleep(value) => {
+        | Expression::Sleep(value)
+        | Expression::Crash(value) => {
             bind_initializer_expression(value, bindings)?;
         }
         Expression::ArgList(value) => bind_initializer_expression(value, bindings)?,
         Expression::GetStep { source, direction } => {
             bind_initializer_expression(source, bindings)?;
             bind_initializer_expression(direction, bindings)?;
+        }
+        Expression::GetStepTowards { source, target } => {
+            bind_initializer_expression(source, bindings)?;
+            bind_initializer_expression(target, bindings)?;
         }
         Expression::Prob(chance) => bind_initializer_expression(chance, bindings)?,
         Expression::Pick { entries } => {
@@ -6048,12 +7546,21 @@ fn bind_initializer_expression(
         Expression::New {
             type_path,
             arguments,
+            overrides,
         } => {
             if let Some(type_path) = type_path {
                 bind_initializer_expression(type_path, bindings)?;
             }
             for argument in arguments {
                 bind_initializer_expression(argument, bindings)?;
+            }
+            for (_, value) in overrides {
+                bind_initializer_expression(value, bindings)?;
+            }
+        }
+        Expression::ModifiedTypePath { overrides, .. } => {
+            for (_, value) in overrides {
+                bind_initializer_expression(value, bindings)?;
             }
         }
         Expression::LocateIn {
@@ -6069,6 +7576,7 @@ fn bind_initializer_expression(
             target,
             procedure,
             arguments,
+            ..
         }
         | Expression::SafeDynamicCall {
             target,
@@ -6081,14 +7589,20 @@ fn bind_initializer_expression(
                 bind_initializer_expression(argument, bindings)?;
             }
         }
-        Expression::List(entries) => {
+        Expression::List(entries) | Expression::AssociativeList(entries) => {
             for entry in entries {
                 match entry {
                     ListExpressionEntry::Positional(value) => {
                         bind_initializer_expression(value, bindings)?;
                     }
                     ListExpressionEntry::Associative { key, value } => {
-                        bind_initializer_expression(key, bindings)?;
+                        // A bare key in `list(name = value)` is named-argument
+                        // syntax and therefore the text "name", even if an
+                        // initializer binding with that spelling exists.
+                        let bare_text_key = matches!(key, Expression::Local(_));
+                        if !bare_text_key {
+                            bind_initializer_expression(key, bindings)?;
+                        }
                         bind_initializer_expression(value, bindings)?;
                     }
                 }
@@ -6121,7 +7635,10 @@ fn bind_initializer_expression(
             bind_initializer_expression(target, bindings)?;
             bind_initializer_expression(value, bindings)?;
         }
-        Expression::CurrentCall { .. } | Expression::ParentCall { .. } | Expression::Result => {
+        Expression::CurrentCall { .. }
+        | Expression::ParentCall { .. }
+        | Expression::Result
+        | Expression::Caller => {
             return Err(compile_error(
                 "current-procedure state is unavailable in a variable initializer",
             ));
@@ -6169,7 +7686,10 @@ impl Default for ExecutionLimits {
 #[derive(Default)]
 pub struct ExecutionState {
     heap: ValueHeap,
+    associative_lists: HashSet<ListId>,
+    global_vars_proxy: Option<ListId>,
     globals: BTreeMap<FieldName, Value>,
+    initial_globals: BTreeMap<FieldName, Value>,
     type_paths: Arc<std::collections::BTreeSet<TypePath>>,
     type_parents: Arc<BTreeMap<TypePath, Option<TypePath>>>,
     initial_values: Arc<BTreeMap<TypePath, BTreeMap<FieldName, Value>>>,
@@ -6178,6 +7698,12 @@ pub struct ExecutionState {
     scheduler_tick: u64,
     scheduler_sequence: u64,
     scheduled_spawns: Vec<ScheduledSpawn>,
+    // Datums whose BYOND `Del()` hook is currently executing. This prevents a
+    // reentrant `del(src)` from dispatching the same hook indefinitely.
+    deleting_datums: HashSet<DatumId>,
+    last_animation_target: Option<Value>,
+    environment_overrides: BTreeMap<String, Option<Value>>,
+    external_timers: BTreeMap<String, Instant>,
 }
 
 impl ExecutionState {
@@ -6192,7 +7718,10 @@ impl ExecutionState {
     pub fn from_heap(heap: ValueHeap) -> Self {
         Self {
             heap,
+            associative_lists: HashSet::new(),
+            global_vars_proxy: None,
             globals: BTreeMap::new(),
+            initial_globals: BTreeMap::new(),
             type_paths: Arc::new(std::collections::BTreeSet::new()),
             type_parents: Arc::new(BTreeMap::new()),
             initial_values: Arc::new(BTreeMap::new()),
@@ -6201,6 +7730,10 @@ impl ExecutionState {
             scheduler_tick: 0,
             scheduler_sequence: 0,
             scheduled_spawns: Vec::new(),
+            deleting_datums: HashSet::new(),
+            last_animation_target: None,
+            environment_overrides: BTreeMap::new(),
+            external_timers: BTreeMap::new(),
         }
     }
 
@@ -6222,6 +7755,32 @@ impl ExecutionState {
         &mut self.heap
     }
 
+    pub(crate) fn environment_override(&self, name: &str) -> Option<&Option<Value>> {
+        self.environment_overrides.get(name)
+    }
+
+    pub(crate) fn set_environment_override(&mut self, name: String, value: Option<Value>) {
+        self.environment_overrides.insert(name, value);
+    }
+
+    pub(crate) fn reset_external_timer(&mut self, name: String) {
+        self.external_timers.insert(name, Instant::now());
+    }
+
+    pub(crate) fn external_timer_milliseconds(&self, name: &str) -> f64 {
+        self.external_timers
+            .get(name)
+            .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0)
+    }
+
+    pub(crate) fn is_associative_list(&self, list: ListId) -> bool {
+        self.associative_lists.contains(&list)
+    }
+
+    pub(crate) fn mark_associative_list(&mut self, list: ListId) {
+        self.associative_lists.insert(list);
+    }
+
     /// Reads a persistent runtime global.
     #[must_use]
     pub fn global(&self, name: &FieldName) -> Option<&Value> {
@@ -6230,7 +7789,20 @@ impl ExecutionState {
 
     /// Inserts or replaces a persistent runtime global.
     pub fn set_global(&mut self, name: FieldName, value: Value) -> Option<Value> {
-        self.globals.insert(name, value)
+        let is_new = !self.globals.contains_key(&name);
+        let previous = self.globals.insert(name.clone(), value);
+        if is_new
+            && let Some(list) = self.global_vars_proxy
+            && let Ok(values) = self.heap.list_mut(list)
+        {
+            values.add(Value::text(name.as_str()));
+        }
+        previous
+    }
+
+    /// Records a declaration-time global/static value used by `initial()`.
+    pub fn set_initial_global(&mut self, name: FieldName, value: Value) -> Option<Value> {
+        self.initial_globals.insert(name, value)
     }
 
     /// Deletes a persistent runtime global.
@@ -6262,9 +7834,22 @@ impl ExecutionState {
         self.type_parents = Arc::new(parents);
     }
 
+    /// Replaces the runtime type-parent catalog with shared immutable metadata.
+    pub fn set_shared_type_parents(&mut self, parents: Arc<BTreeMap<TypePath, Option<TypePath>>>) {
+        self.type_parents = parents;
+    }
+
     /// Replaces effective compile-time initial field values for every runtime type.
     pub fn set_initial_values(&mut self, values: BTreeMap<TypePath, BTreeMap<FieldName, Value>>) {
         self.initial_values = Arc::new(values);
+    }
+
+    /// Replaces effective initial values with shared immutable metadata.
+    pub fn set_shared_initial_values(
+        &mut self,
+        values: Arc<BTreeMap<TypePath, BTreeMap<FieldName, Value>>>,
+    ) {
+        self.initial_values = values;
     }
 
     /// Sets the project root used by BYOND filesystem procedures such as `fexists()`.
@@ -6301,6 +7886,18 @@ impl ExecutionState {
     #[must_use]
     pub const fn scheduler_tick(&self) -> u64 {
         self.scheduler_tick
+    }
+
+    /// Returns the number of suspended or spawned tasks awaiting dispatch.
+    #[must_use]
+    pub const fn scheduled_task_count(&self) -> usize {
+        self.scheduled_spawns.len()
+    }
+
+    /// Returns the earliest tick at which pending scheduler work is due.
+    #[must_use]
+    pub fn next_scheduled_tick(&self) -> Option<u64> {
+        self.scheduled_spawns.iter().map(|task| task.due_tick).min()
     }
 }
 
@@ -6353,6 +7950,9 @@ struct CallFrame {
     // extras beyond the declared parameter slots.
     arguments: Vec<Value>,
     exception_handlers: Vec<ExceptionHandler>,
+    // A waitfor=FALSE boundary detaches from its caller only once. Later
+    // sleeps in the already-detached continuation yield normally.
+    detached_waitfor: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -6374,6 +7974,55 @@ struct ScheduledSpawn {
 enum FrameRunOutcome {
     Complete(Value),
     Yielded { frames: Vec<CallFrame>, delay: u64 },
+}
+
+fn materialize_callee_chain(
+    module: &Module,
+    state: &mut ExecutionState,
+    callers: &[CallFrame],
+) -> Result<Value, String> {
+    let callee_path = TypePath::parse("/callee").expect("built-in /callee path");
+    let mut previous = Value::Null;
+    for frame in callers {
+        let args = state.heap.allocate_list();
+        for argument in &frame.arguments {
+            state
+                .heap
+                .list_mut(args)
+                .map_err(|error| error.to_string())?
+                .add(argument.clone());
+        }
+        let datum = state.heap.allocate_datum(callee_path.clone());
+        let procedure = module
+            .procedure_path(frame.procedure)
+            .unwrap_or("/proc")
+            .split('@')
+            .next()
+            .unwrap_or("/proc");
+        let procedure_value = TypePath::parse(procedure)
+            .map(Value::TypePath)
+            .unwrap_or_else(|_| Value::text(procedure));
+        for (name, value) in [
+            ("caller", previous.clone()),
+            ("src", frame.src.clone()),
+            ("usr", frame.usr.clone()),
+            ("args", Value::List(args)),
+            ("type", procedure_value),
+            ("file", Value::Null),
+            ("line", Value::number(0.0)),
+        ] {
+            state
+                .heap
+                .set_datum_field(
+                    datum,
+                    FieldName::parse(name).expect("built-in callee field"),
+                    value,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        previous = Value::Datum(datum);
+    }
+    Ok(previous)
 }
 
 /// Executes one standalone program to completion on the reference interpreter.
@@ -6418,6 +8067,7 @@ pub fn execute_in_context(
         procedures: vec![program.clone()],
         paths: vec!["<standalone>".to_owned()],
         names: HashMap::new(),
+        deferred: HashMap::new(),
     };
     execute_module_with_limits_in_context(
         &module,
@@ -6461,6 +8111,7 @@ pub fn execute_with_limits_in_state(
         procedures: vec![program.clone()],
         paths: vec!["<standalone>".to_owned()],
         names: HashMap::new(),
+        deferred: HashMap::new(),
     };
     execute_module_with_limits_in_state(&module, entry, arguments, limits, state)
 }
@@ -6574,14 +8225,14 @@ pub fn execute_module_with_limits_in_context(
     state: &mut ExecutionState,
     context: &ExecutionContext,
 ) -> Result<Value, RuntimeError> {
-    let Some(program) = module.procedure(entry) else {
-        return Err(RuntimeError {
-            message: format!("invalid entry procedure {}", entry.index()),
+    let program = module
+        .resolve_procedure(entry)
+        .map_err(|message| RuntimeError {
+            message,
             instruction: 0,
             source_span: None,
             call_stack: Vec::new(),
-        });
-    };
+        })?;
     if limits.max_call_depth == 0 {
         return Err(RuntimeError {
             message: "maximum call depth must be at least one".to_owned(),
@@ -6623,6 +8274,7 @@ pub fn advance_scheduler(
     state: &mut ExecutionState,
 ) -> Result<Vec<Value>, RuntimeError> {
     state.scheduler_tick = state.scheduler_tick.saturating_add(ticks);
+    advance_headless_world_clock(state, ticks);
     state
         .scheduled_spawns
         .sort_by_key(|spawn| (spawn.due_tick, spawn.sequence));
@@ -6633,24 +8285,91 @@ pub fn advance_scheduler(
         .scheduled_spawns
         .drain(..due_count)
         .collect::<Vec<_>>();
+    // BYOND exposes elapsed host-tick percentage. The deterministic headless
+    // VM has no wall-clock budget, so due work observes one fully active tick
+    // and the quiescent boundary observes zero.
+    set_world_numeric_field(
+        state,
+        "tick_usage",
+        if due.is_empty() { 0.0 } else { 100.0 },
+    );
     let mut completed = Vec::new();
     for spawn in due {
-        match run_frames(module, spawn.frames, limits, state)? {
+        let outcome = match run_frames(module, spawn.frames, limits, state) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                set_world_numeric_field(state, "tick_usage", 0.0);
+                return Err(error);
+            }
+        };
+        match outcome {
             FrameRunOutcome::Complete(value) => completed.push(value),
             FrameRunOutcome::Yielded { frames, delay } => schedule_frames(state, frames, delay),
         }
     }
+    set_world_numeric_field(state, "tick_usage", 0.0);
     Ok(completed)
 }
 
 fn schedule_frames(state: &mut ExecutionState, frames: Vec<CallFrame>, delay: u64) {
     let sequence = state.scheduler_sequence;
     state.scheduler_sequence = state.scheduler_sequence.saturating_add(1);
+    let tick_lag = world_numeric_field(state, "tick_lag")
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(1.0);
+    let delay_ticks = if delay == 0 {
+        0
+    } else {
+        ((delay as f64) / f64::from(tick_lag)).ceil() as u64
+    };
     state.scheduled_spawns.push(ScheduledSpawn {
-        due_tick: state.scheduler_tick.saturating_add(delay),
+        due_tick: state.scheduler_tick.saturating_add(delay_ticks),
         sequence,
         frames,
     });
+}
+
+fn world_datum(state: &ExecutionState) -> Option<DatumId> {
+    state
+        .global(&FieldName::parse("world").expect("built-in world global"))
+        .and_then(|value| match value {
+            Value::Datum(world) => Some(*world),
+            _ => None,
+        })
+}
+
+fn world_numeric_field(state: &ExecutionState, name: &str) -> Option<f32> {
+    state
+        .heap
+        .datum_field(world_datum(state)?, &FieldName::parse(name).ok()?)
+        .ok()?
+        .as_number()
+}
+
+fn set_world_numeric_field(state: &mut ExecutionState, name: &str, value: f32) {
+    let Some(world) = world_datum(state) else {
+        return;
+    };
+    let _ = state.heap.set_datum_field(
+        world,
+        FieldName::parse(name).expect("built-in world numeric field"),
+        Value::number(value),
+    );
+}
+
+fn advance_headless_world_clock(state: &mut ExecutionState, ticks: u64) {
+    if ticks == 0 {
+        return;
+    }
+    let tick_lag = world_numeric_field(state, "tick_lag")
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(1.0);
+    let elapsed = (ticks as f64 * f64::from(tick_lag)) as f32;
+    let time = world_numeric_field(state, "time").unwrap_or(0.0) + elapsed;
+    let timeofday =
+        (world_numeric_field(state, "timeofday").unwrap_or(0.0) + elapsed).rem_euclid(864_000.0);
+    set_world_numeric_field(state, "time", time);
+    set_world_numeric_field(state, "timeofday", timeofday);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6665,13 +8384,9 @@ fn run_frames(
         let frame_index = frames.len() - 1;
         let procedure = frames[frame_index].procedure;
         let instruction_index = frames[frame_index].instruction;
-        let Some(program) = module.procedure(procedure) else {
-            return Err(execution_error(
-                module,
-                &frames,
-                format!("invalid procedure {}", procedure.index()),
-            ));
-        };
+        let program = module
+            .resolve_procedure(procedure)
+            .map_err(|message| execution_error(module, &frames, message))?;
         let Some(instruction) = program.instructions.get(instruction_index).cloned() else {
             return Err(execution_error(
                 module,
@@ -6697,6 +8412,30 @@ fn run_frames(
             Instruction::PushTypePath(path) => {
                 frames[frame_index].stack.push(Value::TypePath(path));
             }
+            Instruction::MakeModifiedTypePath { fields } => {
+                let stack = &mut frames[frame_index].stack;
+                if stack.len() < fields.len() + 1 {
+                    return Err(execution_error(module, &frames, "bytecode stack underflow"));
+                }
+                let values_start = stack.len() - fields.len();
+                let base_index = values_start - 1;
+                let Value::TypePath(base) = stack[base_index].clone() else {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "modified type requires a base type path",
+                    ));
+                };
+                let overrides = fields
+                    .iter()
+                    .cloned()
+                    .zip(stack[values_start..].iter().cloned())
+                    .collect();
+                stack.truncate(base_index);
+                stack.push(Value::ModifiedTypePath(Arc::new(ModifiedTypePath::new(
+                    base, overrides,
+                ))));
+            }
             Instruction::ExpandArgumentLists {
                 argument_count,
                 expanded_indices,
@@ -6713,6 +8452,12 @@ fn run_frames(
                 for (index, value) in source.into_iter().enumerate() {
                     let index = u16::try_from(index).expect("source argument count is u16");
                     if expanded_indices.binary_search(&index).is_ok() {
+                        // BYOND treats `arglist(null)` as an empty argument
+                        // vector. Callback.Invoke relies on this when neither
+                        // its constructor nor invocation supplied arguments.
+                        if matches!(value, Value::Null) {
+                            continue;
+                        }
                         let Value::List(list) = value else {
                             return Err(execution_error(
                                 module,
@@ -6751,8 +8496,9 @@ fn run_frames(
                 }
                 let arguments_start = stack.len() - count;
                 let type_path_index = arguments_start - 1;
-                let type_path = match stack[type_path_index].clone() {
-                    Value::TypePath(path) => path,
+                let (type_path, overrides) = match stack[type_path_index].clone() {
+                    Value::TypePath(path) => (path, None),
+                    Value::ModifiedTypePath(modified) => (modified.base().clone(), Some(modified)),
                     value => {
                         return Err(execution_error(
                             module,
@@ -6763,13 +8509,50 @@ fn run_frames(
                 };
                 let arguments = stack[arguments_start..].to_vec();
                 stack.truncate(type_path_index);
-                let datum = if type_path.as_str() == "/matrix" {
-                    construct_matrix(&arguments, &mut state.heap)
-                        .map_err(|message| execution_error(module, &frames, message))?
+                let allocated = if type_path.as_str() == "/list" {
+                    Value::List(state.heap.allocate_list())
                 } else {
-                    state.heap.allocate_datum(type_path)
+                    let datum = if type_path.as_str() == "/matrix" {
+                        construct_matrix(&arguments, &mut state.heap)
+                            .map_err(|message| execution_error(module, &frames, message))?
+                    } else if type_path.as_str() == "/vector" {
+                        construct_vector(&arguments, &mut state.heap)
+                            .map_err(|message| execution_error(module, &frames, message))?
+                    } else {
+                        allocate_initialized_datum(state, type_path)
+                            .map_err(|message| execution_error(module, &frames, message))?
+                    };
+                    Value::Datum(datum)
                 };
-                frames[frame_index].stack.push(Value::Datum(datum));
+                if let (Value::Datum(datum), Some(modified)) = (&allocated, overrides) {
+                    for (field, value) in modified.overrides() {
+                        state
+                            .heap_mut()
+                            .set_datum_field(*datum, field.clone(), value.clone())
+                            .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                    }
+                }
+                if let Value::Datum(datum) = &allocated {
+                    invoke_constructor_if_present(
+                        module,
+                        state,
+                        *datum,
+                        &arguments,
+                        &frame_context(&frames[frame_index]),
+                    )
+                    .map_err(|mut error| {
+                        error.call_stack.insert(
+                            0,
+                            trace(
+                                module,
+                                frames[frame_index].procedure,
+                                frames[frame_index].instruction.saturating_sub(1),
+                            ),
+                        );
+                        error
+                    })?;
+                }
+                frames[frame_index].stack.push(allocated);
             }
             Instruction::AllocateCurrentDatum { argument_count } => {
                 let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
@@ -6793,10 +8576,29 @@ fn run_frames(
                         ));
                     }
                 };
-                let stack = &mut frames[frame_index].stack;
-                stack.truncate(stack.len() - count);
-                let datum = state.heap.allocate_datum(type_path);
-                stack.push(Value::Datum(datum));
+                let new_stack_len = frames[frame_index].stack.len() - count;
+                frames[frame_index].stack.truncate(new_stack_len);
+                let datum = allocate_initialized_datum(state, type_path)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                invoke_constructor_if_present(
+                    module,
+                    state,
+                    datum,
+                    &[],
+                    &frame_context(&frames[frame_index]),
+                )
+                .map_err(|mut error| {
+                    error.call_stack.insert(
+                        0,
+                        trace(
+                            module,
+                            frames[frame_index].procedure,
+                            frames[frame_index].instruction.saturating_sub(1),
+                        ),
+                    );
+                    error
+                })?;
+                frames[frame_index].stack.push(Value::Datum(datum));
             }
             Instruction::MakeRegex { argument_count } => {
                 let count = usize::from(argument_count);
@@ -6863,6 +8665,23 @@ fn run_frames(
                     .map_err(|message| execution_error(module, &frames, message))?;
                 frames[frame_index].stack.push(Value::Datum(datum));
             }
+            Instruction::MakeVector { argument_count } => {
+                let count = usize::from(argument_count);
+                if frames[frame_index].stack.len() < count {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "invalid vector constructor stack",
+                    ));
+                }
+                let arguments = {
+                    let stack = &mut frames[frame_index].stack;
+                    stack.split_off(stack.len() - count)
+                };
+                let datum = construct_vector(&arguments, &mut state.heap)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].stack.push(Value::Datum(datum));
+            }
             Instruction::ReplaceText {
                 argument_count,
                 exact,
@@ -6916,9 +8735,168 @@ fn run_frames(
                     let stack = &mut frames[frame_index].stack;
                     stack.split_off(stack.len() - count)
                 };
-                let value = execute_standard_builtin(&name, &arguments, state)
+                let value = if name == "del" {
+                    execute_del(
+                        module,
+                        &arguments,
+                        state,
+                        &frame_context(&frames[frame_index]),
+                    )?
+                } else {
+                    execute_standard_builtin(&name, &arguments, state)
+                        .map_err(|message| execution_error(module, &frames, message))?
+                };
+                frames[frame_index].stack.push(value);
+            }
+            Instruction::NativeSrcMethod {
+                name,
+                argument_count,
+            } => {
+                let count = usize::from(argument_count);
+                if count > frames[frame_index].stack.len() {
+                    return Err(execution_error(module, &frames, "bytecode stack underflow"));
+                }
+                let arguments = {
+                    let stack = &mut frames[frame_index].stack;
+                    stack.split_off(stack.len() - count)
+                };
+                let Value::Datum(src) = frames[frame_index].src else {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        format!("native method {name} requires a datum src"),
+                    ));
+                };
+                let value = match name.as_str() {
+                    "MapColors" if is_icon_datum(src, &state.heap) => {
+                        apply_icon_map_colors(src, &arguments, &mut state.heap)
+                            .map_err(|message| execution_error(module, &frames, message))?;
+                        Value::Null
+                    }
+                    "Blend" if is_icon_datum(src, &state.heap) => {
+                        apply_icon_blend(src, &arguments, &mut state.heap)
+                            .map_err(|message| execution_error(module, &frames, message))?;
+                        Value::Null
+                    }
+                    "SetIntensity" if is_icon_datum(src, &state.heap) => {
+                        apply_icon_set_intensity(src, &arguments, &mut state.heap)
+                            .map_err(|message| execution_error(module, &frames, message))?;
+                        Value::Null
+                    }
+                    "Turn" if is_matrix_datum(src, &state.heap) => {
+                        execute_matrix_method(src, "Turn", &arguments, &mut state.heap)
+                            .map_err(|message| execution_error(module, &frames, message))?
+                    }
+                    _ => {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("unknown native method {name} for src"),
+                        ));
+                    }
+                };
+                frames[frame_index].stack.push(value);
+            }
+            Instruction::Output => {
+                let value = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let target = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                execute_output(&target, &value, state)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+            }
+            Instruction::ExternalCall { argument_count } => {
+                let count = usize::from(argument_count) + 2;
+                if count > frames[frame_index].stack.len() {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "external call stack underflow",
+                    ));
+                }
+                let values = {
+                    let stack = &mut frames[frame_index].stack;
+                    stack.split_off(stack.len() - count)
+                };
+                let value = execute_external_call(&values[0], &values[1], &values[2..], state)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 frames[frame_index].stack.push(value);
+            }
+            Instruction::Animate { argument_names } => {
+                let count = argument_names.len();
+                if count > frames[frame_index].stack.len() {
+                    return Err(execution_error(module, &frames, "animate stack underflow"));
+                }
+                let arguments = {
+                    let stack = &mut frames[frame_index].stack;
+                    stack.split_off(stack.len() - count)
+                };
+                let value = execute_animate(&argument_names, &arguments, state)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].stack.push(value);
+            }
+            Instruction::MakeFilter {
+                argument_names,
+                expanded_indices,
+            } => {
+                let count = argument_names.len();
+                if count > frames[frame_index].stack.len() {
+                    return Err(execution_error(module, &frames, "filter stack underflow"));
+                }
+                let arguments = {
+                    let stack = &mut frames[frame_index].stack;
+                    stack.split_off(stack.len() - count)
+                };
+                let filter = state
+                    .heap_mut()
+                    .allocate_datum(TypePath::parse("/dm_filter").expect("canonical filter path"));
+                let mut fields = Vec::new();
+                for (index, (name, value)) in argument_names.iter().zip(arguments).enumerate() {
+                    if expanded_indices
+                        .binary_search(
+                            &to_local_index(index).expect("filter argument count is u16"),
+                        )
+                        .is_ok()
+                    {
+                        let Value::List(list) = value else {
+                            return Err(execution_error(
+                                module,
+                                &frames,
+                                "arglist requires a list value",
+                            ));
+                        };
+                        let list = state
+                            .heap
+                            .list(list)
+                            .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                        fields.extend(list.associations().filter_map(|(key, value)| match key {
+                            Value::Text(key) => Some((key.to_string(), value.clone())),
+                            _ => None,
+                        }));
+                        continue;
+                    }
+                    let field = name.clone().unwrap_or_else(|| {
+                        if index == 0 {
+                            "type".to_owned()
+                        } else {
+                            format!("arg{}", index + 1)
+                        }
+                    });
+                    fields.push((field, value));
+                }
+                for (field, value) in fields {
+                    state
+                        .heap_mut()
+                        .set_datum_field(
+                            filter,
+                            FieldName::parse(&field).map_err(|error| {
+                                execution_error(module, &frames, error.to_string())
+                            })?,
+                            value,
+                        )
+                        .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                }
+                frames[frame_index].stack.push(Value::Datum(filter));
             }
             Instruction::Sleep => {
                 let delay = pop(&mut frames[frame_index].stack)
@@ -6937,6 +8915,26 @@ fn run_frames(
                 };
                 frames[frame_index].stack.push(Value::Null);
                 frames[frame_index].instruction += 1;
+                if let Some(detach_at) = frames.iter().rposition(|frame| {
+                    !frame.detached_waitfor
+                        && module
+                            .procedure(frame.procedure)
+                            .is_some_and(|program| !program.wait_for)
+                }) {
+                    let detached_result = frames[detach_at].result.clone();
+                    let mut detached = frames.split_off(detach_at);
+                    detached[0].detached_waitfor = true;
+                    schedule_frames(state, detached, delay);
+                    if let Some(caller) = frames.last_mut() {
+                        // The caller continues exactly as if the waitfor=0
+                        // procedure returned its current `.` value. The
+                        // detached continuation's eventual return is ignored.
+                        caller.stack.push(detached_result);
+                        caller.instruction += 1;
+                        continue;
+                    }
+                    return Ok(FrameRunOutcome::Complete(detached_result));
+                }
                 return Ok(FrameRunOutcome::Yielded { frames, delay });
             }
             Instruction::Length => {
@@ -6959,6 +8957,17 @@ fn run_frames(
                 let direction = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let source = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let value = get_step_builtin(&source, &direction, &state.heap)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].stack.push(value);
+            }
+            Instruction::GetStepTowards => {
+                let target = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let source = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let direction = direction_towards_builtin(&source, &target, &state.heap)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let value = get_step_builtin(&source, &direction, &state.heap)
                     .map_err(|message| execution_error(module, &frames, message))?;
@@ -7034,7 +9043,7 @@ fn run_frames(
             }
             Instruction::Rand { argument_count } => {
                 let count = usize::from(argument_count);
-                if !(1..=2).contains(&count) || frames[frame_index].stack.len() < count {
+                if count > 2 || frames[frame_index].stack.len() < count {
                     return Err(execution_error(
                         module,
                         &frames,
@@ -7044,6 +9053,21 @@ fn run_frames(
                 let stack_length = frames[frame_index].stack.len();
                 let arguments = frames[frame_index].stack.split_off(stack_length - count);
                 let value = random_integer(&arguments, &mut state.random_state)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].stack.push(Value::number(value));
+            }
+            Instruction::Roll { argument_count } => {
+                let count = usize::from(argument_count);
+                if !(1..=2).contains(&count) || frames[frame_index].stack.len() < count {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "invalid roll builtin stack",
+                    ));
+                }
+                let stack_length = frames[frame_index].stack.len();
+                let arguments = frames[frame_index].stack.split_off(stack_length - count);
+                let value = roll_dice(&arguments, &mut state.random_state)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 frames[frame_index].stack.push(Value::number(value));
             }
@@ -7146,6 +9170,27 @@ fn run_frames(
                 }
                 frames[frame_index].stack.push(Value::List(list));
             }
+            Instruction::MakeArray(dimension_count) => {
+                let count = usize::from(dimension_count);
+                if frames[frame_index].stack.len() < count {
+                    return Err(execution_error(module, &frames, "bytecode stack underflow"));
+                }
+                let stack_len = frames[frame_index].stack.len();
+                let values = frames[frame_index].stack.split_off(stack_len - count);
+                let mut sizes = Vec::with_capacity(count);
+                for value in values {
+                    let Some(size) = value.as_number() else {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            "array dimension must be numeric",
+                        ));
+                    };
+                    sizes.push(size.max(0.0).floor() as usize);
+                }
+                let array = allocate_dm_array(&mut state.heap, &sizes, 0);
+                frames[frame_index].stack.push(Value::List(array));
+            }
             Instruction::MakeArgs => {
                 let list = state.heap.allocate_list();
                 for value in &frames[frame_index].arguments {
@@ -7198,6 +9243,46 @@ fn run_frames(
                 }
                 frames[frame_index].stack.push(Value::List(list));
             }
+            Instruction::MakeAssociativeListEntries(kinds) => {
+                let value_count = kinds.iter().try_fold(0_usize, |count, kind| {
+                    count.checked_add(match kind {
+                        ListEntryKind::Positional => 1,
+                        ListEntryKind::Associative => 2,
+                    })
+                });
+                let Some(value_count) = value_count else {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "alist literal is too large",
+                    ));
+                };
+                let stack_length = frames[frame_index].stack.len();
+                if value_count > stack_length {
+                    return Err(execution_error(module, &frames, "bytecode stack underflow"));
+                }
+                let values = frames[frame_index]
+                    .stack
+                    .split_off(stack_length - value_count);
+                let list = state.heap.allocate_list();
+                let entries = state.heap.list_mut(list).expect("new alist is live");
+                let mut values = values.into_iter();
+                for kind in kinds {
+                    match kind {
+                        ListEntryKind::Positional => {
+                            let key = values.next().expect("alist entry count was validated");
+                            entries.set_key(key, Value::Null);
+                        }
+                        ListEntryKind::Associative => {
+                            let key = values.next().expect("alist key count was validated");
+                            let value = values.next().expect("alist value count was validated");
+                            entries.set_key(key, value);
+                        }
+                    }
+                }
+                state.mark_associative_list(list);
+                frames[frame_index].stack.push(Value::List(list));
+            }
             Instruction::IndexList => {
                 let key = match pop(&mut frames[frame_index].stack) {
                     Ok(value) => value,
@@ -7214,14 +9299,26 @@ fn run_frames(
                     }
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                let value = match read_list_value(&state.heap, list, &key) {
-                    Ok(value) => value.clone(),
-                    // BYOND associative lookup returns null for an absent key.
-                    // Lazy-list idioms such as `lists[target] ||= list()` rely
-                    // on this before inserting the new association.
-                    Err(ValueError::MissingKey) => Value::Null,
-                    Err(error) => {
-                        return Err(execution_error(module, &frames, error.to_string()));
+                let value = if state.global_vars_proxy == Some(list) {
+                    match &key {
+                        Value::Text(name) => FieldName::parse(name)
+                            .ok()
+                            .and_then(|name| state.global(&name).cloned())
+                            .unwrap_or(Value::Null),
+                        _ => read_list_value(&state.heap, list, &key)
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    }
+                } else {
+                    match read_list_value(&state.heap, list, &key) {
+                        Ok(value) => value.clone(),
+                        // BYOND associative lookup returns null for an absent key.
+                        // Lazy-list idioms such as `lists[target] ||= list()` rely
+                        // on this before inserting the new association.
+                        Err(ValueError::MissingKey) => Value::Null,
+                        Err(error) => {
+                            return Err(execution_error(module, &frames, error.to_string()));
+                        }
                     }
                 };
                 frames[frame_index].stack.push(value);
@@ -7246,7 +9343,18 @@ fn run_frames(
                     }
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                if let Err(error) = write_list_value(&mut state.heap, list, key, value) {
+                if state.global_vars_proxy == Some(list) {
+                    let Value::Text(name) = key else {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            "global.vars writes require a text key",
+                        ));
+                    };
+                    let name = FieldName::parse(&name)
+                        .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                    state.set_global(name, value);
+                } else if let Err(error) = write_list_value(&mut state.heap, list, key, value) {
                     return Err(execution_error(module, &frames, error.to_string()));
                 }
             }
@@ -7270,13 +9378,26 @@ fn run_frames(
                     }
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                if let Err(error) = write_list_value(&mut state.heap, list, key, value.clone()) {
+                if state.global_vars_proxy == Some(list) {
+                    let Value::Text(name) = key else {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            "global.vars writes require a text key",
+                        ));
+                    };
+                    let name = FieldName::parse(&name)
+                        .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                    state.set_global(name, value.clone());
+                } else if let Err(error) =
+                    write_list_value(&mut state.heap, list, key, value.clone())
+                {
                     return Err(execution_error(module, &frames, error.to_string()));
                 }
                 frames[frame_index].stack.push(value);
             }
             Instruction::CompoundListIndex(operator) => {
-                let right = match pop_number(&mut frames[frame_index].stack) {
+                let right = match pop(&mut frames[frame_index].stack) {
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
@@ -7295,22 +9416,68 @@ fn run_frames(
                     }
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                let current = match read_list_value(&state.heap, list, &key) {
-                    Ok(value) => value.clone(),
-                    Err(error) => {
-                        return Err(execution_error(module, &frames, error.to_string()));
+                let current = if state.global_vars_proxy == Some(list) {
+                    let Value::Text(name) = &key else {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            "global.vars writes require a text key",
+                        ));
+                    };
+                    FieldName::parse(name)
+                        .ok()
+                        .and_then(|name| state.global(&name).cloned())
+                        .unwrap_or(Value::Null)
+                } else {
+                    match read_list_value(&state.heap, list, &key) {
+                        Ok(value) => value.clone(),
+                        Err(ValueError::MissingKey) => Value::Null,
+                        Err(error) => {
+                            return Err(execution_error(module, &frames, error.to_string()));
+                        }
                     }
                 };
-                let Some(left) = current.as_number() else {
-                    return Err(execution_error(
-                        module,
-                        &frames,
-                        format!("numeric operation received {current}"),
-                    ));
+                let value = match (&current, &right, operator) {
+                    (Value::Null, Value::List(_), CompoundListIndexOperator::Add) => right,
+                    (Value::List(current), _, CompoundListIndexOperator::Add) => {
+                        execute_list_compound_operator(
+                            CompoundAssignmentOperator::Add,
+                            *current,
+                            &right,
+                            state,
+                        )
+                        .map_err(|message| execution_error(module, &frames, message))?
+                    }
+                    _ => {
+                        let left = current.as_number().ok_or_else(|| {
+                            execution_error(
+                                module,
+                                &frames,
+                                format!("numeric operation received {current}"),
+                            )
+                        })?;
+                        let right = right.as_number().ok_or_else(|| {
+                            execution_error(
+                                module,
+                                &frames,
+                                format!("numeric operation received {right}"),
+                            )
+                        })?;
+                        Value::number(execute_compound_list_index_operation(operator, left, right))
+                    }
                 };
-                let value =
-                    Value::number(execute_compound_list_index_operation(operator, left, right));
-                if let Err(error) = write_list_value(&mut state.heap, list, key, value) {
+                if state.global_vars_proxy == Some(list) {
+                    let Value::Text(name) = key else {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            "global.vars writes require a text key",
+                        ));
+                    };
+                    let name = FieldName::parse(&name)
+                        .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                    state.set_global(name, value);
+                } else if let Err(error) = write_list_value(&mut state.heap, list, key, value) {
                     return Err(execution_error(module, &frames, error.to_string()));
                 }
             }
@@ -7345,9 +9512,23 @@ fn run_frames(
                 let src = frames[frame_index].src.clone();
                 frames[frame_index].stack.push(src);
             }
+            Instruction::StoreSrc => {
+                let src = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].src = src;
+            }
             Instruction::LoadUsr => {
                 let usr = frames[frame_index].usr.clone();
                 frames[frame_index].stack.push(usr);
+            }
+            Instruction::LoadCaller => {
+                let caller = if frame_index == 0 {
+                    Value::Null
+                } else {
+                    materialize_callee_chain(module, state, &frames[..frame_index])
+                        .map_err(|message| execution_error(module, &frames, message))?
+                };
+                frames[frame_index].stack.push(caller);
             }
             Instruction::LoadField(name) => {
                 let receiver = match pop(&mut frames[frame_index].stack) {
@@ -7454,6 +9635,39 @@ fn run_frames(
                 };
                 match receiver {
                     Value::Datum(datum) => {
+                        let is_world = state
+                            .heap
+                            .datum(datum)
+                            .is_ok_and(|datum| datum.type_path().as_str() == "/world");
+                        if name.as_str() == "loc" {
+                            let old_loc =
+                                state.heap.datum_field(datum, name).ok().and_then(|value| {
+                                    match value {
+                                        Value::Datum(loc) => Some(*loc),
+                                        _ => None,
+                                    }
+                                });
+                            let new_loc = match &value {
+                                Value::Datum(loc) => Some(*loc),
+                                Value::Null => None,
+                                value => {
+                                    return Err(execution_error(
+                                        module,
+                                        &frames,
+                                        format!(
+                                            "loc assignment requires a datum or null, received {value}"
+                                        ),
+                                    ));
+                                }
+                            };
+                            if old_loc != new_loc
+                                && let Err(message) = builtins::synchronize_moved_atom_contents(
+                                    state, datum, old_loc, new_loc,
+                                )
+                            {
+                                return Err(execution_error(module, &frames, message));
+                            }
+                        }
                         if let Err(error) =
                             state
                                 .heap
@@ -7461,18 +9675,47 @@ fn run_frames(
                         {
                             return Err(execution_error(module, &frames, error.to_string()));
                         }
+                        if is_world {
+                            let reciprocal = match (name.as_str(), value.as_number()) {
+                                ("tick_lag", Some(value)) if value.is_finite() && value > 0.0 => {
+                                    Some(("fps", 10.0 / value))
+                                }
+                                ("fps", Some(value)) if value.is_finite() && value > 0.0 => {
+                                    Some(("tick_lag", 10.0 / value))
+                                }
+                                _ => None,
+                            };
+                            if let Some((field, reciprocal)) = reciprocal {
+                                let _ = state.heap.set_datum_field(
+                                    datum,
+                                    FieldName::parse(field).expect("built-in world timing field"),
+                                    Value::number(reciprocal),
+                                );
+                            }
+                        }
                     }
                     Value::List(list) if name.as_str() == "len" => {
                         let new_len = match &value {
-                            Value::Number(number) if number.to_f32().is_finite() => number
-                                .to_f32()
-                                .trunc()
-                                .max(0.0)
-                                .to_string()
-                                .parse::<usize>()
-                                .unwrap_or(usize::MAX),
+                            Value::Number(number) if number.to_f32().is_finite() => {
+                                let length = number.to_f32().trunc();
+                                if length < 0.0 {
+                                    return Err(execution_error(
+                                        module,
+                                        &frames,
+                                        "list length cannot be negative",
+                                    ));
+                                }
+                                length.to_string().parse::<usize>().unwrap_or(usize::MAX)
+                            }
                             _ => 0,
                         };
+                        if state.is_associative_list(list) && new_len != 0 {
+                            return Err(execution_error(
+                                module,
+                                &frames,
+                                "alist length can only be assigned zero",
+                            ));
+                        }
                         if let Err(error) = state
                             .heap
                             .list_mut(list)
@@ -7508,6 +9751,32 @@ fn run_frames(
                         format!("runtime global {name:?} is absent"),
                     ));
                 };
+                frames[frame_index].stack.push(value);
+            }
+            Instruction::LoadGlobalVars => {
+                let list = if let Some(list) = state.global_vars_proxy {
+                    list
+                } else {
+                    let list = state.heap.allocate_list();
+                    for name in state.globals.keys() {
+                        state
+                            .heap
+                            .list_mut(list)
+                            .expect("new global.vars proxy is live")
+                            .add(Value::text(name.as_str()));
+                    }
+                    state.mark_associative_list(list);
+                    state.global_vars_proxy = Some(list);
+                    list
+                };
+                frames[frame_index].stack.push(Value::List(list));
+            }
+            Instruction::LoadInitialGlobal(name) => {
+                let value = state
+                    .initial_globals
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 frames[frame_index].stack.push(value);
             }
             Instruction::StoreGlobal(name) => {
@@ -7594,7 +9863,22 @@ fn run_frames(
                             .map_err(|error| execution_error(module, &frames, error.to_string()))?;
                     }
                     Value::List(list) => {
-                        let new_len = updated.as_number().unwrap_or(0.0).trunc().max(0.0) as usize;
+                        let length = updated.as_number().unwrap_or(0.0).trunc();
+                        if length < 0.0 {
+                            return Err(execution_error(
+                                module,
+                                &frames,
+                                "list length cannot be negative",
+                            ));
+                        }
+                        if state.is_associative_list(list) && length != 0.0 {
+                            return Err(execution_error(
+                                module,
+                                &frames,
+                                "alist length can only be assigned zero",
+                            ));
+                        }
+                        let new_len = length as usize;
                         state
                             .heap
                             .list_mut(list)
@@ -7661,6 +9945,13 @@ fn run_frames(
             Instruction::LoadResult => {
                 let result = frames[frame_index].result.clone();
                 frames[frame_index].stack.push(result);
+            }
+            Instruction::StoreUsr => {
+                let value = match pop(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                frames[frame_index].usr = value;
             }
             Instruction::StoreResult => {
                 let value = match pop(&mut frames[frame_index].stack) {
@@ -7809,11 +10100,17 @@ fn run_frames(
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let left = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
-                let value = if let Value::Datum(datum) = left
-                    && is_matrix_datum(datum, &state.heap)
-                {
-                    execute_matrix_compound(operator, datum, &right, &mut state.heap)
-                        .map_err(|message| execution_error(module, &frames, message))?
+                let value = if let Value::Datum(datum) = left {
+                    if is_matrix_datum(datum, &state.heap) {
+                        execute_matrix_compound(operator, datum, &right, &mut state.heap)
+                            .map_err(|message| execution_error(module, &frames, message))?
+                    } else if is_vector_datum(datum, &state.heap) {
+                        execute_vector_compound(operator, datum, &right, &mut state.heap)
+                            .map_err(|message| execution_error(module, &frames, message))?
+                    } else {
+                        execute_scalar_compound_assignment(operator, Value::Datum(datum), right)
+                            .map_err(|message| execution_error(module, &frames, message))?
+                    }
                 } else if let Value::List(list) = left {
                     execute_list_compound_operator(operator, list, &right, state)
                         .map_err(|message| execution_error(module, &frames, message))?
@@ -7842,6 +10139,18 @@ fn run_frames(
                     )
                     .map_err(|message| execution_error(module, &frames, message))?;
                     Value::Datum(datum)
+                } else if let (Value::Datum(left), Value::Datum(right)) = (&left, &right)
+                    && is_vector_datum(*left, &state.heap)
+                    && is_vector_datum(*right, &state.heap)
+                {
+                    Value::Datum(
+                        allocate_vector(
+                            vector_zip(*left, *right, &state.heap, |a, b| a + b)
+                                .map_err(|message| execution_error(module, &frames, message))?,
+                            &mut state.heap,
+                        )
+                        .map_err(|message| execution_error(module, &frames, message))?,
+                    )
                 } else if let Value::List(list) = left {
                     execute_list_binary_operator("+", list, &right, state)
                         .map_err(|message| execution_error(module, &frames, message))?
@@ -7881,6 +10190,19 @@ fn run_frames(
                     )
                     .map_err(|message| execution_error(module, &frames, message))?;
                     Value::Datum(datum)
+                } else if matches!(instruction, Instruction::Subtract)
+                    && let (Value::Datum(left), Value::Datum(right)) = (&left, &right)
+                    && is_vector_datum(*left, &state.heap)
+                    && is_vector_datum(*right, &state.heap)
+                {
+                    Value::Datum(
+                        allocate_vector(
+                            vector_zip(*left, *right, &state.heap, |a, b| a - b)
+                                .map_err(|message| execution_error(module, &frames, message))?,
+                            &mut state.heap,
+                        )
+                        .map_err(|message| execution_error(module, &frames, message))?,
+                    )
                 } else if let Value::List(list) = left {
                     execute_list_binary_operator(operator, list, &right, state)
                         .map_err(|message| execution_error(module, &frames, message))?
@@ -7900,21 +10222,29 @@ fn run_frames(
             | Instruction::FractionalRemainder
             | Instruction::ShiftLeft
             | Instruction::ShiftRight => {
-                let right = match pop_number(&mut frames[frame_index].stack) {
-                    Ok(value) => value,
-                    Err(message) => return Err(execution_error(module, &frames, message)),
+                let right = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let left = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let vector_operator = match instruction {
+                    Instruction::Multiply => Some("*"),
+                    Instruction::Divide => Some("/"),
+                    _ => None,
                 };
-                let left = match pop_number(&mut frames[frame_index].stack) {
-                    Ok(value) => value,
-                    Err(message) => return Err(execution_error(module, &frames, message)),
+                let value = if let Value::Datum(datum) = left
+                    && is_vector_datum(datum, &state.heap)
+                    && let Some(operator) = vector_operator
+                {
+                    execute_vector_binary(operator, datum, &right, &mut state.heap)
+                        .map_err(|message| execution_error(module, &frames, message))?
+                } else {
+                    let left = scalar_number_string(left)
+                        .map_err(|message| execution_error(module, &frames, message))?;
+                    let right = scalar_number_string(right)
+                        .map_err(|message| execution_error(module, &frames, message))?;
+                    Value::number(execute_numeric_binary(&instruction, left, right))
                 };
-                frames[frame_index]
-                    .stack
-                    .push(Value::number(execute_numeric_binary(
-                        &instruction,
-                        left,
-                        right,
-                    )));
+                frames[frame_index].stack.push(value);
             }
             Instruction::Less
             | Instruction::LessEqual
@@ -8070,7 +10400,7 @@ fn run_frames(
                 }
             }
             Instruction::Call {
-                procedure: target,
+                procedure: mut target,
                 argument_count,
             } => {
                 if frames.len() >= limits.max_call_depth {
@@ -8087,14 +10417,28 @@ fn run_frames(
                     return Err(execution_error(module, &frames, "bytecode stack underflow"));
                 }
                 let arguments = frames[frame_index].stack.split_off(stack_length - count);
-                let Some(target_program) = module.procedure(target) else {
-                    return Err(execution_error(
+                let mut context = frame_context(&frames[frame_index]);
+                if let Some(path) = module.procedure_path(target)
+                    && let Some((_, selector)) = path.rsplit_once("/proc/")
+                    && !path.starts_with("/proc/")
+                    && matches!(frames[frame_index].src, Value::Datum(_))
+                {
+                    let selector = selector.split('@').next().unwrap_or(selector);
+                    let (dynamic_target, dynamic_context) = dynamic_call_target(
                         module,
-                        &frames,
-                        format!("invalid call target {}", target.index()),
-                    ));
-                };
-                let context = frame_context(&frames[frame_index]);
+                        state,
+                        &frames[frame_index].src,
+                        &Value::text(selector),
+                        &context,
+                        false,
+                    )
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                    target = dynamic_target;
+                    context = dynamic_context;
+                }
+                let target_program = module
+                    .resolve_procedure(target)
+                    .map_err(|message| execution_error(module, &frames, message))?;
                 frames.push(make_frame(target, target_program, &arguments, &context));
                 continue;
             }
@@ -8152,18 +10496,17 @@ fn run_frames(
                 } else {
                     frames[frame_index].arguments.clone()
                 };
-                let Some(target_program) = module.procedure(target) else {
-                    return Err(execution_error(
-                        module,
-                        &frames,
-                        format!("invalid parent call target {}", target.index()),
-                    ));
-                };
+                let target_program = module
+                    .resolve_procedure(target)
+                    .map_err(|message| execution_error(module, &frames, message))?;
                 let context = frame_context(&frames[frame_index]);
                 frames.push(make_frame(target, target_program, &arguments, &context));
                 continue;
             }
-            Instruction::CallDynamic { argument_count } => {
+            Instruction::CallDynamic {
+                argument_count,
+                null_receiver_is_global,
+            } => {
                 let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let stack_length = frames[frame_index].stack.len();
@@ -8204,6 +10547,26 @@ fn run_frames(
                     let result = execute_matrix_method(*datum, method, &arguments, &mut state.heap)
                         .map_err(|message| execution_error(module, &frames, message))?;
                     frames[frame_index].stack.push(result);
+                } else if let (Value::Datum(datum), Value::Text(method)) = (&receiver, &selector)
+                    && is_vector_datum(*datum, &state.heap)
+                {
+                    let result = execute_vector_method(*datum, method, &arguments, &mut state.heap)
+                        .map_err(|message| execution_error(module, &frames, message))?;
+                    frames[frame_index].stack.push(result);
+                } else if let (Value::Datum(datum), Value::Text(method)) = (&receiver, &selector)
+                    && is_icon_datum(*datum, &state.heap)
+                    && matches!(method.as_ref(), "MapColors" | "Blend" | "SetIntensity")
+                {
+                    match method.as_ref() {
+                        "MapColors" => apply_icon_map_colors(*datum, &arguments, &mut state.heap),
+                        "Blend" => apply_icon_blend(*datum, &arguments, &mut state.heap),
+                        "SetIntensity" => {
+                            apply_icon_set_intensity(*datum, &arguments, &mut state.heap)
+                        }
+                        _ => unreachable!(),
+                    }
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                    frames[frame_index].stack.push(Value::Null);
                 } else {
                     if frames.len() >= limits.max_call_depth {
                         return Err(execution_error(
@@ -8213,16 +10576,18 @@ fn run_frames(
                         ));
                     }
                     let caller_context = frame_context(&frames[frame_index]);
-                    let (target, context) =
-                        dynamic_call_target(module, state, &receiver, &selector, &caller_context)
-                            .map_err(|message| execution_error(module, &frames, message))?;
-                    let Some(target_program) = module.procedure(target) else {
-                        return Err(execution_error(
-                            module,
-                            &frames,
-                            format!("invalid dynamic call target {}", target.index()),
-                        ));
-                    };
+                    let (target, context) = dynamic_call_target(
+                        module,
+                        state,
+                        &receiver,
+                        &selector,
+                        &caller_context,
+                        null_receiver_is_global,
+                    )
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                    let target_program = module
+                        .resolve_procedure(target)
+                        .map_err(|message| execution_error(module, &frames, message))?;
                     frames.push(make_frame(target, target_program, &arguments, &context));
                     continue;
                 }
@@ -8296,6 +10661,7 @@ fn make_frame(
         usr: context.usr.clone(),
         arguments: arguments.to_vec(),
         exception_handlers: Vec::new(),
+        detached_waitfor: false,
     }
 }
 
@@ -8491,6 +10857,289 @@ fn values_equivalent(left: &Value, right: &Value, heap: &ValueHeap) -> Result<bo
     Ok(true)
 }
 
+const VECTOR_FIELDS: [&str; 3] = ["x", "y", "z"];
+
+fn is_vector_datum(datum: DatumId, heap: &ValueHeap) -> bool {
+    heap.datum(datum)
+        .is_ok_and(|datum| datum.type_path().as_str() == "/vector")
+}
+
+fn is_icon_datum(datum: DatumId, heap: &ValueHeap) -> bool {
+    heap.datum(datum)
+        .is_ok_and(|datum| datum.type_path().as_str() == "/icon")
+}
+
+fn apply_icon_map_colors(
+    icon: DatumId,
+    arguments: &[Value],
+    heap: &mut ValueHeap,
+) -> Result<(), String> {
+    if !matches!(arguments.len(), 4 | 5 | 12 | 20) {
+        return Err(format!(
+            "icon.MapColors requires 4, 5, 12, or 20 arguments, received {}",
+            arguments.len()
+        ));
+    }
+    let matrix = heap.allocate_list();
+    for value in arguments {
+        heap.list_mut(matrix)
+            .map_err(|error| error.to_string())?
+            .add(value.clone());
+    }
+    heap.set_datum_field(
+        icon,
+        FieldName::parse("_dream64_color_matrix").expect("headless icon field is valid"),
+        Value::List(matrix),
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn apply_icon_blend(
+    icon: DatumId,
+    arguments: &[Value],
+    heap: &mut ValueHeap,
+) -> Result<(), String> {
+    if !(1..=4).contains(&arguments.len()) {
+        return Err(format!(
+            "icon.Blend requires an icon/color and up to mode, x, y; received {} arguments",
+            arguments.len()
+        ));
+    }
+    let history_field =
+        FieldName::parse("_dream64_blends").expect("headless icon blend field is valid");
+    let history = match heap.datum_field(icon, &history_field) {
+        Ok(Value::List(history)) => *history,
+        _ => {
+            let history = heap.allocate_list();
+            heap.set_datum_field(icon, history_field, Value::List(history))
+                .map_err(|error| error.to_string())?;
+            history
+        }
+    };
+    let operation = heap.allocate_list();
+    for value in [
+        arguments[0].clone(),
+        arguments.get(1).cloned().unwrap_or(Value::number(0.0)),
+        arguments.get(2).cloned().unwrap_or(Value::number(1.0)),
+        arguments.get(3).cloned().unwrap_or(Value::number(1.0)),
+    ] {
+        heap.list_mut(operation)
+            .map_err(|error| error.to_string())?
+            .add(value);
+    }
+    heap.list_mut(history)
+        .map_err(|error| error.to_string())?
+        .add(Value::List(operation));
+    Ok(())
+}
+
+fn apply_icon_set_intensity(
+    icon: DatumId,
+    arguments: &[Value],
+    heap: &mut ValueHeap,
+) -> Result<(), String> {
+    if !(1..=3).contains(&arguments.len()) {
+        return Err(format!(
+            "icon.SetIntensity requires r and optional g and b, received {} arguments",
+            arguments.len()
+        ));
+    }
+    let red = arguments[0]
+        .as_number()
+        .ok_or_else(|| "icon.SetIntensity red component must be numeric".to_owned())?;
+    let green = arguments
+        .get(1)
+        .unwrap_or(&arguments[0])
+        .as_number()
+        .ok_or_else(|| "icon.SetIntensity green component must be numeric".to_owned())?;
+    let blue = arguments
+        .get(2)
+        .unwrap_or(&arguments[0])
+        .as_number()
+        .ok_or_else(|| "icon.SetIntensity blue component must be numeric".to_owned())?;
+    apply_icon_map_colors(
+        icon,
+        &[
+            Value::number(red),
+            Value::number(0.0),
+            Value::number(0.0),
+            Value::number(0.0),
+            Value::number(green),
+            Value::number(0.0),
+            Value::number(0.0),
+            Value::number(0.0),
+            Value::number(blue),
+            Value::number(0.0),
+            Value::number(0.0),
+            Value::number(0.0),
+        ],
+        heap,
+    )
+}
+
+fn vector_components(datum: DatumId, heap: &ValueHeap) -> Result<[f32; 3], String> {
+    if !is_vector_datum(datum, heap) {
+        return Err("vector operation requires a /vector datum".to_owned());
+    }
+    let mut values = [0.0; 3];
+    for (index, name) in VECTOR_FIELDS.iter().enumerate() {
+        let field = FieldName::parse(name).expect("vector field is valid");
+        values[index] = heap
+            .datum_field(datum, &field)
+            .map_err(|error| error.to_string())?
+            .as_number()
+            .unwrap_or(0.0);
+    }
+    Ok(values)
+}
+
+fn write_vector(datum: DatumId, values: [f32; 3], heap: &mut ValueHeap) -> Result<(), String> {
+    for (name, value) in VECTOR_FIELDS.into_iter().zip(values) {
+        heap.set_datum_field(
+            datum,
+            FieldName::parse(name).expect("vector field is valid"),
+            Value::number(value),
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    let magnitude = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+    for (name, value) in [("len", 3.0), ("size", magnitude)] {
+        heap.set_datum_field(
+            datum,
+            FieldName::parse(name).expect("vector metadata field is valid"),
+            Value::number(value),
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn allocate_vector(values: [f32; 3], heap: &mut ValueHeap) -> Result<DatumId, String> {
+    let datum = heap.allocate_datum(TypePath::parse("/vector").expect("vector path is valid"));
+    write_vector(datum, values, heap)?;
+    Ok(datum)
+}
+
+fn construct_vector(arguments: &[Value], heap: &mut ValueHeap) -> Result<DatumId, String> {
+    if arguments.len() > 3 {
+        return Err("vector accepts at most three arguments".to_owned());
+    }
+    let mut values = [0.0; 3];
+    for (index, value) in arguments.iter().enumerate() {
+        values[index] = value.as_number().unwrap_or(0.0);
+    }
+    allocate_vector(values, heap)
+}
+
+fn vector_zip(
+    left: DatumId,
+    right: DatumId,
+    heap: &ValueHeap,
+    operation: impl Fn(f32, f32) -> f32,
+) -> Result<[f32; 3], String> {
+    let left = vector_components(left, heap)?;
+    let right = vector_components(right, heap)?;
+    Ok(std::array::from_fn(|index| {
+        operation(left[index], right[index])
+    }))
+}
+
+fn execute_vector_binary(
+    operator: &str,
+    datum: DatumId,
+    right: &Value,
+    heap: &mut ValueHeap,
+) -> Result<Value, String> {
+    let left = vector_components(datum, heap)?;
+    let right_values = match right {
+        Value::Datum(other) if is_vector_datum(*other, heap) => vector_components(*other, heap)?,
+        value => [value.as_number().unwrap_or(0.0); 3],
+    };
+    let values = match operator {
+        "*" => std::array::from_fn(|index| left[index] * right_values[index]),
+        "/" => std::array::from_fn(|index| left[index] / right_values[index]),
+        _ => return Err(format!("unsupported vector operator {operator}")),
+    };
+    Ok(Value::Datum(allocate_vector(values, heap)?))
+}
+
+fn execute_vector_compound(
+    operator: CompoundAssignmentOperator,
+    datum: DatumId,
+    right: &Value,
+    heap: &mut ValueHeap,
+) -> Result<Value, String> {
+    let left = vector_components(datum, heap)?;
+    let right_values = match right {
+        Value::Datum(other) if is_vector_datum(*other, heap) => vector_components(*other, heap)?,
+        value => [value.as_number().unwrap_or(0.0); 3],
+    };
+    let values = match operator {
+        CompoundAssignmentOperator::Add => {
+            std::array::from_fn(|index| left[index] + right_values[index])
+        }
+        CompoundAssignmentOperator::Subtract => {
+            std::array::from_fn(|index| left[index] - right_values[index])
+        }
+        CompoundAssignmentOperator::Multiply => {
+            std::array::from_fn(|index| left[index] * right_values[index])
+        }
+        CompoundAssignmentOperator::Divide => {
+            std::array::from_fn(|index| left[index] / right_values[index])
+        }
+        _ => return Err("unsupported vector compound operator".to_owned()),
+    };
+    write_vector(datum, values, heap)?;
+    Ok(Value::Datum(datum))
+}
+
+fn execute_vector_method(
+    datum: DatumId,
+    method: &str,
+    arguments: &[Value],
+    heap: &mut ValueHeap,
+) -> Result<Value, String> {
+    let current = vector_components(datum, heap)?;
+    match method.to_ascii_lowercase().as_str() {
+        "dot" => {
+            let Some(Value::Datum(other)) = arguments.first() else {
+                return Err("vector.Dot requires a vector".to_owned());
+            };
+            let other = vector_components(*other, heap)?;
+            Ok(Value::number(
+                current.iter().zip(other).map(|(a, b)| a * b).sum::<f32>(),
+            ))
+        }
+        "interpolate" => {
+            let Some(Value::Datum(other)) = arguments.first() else {
+                return Err("vector.Interpolate requires a vector and factor".to_owned());
+            };
+            let other = vector_components(*other, heap)?;
+            let factor = arguments.get(1).and_then(Value::as_number).unwrap_or(0.0);
+            let values = std::array::from_fn(|index| {
+                current[index] + (other[index] - current[index]) * factor
+            });
+            Ok(Value::Datum(allocate_vector(values, heap)?))
+        }
+        "normalize" => {
+            let magnitude = current
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                .sqrt();
+            let values = if magnitude == 0.0 {
+                current
+            } else {
+                current.map(|value| value / magnitude)
+            };
+            write_vector(datum, values, heap)?;
+            Ok(Value::Datum(datum))
+        }
+        _ => Err(format!("unknown /vector procedure {method:?}")),
+    }
+}
+
 const MATRIX_FIELDS: [&str; 6] = ["a", "b", "c", "d", "e", "f"];
 
 fn matrix_numeric(value: &Value) -> f32 {
@@ -8530,6 +11179,67 @@ fn allocate_matrix(values: [f32; 6], heap: &mut ValueHeap) -> Result<DatumId, St
     let datum = heap.allocate_datum(TypePath::parse("/matrix").expect("matrix path is valid"));
     write_matrix(datum, values, heap)?;
     Ok(datum)
+}
+
+fn allocate_initialized_datum(
+    state: &mut ExecutionState,
+    type_path: TypePath,
+) -> Result<DatumId, String> {
+    let initial_values = state
+        .initial_values
+        .get(&type_path)
+        .cloned()
+        .unwrap_or_default();
+    let is_atom = is_atom_type_path(&type_path);
+    let datum = state.heap.allocate_datum(type_path);
+    for (name, value) in initial_values {
+        state
+            .heap
+            .set_datum_field(datum, name, value)
+            .map_err(|error| error.to_string())?;
+    }
+    if is_atom {
+        let contents = FieldName::parse("contents").expect("built-in contents field");
+        if state.heap.datum_field(datum, &contents).is_err() {
+            let list = state.heap.allocate_list();
+            state
+                .heap
+                .set_datum_field(datum, contents.clone(), Value::List(list))
+                .map_err(|error| error.to_string())?;
+        }
+        let world = FieldName::parse("world").expect("built-in world global");
+        let world_contents = state
+            .global(&world)
+            .and_then(|value| match value {
+                Value::Datum(world) => Some(*world),
+                _ => None,
+            })
+            .and_then(|world| state.heap.datum_field(world, &contents).ok())
+            .and_then(|value| match value {
+                Value::List(list) => Some(*list),
+                _ => None,
+            });
+        if let Some(list) = world_contents {
+            state
+                .heap
+                .list_mut(list)
+                .map_err(|error| error.to_string())?
+                .add(Value::Datum(datum));
+        }
+    }
+    Ok(datum)
+}
+
+fn is_atom_type_path(path: &TypePath) -> bool {
+    let path = path.as_str();
+    ["/atom", "/area", "/turf", "/obj", "/mob"]
+        .into_iter()
+        .any(|root| {
+            path == root
+                || path
+                    .strip_prefix(root)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
 }
 
 fn construct_matrix(arguments: &[Value], heap: &mut ValueHeap) -> Result<DatumId, String> {
@@ -8924,9 +11634,10 @@ fn random_integer(arguments: &[Value], state: &mut u64) -> Result<f32, String> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     let (low, high) = match bounds.as_slice() {
+        [] => return Ok(deterministic_unit(state)),
         [high] => (0.0, *high),
         [low, high] => (*low, *high),
-        _ => return Err("rand requires one or two bounds".to_owned()),
+        _ => return Err("rand accepts zero, one, or two bounds".to_owned()),
     };
     let low = low.ceil();
     let high = high.floor();
@@ -8934,6 +11645,62 @@ fn random_integer(arguments: &[Value], state: &mut u64) -> Result<f32, String> {
         return Err(format!("invalid rand range {low} through {high}"));
     }
     Ok(low + (deterministic_unit(state) * (high - low + 1.0)).floor())
+}
+
+fn roll_dice(arguments: &[Value], state: &mut u64) -> Result<f32, String> {
+    let (count, sides, offset) = match arguments {
+        [Value::Text(dice)] => {
+            let dice = dice.trim();
+            let (count, remainder) = dice
+                .split_once(['d', 'D'])
+                .ok_or_else(|| format!("invalid dice expression {dice:?}"))?;
+            let sign = remainder
+                .char_indices()
+                .skip(1)
+                .find(|(_, character)| matches!(character, '+' | '-'))
+                .map(|(index, _)| index);
+            let (sides, offset) = sign.map_or((remainder, "0"), |index| remainder.split_at(index));
+            (
+                count
+                    .parse::<i32>()
+                    .map_err(|_| format!("invalid dice count {count:?}"))?,
+                sides
+                    .parse::<i32>()
+                    .map_err(|_| format!("invalid dice sides {sides:?}"))?,
+                offset
+                    .parse::<i32>()
+                    .map_err(|_| format!("invalid dice offset {offset:?}"))?,
+            )
+        }
+        [sides] => (
+            1,
+            sides
+                .as_number()
+                .ok_or_else(|| format!("roll requires a number or dice text, received {sides}"))?
+                .trunc() as i32,
+            0,
+        ),
+        [count, sides] => (
+            count
+                .as_number()
+                .ok_or_else(|| format!("roll count requires a number, received {count}"))?
+                .trunc() as i32,
+            sides
+                .as_number()
+                .ok_or_else(|| format!("roll sides requires a number, received {sides}"))?
+                .trunc() as i32,
+            0,
+        ),
+        _ => return Err("roll requires one or two arguments".to_owned()),
+    };
+    if count < 0 || sides < 1 {
+        return Err(format!("invalid dice dimensions {count}d{sides}"));
+    }
+    let mut total = offset as f32;
+    for _ in 0..count {
+        total += random_integer(&[Value::number(1.0), Value::number(sides as f32)], state)?;
+    }
+    Ok(total)
 }
 
 #[allow(
@@ -9024,7 +11791,11 @@ fn ref_builtin(value: &Value) -> Value {
         Value::List(list) => format!("[0xe{:06x}]", list.index() + 1),
         // `ref` identifies runtime heap objects; scalar values have no
         // object identity and therefore cannot yield a usable reference.
-        Value::Null | Value::Number(_) | Value::Text(_) | Value::TypePath(_) => return Value::Null,
+        Value::Null
+        | Value::Number(_)
+        | Value::Text(_)
+        | Value::TypePath(_)
+        | Value::ModifiedTypePath(_) => return Value::Null,
     };
     Value::text(reference)
 }
@@ -9088,6 +11859,42 @@ fn get_step_builtin(source: &Value, direction: &Value, heap: &ValueHeap) -> Resu
         }
     }
     Ok(Value::Null)
+}
+
+fn direction_towards_builtin(
+    source: &Value,
+    target: &Value,
+    heap: &ValueHeap,
+) -> Result<Value, String> {
+    let (Value::Datum(source), Value::Datum(target)) = (source, target) else {
+        return Ok(Value::number(0.0));
+    };
+    let coordinate = |datum: DatumId, name: &str| -> Result<f32, String> {
+        heap.datum_field(
+            datum,
+            &FieldName::parse(name).expect("built-in coordinate field is valid"),
+        )
+        .map_err(|error| error.to_string())?
+        .as_number()
+        .ok_or_else(|| format!("get_step_towards coordinate {name} is not numeric"))
+    };
+    if coordinate(*source, "z")? != coordinate(*target, "z")? {
+        return Ok(Value::number(0.0));
+    }
+    let dx = coordinate(*target, "x")? - coordinate(*source, "x")?;
+    let dy = coordinate(*target, "y")? - coordinate(*source, "y")?;
+    let mut direction = 0_u8;
+    if dy > 0.0 {
+        direction |= 1;
+    } else if dy < 0.0 {
+        direction |= 2;
+    }
+    if dx > 0.0 {
+        direction |= 4;
+    } else if dx < 0.0 {
+        direction |= 8;
+    }
+    Ok(Value::number(f32::from(direction)))
 }
 
 /// Resolves BYOND's `block()` over materialized headless turfs.
@@ -9369,6 +12176,10 @@ fn type_predicate_builtin(
             let Value::TypePath(target) = target else {
                 return Ok(false);
             };
+            if let Value::List(list) = value {
+                return Ok(target.as_str() == "/list"
+                    || (target.as_str() == "/alist" && state.is_associative_list(*list)));
+            }
             let candidate = match value {
                 Value::TypePath(path) => path,
                 Value::Datum(datum) => heap
@@ -9486,6 +12297,7 @@ fn dynamic_call_target(
     receiver: &Value,
     selector: &Value,
     caller_context: &ExecutionContext,
+    null_receiver_is_global: bool,
 ) -> Result<(ProcedureId, ExecutionContext), String> {
     let selector = match selector {
         Value::Text(selector) => String::from(selector.as_ref()),
@@ -9498,7 +12310,10 @@ fn dynamic_call_target(
     };
 
     let (base_path, context) = match receiver {
-        Value::Null => ("/proc".to_owned(), caller_context.clone()),
+        Value::Null if null_receiver_is_global => ("/proc".to_owned(), caller_context.clone()),
+        Value::Null => {
+            return Err("cannot call a procedure on null".to_owned());
+        }
         Value::Datum(datum) => (
             state
                 .heap()
@@ -9515,9 +12330,14 @@ fn dynamic_call_target(
             ));
         }
     };
-    let selector_path = selector.trim_start_matches('/');
+    let selector_path = selector
+        .trim_start_matches('/')
+        .strip_prefix("proc/")
+        .unwrap_or_else(|| selector.trim_start_matches('/'));
     let requested = if selector.starts_with('/') {
         selector.clone()
+    } else if base_path == "/proc" {
+        format!("/proc/{selector_path}")
     } else {
         format!("{base_path}/proc/{selector_path}")
     };
@@ -9550,6 +12370,72 @@ fn dynamic_call_target(
     Err(format!(
         "dynamic call could not resolve procedure {requested:?}"
     ))
+}
+
+fn execute_del(
+    module: &Module,
+    arguments: &[Value],
+    state: &mut ExecutionState,
+    caller_context: &ExecutionContext,
+) -> Result<Value, RuntimeError> {
+    let Some(value) = arguments.first() else {
+        return Ok(Value::Null);
+    };
+    let Value::Datum(datum) = value else {
+        return execute_standard_builtin("del", arguments, state).map_err(|message| RuntimeError {
+            message,
+            instruction: 0,
+            source_span: None,
+            call_stack: Vec::new(),
+        });
+    };
+
+    // A Del() body is allowed to delete its own src. In that case invalidate
+    // the handle immediately, while the outer deletion remains responsible for
+    // treating its eventual stale finalization as success.
+    if !state.deleting_datums.insert(*datum) {
+        let _ = state.heap_mut().destroy_datum(*datum);
+        return Ok(Value::Null);
+    }
+
+    let receiver = Value::Datum(*datum);
+    let hook = dynamic_call_target(
+        module,
+        state,
+        &receiver,
+        &Value::text("Del"),
+        caller_context,
+        false,
+    );
+    let hook_result = match hook {
+        Ok((procedure, context)) => {
+            execute_module_in_context(module, procedure, &[], state, &context).map(|_| ())
+        }
+        Err(_) => Ok(()),
+    };
+
+    // BYOND invalidates the object after Del() regardless of its return value.
+    // Runtime failure likewise must not resurrect a half-cleaned-up datum.
+    let _ = state.heap_mut().destroy_datum(*datum);
+    state.deleting_datums.remove(datum);
+    hook_result.map(|()| Value::Null)
+}
+
+fn invoke_constructor_if_present(
+    module: &Module,
+    state: &mut ExecutionState,
+    datum: DatumId,
+    arguments: &[Value],
+    caller_context: &ExecutionContext,
+) -> Result<(), RuntimeError> {
+    let receiver = Value::Datum(datum);
+    let selector = Value::text("New");
+    let Ok((constructor, context)) =
+        dynamic_call_target(module, state, &receiver, &selector, caller_context, false)
+    else {
+        return Ok(());
+    };
+    execute_module_in_context(module, constructor, arguments, state, &context).map(|_| ())
 }
 
 fn read_list_value<'heap>(
@@ -9603,6 +12489,92 @@ fn pop(stack: &mut Vec<Value>) -> Result<Value, String> {
         .ok_or_else(|| "bytecode stack underflow".to_owned())
 }
 
+fn allocate_dm_array(heap: &mut ValueHeap, sizes: &[usize], depth: usize) -> ListId {
+    let list = heap.allocate_list();
+    for _ in 0..sizes.get(depth).copied().unwrap_or(0) {
+        let value = if depth + 1 < sizes.len() {
+            Value::List(allocate_dm_array(heap, sizes, depth + 1))
+        } else {
+            Value::Null
+        };
+        heap.list_mut(list)
+            .expect("new array list is live")
+            .add(value);
+    }
+    list
+}
+
+fn execute_animate(
+    names: &[Option<String>],
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    let explicit_target = names
+        .iter()
+        .zip(arguments)
+        .find(|(name, _)| name.is_none())
+        .map(|(_, value)| value.clone());
+    let target = explicit_target
+        .clone()
+        .or_else(|| state.last_animation_target.clone());
+    if let Some(target) = explicit_target {
+        state.last_animation_target = Some(target);
+    }
+    let Some(Value::Datum(target)) = target else {
+        // Rendering-only calls against null or unsupported client-side values
+        // have no persistent effect in a headless world.
+        return Ok(Value::Null);
+    };
+
+    const CONTROL_ARGUMENTS: &[&str] = &[
+        "time",
+        "loop",
+        "easing",
+        "flags",
+        "delay",
+        "tag",
+        "command",
+        "appearance",
+        "var_list",
+        "object",
+    ];
+    for (name, value) in names.iter().zip(arguments) {
+        let Some(name) = name else { continue };
+        if CONTROL_ARGUMENTS.contains(&name.to_ascii_lowercase().as_str()) {
+            if name.eq_ignore_ascii_case("var_list") {
+                let Value::List(list) = value else { continue };
+                let fields = state
+                    .heap
+                    .list(*list)
+                    .map_err(|error| error.to_string())?
+                    .associations()
+                    .filter_map(|(key, value)| match key {
+                        Value::Text(key) => {
+                            FieldName::parse(key).ok().map(|key| (key, value.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let datum = state
+                    .heap
+                    .datum_mut(target)
+                    .map_err(|error| error.to_string())?;
+                for (field, value) in fields {
+                    datum.set_field(field, value);
+                }
+            }
+            continue;
+        }
+        let field = FieldName::parse(name).map_err(|error| error.to_string())?;
+        state
+            .heap
+            .datum_mut(target)
+            .map_err(|error| error.to_string())?
+            .set_field(field, value.clone());
+    }
+    Ok(Value::Null)
+}
+
 fn scalar_number_string(value: Value) -> Result<f32, String> {
     match value {
         Value::Null => Ok(0.0),
@@ -9635,6 +12607,10 @@ fn execute_scalar_add(left: Value, right: Value) -> Result<Value, String> {
         (Value::Null, Value::Number(right)) => Ok(Value::number(right.to_f32())),
         (Value::Number(left), Value::Null) => Ok(Value::number(left.to_f32())),
         (Value::Null, Value::Null) => Ok(Value::number(0.0)),
+        // A declaration-only `/list` variable begins as null, and BYOND's
+        // `field += list(value)` idiom initializes it to that list. Logging
+        // queues and many SS13 lazy collections depend on this coercion.
+        (Value::Null, right @ Value::List(_)) => Ok(right),
         (Value::Text(left), Value::Text(right)) => Ok(Value::text(format!("{left}{right}"))),
         (left, right) => Err(format!(
             "addition requires compatible DM values, received {left} and {right}"
@@ -9647,6 +12623,11 @@ fn execute_scalar_compound_assignment(
     left: Value,
     right: Value,
 ) -> Result<Value, String> {
+    if matches!(operator, CompoundAssignmentOperator::Add)
+        && matches!((&left, &right), (Value::Null, Value::List(_)))
+    {
+        return Ok(right);
+    }
     if matches!(operator, CompoundAssignmentOperator::Add)
         && matches!((&left, &right), (Value::Text(_), Value::Text(_)))
     {
@@ -9705,7 +12686,7 @@ fn runtime_argument_count(stack: &mut Vec<Value>, encoded: u16) -> Result<usize,
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::sync::Arc;
 
     use dm_core::{DmNumberBits, SourceSpan};
@@ -9716,16 +12697,285 @@ mod tests {
     use super::{
         CompoundListIndexOperator, ExecutionContext, ExecutionLimits, ExecutionState,
         InitializerBinding, Instruction, ProcedureSpec, Program, Value, advance_scheduler,
-        compile_initializer, compile_module, compile_module_specs, compile_procedure,
-        compile_procedure_with_resolver_and_fields, condition_tokens, execute, execute_in_context,
-        execute_in_state, execute_module, execute_module_in_context, execute_module_in_state,
-        execute_module_with_limits, execute_with_limits, execute_with_limits_in_state,
+        allocate_initialized_datum, allocate_matrix, compile_initializer, compile_module,
+        compile_module_specs, compile_module_specs_selective,
+        compile_module_specs_selective_with_errors, compile_procedure,
+        compile_procedure_with_resolver_and_fields, condition_tokens, dm_builtin_numeric_constant,
+        execute, execute_in_context, execute_in_state, execute_module, execute_module_in_context,
+        execute_module_in_state, execute_module_with_limits, execute_with_limits,
+        execute_with_limits_in_state, interpolated_expression_close, matrix_components,
     };
+
+    #[test]
+    fn builtin_mob_sight_flag_family_has_byond_bit_values() {
+        for (name, expected) in [
+            ("BLIND", 1.0),
+            ("SEE_MOBS", 4.0),
+            ("SEEMOBS", 4.0),
+            ("SEE_OBJS", 8.0),
+            ("SEEOBJS", 8.0),
+            ("SEE_TURFS", 16.0),
+            ("SEETURFS", 16.0),
+            ("SEE_SELF", 32.0),
+            ("SEE_INFRA", 64.0),
+            ("SEE_PIXELS", 256.0),
+            ("SEE_THRU", 512.0),
+            ("SEE_BLACKNESS", 1024.0),
+        ] {
+            assert_eq!(dm_builtin_numeric_constant(name), Some(expected), "{name}");
+        }
+    }
+
+    #[test]
+    fn interpolation_close_skips_brackets_inside_nested_quotes() {
+        let expression = r#"src ? "nested[value]" : fallback]tail"#;
+        let close = interpolated_expression_close(expression, 0).expect("outer close should exist");
+        assert_eq!(
+            &expression[..=close],
+            r#"src ? "nested[value]" : fallback]"#
+        );
+    }
 
     fn execute_source(source: &str, argument: f32) -> Value {
         let syntax = parse(source).expect("source should parse");
         let program = compile_procedure(&syntax.definitions[0]).expect("procedure should compile");
         execute(&program, &[Value::number(argument)]).expect("procedure should execute")
+    }
+
+    #[test]
+    fn procedure_specs_resolve_implicit_owner_calls_through_the_path_index() {
+        let source = parse(
+            "/datum/example/proc/value()\n\treturn 17\n/datum/example/proc/read()\n\treturn value()\n",
+        )
+        .expect("source should parse");
+        let specs = [
+            ProcedureSpec {
+                path: "/datum/example/proc/value@0".to_owned(),
+                definition: &source.definitions[0],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/datum/example/proc/read@0".to_owned(),
+                definition: &source.definitions[1],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+        ];
+        let module = compile_module_specs(&specs).expect("implicit owner call should resolve");
+        let entry = module
+            .procedure_id("/datum/example/proc/read@0")
+            .expect("read entry should exist");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(17.0)));
+    }
+
+    #[test]
+    fn text_template_fills_empty_and_whitespace_holes_and_honors_escaped_brackets() {
+        let syntax = parse(
+            "/proc/run()\n\treturn text(\"before [] [ ] \\[literal\\] after\", \"one\", 2)\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("text() should compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(
+            execute_module(&module, entry, &[]),
+            Ok(Value::text("before one 2 [literal] after"))
+        );
+    }
+
+    #[test]
+    fn crash_expression_is_lazy_behind_null_conditional_access() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/value = null\n\tvalue?.field = CRASH(\"skipped rhs\")\n\tvar/result = value?.method(CRASH(\"skipped argument\"))\n\treturn isnull(result)\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("CRASH expression should compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(1.0)));
+    }
+
+    #[test]
+    fn newlist_constructs_one_fresh_datum_for_each_type_path() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/list/items = newlist(/datum/one, /datum/two)\n\treturn length(items) + istype(items[1], /datum/one) + istype(items[2], /datum/two)\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("newlist should compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(4.0)));
+    }
+
+    #[test]
+    fn src_assignment_rebinds_subsequent_bare_method_dispatch() {
+        let syntax = parse(
+            "/datum/A/proc/who()\n\treturn 1\n/datum/B/proc/who()\n\treturn 2\n/datum/A/proc/test()\n\tsrc = new /datum/B\n\treturn who()\n/proc/run()\n\tvar/datum/A/item = new /datum/A\n\treturn item.test()\n",
+        )
+        .expect("source should parse");
+        let definitions = &syntax.definitions;
+        let specs = [
+            ProcedureSpec {
+                path: "/datum/A/proc/who".to_owned(),
+                definition: &definitions[0],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/datum/B/proc/who".to_owned(),
+                definition: &definitions[1],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/datum/A/proc/test".to_owned(),
+                definition: &definitions[2],
+                parent: None,
+                static_calls: BTreeMap::from([("who".to_owned(), 0)]),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/proc/run".to_owned(),
+                definition: &definitions[3],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+        ];
+        let module = compile_module_specs(&specs).expect("src rebinding family compiles");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(2.0)));
+    }
+
+    #[test]
+    fn exact_list_allocation_constructs_heap_list_identity() {
+        let syntax = parse("/proc/run()\n\tvar/list/items = new /list\n\treturn islist(items)\n")
+            .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("new /list compiles");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(1.0)));
+    }
+
+    #[test]
+    fn modified_type_construction_applies_overrides_after_declared_initial_values() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/datum/plain = new /datum/example\n\tvar/datum/changed = new /datum/example {a=6;b=8}\n\treturn plain.a + plain.b + changed.a + changed.b\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("modified type should compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        let path = TypePath::parse("/datum/example").expect("type path");
+        let mut state = ExecutionState::new();
+        state.set_initial_values(BTreeMap::from([(
+            path,
+            BTreeMap::from([
+                (field("a"), Value::number(5.0)),
+                (field("b"), Value::number(7.0)),
+            ]),
+        )]));
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::number(26.0))
+        );
+    }
+
+    #[test]
+    fn modified_type_paths_are_list_keys_and_dynamic_new_operands() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/amount = 15\n\tvar/list/cache = list(/datum/example{a = amount} = 4)\n\tvar/kind = /datum/example{a = amount}\n\tvar/datum/created = new kind\n\treturn cache[kind] + created.a + created.b\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("modified path values compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        let path = TypePath::parse("/datum/example").expect("type path");
+        let mut state = ExecutionState::new();
+        state.set_initial_values(BTreeMap::from([(
+            path,
+            BTreeMap::from([
+                (field("a"), Value::number(1.0)),
+                (field("b"), Value::number(2.0)),
+            ]),
+        )]));
+
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::number(21.0)),
+            "the modified path must retain its evaluated key identity and override defaults after allocation"
+        );
+    }
+
+    #[test]
+    fn infinity_constants_interpolate_and_complex_raw_strings_use_custom_delimiters() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/a = 1#INF\n\tvar/b = -1#INF\n\tvar/c = -1#IND\n\tvar/raw = @(END)\nhello worldEND\n\treturn (\"[a]\" == \"inf\") + (\"[b]\" == \"-inf\") + (\"[c]\" == \"nan\") + (raw == \"hello world\")\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("constant expressions compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(4.0)));
+    }
+
+    #[test]
+    fn assign_into_is_direct_assignment_and_output_statement_does_not_shift_receiver() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/value = 5\n\tvalue := 10\n\tvalue << 1\n\tvar/other = 3\n\tother := null\n\treturn value + isnull(other)\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("operator statements compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(11.0)));
+    }
+
+    #[test]
+    fn comma_locals_logical_assignment_and_procedure_scope_name_follow_dm_rules() {
+        let syntax = parse(
+            "/datum/proc/foo()\n\tset name = \"display\"\n\treturn\n/proc/run()\n\tvar/v1,v2\n\tv1 = 0\n\tv2 = 1\n\tv1 ||= 5\n\tv2 &&= 7\n\treturn v1 + v2 + (/datum/proc/foo::name == \"foo\")\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("operator parser family compiles");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(13.0)));
+    }
+
+    #[test]
+    fn alist_constructs_ordered_key_value_storage_and_preserves_its_runtime_type() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/alist/inner = alist(\"one\" = 1, \"two\" = 2)\n\tvar/alist/items = alist(\"left\" = inner, \"right\" = 3)\n\titems += alist(\"right\" = 9, \"extra\" = 4)\n\tvar/alist/copy = items.Copy()\n\tif(!istype(items[\"left\"], /alist)) return 0\n\tif(items[\"right\"] != 3 || items[\"extra\"] != 4) return 0\n\tif(length(items) != 3 || !istype(copy, /alist)) return 0\n\treturn copy[\"left\"][\"two\"]\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("alist family should compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(2.0)));
+    }
+
+    #[test]
+    fn list_length_is_writable_and_values_cut_filters_associations_by_numeric_value() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/list/items = list(\"a\" = 1, \"b\" = 2, \"c\" = 0)\n\tvar/removed = values_cut_over(items, 1, TRUE)\n\tvar/list/plain = list(1, 2, 3, 4)\n\tplain.len--\n\tplain.len -= 1\n\tplain.len = 1\n\treturn removed * 10 + length(items) + length(plain)\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("list mutation family compiles");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(22.0)));
+
+        let negative = parse("/proc/run()\n\tvar/list/items = list()\n\titems.len--\n")
+            .expect("negative source parses");
+        let negative = compile_module(&negative.definitions).expect("negative source compiles");
+        let entry = negative.procedure_id("/proc/run").expect("entry");
+        assert!(
+            execute_module(&negative, entry, &[])
+                .expect_err("negative length must fail")
+                .message
+                .contains("cannot be negative")
+        );
     }
 
     #[test]
@@ -9986,6 +13236,110 @@ mod tests {
     }
 
     #[test]
+    fn trailing_slash_type_path_is_canonicalized_in_list_keys() {
+        let syntax = parse("/proc/build()\n\treturn list(/datum/example/ = 7)\n")
+            .expect("trailing-slash type path should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("type-path list should compile");
+        let mut state = ExecutionState::new();
+        let Value::List(list) =
+            execute_in_state(&program, &[], &mut state).expect("initializer should execute")
+        else {
+            panic!("initializer should return a list");
+        };
+        let key = Value::TypePath(TypePath::parse("/datum/example").unwrap());
+        assert_eq!(
+            state.heap().list(list).unwrap().get_key(&key),
+            Ok(&Value::number(7.0))
+        );
+    }
+
+    #[test]
+    fn runtime_created_atoms_register_with_world_and_receive_contents() {
+        let mut state = ExecutionState::new();
+        let world = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/world").unwrap());
+        let world_contents = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .set_datum_field(world, field("contents"), Value::List(world_contents))
+            .unwrap();
+        state.set_global(field("world"), Value::Datum(world));
+
+        let atom =
+            allocate_initialized_datum(&mut state, TypePath::parse("/obj/item/runtime").unwrap())
+                .expect("runtime atom should allocate");
+        let datum_contents = state.heap().datum_field(atom, &field("contents")).unwrap();
+
+        assert!(matches!(datum_contents, Value::List(_)));
+        assert!(
+            state
+                .heap()
+                .list(world_contents)
+                .unwrap()
+                .contains(&Value::Datum(atom))
+        );
+    }
+
+    #[test]
+    fn direct_loc_assignment_synchronizes_container_contents() {
+        let syntax =
+            parse("/proc/move(atom, target)\n\tatom.loc = target\n\treturn atom.loc\n").unwrap();
+        let program = compile_procedure(&syntax.definitions[0]).unwrap();
+        let mut state = ExecutionState::new();
+        let old = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/turf/old").unwrap());
+        let new = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/turf/new").unwrap());
+        let atom = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/item").unwrap());
+        let old_contents = state.heap_mut().allocate_list();
+        let new_contents = state.heap_mut().allocate_list();
+        for (container, list) in [(old, old_contents), (new, new_contents)] {
+            state
+                .heap_mut()
+                .set_datum_field(container, field("contents"), Value::List(list))
+                .unwrap();
+        }
+        state
+            .heap_mut()
+            .list_mut(old_contents)
+            .unwrap()
+            .add(Value::Datum(atom));
+        state
+            .heap_mut()
+            .set_datum_field(atom, field("loc"), Value::Datum(old))
+            .unwrap();
+
+        assert_eq!(
+            execute_in_state(
+                &program,
+                &[Value::Datum(atom), Value::Datum(new)],
+                &mut state
+            ),
+            Ok(Value::Datum(new))
+        );
+        assert!(
+            !state
+                .heap()
+                .list(old_contents)
+                .unwrap()
+                .contains(&Value::Datum(atom))
+        );
+        assert!(
+            state
+                .heap()
+                .list(new_contents)
+                .unwrap()
+                .contains(&Value::Datum(atom))
+        );
+    }
+
+    #[test]
     fn runtime_new_type_and_proc_ref_macro_expansion_compile() {
         let syntax = parse(
             "/proc/build(starting_organ)\n\tvar/item = new starting_organ(src)\n\treturn list((nameof(.proc/on_entered)), item)\n",
@@ -10002,6 +13356,7 @@ mod tests {
     fn manual_program(instructions: Vec<Instruction>, parameter_count: usize) -> Program {
         let instruction_count = instructions.len();
         Program {
+            wait_for: true,
             parameter_count,
             local_count: parameter_count,
             instructions,
@@ -10135,6 +13490,7 @@ mod tests {
             &HashMap::new(),
             &BTreeMap::from([("count".to_owned(), field("count"))]),
             &BTreeMap::new(),
+            &BTreeMap::new(),
         )
         .expect("increments should compile");
         let mut state = ExecutionState::new();
@@ -10217,6 +13573,7 @@ mod tests {
             &syntax.definitions[0],
             &HashMap::new(),
             &BTreeMap::from([("count".to_owned(), field("count"))]),
+            &BTreeMap::new(),
             &BTreeMap::new(),
         )
         .expect("field mutation should compile");
@@ -10457,6 +13814,117 @@ mod tests {
     }
 
     #[test]
+    fn symbolic_dynamic_target_compiles_once_and_survives_scheduler_yield() {
+        let source = parse(
+            "/proc/entry(receiver)\n\treturn receiver.run()\n/datum/child/proc/run()\n\tsleep(1)\n\treturn 9\n",
+        )
+        .unwrap();
+        let specs = [
+            ProcedureSpec {
+                path: "/proc/entry@0".to_owned(),
+                definition: &source.definitions[0],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/datum/child/proc/run@0".to_owned(),
+                definition: &source.definitions[1],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+        ];
+        let module = compile_module_specs_selective(
+            &specs,
+            &[BTreeMap::new(), BTreeMap::new()],
+            &BTreeSet::from([0]),
+        )
+        .unwrap();
+        assert_eq!(module.deferred_procedure_count(), 1);
+        assert_eq!(module.materialized_deferred_procedure_count(), 0);
+
+        let mut state = ExecutionState::new();
+        let receiver = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/child").unwrap());
+        let entry = module.procedure_id_at(0).unwrap();
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                entry,
+                &[Value::Datum(receiver)],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::Null)
+        );
+        assert_eq!(module.materialized_deferred_procedure_count(), 1);
+        assert_eq!(state.scheduled_task_count(), 1);
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::number(9.0)])
+        );
+        assert_eq!(module.materialized_deferred_procedure_count(), 1);
+    }
+
+    #[test]
+    fn deferred_semantic_error_blocks_only_when_runtime_selects_symbol() {
+        let source = parse(
+            "/proc/entry(receiver)\n\treturn receiver.run()\n/datum/child/proc/run()\n\treturn 9\n",
+        )
+        .unwrap();
+        let specs = [
+            ProcedureSpec {
+                path: "/proc/entry@0".to_owned(),
+                definition: &source.definitions[0],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/datum/child/proc/run@0".to_owned(),
+                definition: &source.definitions[1],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+        ];
+        let module = compile_module_specs_selective_with_errors(
+            &specs,
+            &[BTreeMap::new(), BTreeMap::new()],
+            &BTreeSet::from([0]),
+            &BTreeMap::from([(
+                1,
+                super::CompileError {
+                    message: "deferred source semantic failure".to_owned(),
+                },
+            )]),
+        )
+        .expect("unselected deferred semantic error must not block module linking");
+        assert_eq!(module.materialized_deferred_procedure_count(), 0);
+
+        let mut state = ExecutionState::new();
+        let receiver = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/child").unwrap());
+        let error = execute_module_in_context(
+            &module,
+            module.procedure_id_at(0).unwrap(),
+            &[Value::Datum(receiver)],
+            &mut state,
+            &ExecutionContext::default(),
+        )
+        .expect_err("selecting the invalid deferred symbol must fail");
+        assert_eq!(error.message, "deferred source semantic failure");
+        assert_eq!(module.materialized_deferred_procedure_count(), 1);
+    }
+
+    #[test]
     fn static_call_statement_executes_and_discards_its_result() {
         let source = parse(
             "/proc/entry()\n\thelper()\n\treturn global.calls\n/proc/helper()\n\tglobal.calls += 1\n\treturn 99\n",
@@ -10686,6 +14154,88 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_advances_world_clock_with_tick_lag_and_resets_tick_usage() {
+        let source = parse(
+            "/proc/entry()\n\tspawn(3)\n\t\treturn_usage()\n/proc/return_usage()\n\tworld.observed = world.tick_usage\n",
+        )
+        .unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+        let entry = module.procedure_id("/proc/entry").unwrap();
+        let mut state = ExecutionState::new();
+        let world = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/world").unwrap());
+        for (name, value) in [
+            ("tick_lag", 2.0),
+            ("fps", 5.0),
+            ("time", 0.0),
+            ("timeofday", 863_999.0),
+            ("tick_usage", 0.0),
+        ] {
+            state
+                .heap_mut()
+                .set_datum_field(world, field(name), Value::number(value))
+                .unwrap();
+        }
+        state.set_global(field("world"), Value::Datum(world));
+
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::Null)
+        );
+        assert_eq!(state.next_scheduled_tick(), Some(2));
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(vec![])
+        );
+        assert_eq!(crate::world_numeric_field(&state, "time"), Some(2.0));
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::Null])
+        );
+        assert_eq!(
+            state.heap().datum_field(world, &field("observed")),
+            Ok(&Value::number(100.0))
+        );
+        assert_eq!(crate::world_numeric_field(&state, "time"), Some(4.0));
+        assert_eq!(crate::world_numeric_field(&state, "timeofday"), Some(3.0));
+        assert_eq!(crate::world_numeric_field(&state, "tick_usage"), Some(0.0));
+    }
+
+    #[test]
+    fn world_fps_and_tick_lag_assignments_remain_reciprocal() {
+        let source = parse(
+            "/proc/set_fps()\n\tworld.fps = 20\n\treturn world.tick_lag\n/proc/set_lag()\n\tworld.tick_lag = 2\n\treturn world.fps\n",
+        )
+        .unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+        let mut state = ExecutionState::new();
+        let world = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/world").unwrap());
+        state.set_global(field("world"), Value::Datum(world));
+
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/set_fps").unwrap(),
+                &[],
+                &mut state,
+            ),
+            Ok(Value::number(0.5))
+        );
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/set_lag").unwrap(),
+                &[],
+                &mut state,
+            ),
+            Ok(Value::number(5.0))
+        );
+    }
+
+    #[test]
     fn spawn_without_parentheses_defaults_to_zero_delay_for_inline_and_block_bodies() {
         for source in [
             "/proc/entry()\n\tspawn helper()\n\treturn 1\n/proc/helper()\n\treturn 2\n",
@@ -10818,13 +14368,17 @@ mod tests {
 
     #[test]
     fn random_builtins_are_deterministic_and_respect_their_bounds() {
-        let source =
-            parse("/proc/range()\n\treturn rand(4, 6)\n/proc/chance()\n\treturn prob(100)\n")
+        let source = parse(
+            "/proc/unit()\n\treturn rand()\n/proc/range()\n\treturn rand(4, 6)\n/proc/chance()\n\treturn prob(100)\n",
+        )
                 .expect("source should parse");
         let module = compile_module(&source.definitions).expect("random builtins should compile");
         let range = module
             .procedure_id("/proc/range")
             .expect("range should exist");
+        let unit = module
+            .procedure_id("/proc/unit")
+            .expect("unit should exist");
         let chance = module
             .procedure_id("/proc/chance")
             .expect("chance should exist");
@@ -10833,7 +14387,53 @@ mod tests {
             execute_module(&module, range, &[]).expect("fresh states should reproduce rand");
         assert_eq!(first, second);
         assert!(matches!(first.as_number(), Some(value) if (4.0..=6.0).contains(&value)));
+        let unit_value = execute_module(&module, unit, &[]).expect("rand() should execute");
+        assert!(
+            matches!(unit_value.as_number(), Some(value) if (0.0..1.0).contains(&value)),
+            "rand() returned {unit_value}"
+        );
         assert_eq!(execute_module(&module, chance, &[]), Ok(Value::number(1.0)));
+    }
+
+    #[test]
+    fn rand_seed_resets_the_stream_consumed_by_random_builtins() {
+        let source = parse(
+            "/proc/seeded(seed)\n\trand_seed(seed)\n\treturn rand(1, 1000000) * 100 + pick(10, 20, 30) + prob(50)\n",
+        )
+        .expect("rand_seed source should parse");
+        let module = compile_module(&source.definitions).expect("rand_seed should compile");
+        let entry = module.procedure_id("/proc/seeded").expect("seeded proc");
+        let mut state = ExecutionState::new();
+        let first =
+            execute_module_in_state(&module, entry, &[Value::number(29051994.0)], &mut state)
+                .expect("first seeded sequence");
+        let repeated =
+            execute_module_in_state(&module, entry, &[Value::number(29051994.0)], &mut state)
+                .expect("repeated seeded sequence");
+        assert_eq!(first, repeated, "reseeding must reproduce the whole stream");
+    }
+
+    #[test]
+    fn roll_supports_numeric_and_encoded_dice_forms() {
+        let source = dm_syntax::parse(
+            "/proc/numeric()\n\treturn roll(3, 6)\n/proc/encoded()\n\treturn roll(\"2d4+5\")\n",
+        )
+        .expect("dice source should parse");
+        let module = compile_module(&source.definitions).expect("roll should compile");
+        let numeric = execute_module(&module, module.procedure_id("/proc/numeric").unwrap(), &[])
+            .expect("numeric dice should execute");
+        let encoded = execute_module(&module, module.procedure_id("/proc/encoded").unwrap(), &[])
+            .expect("encoded dice should execute");
+        assert!(
+            numeric
+                .as_number()
+                .is_some_and(|value| (3.0..=18.0).contains(&value))
+        );
+        assert!(
+            encoded
+                .as_number()
+                .is_some_and(|value| (7.0..=13.0).contains(&value))
+        );
     }
 
     #[test]
@@ -10880,6 +14480,57 @@ mod tests {
             .expect("entry procedure should resolve");
 
         assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(34.0)));
+    }
+
+    #[test]
+    fn calls_accept_omitted_positional_arguments() {
+        let source = parse(
+            "/proc/entry()\n\treturn helper(3,, 4)\n/proc/helper(first, omitted, third)\n\treturn first * 10 + third + isnull(omitted)\n",
+        )
+        .expect("source should parse");
+        let module =
+            compile_module(&source.definitions).expect("interior omitted arguments should compile");
+        let entry = module.procedure_id("/proc/entry").unwrap();
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(35.0)));
+    }
+
+    #[test]
+    fn expression_produced_procedure_selectors_are_invocable() {
+        let source = parse(
+            "/proc/entry()\n\treturn selector()(4)\n/proc/selector()\n\treturn \"/proc/helper\"\n/proc/helper(value)\n\treturn value + 3\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&source.definitions)
+            .expect("a procedure selector returned by an expression should compile");
+        let entry = module.procedure_id("/proc/entry").unwrap();
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(7.0)));
+    }
+
+    #[test]
+    fn call_ext_retains_both_selectors_and_call_arguments() {
+        let source =
+            parse("/proc/entry()\n\treturn call_ext(\"bridge.dll\", \"run\")(1, \"two\")\n")
+                .expect("call_ext source should parse");
+        let program = compile_procedure(&source.definitions[0])
+            .expect("call_ext selector and invocation should compile");
+        assert!(program.instructions.iter().any(|instruction| matches!(
+            instruction,
+            Instruction::ExternalCall { argument_count: 2 }
+        )));
+        let error = execute(&program, &[]).expect_err("headless execution has no host bridge");
+        assert!(error.message.contains("bridge.dll"));
+        assert!(error.message.contains("run"));
+        assert!(error.message.contains("installed host bridge"));
+    }
+
+    #[test]
+    fn special_result_supports_indexed_assignment() {
+        let source =
+            parse("/proc/entry()\n\t. = list()\n\t.[\"answer\"] = 42\n\treturn .[\"answer\"]\n")
+                .expect("source should parse");
+        let program = compile_procedure(&source.definitions[0])
+            .expect("indexed special-result assignment should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(42.0)));
     }
 
     #[test]
@@ -10937,6 +14588,85 @@ mod tests {
                 )],
                 &mut state,
                 &context,
+            ),
+            Ok(Value::number(7.0))
+        );
+    }
+
+    #[test]
+    fn dynamic_call_canonicalizes_global_proc_selectors_without_double_proc_segment() {
+        let source = parse(
+            "/proc/entry(selector)\n\treturn call(selector)(4)\n/proc/Log(value)\n\treturn value + 3\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&source.definitions).expect("module should compile");
+        let entry = module.procedure_id("/proc/entry").unwrap();
+
+        for selector in [
+            Value::text("Log"),
+            Value::text("proc/Log"),
+            Value::TypePath(TypePath::parse("/proc/Log").unwrap()),
+        ] {
+            assert_eq!(
+                execute_module(&module, entry, &[selector]),
+                Ok(Value::number(7.0))
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_member_call_on_null_is_not_reinterpreted_as_a_global_proc() {
+        let source = parse(
+            "/proc/entry()\n\tvar/datum/logger = null\n\treturn logger.Log(4)\n/proc/Log(value)\n\treturn value + 3\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&source.definitions).expect("module should compile");
+        let error = execute_module(&module, module.procedure_id("/proc/entry").unwrap(), &[])
+            .expect_err("null member calls must remain datum calls");
+        assert!(error.message.contains("procedure on null"));
+    }
+
+    #[test]
+    fn bare_owner_proc_with_arglist_binds_current_src_not_global_namespace() {
+        let source = parse(
+            "/datum/log_holder/proc/init_logging()\n\tvar/list/arg_list = list(4)\n\treturn Log(arglist(arg_list))\n/datum/log_holder/proc/Log(value)\n\treturn src.base + value\n",
+        )
+        .expect("Monk-shaped logger source should parse");
+        let module = compile_module_specs(&[
+            ProcedureSpec {
+                path: "/datum/log_holder/proc/init_logging@0".to_owned(),
+                definition: &source.definitions[0],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/datum/log_holder/proc/Log@0".to_owned(),
+                definition: &source.definitions[1],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+        ])
+        .expect("bare Log call should owner-resolve");
+        let mut state = ExecutionState::new();
+        let logger = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/log_holder").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(logger, field("base"), Value::number(3.0))
+            .unwrap();
+
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                module.procedure_id_at(0).unwrap(),
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(logger), Value::Null),
             ),
             Ok(Value::number(7.0))
         );
@@ -11201,7 +14931,7 @@ mod tests {
     #[test]
     fn plane_macro_nested_scope_keeps_cached_locals_visible() {
         let source = parse(
-            "/proc/plane_macro(flag, other)\n\tvar/output = 0\n\tdo { if(flag) { var/_cached_plane = 7; var/_our_turf = other; if(_our_turf) { output = _cached_plane; } else if(other) { output = _cached_plane; } else { output = _cached_plane; } } else { output = 2; } } while(0)\n\treturn output\n",
+            "/proc/plane_macro(flag, other)\n\tvar/output = 0\n\tdo { if(flag) { var/_cached_plane = 7; var/_our_turf = other; if(_our_turf) { var/key = \"[_cached_plane]\"; output = _cached_plane; } else if(other) { output = _cached_plane; } else { output = _cached_plane; } } else { output = 2; } } while(0)\n\treturn output\n",
         )
         .expect("plane macro source should parse");
         let module = compile_module(&source.definitions).expect("plane macro scope should compile");
@@ -11209,6 +14939,21 @@ mod tests {
         assert_eq!(
             execute_module(&module, entry, &[Value::number(1.0), Value::number(1.0)]),
             Ok(Value::number(7.0))
+        );
+    }
+
+    #[test]
+    fn compact_brace_scope_survives_physical_macro_lines() {
+        let source = parse(
+            "/proc/plane_macro(flag, inner)\n\tvar/output = 0\n\tif(flag) { var/_cached_plane = 7; if(inner) { output = 1; } else if(flag) { output = 2;\n\t} else { output = _cached_plane; } } else { output = 3; }\n\treturn output\n",
+        )
+        .expect("continued compact macro body should parse");
+        let module = compile_module(&source.definitions)
+            .expect("continued compact macro scope should compile");
+        let entry = module.procedure_id("/proc/plane_macro").expect("entry");
+        assert_eq!(
+            execute_module(&module, entry, &[Value::number(1.0), Value::Null]),
+            Ok(Value::number(2.0))
         );
     }
 
@@ -11236,6 +14981,31 @@ mod tests {
         assert_eq!(
             execute_module(&module, module.procedure_id("/proc/run").unwrap(), &[]),
             Ok(Value::number(17.0))
+        );
+    }
+
+    #[test]
+    fn null_plus_equals_list_initializes_a_lazy_list() {
+        let source = parse("/proc/queue(value)\n\tvar/list/waiting\n\twaiting += list(value)\n\treturn waiting[1]\n")
+        .expect("lazy list source should parse");
+        let module = compile_module(&source.definitions).expect("lazy list should compile");
+        let entry = module.procedure_id("/proc/queue").expect("queue proc");
+        assert_eq!(
+            execute_module(&module, entry, &[Value::number(7.0)]),
+            Ok(Value::number(7.0))
+        );
+    }
+
+    #[test]
+    fn missing_association_plus_equals_list_initializes_nested_collection() {
+        let source = parse(
+            "/proc/queue()\n\tvar/list/groups = list()\n\tgroups[\"master\"] += list(/datum/one)\n\tgroups[\"master\"] += list(/datum/two)\n\treturn groups[\"master\"].len\n",
+        )
+        .expect("nested lazy list source should parse");
+        let module = compile_module(&source.definitions).expect("nested lazy list should compile");
+        assert_eq!(
+            execute_module(&module, module.procedure_id("/proc/queue").unwrap(), &[]),
+            Ok(Value::number(2.0))
         );
     }
 
@@ -11756,6 +15526,37 @@ mod tests {
         let program = compile_procedure(&short_circuit.definitions[0])
             .expect("conditional expressions should compile");
         assert_eq!(execute(&program, &[]), Ok(Value::number(7.0)));
+
+        // `:` is both the conditional delimiter and DreamMaker's dynamic
+        // member operator.  A member access in the false arm must not be
+        // mistaken for a second conditional delimiter.
+        let dynamic_false_arm =
+            parse("/proc/dynamic_false_arm(input)\n\treturn input ? 7 : input:type\n")
+                .expect("dynamic-member conditional source should parse");
+        let program = compile_procedure(&dynamic_false_arm.definitions[0])
+            .expect("dynamic member in the false arm should compile");
+        assert!(
+            execute(&program, &[Value::Null])
+                .expect_err("reading a dynamic field from null should fail at runtime")
+                .message
+                .contains("field read received null")
+        );
+
+        let nested_false_arm = parse("/proc/nested(a, b)\n\treturn a ? (b ? 10 : 20) : 30\n")
+            .expect("nested conditional source should parse");
+        let program = compile_procedure(&nested_false_arm.definitions[0])
+            .expect("an outer delimiter after a nested false arm should compile");
+        assert_eq!(
+            execute(&program, &[Value::number(1.0), Value::number(0.0)]),
+            Ok(Value::number(20.0))
+        );
+
+        let macro_nested = parse(
+            "/proc/macro_nested(a, b, c, d, e, f, g)\n\treturn ((a) ? (b?[\"x\"] ? -9 : (-9) - (((c) ? (d ? e[f] : g) : 0) + 1)) : (-9))\n",
+        )
+        .expect("macro-expanded nested conditional source should parse");
+        compile_procedure(&macro_nested.definitions[0])
+            .expect("nested conditional delimiters should remain distinct from dynamic access");
     }
 
     #[test]
@@ -11904,6 +15705,20 @@ mod tests {
     }
 
     #[test]
+    fn arglist_null_expands_to_zero_callback_arguments() {
+        let source = parse(
+            "/proc/invoke(arguments)\n\treturn call(/proc/target)(arglist(arguments))\n/proc/target(value = 9)\n\treturn value\n",
+        )
+        .expect("callback-shaped arglist source should parse");
+        let module = compile_module(&source.definitions).expect("arglist(null) should compile");
+        let entry = module.procedure_id("/proc/invoke").expect("invoke proc");
+        assert_eq!(
+            execute_module(&module, entry, &[Value::Null]),
+            Ok(Value::number(9.0))
+        );
+    }
+
+    #[test]
     fn executes_recursive_calls_on_explicit_frames() {
         let source = "/proc/factorial(input)\n\tif(input <= 1)\n\t\treturn 1\n\treturn input * factorial(input - 1)\n";
         let syntax = parse(source).expect("source should parse");
@@ -11986,6 +15801,13 @@ mod tests {
         assert_eq!(error.call_stack[0].procedure, "/proc/main");
         assert_eq!(error.call_stack[1].procedure, "/proc/broken");
         assert_eq!(error.call_stack[1].source_span, Some(expected_span));
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("call stack:\n  /proc/broken at instruction"));
+        assert!(diagnostic.contains("\n  /proc/main at instruction"));
+        assert!(diagnostic.contains(&format!(
+            "(source {}..{})",
+            expected_span.start, expected_span.end
+        )));
     }
 
     #[test]
@@ -12088,6 +15910,14 @@ mod tests {
     }
 
     #[test]
+    fn conditional_accepts_inline_braced_do_while_macro_statement() {
+        let source = "/proc/run(enabled)\n\tvar/result = 0\n\tif(enabled) do { result += 2; } while(0); result += 1\n\treturn result\n";
+
+        assert_eq!(execute_source(source, 0.0), Value::number(1.0));
+        assert_eq!(execute_source(source, 1.0), Value::number(3.0));
+    }
+
+    #[test]
     fn switch_matches_values_ranges_and_default_after_evaluating_selector_once() {
         let source = "/proc/classify(value)\n\tvar/calls = 0\n\tswitch(value + 0)\n\t\tif(1, 3)\n\t\t\treturn 10\n\t\tif(4 to 6)\n\t\t\treturn 20\n\t\telse\n\t\t\treturn 30\n";
         let syntax = parse(source).expect("source should parse");
@@ -12178,6 +16008,13 @@ mod tests {
         let source = "/proc/nested(limit)\n\tvar/outer = 0\n\tvar/total = 0\n\twhile(outer < limit)\n\t\touter = outer + 1\n\t\tvar/inner = 0\n\t\twhile(inner < 5)\n\t\t\tinner = inner + 1\n\t\t\tif(inner == 2)\n\t\t\t\tcontinue\n\t\t\tif(inner == 4)\n\t\t\t\tbreak\n\t\t\ttotal = total + 1\n\treturn total\n";
 
         assert_eq!(execute_source(source, 3.0), Value::number(6.0));
+    }
+
+    #[test]
+    fn labeled_loop_break_exits_the_selected_loop() {
+        let source = "/proc/run()\n\tvar/result = 0\n\touter:\n\t\tfor(var/x in 1 to 3)\n\t\t\tfor(var/y in 1 to 3)\n\t\t\t\tresult += 1\n\t\t\t\tbreak outer\n\treturn result\n";
+
+        assert_eq!(execute_source(source, 0.0), Value::number(1.0));
     }
 
     #[test]
@@ -12523,6 +16360,7 @@ mod tests {
                 &HashMap::new(),
                 &fields,
                 &BTreeMap::new(),
+                &BTreeMap::new(),
             )
             .expect("field range loop should compile");
             let mut state = ExecutionState::new();
@@ -12692,6 +16530,15 @@ mod tests {
     }
 
     #[test]
+    fn dm_profile_command_constants_are_byond_bitflags() {
+        let source = "/proc/profile_flags()\n\treturn PROFILE_START + PROFILE_REFRESH + PROFILE_STOP + PROFILE_CLEAR + PROFILE_RESTART + PROFILE_AVERAGE\n";
+        let syntax = parse(source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("BYOND profiling constants should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(9.0)));
+    }
+
+    #[test]
     fn dm_blend_constants_work_in_defaults_and_expressions() {
         let source = "/proc/blend(mode = BLEND_MULTIPLY)\n\treturn mode + BLEND_INSET_OVERLAY + BLEND_DEFAULT + BLEND_OVERLAY + BLEND_ADD + BLEND_SUBTRACT\n";
         let syntax = parse(source).expect("source should parse");
@@ -12754,6 +16601,30 @@ mod tests {
             .expect("typed locals without initializers should compile");
 
         assert_eq!(execute(&program, &[]), Ok(Value::number(7.0)));
+    }
+
+    #[test]
+    fn suffix_array_locals_use_declared_name_and_dynamic_dimensions() {
+        let syntax = parse(
+            "/proc/one(roomSize)\n\tvar/storage[roomSize]\n\treturn storage.len\n/proc/multi(x, y)\n\tvar/list/grid[x][y]\n\treturn grid[1].len\n",
+        ).expect("suffix array source");
+        let module = compile_module(&syntax.definitions).expect("suffix arrays compile");
+        assert_eq!(
+            execute_module(
+                &module,
+                module.procedure_id("/proc/one").unwrap(),
+                &[Value::number(4.0)]
+            ),
+            Ok(Value::number(4.0)),
+        );
+        assert_eq!(
+            execute_module(
+                &module,
+                module.procedure_id("/proc/multi").unwrap(),
+                &[Value::number(2.0), Value::number(3.0)]
+            ),
+            Ok(Value::number(3.0)),
+        );
     }
 
     #[test]
@@ -12966,8 +16837,8 @@ mod tests {
     }
 
     #[test]
-    fn waitfor_directives_are_headless_scheduling_metadata() {
-        for value in ["FALSE", "TRUE", "0", "1"] {
+    fn waitfor_directives_set_procedure_call_scheduling() {
+        for (value, waits) in [("FALSE", false), ("TRUE", true), ("0", false), ("1", true)] {
             let syntax = parse(&format!(
                 "/proc/scheduled()\n\tset waitfor = {value}\n\treturn 17\n"
             ))
@@ -12976,7 +16847,90 @@ mod tests {
                 .expect("waitfor directive should compile");
 
             assert_eq!(execute(&program, &[]), Ok(Value::number(17.0)));
+            assert_eq!(program.wait_for, waits);
         }
+    }
+
+    #[test]
+    fn waitfor_false_detaches_at_sleep_and_returns_current_dot_to_caller() {
+        let syntax = parse(
+            "/proc/c()\n\tsleep(1)\n\tsleep(1)\n\treturn 99\n\n/proc/b()\n\tset waitfor = FALSE\n\t. = 7\n\treturn c()\n\n/proc/a()\n\treturn b() + 1\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("waitfor chain should compile");
+        let entry = module.procedure_id("/proc/a").unwrap();
+        let mut state = ExecutionState::new();
+
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::number(8.0))
+        );
+        assert_eq!(state.scheduled_task_count(), 1);
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(vec![])
+        );
+        assert_eq!(state.scheduled_task_count(), 1);
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::number(99.0)])
+        );
+    }
+
+    #[test]
+    fn waitfor_false_without_sleep_returns_normally_and_post_sleep_errors_are_scheduled() {
+        let syntax = parse(
+            "/proc/plain()\n\tset waitfor = 0\n\treturn 12\n\n/proc/fails_later()\n\tset waitfor = 0\n\t. = 4\n\tsleep(1)\n\tCRASH(\"later\")\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("waitfor procedures compile");
+        assert_eq!(
+            execute_module(&module, module.procedure_id("/proc/plain").unwrap(), &[]),
+            Ok(Value::number(12.0))
+        );
+
+        let mut state = ExecutionState::new();
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/fails_later").unwrap(),
+                &[],
+                &mut state,
+            ),
+            Ok(Value::number(4.0))
+        );
+        let error = advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state)
+            .expect_err("errors after detachment belong to the scheduled continuation");
+        assert!(error.message.contains("later"));
+    }
+
+    #[test]
+    fn waitfor_false_preserves_spawned_deletion_and_detached_src_context() {
+        let syntax = parse(
+            "/proc/run()\n\tset waitfor = FALSE\n\t. = 3\n\tspawn(1)\n\t\tqdel(src)\n\tsleep(2)\n\treturn 9\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("procedure should compile");
+        let entry = module.procedure_id("/proc/run").unwrap();
+        let mut state = ExecutionState::new();
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/test").unwrap());
+        let context = ExecutionContext::new(Value::Datum(datum), Value::Null);
+
+        assert_eq!(
+            execute_module_in_context(&module, entry, &[], &mut state, &context),
+            Ok(Value::number(3.0))
+        );
+        assert_eq!(state.scheduled_task_count(), 2);
+        advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state)
+            .expect("spawned deletion should run");
+        assert!(state.heap().datum(datum).is_err());
+        assert_eq!(state.scheduled_task_count(), 1);
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::number(9.0)])
+        );
     }
 
     #[test]
@@ -13259,6 +17213,195 @@ mod tests {
             ),
             Ok(Value::Null)
         );
+        let towards =
+            parse("/proc/towards(source, target)\n\treturn get_step_towards(source, target)\n")
+                .unwrap();
+        let towards = compile_procedure(&towards.definitions[0]).unwrap();
+        let target = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/target").unwrap());
+        for (name, value) in [("x", 20.0), ("y", 30.0), ("z", 2.0)] {
+            state
+                .heap_mut()
+                .set_datum_field(target, field(name), Value::number(value))
+                .unwrap();
+        }
+        assert_eq!(
+            execute_in_state(
+                &towards,
+                &[Value::Datum(origin), Value::Datum(target)],
+                &mut state,
+            ),
+            Ok(Value::Datum(north_east))
+        );
+    }
+
+    #[test]
+    fn resource_regex_json_and_headless_ui_natives_follow_byond_contracts() {
+        let syntax = parse(
+            "/proc/resource(value)\n\treturn fcopy_rsc(value)\n/proc/quote(value)\n\treturn REGEX_QUOTE(value)\n/proc/pretty_flag()\n\treturn JSON_PRETTY_PRINT\n/proc/mask_inverse()\n\treturn MASK_INVERSE\n/proc/floor_value(value, multiple)\n\treturn FLOOR(value, multiple)\n/proc/ui(client)\n\twinset(client, \"main\", \"flash=5\")\n\treturn browse(\"<b>ready</b>\", \"window=status\")\n/proc/window_exists(client, control)\n\treturn winexists(client, control)\n/proc/choose(client)\n\treturn alert(client, \"Continue?\", \"Dream64\", \"Yes\", \"No\")\n/proc/colors()\n\tvar/icon/value = icon()\n\tvalue.MapColors(1,0,0, 0,1,0, 0,0,1, 0,0,0)\n\tvalue.Blend(\"#ffffff\", ICON_SUBTRACT, 2, 3)\n\tvalue.SetIntensity(0.25, 0.5, 0.75)\n\treturn value\n",
+        )
+        .unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let mut state = ExecutionState::new();
+        let run = |path: &str, arguments: &[Value], state: &mut ExecutionState| {
+            execute_module_in_state(
+                &module,
+                module.procedure_id(path).unwrap(),
+                arguments,
+                state,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            run("/proc/resource", &[Value::text("icons/a.dmi")], &mut state),
+            Value::text("icons/a.dmi")
+        );
+        assert_eq!(
+            run("/proc/quote", &[Value::text("a+b.c?")], &mut state),
+            Value::text("a\\+b\\.c\\?")
+        );
+        assert_eq!(
+            run("/proc/pretty_flag", &[], &mut state),
+            Value::number(1.0)
+        );
+        assert_eq!(
+            run("/proc/mask_inverse", &[], &mut state),
+            Value::number(1.0)
+        );
+        assert_eq!(
+            run(
+                "/proc/floor_value",
+                &[Value::number(17.0), Value::number(5.0)],
+                &mut state,
+            ),
+            Value::number(15.0)
+        );
+
+        let client = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/client").unwrap());
+        assert_eq!(
+            run("/proc/choose", &[Value::Datum(client)], &mut state),
+            Value::text("Yes")
+        );
+        let browse = run("/proc/ui", &[Value::Datum(client)], &mut state);
+        assert!(matches!(browse, Value::List(_)));
+        let settings = state
+            .heap()
+            .datum_field(client, &field("_dream64_winset"))
+            .unwrap();
+        let Value::List(settings) = settings else {
+            panic!("winset state should be a list");
+        };
+        assert_eq!(
+            state
+                .heap()
+                .list(*settings)
+                .unwrap()
+                .get_key(&Value::text("main")),
+            Ok(&Value::text("flash=5"))
+        );
+        assert_eq!(
+            run(
+                "/proc/window_exists",
+                &[Value::Datum(client), Value::text("main")],
+                &mut state,
+            ),
+            Value::number(1.0)
+        );
+        let Value::Datum(icon) = run("/proc/colors", &[], &mut state) else {
+            panic!("icon() should return an icon datum");
+        };
+        let Value::List(matrix) = state
+            .heap()
+            .datum_field(icon, &field("_dream64_color_matrix"))
+            .unwrap()
+        else {
+            panic!("MapColors should retain the headless matrix");
+        };
+        assert_eq!(state.heap().list(*matrix).unwrap().len(), 12);
+        assert_eq!(
+            state.heap().list(*matrix).unwrap().get(1),
+            Ok(&Value::number(0.25))
+        );
+        assert_eq!(
+            state.heap().list(*matrix).unwrap().get(5),
+            Ok(&Value::number(0.5))
+        );
+        assert_eq!(
+            state.heap().list(*matrix).unwrap().get(9),
+            Ok(&Value::number(0.75))
+        );
+        let Value::List(blends) = state
+            .heap()
+            .datum_field(icon, &field("_dream64_blends"))
+            .unwrap()
+        else {
+            panic!("Blend should retain its headless composition operation");
+        };
+        assert_eq!(state.heap().list(*blends).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn implicit_src_engine_methods_resolve_for_icon_and_matrix_procs() {
+        let syntax = parse(
+            "/icon/proc/colors()\n\tMapColors(1,0,0, 0,1,0, 0,0,1, 0,0,0)\n\tBlend(\"#808080\", ICON_MULTIPLY)\n\tSetIntensity(0.5)\n\treturn src\n/matrix/proc/rotate()\n\tTurn(90)\n\treturn src\n",
+        )
+        .unwrap();
+        let icon_program = compile_procedure(&syntax.definitions[0]).unwrap();
+        let matrix_program = compile_procedure(&syntax.definitions[1]).unwrap();
+        let mut state = ExecutionState::new();
+        let icon = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/icon").unwrap());
+        assert_eq!(
+            execute_in_context(
+                &icon_program,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(icon), Value::Null),
+            ),
+            Ok(Value::Datum(icon))
+        );
+        assert!(matches!(
+            state
+                .heap()
+                .datum_field(icon, &field("_dream64_color_matrix")),
+            Ok(Value::List(_))
+        ));
+        assert!(matches!(
+            state.heap().datum_field(icon, &field("_dream64_blends")),
+            Ok(Value::List(_))
+        ));
+        let Value::List(intensity) = state
+            .heap()
+            .datum_field(icon, &field("_dream64_color_matrix"))
+            .unwrap()
+        else {
+            panic!("SetIntensity should lower to an icon color matrix");
+        };
+        for index in [1, 5, 9] {
+            assert_eq!(
+                state.heap().list(*intensity).unwrap().get(index),
+                Ok(&Value::number(0.5))
+            );
+        }
+
+        let matrix = allocate_matrix([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], state.heap_mut()).unwrap();
+        assert_eq!(
+            execute_in_context(
+                &matrix_program,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(matrix), Value::Null),
+            ),
+            Ok(Value::Datum(matrix))
+        );
+        assert_eq!(
+            matrix_components(matrix, state.heap()).unwrap(),
+            [0.0, 1.0, 0.0, -1.0, 0.0, 0.0]
+        );
     }
 
     fn compile_range_programs() -> (Program, Program, Program) {
@@ -13394,6 +17537,93 @@ mod tests {
     }
 
     #[test]
+    fn del_builtin_destroys_the_target_list_itself() {
+        let syntax = parse("/proc/test(v)\n\tdel(v)\n").expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("del should compile");
+        let mut state = ExecutionState::new();
+        let list = state.heap_mut().allocate_list();
+        execute_in_state(&program, &[Value::List(list)], &mut state)
+            .expect("del should destroy a list");
+        assert!(state.heap().list(list).is_err());
+    }
+
+    #[test]
+    fn del_dispatches_effective_hook_before_invalidating_the_datum() {
+        let syntax = parse(
+            "/proc/run(v)\n\tdel(v)\n\treturn global.calls\n/datum/example/Del()\n\tglobal.calls += 1\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("deletion module should compile");
+        let entry = module
+            .procedure_id("/proc/run")
+            .expect("entry should exist");
+        let mut state = ExecutionState::new();
+        state.set_global(field("calls"), Value::number(0.0));
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").unwrap());
+
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::Datum(datum)], &mut state),
+            Ok(Value::number(1.0))
+        );
+        assert!(state.heap().datum(datum).is_err());
+    }
+
+    #[test]
+    fn del_finalizes_after_hook_failure_and_tolerates_reentrant_del() {
+        for body in ["\tCRASH(\"boom\")\n", "\tdel(src)\n"] {
+            let syntax = parse(&format!(
+                "/proc/run(v)\n\tdel(v)\n/datum/example/Del()\n\tglobal.calls += 1\n{body}"
+            ))
+            .expect("source should parse");
+            let module =
+                compile_module(&syntax.definitions).expect("deletion module should compile");
+            let entry = module
+                .procedure_id("/proc/run")
+                .expect("entry should exist");
+            let mut state = ExecutionState::new();
+            state.set_global(field("calls"), Value::number(0.0));
+            let datum = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/datum/example").unwrap());
+
+            let result =
+                execute_module_in_state(&module, entry, &[Value::Datum(datum)], &mut state);
+            if body.contains("CRASH") {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result, Ok(Value::Null));
+            }
+            assert!(state.heap().datum(datum).is_err());
+            assert_eq!(state.global(&field("calls")), Some(&Value::number(1.0)));
+        }
+    }
+
+    #[test]
+    fn project_qdel_procedure_shadows_the_native_fallback() {
+        let syntax = parse(
+            "/proc/qdel(v)\n\tglobal.calls += 1\n/proc/run(v)\n\tqdel(v)\n\treturn global.calls\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("qdel override should compile");
+        let entry = module
+            .procedure_id("/proc/run")
+            .expect("entry should exist");
+        let mut state = ExecutionState::new();
+        state.set_global(field("calls"), Value::number(0.0));
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").unwrap());
+
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::Datum(datum)], &mut state),
+            Ok(Value::number(1.0))
+        );
+        assert!(state.heap().datum(datum).is_ok());
+    }
+
+    #[test]
     fn sort_list_builtin_orders_positional_values_with_stable_text_order() {
         let syntax = parse("/proc/test()\n\tvar/list/L = list(2, 10, 1)\n\treturn sort_list(L)\n")
             .expect("source should parse");
@@ -13467,6 +17697,44 @@ mod tests {
     }
 
     #[test]
+    fn typecacheof_unions_a_list_of_base_paths() {
+        let syntax =
+            parse("/proc/test()\n\treturn typecacheof(list(null, /datum/one, /obj/item))\n")
+                .expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("typecache list compiles");
+        let mut state = ExecutionState::new();
+        let one = TypePath::parse("/datum/one").unwrap();
+        let one_child = TypePath::parse("/datum/one/child").unwrap();
+        let item = TypePath::parse("/obj/item").unwrap();
+        let unrelated = TypePath::parse("/mob").unwrap();
+        state.set_type_paths([
+            one.clone(),
+            one_child.clone(),
+            item.clone(),
+            unrelated.clone(),
+        ]);
+        let Value::List(cache) = execute_in_state(&program, &[], &mut state).unwrap() else {
+            panic!("typecacheof should return a list");
+        };
+        let cache = state.heap().list(cache).unwrap();
+        for included in [one, one_child, item] {
+            assert_eq!(
+                cache.get_key(&Value::TypePath(included)),
+                Ok(&Value::number(1.0))
+            );
+        }
+        assert!(cache.get_key(&Value::TypePath(unrelated)).is_err());
+    }
+
+    #[test]
+    fn min_and_max_accept_variadic_values_and_single_lists() {
+        let syntax = parse("/proc/test()\n\treturn min(8, 3, 5) + max(list(2, 9, 4))\n")
+            .expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("extrema compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(12.0)));
+    }
+
+    #[test]
     fn image_builtin_constructs_image_datum_with_icon_fields() {
         let syntax = parse("/proc/build()\n\treturn image(null, null, \"state\", 4, 2)\n")
             .expect("source should parse");
@@ -13491,6 +17759,12 @@ mod tests {
         assert_eq!(datum.field(&field("icon_state")), Ok(&Value::text("state")));
         assert_eq!(datum.field(&field("layer")), Ok(&Value::number(4.0)));
         assert_eq!(datum.field(&field("dir")), Ok(&Value::number(2.0)));
+        assert_eq!(datum.field(&field("alpha")), Ok(&Value::number(255.0)));
+        assert_eq!(
+            datum.field(&field("appearance_flags")),
+            Ok(&Value::number(0.0))
+        );
+        assert_eq!(datum.field(&field("overlays")), Ok(&Value::Null));
     }
 
     #[test]
@@ -13592,5 +17866,266 @@ mod tests {
             |(instruction, span)| matches!(instruction, Instruction::StoreResult)
                 && *span == parent_assignment_span
         ));
+    }
+
+    #[test]
+    fn vector_constructor_operators_and_methods_use_three_numeric_components() {
+        let source = concat!(
+            "/proc/run()\n",
+            "\tvar/vector/a = vector(3, 3)\n",
+            "\tvar/vector/b = vector(4, 4, 4)\n",
+            "\tvar/vector/c = a + b\n",
+            "\ta *= b\n",
+            "\tvar/vector/i = vector(1, 1).Interpolate(vector(12, 124, 91), 0.5)\n",
+            "\tvar/vector/n = vector(3, 4)\n",
+            "\tn.Normalize()\n",
+            "\treturn c.x + c.z + a.x + i.x + i.y + i.z + n.size\n",
+        );
+        let syntax = parse(source).expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("vector source should compile");
+        let entry = module.procedure_id("/proc/run").expect("run should exist");
+
+        assert_eq!(
+            execute_module(&module, entry, &[]),
+            Ok(Value::number(138.5))
+        );
+    }
+
+    #[test]
+    fn animate_applies_named_values_and_continues_the_last_sequence_headlessly() {
+        let syntax = parse(
+            "/proc/run()\n\tanimate(src, alpha = 128, time = 5)\n\tanimate(pixel_x = 12, time = 2)\n\treturn src.alpha + src.pixel_x\n",
+        )
+        .expect("animate source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("animate should compile");
+        let mut state = ExecutionState::new();
+        let object = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj").expect("obj path"));
+        let context = ExecutionContext::new(Value::Datum(object), Value::Null);
+
+        assert_eq!(
+            execute_in_context(&program, &[], &mut state, &context),
+            Ok(Value::number(140.0))
+        );
+    }
+
+    #[test]
+    fn flick_does_not_mutate_the_persistent_icon_state() {
+        let syntax = parse("/proc/run()\n\tflick(\"opening\", src)\n\treturn src.icon_state\n")
+            .expect("flick source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("flick should compile");
+        let mut state = ExecutionState::new();
+        let object = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj").expect("obj path"));
+        state
+            .heap_mut()
+            .set_datum_field(object, field("icon_state"), Value::text("closed"))
+            .expect("icon state should materialize");
+        let context = ExecutionContext::new(Value::Datum(object), Value::Null);
+
+        assert_eq!(
+            execute_in_context(&program, &[], &mut state, &context),
+            Ok(Value::text("closed"))
+        );
+    }
+
+    #[test]
+    fn filter_preserves_named_properties_on_a_filter_datum() {
+        let syntax =
+            parse("/proc/run()\n\tvar/f = filter(type = \"blur\", size = 4)\n\treturn f.size\n")
+                .expect("filter source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("filter should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(4.0)));
+    }
+
+    #[test]
+    fn filter_arglist_spreads_associative_entries_as_named_properties() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/list/arguments = list(\"type\" = \"blur\", \"size\" = 7)\n\tvar/f = filter(arglist(arguments))\n\treturn f.size\n",
+        )
+        .expect("filter arglist source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("filter arglist should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(7.0)));
+    }
+
+    #[test]
+    fn deeply_nested_macro_ternaries_remain_one_call_argument() {
+        let source = "/proc/run(a, b, t, m, p)\n\treturn helper(((a) ? (b?[\"[-9]\"] ? -9 : (-9) - ((110 - -100) * (((a && (isloc(t)))) ? (t.z ? (m[t.z]) : ((p) ? p[\"[t.plane]\"] : t.plane)) : 0))) : (-9)), 1)\n/proc/helper(value, other)\n\treturn value\n";
+        let syntax = parse(source).expect("nested conditional source should parse");
+        compile_module(&syntax.definitions)
+            .expect("nested conditional must not consume the call delimiter");
+    }
+
+    #[test]
+    fn safe_index_does_not_expose_named_call_assignment_as_statement_assignment() {
+        let source = "/proc/run(mapping, flags)\n\thelper(mapping?[\"key\"], add_appearance_flags = flags)\n\treturn 1\n/proc/helper(value, add_appearance_flags)\n\treturn value\n";
+        let syntax = parse(source).expect("safe-index call source should parse");
+        compile_module(&syntax.definitions)
+            .expect("named argument inside a safe-index call must remain nested");
+    }
+
+    #[test]
+    fn output_preserves_message_and_control_for_later_client_routing() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/o = output(\"score: 5\", \"scorepane.output\")\n\treturn o.control\n",
+        )
+        .expect("output source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("output should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::text("scorepane.output")));
+    }
+
+    #[test]
+    fn eager_compact_control_and_expression_families_lower_together() {
+        let source = concat!(
+            "/proc/run(flag)\n",
+            "\tvar/i = 0\n",
+            "\t++i\n",
+            "\twhile(i < 3) i++\n",
+            "\tvar/list/values = list(10, 20)\n",
+            "\tvar/picked = values[flag ? 1 : 2]\n",
+            "\tif(i in 1 to 4)\n",
+            "\t\tswitch(picked)\n",
+            "\t\t\tif(10) return i + picked\n",
+            "\t\t\telse return 99\n",
+            "\treturn 0\n",
+        );
+        let syntax = parse(source).expect("compact eager-family source should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("compact control, prefix mutation, range, and ternary index should compile");
+        let entry = module.procedure_id("/proc/run").expect("run should exist");
+        assert_eq!(
+            execute_module(&module, entry, &[Value::number(1.0)]),
+            Ok(Value::number(13.0))
+        );
+        assert_eq!(
+            execute_module(&module, entry, &[Value::number(0.0)]),
+            Ok(Value::number(99.0))
+        );
+    }
+
+    #[test]
+    fn gate3_prefix_compact_switch_colon_and_optional_call_shapes_compile() {
+        let source = concat!(
+            "/datum/worker/proc/queue(value)\n\treturn value\n",
+            "/proc/run(worker, current_vote, choice)\n",
+            "\tvar/count = 0\n",
+            "\t++count\n",
+            "\tcurrent_vote?.reset()\n",
+            "\tvar/result = worker:queue(count)\n",
+            "\tswitch(choice)\n",
+            "\t\tif(1) return result\n",
+            "\t\telse return 0\n",
+        );
+        let syntax = parse(source).expect("gate3 syntax shapes should parse");
+        compile_module(&syntax.definitions)
+            .expect("prefix, compact switch, colon call, and optional call should lower");
+    }
+
+    #[test]
+    fn gate4_macro_expanded_statement_and_expression_shapes_compile() {
+        let cases = [
+            (
+                "verb metadata",
+                "/verb/succumb()\n\tset hidden = TRUE\n\treturn 1\n",
+            ),
+            (
+                "increments",
+                "/proc/run(target)\n\t++.\n\t++target.AdminProcCallCount\n",
+            ),
+            (
+                "colon ternary",
+                "/proc/run(target)\n\treturn target ? target:client : (target:current?:client)\n",
+            ),
+            (
+                "inline for",
+                "/proc/run(generated_actions)\n\tif(generated_actions) { for(var/I in generated_actions) qdel(I); generated_actions.Cut(); }\n",
+            ),
+            (
+                "empty switch",
+                "/proc/run(x)\n\tswitch(x)\n\t\tif(1)\n\t\tif(2) return 2\n",
+            ),
+            (
+                "input suffix",
+                "/proc/run(items)\n\treturn input(null, \"pick\", \"title\", null) as null|anything in items\n",
+            ),
+        ];
+        for (name, source) in cases {
+            let syntax = parse(source).unwrap_or_else(|error| panic!("{name}: {error}"));
+            compile_module(&syntax.definitions)
+                .unwrap_or_else(|error| panic!("{name}: {}", error.message));
+        }
+    }
+
+    #[test]
+    fn global_vars_is_a_live_iterable_namespace_over_global_storage() {
+        let source = concat!(
+            "/proc/run()\n",
+            "\tvar/list/reflection = global.vars\n",
+            "\tvar/total = 0\n",
+            "\tfor(var/name in reflection)\n",
+            "\t\ttotal += reflection[name]\n",
+            "\tglobal.counter = 5\n",
+            "\tvar/live_read = reflection[\"counter\"]\n",
+            "\treflection[\"counter\"] = 7\n",
+            "\treturn total * 100 + live_read * 10 + global.counter\n",
+        );
+        let syntax = parse(source).expect("global.vars source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("global.vars iteration and indexed writes should compile");
+        let mut state = ExecutionState::new();
+        state.set_global(field("counter"), Value::number(3.0));
+        let qualified = FieldName::static_storage("/datum/example/var/static/shared");
+        state.set_global(qualified, Value::number(8.0));
+
+        assert_eq!(
+            execute_in_state(&program, &[], &mut state),
+            Ok(Value::number(1157.0))
+        );
+        assert_eq!(state.global(&field("counter")), Some(&Value::number(7.0)));
+    }
+
+    #[test]
+    fn nested_waitfor_false_processing_loop_does_not_block_staged_initializer() {
+        let source = concat!(
+            "/proc/main()\n\tinitialize()\n\treturn 1\n",
+            "/proc/initialize()\n",
+            "\tset waitfor = 0\n",
+            "\tsleep(1)\n",
+            "\tglobal.stage = 1\n",
+            "\tstart_processing()\n",
+            "\tglobal.stage = 2\n",
+            "\tsleep(1)\n",
+            "\tglobal.stage = 3\n",
+            "/proc/start_processing()\n",
+            "\tset waitfor = 0\n",
+            "\tglobal.loops += 1\n",
+            "\tsleep(1)\n",
+            "\tglobal.loops += 10\n",
+        );
+        let syntax = parse(source).expect("staged waitfor source should parse");
+        let module =
+            compile_module(&syntax.definitions).expect("staged waitfor source should compile");
+        let mut state = ExecutionState::new();
+        state.set_global(field("stage"), Value::number(0.0));
+        state.set_global(field("loops"), Value::number(0.0));
+        let main = module.procedure_id("/proc/main").expect("main exists");
+
+        assert_eq!(
+            execute_module_in_state(&module, main, &[], &mut state),
+            Ok(Value::number(1.0))
+        );
+        assert_eq!(state.scheduled_task_count(), 1);
+        advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state)
+            .expect("first initialization slice should run");
+        assert_eq!(state.global(&field("stage")), Some(&Value::number(2.0)));
+        assert_eq!(state.global(&field("loops")), Some(&Value::number(1.0)));
+        assert_eq!(state.scheduled_task_count(), 2);
+        advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state)
+            .expect("processing and initialization continuations should both run");
+        assert_eq!(state.global(&field("stage")), Some(&Value::number(3.0)));
+        assert_eq!(state.global(&field("loops")), Some(&Value::number(11.0)));
     }
 }

@@ -11,15 +11,19 @@ use dm_object_tree::{NodeId, NodeKind};
 use dm_runtime::RuntimeImage;
 use dm_semantics::{Procedure, ProcedureId, ProcedureImplementationId, ProcedureRegistry};
 use dm_value::{DatumId, FieldName, TypePath, Value};
-use dm_vm::{ExecutionContext, RuntimeError, execute_module_in_context};
+use dm_vm::{
+    ExecutionContext, ExecutionLimits, RuntimeError, advance_scheduler, execute_module_in_context,
+};
 use dm_world::{
     AtomCategory, InitializerResolution, WorldAllocation, WorldAllocationWorkKind, WorldCoordinate,
-    WorldPlan,
+    WorldPlan, materialize_world_map_state,
 };
 
 /// Lifecycle entry points resolved for every runtime type.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum LifecycleKind {
+    /// Earliest world bootstrap hook, before `world/New()`.
+    Genesis,
     /// Construction hook.
     New,
     /// Primary atom initialization hook.
@@ -31,7 +35,8 @@ pub enum LifecycleKind {
 }
 
 impl LifecycleKind {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
+        Self::Genesis,
         Self::New,
         Self::Initialize,
         Self::LateInitialize,
@@ -42,6 +47,7 @@ impl LifecycleKind {
 
     const fn procedure_name(self) -> &'static str {
         match self {
+            Self::Genesis => "Genesis",
             Self::New => "New",
             Self::Initialize => "Initialize",
             Self::LateInitialize => "LateInitialize",
@@ -151,6 +157,8 @@ pub enum LifecycleResolution {
 /// All four effective lifecycle entry points for one type.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LifecycleTargets {
+    /// Effective pre-world bootstrap target.
+    pub genesis: LifecycleResolution,
     /// Effective `New()` target.
     pub new_target: LifecycleResolution,
     /// Effective `Initialize()` target.
@@ -166,6 +174,7 @@ impl LifecycleTargets {
     #[must_use]
     pub const fn get(&self, kind: LifecycleKind) -> &LifecycleResolution {
         match kind {
+            LifecycleKind::Genesis => &self.genesis,
             LifecycleKind::New => &self.new_target,
             LifecycleKind::Initialize => &self.initialize,
             LifecycleKind::LateInitialize => &self.late_initialize,
@@ -264,6 +273,13 @@ impl LifecycleIndex {
                 continue;
             };
             let targets = LifecycleTargets {
+                genesis: resolve_target(
+                    compilation,
+                    procedures,
+                    &direct,
+                    node,
+                    LifecycleKind::Genesis,
+                ),
                 new_target: resolve_target(
                     compilation,
                     procedures,
@@ -431,7 +447,7 @@ pub struct InitializationPlan {
     pub world_type: Option<usize>,
     /// Resolved map placements in cell and initializer order.
     pub map_atoms: Vec<PlannedAtom>,
-    /// Globals-first, world-New, map-New/Initialize/LateInitialize events.
+    /// Globals-first, world-Genesis/world-New, then mapped lifecycle events.
     pub events: Vec<InitializationEvent>,
     /// Recoverable source-aware diagnostics.
     pub diagnostics: Vec<LifecycleDiagnostic>,
@@ -514,6 +530,73 @@ pub struct InitializationExecution {
     pub events: Vec<ExecutedLifecycleEvent>,
     /// Repeated map placements sharing an already initialized datum.
     pub duplicate_map_events: usize,
+    /// Deterministic scheduler work completed after lifecycle initialization.
+    pub scheduler: SchedulerDrain,
+}
+
+/// Safety bounds for the post-initialization deterministic scheduler drain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SchedulerDrainLimits {
+    /// Maximum scheduler ticks advanced from the lifecycle completion tick.
+    pub max_ticks: u64,
+    /// Maximum dispatch rounds, including zero-delay rescheduling rounds.
+    pub max_rounds: usize,
+}
+
+/// Explicit runtime state which proves a persistent server finished startup.
+///
+/// The probe begins at a global and may follow datum fields before comparing
+/// the resulting value. This lets a codebase expose its own authoritative
+/// readiness marker instead of mistaking a scheduler budget for success.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeadlessReadinessProbe {
+    /// Owner-qualified VM slot when the readiness marker is a type static.
+    pub qualified_storage: Option<FieldName>,
+    /// Runtime global containing the marker or its root datum.
+    pub global: FieldName,
+    /// Datum fields followed from the global value, in order.
+    pub fields: Vec<FieldName>,
+    /// Value which denotes completed startup.
+    pub expected: Value,
+}
+
+impl Default for SchedulerDrainLimits {
+    fn default() -> Self {
+        Self {
+            max_ticks: 10_000,
+            max_rounds: 10_000,
+        }
+    }
+}
+
+/// Honest reason the bounded post-initialization scheduler drain stopped.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SchedulerDrainTermination {
+    /// No scheduled work remains.
+    #[default]
+    StableIdle,
+    /// The configured codebase-owned readiness marker was observed while
+    /// persistent scheduled work remained.
+    HeadlessReady,
+    /// Work remains beyond the configured tick budget.
+    TickLimit,
+    /// Work remains after the configured dispatch-round budget.
+    RoundLimit,
+}
+
+/// Deterministic post-initialization scheduler summary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SchedulerDrain {
+    /// Scheduler tick at which draining stopped.
+    pub final_tick: u64,
+    /// Number of dispatch rounds performed.
+    pub rounds: usize,
+    /// Number of tasks which ran to completion.
+    pub completed_tasks: usize,
+    /// Tasks still pending when draining stopped.
+    pub pending_tasks: usize,
+    /// Why draining stopped.
+    pub termination: SchedulerDrainTermination,
 }
 
 /// Failure while binding or executing a planned lifecycle hook.
@@ -557,6 +640,8 @@ pub enum InitializationExecutionError {
     },
     /// The runtime image cannot allocate the singleton `/world` datum.
     WorldAllocation(dm_runtime::RuntimeImageError),
+    /// Map-derived dimensions or contents could not be applied to `/world`.
+    WorldMapState(dm_world::WorldAllocationError),
     /// VM execution failed with its original source-mapped call stack.
     Runtime {
         /// Event being executed.
@@ -566,6 +651,183 @@ pub enum InitializationExecutionError {
         /// Original VM failure.
         error: Box<RuntimeError>,
     },
+    /// A spawned or sleeping task failed during the scheduler drain.
+    Scheduler(RuntimeError),
+}
+
+/// Failure while allocating a datum and dispatching its effective `New` procedure.
+#[derive(Debug)]
+pub enum ConstructionError {
+    /// Runtime defaults could not be materialized for the requested type.
+    Allocation(dm_runtime::RuntimeImageError),
+    /// The selected constructor closure could not be lowered.
+    Compile(dm_vm::CompileError),
+    /// Lifecycle metadata for the requested type or constructor is incomplete.
+    MissingTarget(String),
+    /// Constructor metadata was resolved but omitted from the compiled module.
+    MissingVmTarget(String),
+    /// Constructor execution failed after allocation; the new datum was destroyed.
+    Runtime(RuntimeError),
+}
+
+impl std::fmt::Display for ConstructionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Allocation(error) => write!(formatter, "datum allocation failed: {error}"),
+            Self::Compile(error) => write!(formatter, "constructor compilation failed: {error}"),
+            Self::MissingTarget(path) => {
+                write!(formatter, "constructor target is missing for {path}")
+            }
+            Self::MissingVmTarget(path) => {
+                write!(formatter, "constructor VM target is missing for {path}")
+            }
+            Self::Runtime(error) => write!(formatter, "constructor execution failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ConstructionError {}
+
+/// Failure while dispatching cleanup for a live datum.
+#[derive(Debug)]
+pub enum DeletionError {
+    /// The datum is stale or its runtime type is unavailable.
+    Datum(dm_value::ValueError),
+    /// Lifecycle metadata for the datum type is incomplete.
+    MissingTarget(String),
+    /// The selected cleanup closure could not be lowered.
+    Compile(dm_vm::CompileError),
+    /// Cleanup metadata was resolved but omitted from the VM module.
+    MissingVmTarget(String),
+    /// Cleanup execution failed. The datum was still invalidated.
+    Runtime(RuntimeError),
+}
+
+impl std::fmt::Display for DeletionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Datum(error) => write!(formatter, "datum deletion failed: {error}"),
+            Self::MissingTarget(path) => write!(formatter, "cleanup target is missing for {path}"),
+            Self::Compile(error) => write!(formatter, "cleanup compilation failed: {error}"),
+            Self::MissingVmTarget(path) => {
+                write!(formatter, "cleanup VM target is missing for {path}")
+            }
+            Self::Runtime(error) => write!(formatter, "cleanup execution failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for DeletionError {}
+
+/// Allocates one datum, applies its inherited/default field layers, and invokes
+/// the effective `New` implementation with the supplied arguments.
+///
+/// A type without a user-defined `New` succeeds after default materialization.
+/// Constructor closures include exact `..()` parent targets. If execution
+/// fails, the newly allocated datum is removed from the shared heap before the
+/// error is returned.
+pub fn construct_datum(
+    compilation: &Compilation,
+    procedures: &ProcedureRegistry,
+    runtime: &mut RuntimeImage,
+    type_path: &TypePath,
+    arguments: &[Value],
+) -> Result<DatumId, ConstructionError> {
+    let index = LifecycleIndex::build(compilation, procedures, runtime);
+    let resolution = index
+        .find_path(type_path.as_str())
+        .ok_or_else(|| ConstructionError::MissingTarget(type_path.to_string()))?
+        .targets
+        .get(LifecycleKind::New)
+        .clone();
+    let target = match resolution {
+        LifecycleResolution::Absent => {
+            return runtime
+                .allocate_datum(type_path)
+                .map_err(ConstructionError::Allocation);
+        }
+        LifecycleResolution::Resolved(target) => target,
+        LifecycleResolution::Unsupported(_) => {
+            return Err(ConstructionError::MissingTarget(type_path.to_string()));
+        }
+    };
+    let executable = procedures
+        .compile_vm_implementations(compilation, [target.implementation])
+        .map_err(ConstructionError::Compile)?;
+    let entry = executable
+        .implementation(target.implementation)
+        .ok_or_else(|| ConstructionError::MissingVmTarget(target.procedure_path.clone()))?;
+    let datum = runtime
+        .allocate_datum(type_path)
+        .map_err(ConstructionError::Allocation)?;
+    let mut state = runtime.take_execution_state();
+    let result = execute_module_in_context(
+        executable.module(),
+        entry,
+        arguments,
+        &mut state,
+        &ExecutionContext::new(Value::Datum(datum), Value::Null),
+    );
+    if result.is_err() {
+        let _ = state.heap_mut().destroy_datum(datum);
+    }
+    runtime.restore_execution_state(state);
+    result.map(|_| datum).map_err(ConstructionError::Runtime)
+}
+
+/// Dispatches the effective qdel-compatible `Destroy` chain once and then
+/// invalidates the datum handle. Cleanup failure never leaves the datum live.
+/// A cleanup body that deletes `src` reentrantly is tolerated; the final stale
+/// destroy is treated as already complete.
+pub fn delete_datum(
+    compilation: &Compilation,
+    procedures: &ProcedureRegistry,
+    runtime: &mut RuntimeImage,
+    datum: DatumId,
+) -> Result<(), DeletionError> {
+    let type_path = runtime
+        .heap()
+        .datum(datum)
+        .map_err(DeletionError::Datum)?
+        .type_path()
+        .clone();
+    let index = LifecycleIndex::build(compilation, procedures, runtime);
+    let resolution = index
+        .find_path(type_path.as_str())
+        .ok_or_else(|| DeletionError::MissingTarget(type_path.to_string()))?
+        .targets
+        .get(LifecycleKind::Destroy)
+        .clone();
+    let target = match resolution {
+        LifecycleResolution::Absent => {
+            runtime
+                .heap_mut()
+                .destroy_datum(datum)
+                .map_err(DeletionError::Datum)?;
+            return Ok(());
+        }
+        LifecycleResolution::Resolved(target) => target,
+        LifecycleResolution::Unsupported(_) => {
+            return Err(DeletionError::MissingTarget(type_path.to_string()));
+        }
+    };
+    let executable = procedures
+        .compile_vm_implementations(compilation, [target.implementation])
+        .map_err(DeletionError::Compile)?;
+    let entry = executable
+        .implementation(target.implementation)
+        .ok_or_else(|| DeletionError::MissingVmTarget(target.procedure_path.clone()))?;
+    let mut state = runtime.take_execution_state();
+    let result = execute_module_in_context(
+        executable.module(),
+        entry,
+        &[],
+        &mut state,
+        &ExecutionContext::new(Value::Datum(datum), Value::Null),
+    );
+    let _ = state.heap_mut().destroy_datum(datum);
+    runtime.restore_execution_state(state);
+    result.map(|_| ()).map_err(DeletionError::Runtime)
 }
 
 impl std::fmt::Display for InitializationExecutionError {
@@ -603,6 +865,9 @@ impl std::fmt::Display for InitializationExecutionError {
                 span.start, span.end
             ),
             Self::WorldAllocation(error) => write!(formatter, "world allocation failed: {error}"),
+            Self::WorldMapState(error) => {
+                write!(formatter, "world map state materialization failed: {error}")
+            }
             Self::Runtime { target, error, .. } => {
                 write!(
                     formatter,
@@ -610,6 +875,7 @@ impl std::fmt::Display for InitializationExecutionError {
                     target.procedure_path
                 )
             }
+            Self::Scheduler(error) => write!(formatter, "scheduled startup task failed: {error}"),
         }
     }
 }
@@ -620,8 +886,10 @@ impl std::error::Error for InitializationExecutionError {
             Self::Compile(error) => Some(error),
             Self::WorldPath(error) => Some(error),
             Self::WorldAllocation(error) => Some(error),
+            Self::WorldMapState(error) => Some(error),
             Self::MapExpression { error, .. } => Some(error),
             Self::Runtime { error, .. } => Some(error),
+            Self::Scheduler(error) => Some(error),
             Self::MissingMapDatum { .. }
             | Self::MissingTarget { .. }
             | Self::MissingVmTarget { .. }
@@ -630,7 +898,8 @@ impl std::error::Error for InitializationExecutionError {
     }
 }
 
-/// Executes `New`, `Initialize`, and `LateInitialize` for allocated map atoms.
+/// Executes world `Genesis`/`New`, then mapped `New`, `Initialize`, and
+/// `LateInitialize` hooks.
 ///
 /// The caller first builds an [`InitializationPlan`] and materializes the same
 /// [`WorldPlan`] with [`dm_world::allocate_world`]. Hooks use each live datum as
@@ -655,6 +924,64 @@ pub fn execute_initialization_plan(
     allocation: &WorldAllocation,
     runtime: &mut RuntimeImage,
 ) -> Result<InitializationExecution, InitializationExecutionError> {
+    execute_initialization_plan_with_scheduler_limits(
+        compilation,
+        procedures,
+        index,
+        plan,
+        allocation,
+        runtime,
+        SchedulerDrainLimits::default(),
+    )
+}
+
+/// Executes lifecycle initialization and then drains deterministic scheduled
+/// startup work within explicit safety bounds.
+///
+/// # Errors
+///
+/// Returns the same source-aware lifecycle failures as
+/// [`execute_initialization_plan`], or a scheduler runtime failure.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn execute_initialization_plan_with_scheduler_limits(
+    compilation: &Compilation,
+    procedures: &ProcedureRegistry,
+    index: &LifecycleIndex,
+    plan: &InitializationPlan,
+    allocation: &WorldAllocation,
+    runtime: &mut RuntimeImage,
+    scheduler_limits: SchedulerDrainLimits,
+) -> Result<InitializationExecution, InitializationExecutionError> {
+    execute_initialization_plan_with_scheduler_policy(
+        compilation,
+        procedures,
+        index,
+        plan,
+        allocation,
+        runtime,
+        scheduler_limits,
+        None,
+    )
+}
+
+/// Executes lifecycle initialization with an optional codebase-owned
+/// persistent-server readiness marker.
+///
+/// # Errors
+///
+/// Returns the same source-aware lifecycle and scheduler failures as
+/// [`execute_initialization_plan_with_scheduler_limits`].
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn execute_initialization_plan_with_scheduler_policy(
+    compilation: &Compilation,
+    procedures: &ProcedureRegistry,
+    index: &LifecycleIndex,
+    plan: &InitializationPlan,
+    allocation: &WorldAllocation,
+    runtime: &mut RuntimeImage,
+    scheduler_limits: SchedulerDrainLimits,
+    readiness: Option<&HeadlessReadinessProbe>,
+) -> Result<InitializationExecution, InitializationExecutionError> {
     eprintln!("boot-progress: selecting lifecycle targets");
     let bindings = map_datum_bindings(plan, allocation, runtime);
     let targets = plan
@@ -666,19 +993,37 @@ pub fn execute_initialization_plan(
         "boot-progress: selected lifecycle targets={}",
         targets.len()
     );
+    let (reachable, closure_stats) =
+        procedures.implementation_closure_with_stats(compilation, targets.iter().copied());
+    eprintln!(
+        "boot-progress: lifecycle closure bodies={} static_selectors={} dynamic_selectors={} dynamic_candidates={}",
+        reachable.len(),
+        closure_stats.static_selectors_resolved,
+        closure_stats.dynamic_selectors_resolved,
+        closure_stats.dynamic_candidates_considered,
+    );
     eprintln!("boot-progress: compiling lifecycle targets");
     let executable = procedures
-        .compile_vm_implementations(compilation, targets)
+        .compile_vm_implementations_symbolic_dynamic(compilation, targets)
         .map_err(InitializationExecutionError::Compile)?;
-    eprintln!("boot-progress: compiled lifecycle targets");
+    eprintln!(
+        "boot-progress: compiled lifecycle targets deferred={} materialized={}",
+        executable.module().deferred_procedure_count(),
+        executable.module().materialized_deferred_procedure_count(),
+    );
     let world = if plan.world_type.is_some() {
-        Some(
+        let world = if let Some(world) = runtime.canonical_world() {
+            world
+        } else {
             runtime
                 .allocate_datum(
                     &TypePath::parse("/world").map_err(InitializationExecutionError::WorldPath)?,
                 )
-                .map_err(InitializationExecutionError::WorldAllocation)?,
-        )
+                .map_err(InitializationExecutionError::WorldAllocation)?
+        };
+        materialize_world_map_state(allocation, runtime, world)
+            .map_err(InitializationExecutionError::WorldMapState)?;
+        Some(world)
     } else {
         None
     };
@@ -767,10 +1112,79 @@ pub fn execute_initialization_plan(
             });
         }
         eprintln!("boot-progress: completed lifecycle events");
+        result.scheduler =
+            drain_startup_scheduler(executable.module(), &mut state, scheduler_limits, readiness)?;
         Ok(result)
     })();
     runtime.restore_execution_state(state);
     execution
+}
+
+fn drain_startup_scheduler(
+    module: &dm_vm::Module,
+    state: &mut dm_vm::ExecutionState,
+    limits: SchedulerDrainLimits,
+    readiness: Option<&HeadlessReadinessProbe>,
+) -> Result<SchedulerDrain, InitializationExecutionError> {
+    let start_tick = state.scheduler_tick();
+    let tick_limit = start_tick.saturating_add(limits.max_ticks);
+    let mut drain = SchedulerDrain {
+        final_tick: start_tick,
+        ..SchedulerDrain::default()
+    };
+    while state.scheduled_task_count() != 0 {
+        if readiness.is_some_and(|probe| readiness_probe_matches(state, probe)) {
+            drain.termination = SchedulerDrainTermination::HeadlessReady;
+            break;
+        }
+        if drain.rounds >= limits.max_rounds {
+            drain.termination = SchedulerDrainTermination::RoundLimit;
+            break;
+        }
+        let next_tick = state
+            .next_scheduled_tick()
+            .expect("a non-empty scheduler has an earliest task");
+        if next_tick > tick_limit {
+            drain.termination = SchedulerDrainTermination::TickLimit;
+            break;
+        }
+        let advance = next_tick.saturating_sub(state.scheduler_tick());
+        let completed = advance_scheduler(module, advance, ExecutionLimits::default(), state)
+            .map_err(InitializationExecutionError::Scheduler)?;
+        drain.rounds += 1;
+        drain.completed_tasks += completed.len();
+        drain.final_tick = state.scheduler_tick();
+    }
+    drain.pending_tasks = state.scheduled_task_count();
+    if drain.pending_tasks == 0 {
+        drain.termination = SchedulerDrainTermination::StableIdle;
+    }
+    eprintln!(
+        "boot-progress: scheduler termination={:?} tick={} rounds={} completed={} pending={}",
+        drain.termination,
+        drain.final_tick,
+        drain.rounds,
+        drain.completed_tasks,
+        drain.pending_tasks
+    );
+    Ok(drain)
+}
+
+fn readiness_probe_matches(state: &dm_vm::ExecutionState, probe: &HeadlessReadinessProbe) -> bool {
+    let storage = probe.qualified_storage.as_ref().unwrap_or(&probe.global);
+    let Some(mut value) = state.global(storage).cloned() else {
+        return false;
+    };
+    for field in &probe.fields {
+        let Value::Datum(datum) = value else {
+            return false;
+        };
+        let Ok(next) = state.heap().datum_field(datum, field) else {
+            return false;
+        };
+        value = next.clone();
+    }
+    value == probe.expected
 }
 
 /// Compiles every lifecycle-reachable body independently and retains all
@@ -1259,6 +1673,15 @@ fn initialization_events(
 ) -> Vec<InitializationEvent> {
     let mut events = vec![InitializationEvent::Globals];
     if let Some(type_index) = world_type
+        && has_target(index, type_index, LifecycleKind::Genesis)
+    {
+        events.push(InitializationEvent::Lifecycle {
+            subject: EventSubject::World,
+            kind: LifecycleKind::Genesis,
+            type_index,
+        });
+    }
+    if let Some(type_index) = world_type
         && has_target(index, type_index, LifecycleKind::New)
     {
         events.push(InitializationEvent::Lifecycle {
@@ -1300,12 +1723,14 @@ mod tests {
     use dm_map::parse;
     use dm_runtime::RuntimeImage;
     use dm_semantics::ProcedureRegistry;
-    use dm_value::{FieldName, Value};
+    use dm_value::{FieldName, TypePath, Value};
+    use dm_vm::execute_module_in_state;
     use dm_world::{WorldCoordinate, allocate_world, build_plan};
 
     use super::{
         EventSubject, InitializationEvent, LifecycleIndex, LifecycleKind, LifecycleResolution,
-        build_initialization_plan, execute_initialization_plan, sweep_lifecycle_compatibility,
+        build_initialization_plan, construct_datum, delete_datum, execute_initialization_plan,
+        sweep_lifecycle_compatibility,
     };
 
     static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
@@ -1373,6 +1798,117 @@ mod tests {
             LifecycleResolution::Resolved(_)
         ));
         assert!(index.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn runtime_upcast_dereference_uses_derived_initial_fields() {
+        let source = "/datum/later\n\tvar/datum/pointless_base/a\n/datum/pointless_base/derived/var/x = 7\n/proc/RunTest()\n\tvar/datum/later/L = new\n\tL.a = new /datum/pointless_base/derived()\n\treturn L.a:x\n";
+        let (_fixture, compilation) = Fixture::compile(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let target = procedures
+            .procedures()
+            .iter()
+            .find(|procedure| procedure.path.to_string() == "/proc/RunTest")
+            .and_then(|procedure| procedure.effective_target)
+            .expect("RunTest should have an effective implementation");
+        let executable = procedures
+            .compile_vm_implementations(&compilation, [target])
+            .expect("RunTest should lower");
+        let entry = executable
+            .implementation(target)
+            .expect("RunTest should be in the VM module");
+        let mut runtime = RuntimeImage::from_compilation(&compilation)
+            .expect("runtime image should materialize defaults");
+        let mut state = runtime.take_execution_state();
+        assert_eq!(
+            execute_module_in_state(executable.module(), entry, &[], &mut state),
+            Ok(Value::number(7.0))
+        );
+    }
+
+    #[test]
+    fn construction_orders_defaults_parent_new_and_arguments_and_cleans_failures() {
+        let source = "/datum/base\n\tvar/value = 1\n\tvar/stage = 1\n\tvar/seen_default = 0\n\tvar/list/waiting_calls\n\tNew(arg)\n\t\tseen_default = value\n\t\tstage = stage * 10 + arg\n/datum/base/sub\n\tvalue = 7\n\tNew(arg)\n\t\t..()\n\t\tstage = stage * 10 + 2\n/datum/fail/New()\n\tvar/list/L = null\n\treturn L[1]\n";
+        let (_fixture, compilation) = Fixture::compile(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let mut runtime = RuntimeImage::from_compilation(&compilation)
+            .expect("runtime image should materialize defaults");
+        let subtype = TypePath::parse("/datum/base/sub").unwrap();
+        let datum = construct_datum(
+            &compilation,
+            &procedures,
+            &mut runtime,
+            &subtype,
+            &[Value::number(3.0)],
+        )
+        .expect("subtype constructor should run");
+        let record = runtime.heap().datum(datum).unwrap();
+        assert_eq!(
+            record.field(&FieldName::parse("seen_default").unwrap()),
+            Ok(&Value::number(7.0))
+        );
+        assert_eq!(
+            record.field(&FieldName::parse("stage").unwrap()),
+            Ok(&Value::number(132.0))
+        );
+        assert_eq!(
+            record.field(&FieldName::parse("waiting_calls").unwrap()),
+            Ok(&Value::Null),
+            "plain inherited declarations must exist before New runs"
+        );
+
+        let before = runtime.heap().datums().count();
+        let failure = TypePath::parse("/datum/fail").unwrap();
+        assert!(construct_datum(&compilation, &procedures, &mut runtime, &failure, &[]).is_err());
+        assert_eq!(
+            runtime.heap().datums().count(),
+            before,
+            "failed constructor allocation must be destroyed"
+        );
+    }
+
+    #[test]
+    fn deletion_runs_parent_cleanup_once_and_invalidates_on_failure() {
+        let source = "var/global/events = 0\n/datum/base/Destroy()\n\tevents = events * 10 + 1\n/datum/base/sub/Destroy()\n\t..()\n\tevents = events * 10 + 2\n/datum/fail/Destroy()\n\tvar/list/L = null\n\treturn L[1]\n/datum/reentrant/Destroy()\n\tqdel(src)\n";
+        let (_fixture, compilation) = Fixture::compile(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let mut runtime =
+            RuntimeImage::from_compilation(&compilation).expect("runtime image should materialize");
+        let subtype = TypePath::parse("/datum/base/sub").unwrap();
+        let datum = construct_datum(&compilation, &procedures, &mut runtime, &subtype, &[])
+            .expect("datum should construct");
+        delete_datum(&compilation, &procedures, &mut runtime, datum)
+            .expect("cleanup chain should succeed");
+        assert!(
+            runtime.heap().datum(datum).is_err(),
+            "deleted handle must be stale"
+        );
+        assert_eq!(
+            runtime
+                .variables()
+                .iter()
+                .find(|variable| variable.path.ends_with("/events"))
+                .map(|variable| &variable.value),
+            Some(&Value::number(12.0)),
+            "parent Destroy must run before subtype cleanup exactly once"
+        );
+
+        let failure = TypePath::parse("/datum/fail").unwrap();
+        let failing = construct_datum(&compilation, &procedures, &mut runtime, &failure, &[])
+            .expect("failing-cleanup datum should construct");
+        assert!(delete_datum(&compilation, &procedures, &mut runtime, failing).is_err());
+        assert!(
+            runtime.heap().datum(failing).is_err(),
+            "cleanup failure must still invalidate the datum"
+        );
+
+        let reentrant = TypePath::parse("/datum/reentrant").unwrap();
+        let reentrant_datum =
+            construct_datum(&compilation, &procedures, &mut runtime, &reentrant, &[])
+                .expect("reentrant-cleanup datum should construct");
+        delete_datum(&compilation, &procedures, &mut runtime, reentrant_datum)
+            .expect("qdel(src) during cleanup should count as already deleted");
+        assert!(runtime.heap().datum(reentrant_datum).is_err());
     }
 
     #[test]
@@ -1512,6 +2048,99 @@ mod tests {
             assert_eq!(
                 runtime.heap().datum_field(*datum, &stage),
                 Ok(&Value::number(111.0))
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_drains_waitfor_false_world_continuations() {
+        let source = concat!(
+            "var/global/finished = 0\n",
+            "/world/New()\n\tset waitfor = FALSE\n\t. = 7\n\tsleep(1)\n\tglobal.finished = 1\n",
+            "/area/test\n/turf/test\n",
+        );
+        let (_fixture, compilation, mut runtime, index) = index(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .expect("map should parse");
+        let world = build_plan(&map, &compilation);
+        let plan = build_initialization_plan(&runtime, &index, &world, "test.dmm");
+        let allocation = allocate_world(&world, &mut runtime).expect("world should allocate");
+
+        let execution = execute_initialization_plan(
+            &compilation,
+            &procedures,
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+        )
+        .expect("detached world continuation should drain");
+
+        assert_eq!(execution.scheduler.pending_tasks, 0);
+        assert!(execution.scheduler.rounds >= 1);
+        assert_eq!(
+            runtime
+                .variables()
+                .iter()
+                .find(|variable| variable.path.ends_with("/finished"))
+                .map(|variable| &variable.value),
+            Some(&Value::number(1.0))
+        );
+    }
+
+    #[test]
+    fn genesis_infers_all_typed_global_bare_new_destinations() {
+        let source = concat!(
+            "var/global/datum/tracy/Tracy = null\n",
+            "var/global/datum/debugger/Debugger = null\n",
+            "var/global/datum/log_holder/logger = null\n",
+            "var/global/datum/controller/master/Master = null\n",
+            "/world/Genesis()\n\tTracy = new\n\tDebugger = new\n\tlogger = new\n\tMaster = new\n",
+            "/datum/tracy\n/datum/debugger\n/datum/log_holder\n/datum/controller/master\n",
+            "/area/test\n/turf/test\n",
+        );
+        let (_fixture, compilation, mut runtime, index) = index(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .expect("map should parse");
+        let world = build_plan(&map, &compilation);
+        let plan = build_initialization_plan(&runtime, &index, &world, "test.dmm");
+        let allocation = allocate_world(&world, &mut runtime).expect("world should allocate");
+        execute_initialization_plan(
+            &compilation,
+            &procedures,
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+        )
+        .expect("typed global bare new should execute");
+
+        for (name, expected) in [
+            ("Tracy", "/datum/tracy"),
+            ("Debugger", "/datum/debugger"),
+            ("logger", "/datum/log_holder"),
+            ("Master", "/datum/controller/master"),
+        ] {
+            let value = &runtime
+                .variables()
+                .iter()
+                .find(|variable| variable.path.ends_with(&format!("/{name}")))
+                .unwrap_or_else(|| panic!("missing global {name}"))
+                .value;
+            let Value::Datum(datum) = value else {
+                panic!("{name} should contain a datum");
+            };
+            assert_eq!(
+                runtime.heap().datum(*datum).unwrap().type_path().as_str(),
+                expected
             );
         }
     }

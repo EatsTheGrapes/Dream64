@@ -284,11 +284,32 @@ impl Parser {
                 },
                 &candidate,
             );
+            let inline_body_start = candidate
+                .kind
+                .owns_procedure_body()
+                .then(|| procedure_signature_end(&line.tokens))
+                .flatten()
+                .filter(|end| {
+                    *end < line.tokens.len()
+                        && !matches!(
+                            line.tokens.get(*end).map(|token| &token.kind),
+                            Some(TokenKind::Identifier(keyword)) if keyword == "as"
+                        )
+                });
+            let header_tokens = inline_body_start.map_or_else(
+                || line.tokens.clone(),
+                |start| line.tokens[..start].to_vec(),
+            );
             let parameters = if candidate.kind.owns_procedure_body() {
-                parse_parameters(&line.tokens)
+                parse_parameters(&header_tokens)
             } else {
                 Vec::new()
             };
+            let inline_body = inline_body_start.map(|start| SourceLine {
+                indentation: line.indentation,
+                span: line.span,
+                tokens: line.tokens[start..].to_vec(),
+            });
             let index = self.definitions.len();
             self.definitions.push(Definition {
                 path,
@@ -297,8 +318,8 @@ impl Parser {
                 indentation: line.indentation,
                 span: line.span,
                 parameters,
-                header: line.tokens,
-                body: Vec::new(),
+                header: header_tokens,
+                body: inline_body.into_iter().collect(),
             });
             self.stack.push(Context::Definition(index));
         }
@@ -370,6 +391,29 @@ impl Parser {
     }
 }
 
+/// Returns the token immediately after the procedure parameter list. Unlike
+/// `rposition(')')`, this ignores parentheses in a same-line body such as
+/// `/proc/version() return call_ext(...)(...)`.
+fn procedure_signature_end(tokens: &[SpannedToken]) -> Option<usize> {
+    let open = tokens
+        .iter()
+        .position(|token| token.kind == TokenKind::Punctuation('('))?;
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(open) {
+        match token.kind {
+            TokenKind::Punctuation('(') => depth += 1,
+            TokenKind::Punctuation(')') => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 impl NamespaceKind {
     const fn definition_kind(self) -> DefinitionKind {
         match self {
@@ -391,15 +435,37 @@ fn classify_line(line: &SourceLine) -> Option<Candidate> {
         return None;
     }
 
-    let header_end = line
+    let parameter_open = line
         .tokens
         .iter()
-        .position(|token| match &token.kind {
-            TokenKind::Punctuation('(') => true,
-            TokenKind::Operator(operator) => operator == "=",
-            _ => false,
-        })
-        .unwrap_or(line.tokens.len());
+        .position(|token| token.kind == TokenKind::Punctuation('('));
+    let operator_index_assignment = parameter_open.is_some_and(|open| {
+        open >= 3
+            && matches!(line.tokens.get(open - 1).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "=")
+            && matches!(line.tokens.get(open - 2).map(|token| &token.kind), Some(TokenKind::Punctuation(']')))
+            && line.tokens[..open - 2].iter().any(
+                |token| matches!(&token.kind, TokenKind::Identifier(identifier) if identifier == "operator"),
+            )
+    });
+    let header_end = if operator_index_assignment {
+        parameter_open.unwrap_or(line.tokens.len())
+    } else {
+        line.tokens
+            .iter()
+            .enumerate()
+            .position(|(index, token)| match &token.kind {
+                TokenKind::Punctuation('(' | ';') => true,
+                // A suffix array dimension belongs to a variable's
+                // initializer shape, not its canonical declaration path:
+                // `var/list/items[SIZE]` declares field `items`.
+                TokenKind::Punctuation('[') => line.tokens[..index].iter().any(
+                    |token| matches!(&token.kind, TokenKind::Identifier(name) if name == "var"),
+                ),
+                TokenKind::Operator(operator) => operator == "=",
+                _ => false,
+            })
+            .unwrap_or(line.tokens.len())
+    };
     let path_tokens = &line.tokens[..header_end];
     let was_absolute = starts_with_slash(path_tokens);
     let segments = path_segments(path_tokens);
@@ -407,10 +473,6 @@ fn classify_line(line: &SourceLine) -> Option<Candidate> {
         return None;
     }
 
-    let parameter_open = line
-        .tokens
-        .iter()
-        .position(|token| token.kind == TokenKind::Punctuation('('));
     let assignment = line
         .tokens
         .iter()
@@ -462,6 +524,13 @@ fn path_segments(tokens: &[SpannedToken]) -> Vec<String> {
             .last_mut()
             .expect("operator segment was checked")
             .push_str(suffix);
+    } else if segments.last().is_some_and(|segment| segment == "operator")
+        && operator_index_suffix(tokens).is_some()
+    {
+        segments
+            .last_mut()
+            .expect("operator segment was checked")
+            .push_str(operator_index_suffix(tokens).expect("suffix was checked"));
     }
     segments
 }
@@ -486,6 +555,15 @@ fn is_preprocessor_line(tokens: &[SpannedToken]) -> bool {
 }
 
 fn is_path_spelling(tokens: &[SpannedToken]) -> bool {
+    if operator_index_suffix(tokens).is_some() {
+        let suffix_len = if matches!(tokens.last().map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "=")
+        {
+            3
+        } else {
+            2
+        };
+        return is_path_spelling(&tokens[..tokens.len() - suffix_len]);
+    }
     tokens.iter().enumerate().all(|(index, token)| {
         matches!(token.kind, TokenKind::Identifier(_))
             || matches!(&token.kind, TokenKind::Operator(operator) if operator == "/")
@@ -494,6 +572,16 @@ fn is_path_spelling(tokens: &[SpannedToken]) -> bool {
                 && matches!(&tokens[index - 1].kind, TokenKind::Identifier(identifier) if identifier == "operator")
                 && operator_procedure_suffix(Some(&token.kind)).is_some())
     })
+}
+
+fn operator_index_suffix(tokens: &[SpannedToken]) -> Option<&'static str> {
+    let assignment = matches!(tokens.last().map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "=");
+    let end = tokens.len().checked_sub(usize::from(assignment))?;
+    (end >= 3
+        && matches!(tokens.get(end - 1).map(|token| &token.kind), Some(TokenKind::Punctuation(']')))
+        && matches!(tokens.get(end - 2).map(|token| &token.kind), Some(TokenKind::Punctuation('[')))
+        && matches!(tokens.get(end - 3).map(|token| &token.kind), Some(TokenKind::Identifier(identifier)) if identifier == "operator"))
+    .then_some(if assignment { "[]=" } else { "[]" })
 }
 
 fn operator_procedure_suffix(kind: Option<&TokenKind>) -> Option<&str> {
@@ -616,7 +704,7 @@ fn expand_braced_definition_sequence(
 ) -> bool {
     let checkpoint = output.len();
     let mut cursor = 0usize;
-    let mut found_brace = false;
+    let mut found_sequence_boundary = false;
     while cursor < tokens.len() {
         while tokens
             .get(cursor)
@@ -634,6 +722,7 @@ fn expand_braced_definition_sequence(
                     return false;
                 }
                 cursor = end + 1;
+                found_sequence_boundary = true;
             }
             Some(SequenceBoundary::Brace(open)) => {
                 let header = &tokens[cursor..open];
@@ -662,7 +751,7 @@ fn expand_braced_definition_sequence(
                     output,
                 );
                 cursor = close + 1;
-                found_brace = true;
+                found_sequence_boundary = true;
             }
             None => {
                 if !push_definition_line(&tokens[cursor..], indentation, output) {
@@ -673,10 +762,10 @@ fn expand_braced_definition_sequence(
             }
         }
     }
-    if !found_brace {
+    if !found_sequence_boundary {
         output.truncate(checkpoint);
     }
-    found_brace
+    found_sequence_boundary
 }
 
 #[derive(Clone, Copy)]
@@ -939,6 +1028,14 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn indexes_semicolon_terminated_global_variable_declarations() {
+        assert_eq!(
+            paths("var/global/datum/log_holder/logger;\n"),
+            vec![("/var/logger".to_owned(), DefinitionKind::Variable, None)]
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use dm_compiler::{Compilation, CompilerDatabase};
+use dm_object_tree::NodeKind;
 use dm_semantics::ProcedureRegistry;
 
 fn main() -> ExitCode {
@@ -34,6 +35,98 @@ fn main() -> ExitCode {
 fn trace(compilation: &Compilation, paths: &[String]) {
     let registry = ProcedureRegistry::build(compilation);
     for requested in paths {
+        if let Some(path) = requested.strip_prefix("closure:") {
+            let Some(procedure) = registry
+                .procedures()
+                .iter()
+                .find(|procedure| procedure.path.to_string() == path)
+            else {
+                println!("trace closure procedure={path} missing");
+                continue;
+            };
+            let Some(entry) = procedure.effective_target else {
+                println!("trace closure procedure={path} has_no_body");
+                continue;
+            };
+            let (closure, stats) = registry.implementation_closure_with_stats(compilation, [entry]);
+            println!(
+                "trace closure procedure={path} bodies={} visited={} static_selectors={} dynamic_selectors={} dynamic_candidates={}",
+                closure.len(),
+                stats.bodies_visited,
+                stats.static_selectors_resolved,
+                stats.dynamic_selectors_resolved,
+                stats.dynamic_candidates_considered,
+            );
+            match registry.compile_vm_implementations(compilation, [entry]) {
+                Ok(executable) => println!(
+                    "trace closure compile=compatible module_procedures={} src_bindings={} global_bindings={}",
+                    executable.stats().procedures,
+                    executable.stats().src_field_bindings,
+                    executable.stats().global_field_bindings,
+                ),
+                Err(error) => println!("trace closure compile=blocked error={:?}", error.message),
+            }
+            let issues = registry
+                .compile_vm_bodies_independently(compilation, closure)
+                .into_iter()
+                .filter_map(|(implementation, result)| {
+                    result.err().map(|error| (implementation, error.message))
+                })
+                .collect::<Vec<_>>();
+            println!("trace closure body_issues={}", issues.len());
+            for (implementation, message) in issues {
+                println!(
+                    "trace closure body_issue implementation={implementation:?} error={message:?}"
+                );
+            }
+            continue;
+        }
+        if let Some(needle) = requested.strip_prefix("text:") {
+            let mut visited = std::collections::BTreeSet::new();
+            for segment in compilation.project().expansion_segments() {
+                if !visited.insert(segment.file_id) {
+                    continue;
+                }
+                let Some(file) = compilation.project().file(segment.file_id) else {
+                    continue;
+                };
+                let Ok(source) = file.compiler_text() else {
+                    continue;
+                };
+                for (line, text) in source
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, text)| text.contains(needle))
+                {
+                    println!(
+                        "trace text source={}:{} value={text:?}",
+                        file.relative_path.display(),
+                        line + 1
+                    );
+                }
+            }
+            continue;
+        }
+        if let Some(variable_name) = requested.strip_prefix("var:") {
+            for node in compilation.code_tree().nodes().iter().filter(|node| {
+                node.kind == NodeKind::Variable
+                    && node
+                        .path
+                        .segments()
+                        .last()
+                        .is_some_and(|name| name == variable_name)
+            }) {
+                println!(
+                    "trace variable={} path={} owner_type={:?} declarations={} implicit={}",
+                    variable_name,
+                    node.path,
+                    node.owner_type,
+                    node.declarations.len(),
+                    node.is_implicit()
+                );
+            }
+            continue;
+        }
         let Some(procedure) = registry
             .procedures()
             .iter()

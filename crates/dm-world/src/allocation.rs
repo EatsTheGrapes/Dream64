@@ -4,7 +4,8 @@ use std::fmt;
 use dm_core::SourceSpan;
 use dm_globals::UnsupportedCategory;
 use dm_runtime::{ConstantFieldApplication, RuntimeImage, RuntimeImageError};
-use dm_value::{DatumId, FieldName, TypePath, ValueError};
+use dm_value::{DatumId, FieldName, TypePath, Value, ValueError};
+use dm_vm::ExecutionState;
 
 use crate::{
     AtomCategory, CellTemplate, InitializerResolution, PlannedInitializer, WorldCoordinate,
@@ -87,6 +88,8 @@ pub struct WorldAllocationStats {
     pub unsupported_overrides: usize,
     /// Initializers skipped because they were unresolved, extra, or non-atom.
     pub skipped_initializers: usize,
+    /// Execution-state transfers used for the complete bulk allocation pass.
+    pub execution_state_transfers: usize,
 }
 
 /// Deterministic result of allocating a [`WorldPlan`] without lifecycle calls.
@@ -130,6 +133,98 @@ impl WorldAllocation {
     pub const fn stats(&self) -> &WorldAllocationStats {
         &self.stats
     }
+}
+
+/// Applies map-derived BYOND `/world` fields to an allocated world datum.
+///
+/// Map dimensions preserve larger compile-time lower bounds. `contents`
+/// contains every distinct initially allocated map atom in deterministic
+/// allocation order.
+///
+/// # Errors
+///
+/// Returns an allocation error if the world datum is stale or heap mutation
+/// fails.
+pub fn materialize_world_map_state(
+    allocation: &WorldAllocation,
+    image: &mut RuntimeImage,
+    world: DatumId,
+) -> Result<(), WorldAllocationError> {
+    let mapped_max = allocation.snapshots.iter().fold(
+        WorldCoordinate { x: 0, y: 0, z: 0 },
+        |maximum, snapshot| WorldCoordinate {
+            x: maximum.x.max(snapshot.coordinate.x),
+            y: maximum.y.max(snapshot.coordinate.y),
+            z: maximum.z.max(snapshot.coordinate.z),
+        },
+    );
+    for (name, mapped) in [
+        ("maxx", mapped_max.x),
+        ("maxy", mapped_max.y),
+        ("maxz", mapped_max.z),
+    ] {
+        let field = FieldName::parse(name).expect("built-in map dimension field is valid");
+        let declared = image
+            .heap()
+            .datum_field(world, &field)
+            .ok()
+            .and_then(Value::as_number)
+            .unwrap_or(0.0);
+        image.heap_mut().set_datum_field(
+            world,
+            field,
+            Value::number(declared.max(mapped as f32)),
+        )?;
+    }
+    let mut atom_contents = BTreeMap::new();
+    for datum in &allocation.allocation_order {
+        let contents = image.heap_mut().allocate_list();
+        image.heap_mut().set_datum_field(
+            *datum,
+            FieldName::parse("contents").expect("built-in atom contents field is valid"),
+            Value::List(contents),
+        )?;
+        atom_contents.insert(*datum, contents);
+    }
+    for snapshot in &allocation.snapshots {
+        if let Some(turf) = snapshot.turf {
+            let turf_contents = atom_contents[&turf];
+            for movable in &snapshot.movables {
+                image
+                    .heap_mut()
+                    .list_mut(turf_contents)?
+                    .add(Value::Datum(*movable));
+            }
+        }
+        if let Some(area) = snapshot.area {
+            let area_contents = atom_contents[&area];
+            if let Some(turf) = snapshot.turf {
+                image
+                    .heap_mut()
+                    .list_mut(area_contents)?
+                    .add(Value::Datum(turf));
+            }
+            for movable in &snapshot.movables {
+                image
+                    .heap_mut()
+                    .list_mut(area_contents)?
+                    .add(Value::Datum(*movable));
+            }
+        }
+    }
+    let contents = image.heap_mut().allocate_list();
+    {
+        let list = image.heap_mut().list_mut(contents)?;
+        for datum in &allocation.allocation_order {
+            list.add(Value::Datum(*datum));
+        }
+    }
+    image.heap_mut().set_datum_field(
+        world,
+        FieldName::parse("contents").expect("built-in world contents field is valid"),
+        Value::List(contents),
+    )?;
+    Ok(())
 }
 
 /// Materializes a world plan into an existing runtime image without DM calls.
@@ -177,10 +272,12 @@ struct Allocator<'plan, 'image> {
     allocation_order: Vec<DatumId>,
     work_items: Vec<WorldAllocationWorkItem>,
     stats: WorldAllocationStats,
+    state: ExecutionState,
 }
 
 impl<'plan, 'image> Allocator<'plan, 'image> {
     fn new(plan: &'plan WorldPlan, image: &'image mut RuntimeImage) -> Self {
+        let state = image.take_execution_state();
         Self {
             plan,
             image,
@@ -189,10 +286,18 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
             allocation_order: Vec::new(),
             work_items: Vec::new(),
             stats: WorldAllocationStats::default(),
+            state,
         }
     }
 
     fn run(mut self) -> Result<WorldAllocation, WorldAllocationError> {
+        let result = self.run_inner();
+        self.image
+            .restore_execution_state(std::mem::take(&mut self.state));
+        result
+    }
+
+    fn run_inner(&mut self) -> Result<WorldAllocation, WorldAllocationError> {
         for cell in self.plan.cells() {
             let mut snapshot = CoordinateDatumSnapshot {
                 coordinate: cell.coordinate,
@@ -216,16 +321,42 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
                 continue;
             };
             self.allocate_template(template, &mut snapshot)?;
+            self.link_cell_locations(&snapshot)?;
             self.snapshots.push(snapshot);
         }
         self.stats.cells = self.snapshots.len();
         self.stats.datums_allocated = self.allocation_order.len();
+        self.stats.execution_state_transfers = 1;
         Ok(WorldAllocation {
-            snapshots: self.snapshots,
-            allocation_order: self.allocation_order,
-            work_items: self.work_items,
+            snapshots: std::mem::take(&mut self.snapshots),
+            allocation_order: std::mem::take(&mut self.allocation_order),
+            work_items: std::mem::take(&mut self.work_items),
             stats: self.stats,
         })
+    }
+
+    fn link_cell_locations(
+        &mut self,
+        snapshot: &CoordinateDatumSnapshot,
+    ) -> Result<(), WorldAllocationError> {
+        let loc = FieldName::parse("loc").expect("built-in location field name is valid");
+        if let (Some(turf), Some(area)) = (snapshot.turf, snapshot.area) {
+            self.state.heap_mut().set_datum_field(
+                turf,
+                loc.clone(),
+                dm_value::Value::Datum(area),
+            )?;
+        }
+        if let Some(turf) = snapshot.turf {
+            for movable in &snapshot.movables {
+                self.state.heap_mut().set_datum_field(
+                    *movable,
+                    loc.clone(),
+                    dm_value::Value::Datum(turf),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn allocate_template(
@@ -322,7 +453,9 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
         initializer: &PlannedInitializer,
     ) -> Result<DatumId, WorldAllocationError> {
         let type_path = TypePath::parse(&initializer.path)?;
-        let datum = self.image.allocate_datum(&type_path)?;
+        let datum = self
+            .image
+            .allocate_datum_in_state(&type_path, &mut self.state)?;
         // BYOND exposes map placement coordinates as built-in atom fields.
         // They are not map-variable overrides, so materialize them before
         // applying source-defined overrides and before lifecycle code runs.
@@ -331,7 +464,7 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
             ("y", coordinate.y),
             ("z", coordinate.z),
         ] {
-            self.image.heap_mut().set_datum_field(
+            self.state.heap_mut().set_datum_field(
                 datum,
                 FieldName::parse(name).expect("coordinate field name is valid"),
                 dm_value::Value::number(
@@ -358,10 +491,12 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
                 });
                 continue;
             };
-            match self
-                .image
-                .apply_constant_field_expression(datum, field, &assignment.value.raw)?
-            {
+            match self.image.apply_constant_field_expression_in_state(
+                &mut self.state,
+                datum,
+                field,
+                &assignment.value.raw,
+            )? {
                 ConstantFieldApplication::Applied => self.stats.constant_overrides += 1,
                 ConstantFieldApplication::Unsupported(unsupported) => {
                     self.stats.unsupported_overrides += 1;

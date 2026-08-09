@@ -89,10 +89,131 @@ fn main() -> ExitCode {
     let targets = locations.len();
     println!("sweep_targets={targets}");
     let ordered_targets = locations.keys().copied().collect::<Vec<_>>();
+    let (reachable, closure_stats) =
+        procedures.implementation_closure_with_stats(&compilation, ordered_targets.iter().copied());
+    let eager =
+        procedures.eager_implementation_closure(&compilation, ordered_targets.iter().copied());
+    let worker_count = env::var("DREAM64_SWEEP_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| *count != 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(4, usize::from)
+                .min(8)
+        });
+    let reachable_count = reachable.len();
+    let eager = eager.into_iter().collect::<Vec<_>>();
+    let chunk_size = eager.len().div_ceil(worker_count);
+    eprintln!(
+        "sweep-progress: compiling {} eager symbolic bodies with {} workers",
+        eager.len(),
+        worker_count
+    );
+    let independent = std::thread::scope(|scope| {
+        let handles = eager
+            .chunks(chunk_size.max(1))
+            .map(|chunk| {
+                scope.spawn(|| {
+                    procedures.compile_vm_bodies_independently(&compilation, chunk.iter().copied())
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut results = Vec::with_capacity(eager.len());
+        for handle in handles {
+            results.extend(handle.join().expect("sweep worker should not panic"));
+        }
+        results
+    });
+    let body_results = independent
+        .into_iter()
+        .map(|(implementation, result)| {
+            let result = result.map(|_| ()).map_err(|error| {
+                let message = error.message;
+                (compatibility_category(&message), message)
+            });
+            (implementation, result)
+        })
+        .collect::<BTreeMap<_, _>>();
+    eprintln!("sweep-progress: linking exact boot symbolic module");
+    let symbolic = procedures
+        .compile_vm_implementations_symbolic_dynamic(&compilation, ordered_targets.iter().copied());
+    println!("sweep_mode=exact-boot-symbolic-module-plus-parallel-eager-audit");
+    println!("sweep_workers={worker_count}");
+    println!("sweep_reachable_bodies={reachable_count}");
+    println!("sweep_eager_bodies={}", body_results.len());
+    println!(
+        "sweep_deferred_symbols={}",
+        reachable_count.saturating_sub(body_results.len())
+    );
+    match &symbolic {
+        Ok(executable) => {
+            println!("sweep_symbolic_module=compatible");
+            println!(
+                "sweep_symbolic_module_deferred={}",
+                executable.module().deferred_procedure_count()
+            );
+            println!(
+                "sweep_symbolic_module_materialized={}",
+                executable.module().materialized_deferred_procedure_count()
+            );
+        }
+        Err(error) => {
+            println!("sweep_symbolic_module=blocked");
+            println!(
+                "sweep_symbolic_module_first_error category={:?} message={:?}",
+                compatibility_category(&error.message),
+                error.message
+            );
+        }
+    }
+    println!(
+        "sweep_closure_bodies_visited={}",
+        closure_stats.bodies_visited
+    );
+    println!(
+        "sweep_closure_static_selectors={}",
+        closure_stats.static_selectors_resolved
+    );
+    println!(
+        "sweep_closure_dynamic_selectors={}",
+        closure_stats.dynamic_selectors_resolved
+    );
+    println!(
+        "sweep_closure_dynamic_candidates={}",
+        closure_stats.dynamic_candidates_considered
+    );
     let mut compatible = 0usize;
     let mut grouped = BTreeMap::<(String, String), Vec<LifecycleCompatibilityLocation>>::new();
     let trace_procedure = env::var("DREAM64_TRACE_PROCEDURE").ok();
     let only_procedure = env::var("DREAM64_SWEEP_ONLY_PROCEDURE").ok();
+
+    let mut body_groups = BTreeMap::<(String, String), Vec<ProcedureImplementationId>>::new();
+    for (implementation, result) in &body_results {
+        if let Err((category, message)) = result {
+            body_groups
+                .entry((category.clone(), message.clone()))
+                .or_default()
+                .push(*implementation);
+        }
+    }
+    println!("sweep_eager_issue_groups={}", body_groups.len());
+    let eager_blocked = !body_groups.is_empty();
+    for ((category, message), implementations) in &body_groups {
+        println!(
+            "sweep_eager_issue category={category:?} bodies={} message={message:?}",
+            implementations.len()
+        );
+        for implementation in implementations.iter().take(5) {
+            let procedure = procedures
+                .procedure(implementation.procedure())
+                .map_or_else(
+                    || "<missing>".to_owned(),
+                    |procedure| procedure.path.to_string(),
+                );
+            println!("sweep_eager_body procedure={procedure} implementation={implementation:?}");
+        }
+    }
 
     for (index, implementation) in ordered_targets.into_iter().enumerate() {
         if only_procedure.as_deref().is_some_and(|path| {
@@ -126,20 +247,20 @@ fn main() -> ExitCode {
                 );
             }
         }
-        let result = procedures.compile_vm_implementations(&compilation, [implementation]);
+        let result = body_results
+            .get(&implementation)
+            .and_then(|result| match result {
+                Err(error) => Some(error.clone()),
+                Ok(()) => None,
+            });
         let target_locations = locations
             .remove(&implementation)
             .expect("sweep target should retain its locations");
         match result {
-            Ok(executable) => {
+            None => {
                 compatible += 1;
-                // Drop each potentially large overlapping closure before compiling
-                // the next one so the audit's live memory is bounded by one closure.
-                drop(executable);
             }
-            Err(error) => {
-                let message = error.message;
-                let category = compatibility_category(&message);
+            Some((category, message)) => {
                 grouped
                     .entry((category, message))
                     .or_default()
@@ -148,8 +269,9 @@ fn main() -> ExitCode {
         }
     }
 
-    println!("sweep_compatible={compatible}");
+    println!("sweep_direct_compatible={compatible}");
     println!("sweep_issue_groups={}", grouped.len());
+    let direct_blocked = !grouped.is_empty();
     for ((category, message), mut issue_locations) in grouped {
         issue_locations.sort_by(|left, right| {
             (
@@ -180,7 +302,11 @@ fn main() -> ExitCode {
         }
     }
 
-    ExitCode::SUCCESS
+    if symbolic.is_err() || eager_blocked || direct_blocked {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 fn compatibility_category(message: &str) -> String {

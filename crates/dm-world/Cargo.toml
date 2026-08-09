@@ -14,6 +14,7 @@ dm-map = { path = "../dm-map" }
 dm-object-tree = { path = "../dm-object-tree" }
 dm-runtime = { path = "../dm-runtime" }
 dm-value = { path = "../dm-value" }
+dm-vm = { path = "../dm-vm" }
 
 [lints]
 workspace = true

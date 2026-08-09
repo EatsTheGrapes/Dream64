@@ -366,6 +366,25 @@ fn upward_path_at(
     contextual_anchor: Option<&DefinitionPath>,
 ) -> Option<(usize, DefinitionPath, Vec<String>)> {
     let mut index = start;
+    let contextual = matches!(
+        tokens.get(index).map(|token| &token.kind),
+        Some(TokenKind::Operator(operator)) if operator == "."
+    );
+    let follows_receiver =
+        tokens
+            .get(start.wrapping_sub(1))
+            .is_some_and(|token| match &token.kind {
+                TokenKind::Identifier(name) => !matches!(name.as_str(), "return" | "throw" | "in"),
+                TokenKind::Number(_)
+                | TokenKind::String(_)
+                | TokenKind::RawString(_)
+                | TokenKind::Resource(_)
+                | TokenKind::Punctuation(')' | ']') => true,
+                _ => false,
+            });
+    if contextual && follows_receiver {
+        return None;
+    }
     let anchor = if matches!(tokens.get(index).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "/")
     {
         let mut segments = Vec::new();
@@ -405,6 +424,12 @@ fn upward_path_at(
         } else {
             break;
         }
+    }
+    // A bare `.` is DM's current procedure result variable (for example
+    // `. = ..()`).  Only `.name` is a contextual upward-search expression.
+    // Absolute `/type.` keeps its separate empty-suffix upward-path meaning.
+    if contextual && suffix.is_empty() {
+        return None;
     }
     Some((index, anchor, suffix))
 }
@@ -1057,6 +1082,7 @@ fn resolve_diagnostic_declarations(
 #[cfg(test)]
 mod tests {
     use dm_core::FileId;
+    use dm_lexer::{TokenKind, lex};
     use dm_syntax::{DefinitionKind, parse};
 
     use super::{
@@ -1305,6 +1331,33 @@ mod tests {
             Some("/datum/foo")
         );
         assert_eq!(resolved(&["datum", "foo"], &["missing"]), None);
+
+        let result_assignment = lex(". = ..()")
+            .expect("result assignment should lex")
+            .into_iter()
+            .filter(|token| !matches!(token.kind, TokenKind::LineStart { .. } | TokenKind::Newline))
+            .collect::<Vec<_>>();
+        let anchor = path(&["datum", "foo"]);
+        let normalized = output
+            .tree
+            .normalize_upward_paths(Some(&anchor), &result_assignment);
+        assert_eq!(
+            normalized, result_assignment,
+            "bare result dot must not become a type path"
+        );
+
+        let member_access = lex("GLOB.foo")
+            .expect("member access should lex")
+            .into_iter()
+            .filter(|token| !matches!(token.kind, TokenKind::LineStart { .. } | TokenKind::Newline))
+            .collect::<Vec<_>>();
+        let normalized = output
+            .tree
+            .normalize_upward_paths(Some(&anchor), &member_access);
+        assert_eq!(
+            normalized, member_access,
+            "receiver member access must not become a contextual type path"
+        );
     }
 
     #[test]
