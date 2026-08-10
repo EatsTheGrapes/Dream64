@@ -188,8 +188,20 @@ pub fn materialize_world_map_state(
     }
     for snapshot in &allocation.snapshots {
         if let Some(turf) = snapshot.turf {
+            if let Some(area) = snapshot.area {
+                image.heap_mut().set_datum_field(
+                    turf,
+                    FieldName::parse("loc").expect("built-in atom loc field is valid"),
+                    Value::Datum(area),
+                )?;
+            }
             let turf_contents = atom_contents[&turf];
             for movable in &snapshot.movables {
+                image.heap_mut().set_datum_field(
+                    *movable,
+                    FieldName::parse("loc").expect("built-in atom loc field is valid"),
+                    Value::Datum(turf),
+                )?;
                 image
                     .heap_mut()
                     .list_mut(turf_contents)?

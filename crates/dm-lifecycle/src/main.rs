@@ -12,7 +12,7 @@ use dm_lifecycle::{
     execute_initialization_plan_with_scheduler_policy, sweep_lifecycle_compatibility,
     sweep_lifecycle_compatibility_with_closures,
 };
-use dm_runtime::RuntimeImage;
+use dm_runtime::{RuntimeImage, RuntimeImageConstructionEvent, RuntimeInitializerDiagnostic};
 use dm_semantics::ProcedureRegistry;
 use dm_value::{FieldName, Value};
 use dm_world::allocate_world;
@@ -77,13 +77,51 @@ fn main() -> ExitCode {
     if command == Command::Boot {
         eprintln!("boot-progress: materializing globals and type defaults");
     }
-    let mut runtime = match RuntimeImage::from_compilation(&compilation) {
+    let mut runtime = match RuntimeImage::from_compilation_with_observer(
+        &compilation,
+        |event: RuntimeImageConstructionEvent| {
+            if command != Command::Boot {
+                return;
+            }
+            if event.completed {
+                eprintln!(
+                    "boot-progress: runtime-phase-complete phase={} elapsed_ms={} items={}",
+                    event.phase.as_str(),
+                    event.elapsed.as_millis(),
+                    event
+                        .items
+                        .map_or_else(|| "unknown".to_owned(), |items| items.to_string()),
+                );
+            } else {
+                eprintln!(
+                    "boot-progress: runtime-phase-start phase={}",
+                    event.phase.as_str()
+                );
+            }
+        },
+    ) {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("runtime image: {error}");
             return ExitCode::FAILURE;
         }
     };
+    if command == Command::Boot {
+        let stats = runtime.stats();
+        eprintln!(
+            "boot-progress: initializer frontier selectors={} typed_constructors={} dynamic_constructor_fallback={} complete_inventory_fallback={} module_procedures={} deferred={} materialized={}",
+            stats.initializer_frontier_selectors,
+            stats.initializer_typed_constructor_targets,
+            stats.initializer_dynamic_constructor_frontier,
+            stats.initializer_complete_symbol_inventory,
+            stats.initializer_module_procedures,
+            stats.initializer_module_deferred_procedures,
+            stats.initializer_module_materialized_procedures,
+        );
+    }
+    for diagnostic in runtime.diagnostics() {
+        eprintln!("{}", format_runtime_diagnostic(diagnostic));
+    }
     if command == Command::Boot {
         eprintln!("boot-progress: indexing procedures and lifecycle dispatch");
     }
@@ -111,6 +149,12 @@ fn main() -> ExitCode {
     };
     let world = dm_world::build_plan(&map, &compilation);
     let plan = build_initialization_plan(&runtime, &index, &world, map_path.clone());
+    // `WorldPlan` and `InitializationPlan` own everything needed after this
+    // point.  Keeping the raw DMM text and parsed map alive through lifecycle
+    // bytecode compilation needlessly retains a second copy of the largest
+    // boot input at the process's peak-memory phase.
+    drop(map);
+    drop(map_source);
 
     print_plan_summary(&map_path, &index, &procedures, &plan);
     if command == Command::Sweep {
@@ -168,6 +212,10 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        // Allocation is the last consumer of the coordinate/template plan.
+        // Runtime execution uses the compact allocation and initialization
+        // event plan, so release the map plan before compiling lifecycle code.
+        drop(world);
         let readiness = master_controller_readiness(&compilation, &runtime);
         if let Some(probe) = &readiness {
             eprintln!(
@@ -196,6 +244,23 @@ fn main() -> ExitCode {
         print_boot_summary(&allocation, &execution);
     }
     ExitCode::SUCCESS
+}
+
+fn format_runtime_diagnostic(diagnostic: &RuntimeInitializerDiagnostic) -> String {
+    format!(
+        "runtime-initializer-diagnostic path={} storage={:?} category={:?} phase={:?} ordinal={} source={}:{}..{} blocker={}..{} message={:?}",
+        diagnostic.variable_path,
+        diagnostic.storage,
+        diagnostic.category,
+        diagnostic.phase,
+        diagnostic.ordinal,
+        diagnostic.source_path,
+        diagnostic.initializer_span.start,
+        diagnostic.initializer_span.end,
+        diagnostic.blocker_span.start,
+        diagnostic.blocker_span.end,
+        diagnostic.message,
+    )
 }
 
 fn master_controller_readiness(

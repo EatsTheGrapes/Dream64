@@ -988,6 +988,25 @@ impl ValueHeap {
         self.datum(id)?.field(name)
     }
 
+    /// Replaces the runtime type of a live datum while preserving its stable
+    /// identity. Engine-owned turf replacement uses this for one map cell.
+    pub fn set_datum_type_path(
+        &mut self,
+        id: DatumId,
+        type_path: TypePath,
+    ) -> Result<TypePath, ValueError> {
+        let datum = self.datum_mut(id)?;
+        Ok(std::mem::replace(&mut datum.type_path, type_path))
+    }
+
+    /// Iterates the materialized fields of a live datum in declaration order.
+    pub fn datum_fields(
+        &self,
+        id: DatumId,
+    ) -> Result<impl Iterator<Item = (&FieldName, &Value)>, ValueError> {
+        Ok(self.datum(id)?.fields())
+    }
+
     /// Inserts or updates a field on a live datum.
     ///
     /// # Errors

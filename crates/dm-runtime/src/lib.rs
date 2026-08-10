@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dm_compiler::{Compilation, CompilerDatabase, CompilerError};
 use dm_core::{FileId, SourceSpan};
@@ -22,8 +23,9 @@ use dm_object_tree::NodeKind;
 use dm_semantics::ProcedureRegistry;
 use dm_value::{DatumDefaults, DatumId, FieldName, TypePath, Value, ValueError, ValueHeap};
 use dm_vm::{
-    ExecutionContext, ExecutionState, InitializerBinding, InitializerProgram, Module, RuntimeError,
-    compile_initializer, compile_initializer_into_module, execute_module_in_context,
+    ExecutionContext, ExecutionState, InitializerBinding, InitializerProgram, InstanceInitializer,
+    Module, RuntimeError, compile_initializer, compile_initializer_into_module,
+    execute_module_in_context,
 };
 
 /// A successfully materialized global or type-static variable.
@@ -125,11 +127,15 @@ fn materialize_builtin_atom_defaults(
         ("maptext", Value::Null),
         ("maptext_height", Value::number(32.0)),
         ("maptext_width", Value::number(32.0)),
+        ("maptext_x", Value::number(0.0)),
+        ("maptext_y", Value::number(0.0)),
         ("mouse_opacity", Value::number(1.0)),
         ("name", Value::Null),
         ("opacity", Value::number(0.0)),
         ("overlays", Value::Null),
         ("plane", Value::number(0.0)),
+        ("pixel_x", Value::number(0.0)),
+        ("pixel_y", Value::number(0.0)),
         ("pixel_w", Value::number(0.0)),
         ("pixel_z", Value::number(0.0)),
         ("render_source", Value::Null),
@@ -149,8 +155,6 @@ fn materialize_builtin_atom_defaults(
         ("bound_x", Value::number(0.0)),
         ("bound_y", Value::number(0.0)),
         ("glide_size", Value::number(0.0)),
-        ("pixel_x", Value::number(0.0)),
-        ("pixel_y", Value::number(0.0)),
         ("screen_loc", Value::Null),
         ("step_size", Value::number(32.0)),
     ];
@@ -273,11 +277,25 @@ fn builtin_initial_fields(path: &TypePath, world_name: &str) -> BTreeMap<FieldNa
                 ("invisibility", Value::number(0.0)),
                 ("layer", Value::number(1.0)),
                 ("loc", Value::Null),
+                ("maptext", Value::Null),
+                ("maptext_height", Value::number(32.0)),
+                ("maptext_width", Value::number(32.0)),
+                ("maptext_x", Value::number(0.0)),
+                ("maptext_y", Value::number(0.0)),
+                ("mouse_opacity", Value::number(1.0)),
                 ("opacity", Value::number(0.0)),
                 ("overlays", Value::Null),
                 ("plane", Value::number(0.0)),
+                ("pixel_x", Value::number(0.0)),
+                ("pixel_y", Value::number(0.0)),
+                ("pixel_w", Value::number(0.0)),
+                ("pixel_z", Value::number(0.0)),
+                ("render_source", Value::Null),
+                ("render_target", Value::Null),
+                ("transform", Value::Null),
                 ("underlays", Value::Null),
                 ("vis_contents", Value::Null),
+                ("vis_flags", Value::number(0.0)),
                 ("x", Value::number(0.0)),
                 ("y", Value::number(0.0)),
                 ("z", Value::number(0.0)),
@@ -293,8 +311,6 @@ fn builtin_initial_fields(path: &TypePath, world_name: &str) -> BTreeMap<FieldNa
                 ("bound_x", Value::number(0.0)),
                 ("bound_y", Value::number(0.0)),
                 ("glide_size", Value::number(0.0)),
-                ("pixel_x", Value::number(0.0)),
-                ("pixel_y", Value::number(0.0)),
                 ("screen_loc", Value::Null),
                 ("step_size", Value::number(32.0)),
             ] {
@@ -423,12 +439,42 @@ pub struct RuntimeImageStats {
     pub datums_allocated: usize,
     /// Per-type instance-initializer plans compiled on first allocation.
     pub instance_initializer_plans_compiled: usize,
+    /// Unique retained instance initializers entered in the owner catalog.
+    pub instance_initializer_candidates_indexed: usize,
+    /// Unique instance-initializer programs compiled across every type plan.
+    pub instance_initializer_unique_programs_compiled: usize,
+    /// Shared compiled-program references installed into per-type plans.
+    pub instance_initializer_plan_references: usize,
+    /// Identifier/index probes used to construct initializer binding maps.
+    pub initializer_binding_index_lookups: usize,
+    /// Referenced bindings emitted across compiled initializer programs.
+    pub initializer_bindings_emitted: usize,
     /// Immutable type metadata snapshots built for execution-state transfers.
     pub execution_metadata_builds: usize,
     /// Per-type inherited-default allocation plans built on first allocation.
     pub datum_allocation_plans_built: usize,
     /// Datums allocated inside a caller-owned persistent execution state.
     pub stateful_datums_allocated: usize,
+    /// Project procedure bodies linked symbolically for initializer dispatch.
+    pub initializer_module_deferred_procedures: usize,
+    /// Deferred project bodies actually lowered while running initializers.
+    pub initializer_module_materialized_procedures: usize,
+    /// Distinct procedure selectors conservatively found in runtime
+    /// initializer expressions.
+    pub initializer_frontier_selectors: usize,
+    /// Procedure specifications retained in the initializer module.
+    pub initializer_module_procedures: usize,
+    /// Whether an indirect `call()` required the complete project inventory.
+    pub initializer_complete_symbol_inventory: usize,
+    /// Exact construction type paths retained by initializer analysis.
+    pub initializer_typed_constructor_targets: usize,
+    /// Whether at least one initializer required the full dynamic `New` set.
+    pub initializer_dynamic_constructor_frontier: usize,
+    /// Existing runtime slots updated through the canonical path index.
+    pub indexed_runtime_variable_updates: usize,
+    /// Runtime slots read through the canonical path index while synchronizing
+    /// initializer state.
+    pub indexed_runtime_variable_reads: usize,
 }
 
 /// Result of compiling instance-initializer plans without allocating datums.
@@ -442,6 +488,87 @@ pub struct InitializerPreflightStats {
     pub plans_reused: usize,
 }
 
+/// Coarse construction phases exposed for cold-boot diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeImageConstructionPhase {
+    /// Inventory global/static/instance variables and initialization plans.
+    VariableRegistry,
+    /// Build runtime type/default and reflection metadata.
+    TypeInventory,
+    /// Materialize compile-time instance constants.
+    InstanceConstants,
+    /// Build the inherited initial-value snapshot used by VM execution.
+    ExecutionMetadata,
+    /// Build semantic procedure identities and dependency indices.
+    ProcedureRegistry,
+    /// Resolve the initializer frontier and construct its symbolic VM module.
+    InitializerModuleLink,
+    /// Compile the unique runtime instance-initializer entry points.
+    InstanceInitializerCompilation,
+    /// Execute source-ordered global and type-static initializers.
+    GlobalInitializerExecution,
+    /// Capture final counters and immutable runtime state.
+    Finalization,
+}
+
+impl RuntimeImageConstructionPhase {
+    /// Stable machine-readable phase label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::VariableRegistry => "variable-registry",
+            Self::TypeInventory => "type-inventory",
+            Self::InstanceConstants => "instance-constants",
+            Self::ExecutionMetadata => "execution-metadata",
+            Self::ProcedureRegistry => "procedure-registry",
+            Self::InitializerModuleLink => "initializer-module-link",
+            Self::InstanceInitializerCompilation => "instance-initializer-compilation",
+            Self::GlobalInitializerExecution => "global-initializer-execution",
+            Self::Finalization => "finalization",
+        }
+    }
+}
+
+/// Boundary event emitted while constructing a [`RuntimeImage`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeImageConstructionEvent {
+    /// Phase entering or completing.
+    pub phase: RuntimeImageConstructionPhase,
+    /// Whether this event marks phase completion rather than entry.
+    pub completed: bool,
+    /// Wall-clock duration for a completed phase; zero on entry.
+    pub elapsed: Duration,
+    /// Deterministic number of principal items handled, when available.
+    pub items: Option<usize>,
+}
+
+fn begin_runtime_phase(
+    observer: &mut impl FnMut(RuntimeImageConstructionEvent),
+    phase: RuntimeImageConstructionPhase,
+) -> Instant {
+    observer(RuntimeImageConstructionEvent {
+        phase,
+        completed: false,
+        elapsed: Duration::ZERO,
+        items: None,
+    });
+    Instant::now()
+}
+
+fn complete_runtime_phase(
+    observer: &mut impl FnMut(RuntimeImageConstructionEvent),
+    phase: RuntimeImageConstructionPhase,
+    started: Instant,
+    items: Option<usize>,
+) {
+    observer(RuntimeImageConstructionEvent {
+        phase,
+        completed: true,
+        elapsed: started.elapsed(),
+        items,
+    });
+}
+
 /// A deterministic runtime-ready constant image for one compiled project.
 pub struct RuntimeImage {
     heap: ValueHeap,
@@ -450,12 +577,19 @@ pub struct RuntimeImage {
     type_paths: Arc<BTreeSet<TypePath>>,
     type_parents: Arc<BTreeMap<TypePath, Option<TypePath>>>,
     initial_values: Arc<BTreeMap<TypePath, BTreeMap<FieldName, Value>>>,
+    shared_fields: Arc<BTreeMap<TypePath, BTreeMap<FieldName, FieldName>>>,
+    global_types: BTreeMap<String, TypePath>,
     world_name: String,
     canonical_world: Option<DatumId>,
     binding_index: RuntimeBindingIndex,
+    runtime_variable_indices: BTreeMap<String, usize>,
     global_variable_indices: BTreeMap<FieldName, usize>,
     diagnostics: Vec<RuntimeInitializerDiagnostic>,
     instance_initializers: Vec<(VariableEntry, InitializationStep)>,
+    instance_initializer_indices_by_owner: BTreeMap<TypePath, Vec<usize>>,
+    compiled_instance_initializers: BTreeMap<usize, CompiledInstanceInitializer>,
+    vm_instance_initializers: Arc<BTreeMap<TypePath, Vec<InstanceInitializer>>>,
+    vm_instance_initializer_module: Option<Arc<Module>>,
     instance_initializer_plans: BTreeMap<TypePath, Arc<[CompiledInstanceInitializer]>>,
     datum_allocation_plans: BTreeMap<TypePath, DatumAllocationPlan>,
     project_root: PathBuf,
@@ -503,7 +637,7 @@ impl RuntimeBindingIndex {
                         .or_default()
                         .insert(field.as_str().to_owned(), field);
                 }
-            } else if entry.storage == StorageClass::Global {
+            } else if entry.storage == StorageClass::Global && entry.owner.is_none() {
                 globals.insert(field.as_str().to_owned(), field);
             } else {
                 statics.insert(entry.path.clone(), FieldName::static_storage(&entry.path));
@@ -572,6 +706,273 @@ fn execution_metadata(
     (type_parents, initial_values)
 }
 
+fn type_parent_metadata(
+    types: &BTreeMap<TypePath, RuntimeType>,
+) -> BTreeMap<TypePath, Option<TypePath>> {
+    types
+        .iter()
+        .map(|(path, runtime_type)| (path.clone(), runtime_type.parent.clone()))
+        .collect()
+}
+
+fn shared_reflection_fields(
+    registry: &VariableRegistry,
+    parents: &BTreeMap<TypePath, Option<TypePath>>,
+) -> Result<BTreeMap<TypePath, BTreeMap<FieldName, FieldName>>, RuntimeImageError> {
+    let mut direct = BTreeMap::<TypePath, BTreeMap<FieldName, FieldName>>::new();
+    for entry in registry
+        .entries()
+        .iter()
+        .filter(|entry| entry.storage != StorageClass::Instance && entry.owner.is_some())
+    {
+        let owner = parse_type_path(&entry.owner.as_ref().expect("filtered owner").path)?;
+        let name = variable_field(&entry.path)?;
+        direct
+            .entry(owner)
+            .or_default()
+            .insert(name, FieldName::static_storage(&entry.path));
+    }
+    let mut result = BTreeMap::new();
+    for path in parents.keys() {
+        let mut hierarchy = Vec::new();
+        let mut current = Some(path.clone());
+        while let Some(candidate) = current {
+            hierarchy.push(candidate.clone());
+            current = parents.get(&candidate).cloned().flatten();
+        }
+        hierarchy.reverse();
+        let mut fields = BTreeMap::new();
+        for ancestor in hierarchy {
+            if let Some(entries) = direct.get(&ancestor) {
+                fields.extend(entries.clone());
+            }
+        }
+        result.insert(path.clone(), fields);
+    }
+    Ok(result)
+}
+
+fn declared_global_types(
+    compilation: &Compilation,
+    registry: &VariableRegistry,
+) -> BTreeMap<String, TypePath> {
+    let mut result = BTreeMap::new();
+    for entry in registry
+        .entries()
+        .iter()
+        .filter(|entry| entry.storage == StorageClass::Global && entry.owner.is_none())
+    {
+        let Some(name) = entry.path.rsplit('/').next() else {
+            continue;
+        };
+        if let Some(path) = declared_variable_type(compilation, entry) {
+            result.insert(name.to_owned(), path);
+        }
+    }
+    result
+}
+
+fn declared_variable_type(compilation: &Compilation, entry: &VariableEntry) -> Option<TypePath> {
+    let name = entry.path.rsplit('/').next()?;
+    let definition = compilation
+        .syntax(entry.file_id)?
+        .definitions
+        .get(entry.definition_index)?;
+    let identifiers = definition
+        .header
+        .iter()
+        .filter_map(|token| match &token.kind {
+            TokenKind::Identifier(identifier) => Some(identifier.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let name_index = identifiers
+        .iter()
+        .rposition(|candidate| *candidate == name)?;
+    let var_index = identifiers
+        .iter()
+        .position(|candidate| *candidate == "var")?;
+    let segments = identifiers[var_index + 1..name_index]
+        .iter()
+        .filter(|segment| !["global", "static", "const", "tmp", "final"].contains(segment))
+        .copied()
+        .collect::<Vec<_>>();
+    (!segments.is_empty())
+        .then(|| TypePath::parse(&format!("/{}", segments.join("/"))).ok())
+        .flatten()
+}
+
+#[derive(Default)]
+struct InitializerProcedureFrontier {
+    selectors: BTreeSet<String>,
+    constructed_types: BTreeSet<TypePath>,
+    requires_dynamic_constructors: bool,
+    requires_complete_inventory: bool,
+}
+
+impl InitializerProcedureFrontier {
+    fn include(&mut self, compilation: &Compilation, entry: &VariableEntry) {
+        let Some(initializer) = &entry.initializer else {
+            return;
+        };
+        let inferred_type = declared_variable_type(compilation, entry);
+        let mut index = 0usize;
+        while index < initializer.tokens.len() {
+            let token = &initializer.tokens[index];
+            match &token.kind {
+                TokenKind::Identifier(name) => {
+                    let is_call_head = matches!(
+                        initializer.tokens.get(index + 1).map(|token| &token.kind),
+                        Some(TokenKind::Punctuation('('))
+                    );
+                    if name == "call" && is_call_head {
+                        // `call(receiver, selector)` may obtain its selector
+                        // from arbitrary runtime data. A reduced inventory is
+                        // not sound for that expression.
+                        self.requires_complete_inventory = true;
+                    } else if name == "new" {
+                        let mut cursor = index + 1;
+                        if matches!(
+                            initializer.tokens.get(cursor).map(|token| &token.kind),
+                            Some(TokenKind::Operator(operator)) if operator == "/"
+                        ) {
+                            let mut segments = Vec::new();
+                            while cursor + 1 < initializer.tokens.len()
+                                && matches!(
+                                    &initializer.tokens[cursor].kind,
+                                    TokenKind::Operator(operator) if operator == "/"
+                                )
+                            {
+                                let TokenKind::Identifier(segment) =
+                                    &initializer.tokens[cursor + 1].kind
+                                else {
+                                    break;
+                                };
+                                segments.push(segment.clone());
+                                cursor += 2;
+                            }
+                            if !segments.is_empty()
+                                && (segments.len() != 1 || segments[0] != "list")
+                            {
+                                if let Ok(path) =
+                                    TypePath::parse(&format!("/{}", segments.join("/")))
+                                {
+                                    self.constructed_types.insert(path);
+                                } else {
+                                    self.requires_dynamic_constructors = true;
+                                }
+                            }
+                            index = cursor.saturating_sub(1);
+                        } else if matches!(
+                            initializer.tokens.get(cursor).map(|token| &token.kind),
+                            None | Some(TokenKind::Punctuation('('))
+                        ) {
+                            if let Some(path) = &inferred_type {
+                                if path.as_str() != "/list" {
+                                    self.constructed_types.insert(path.clone());
+                                }
+                            } else {
+                                self.requires_dynamic_constructors = true;
+                            }
+                        } else {
+                            // `new type_expression(...)` is selected at runtime.
+                            self.requires_dynamic_constructors = true;
+                            if let Some(open) = initializer.tokens[cursor..]
+                                .iter()
+                                .position(|token| matches!(token.kind, TokenKind::Punctuation('(')))
+                            {
+                                // Do not reinterpret the dynamic type operand
+                                // as a call selector. Arguments after the open
+                                // parenthesis remain visible to this scan.
+                                index = cursor + open;
+                            }
+                        }
+                    } else if is_call_head {
+                        self.selectors.insert(name.clone());
+                    }
+                }
+                TokenKind::String(text)
+                | TokenKind::RawString(text)
+                | TokenKind::TextBlock(text) => {
+                    // Literal procedure paths remain first-class references,
+                    // including paths passed through text2path(). Ordinary
+                    // user-facing strings are not procedure selectors.
+                    if let Some(selector) = proc_selector_from_text_path(text) {
+                        self.selectors.insert(selector.to_owned());
+                    }
+                }
+                TokenKind::Operator(operator) if operator == "/" => {
+                    let mut cursor = index;
+                    let mut segments = Vec::new();
+                    while cursor + 1 < initializer.tokens.len()
+                        && matches!(&initializer.tokens[cursor].kind, TokenKind::Operator(operator) if operator == "/")
+                    {
+                        let TokenKind::Identifier(segment) = &initializer.tokens[cursor + 1].kind
+                        else {
+                            break;
+                        };
+                        segments.push(segment.as_str());
+                        cursor += 2;
+                    }
+                    if let Some(proc_index) = segments.iter().position(|segment| *segment == "proc")
+                        && let Some(selector) = segments.get(proc_index + 1)
+                    {
+                        self.selectors.insert((*selector).to_owned());
+                        index = cursor.saturating_sub(1);
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+    }
+}
+
+fn proc_selector_from_text_path(text: &str) -> Option<&str> {
+    let segments = text.strip_prefix('/')?.split('/').collect::<Vec<_>>();
+    let proc_index = segments.iter().position(|segment| *segment == "proc")?;
+    segments
+        .get(proc_index + 1)
+        .copied()
+        .filter(|selector| !selector.is_empty())
+}
+
+#[derive(Default)]
+struct InitializerBindingReferences {
+    bare: BTreeSet<String>,
+    qualified: BTreeSet<(String, String)>,
+}
+
+fn initializer_binding_references(
+    tokens: &[dm_lexer::SpannedToken],
+) -> InitializerBindingReferences {
+    let mut references = InitializerBindingReferences::default();
+    for token in tokens {
+        if let TokenKind::Identifier(name) = &token.kind {
+            references.bare.insert(name.clone());
+        }
+    }
+    for window in tokens.windows(3) {
+        let [receiver, operator, member] = window else {
+            continue;
+        };
+        let TokenKind::Identifier(receiver) = &receiver.kind else {
+            continue;
+        };
+        if !matches!(&operator.kind, TokenKind::Operator(operator) if matches!(operator.as_str(), "." | "?." | "::"))
+        {
+            continue;
+        }
+        let TokenKind::Identifier(member) = &member.kind else {
+            continue;
+        };
+        references
+            .qualified
+            .insert((receiver.clone(), member.clone()));
+    }
+    references
+}
+
 impl RuntimeImage {
     fn refresh_execution_metadata(&mut self) {
         let (type_parents, initial_values) = execution_metadata(&self.types, &self.world_name);
@@ -599,9 +1000,34 @@ impl RuntimeImage {
     /// Returns [`RuntimeImageError`] if a frontend path cannot be represented
     /// by the runtime's canonical path or field-name types.
     pub fn from_compilation(compilation: &Compilation) -> Result<Self, RuntimeImageError> {
+        Self::from_compilation_with_observer(compilation, |_| {})
+    }
+
+    /// Materializes one frontend snapshot while reporting structured phase
+    /// boundaries to `observer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::from_compilation`]. A phase that
+    /// fails emits its entry event but no completion event.
+    pub fn from_compilation_with_observer(
+        compilation: &Compilation,
+        mut observer: impl FnMut(RuntimeImageConstructionEvent),
+    ) -> Result<Self, RuntimeImageError> {
+        let phase = RuntimeImageConstructionPhase::VariableRegistry;
+        let phase_started = begin_runtime_phase(&mut observer, phase);
         let registry = VariableRegistry::build(compilation);
         let plans = registry.initialization_plans();
         let binding_index = RuntimeBindingIndex::build(&registry)?;
+        complete_runtime_phase(
+            &mut observer,
+            phase,
+            phase_started,
+            Some(registry.entries().len()),
+        );
+
+        let phase = RuntimeImageConstructionPhase::TypeInventory;
+        let phase_started = begin_runtime_phase(&mut observer, phase);
         let mut types = runtime_types(compilation)?;
         // BYOND materializes every declared instance variable on every datum,
         // even when the declaration has no explicit initializer. Seed those
@@ -630,26 +1056,38 @@ impl RuntimeImage {
             .and_then(|stem| stem.to_str())
             .unwrap_or("world")
             .to_owned();
-        let (type_parents, initial_values) = execution_metadata(&types, &world_name);
+        // Reflection of shared fields needs only the parent graph here. The
+        // much larger inherited-initial-value snapshot is built once after
+        // all compile-time instance constants have been applied.
+        let type_parents = type_parent_metadata(&types);
+        let shared_fields = shared_reflection_fields(&registry, &type_parents)?;
+        let global_types = declared_global_types(compilation, &registry);
+        complete_runtime_phase(&mut observer, phase, phase_started, Some(types.len()));
         let mut image = Self {
             heap: ValueHeap::new(),
             variables: Vec::new(),
             types,
             type_paths,
             type_parents: Arc::new(type_parents),
-            initial_values: Arc::new(initial_values),
+            initial_values: Arc::new(BTreeMap::new()),
+            shared_fields: Arc::new(shared_fields),
+            global_types,
             world_name,
             canonical_world: None,
             binding_index,
+            runtime_variable_indices: BTreeMap::new(),
             global_variable_indices: BTreeMap::new(),
             diagnostics: Vec::new(),
             instance_initializers: Vec::new(),
+            instance_initializer_indices_by_owner: BTreeMap::new(),
+            compiled_instance_initializers: BTreeMap::new(),
+            vm_instance_initializers: Arc::new(BTreeMap::new()),
+            vm_instance_initializer_module: None,
             instance_initializer_plans: BTreeMap::new(),
             datum_allocation_plans: BTreeMap::new(),
             project_root: compilation.project().root_directory.clone(),
             stats: RuntimeImageStats {
                 variables: registry.entries().len(),
-                execution_metadata_builds: 1,
                 initializer_steps: plans.global_steps.len()
                     + plans
                         .type_defaults
@@ -659,6 +1097,38 @@ impl RuntimeImage {
                 ..RuntimeImageStats::default()
             },
         };
+
+        let phase = RuntimeImageConstructionPhase::InstanceConstants;
+        let phase_started = begin_runtime_phase(&mut observer, phase);
+
+        // Shared declarations exist even without an explicit initializer.
+        // Type-owned `var/global` is BYOND static storage, not a project bare
+        // global, and therefore uses the same owner-qualified slot as
+        // `var/static`.
+        for entry in registry.entries().iter().filter(|entry| {
+            entry.storage != StorageClass::Instance
+                && entry.assignment == dm_globals::AssignmentKind::Declaration
+                && entry.initializer.is_none()
+        }) {
+            let field = if entry.storage == StorageClass::Global && entry.owner.is_none() {
+                variable_field(&entry.path)?
+            } else {
+                FieldName::static_storage(&entry.path)
+            };
+            image.variables.push(RuntimeVariable {
+                path: entry.path.clone(),
+                storage: entry.storage,
+                value: Value::Null,
+                ordinal: entry.ordinal,
+            });
+            image
+                .runtime_variable_indices
+                .entry(entry.path.clone())
+                .or_insert(image.variables.len() - 1);
+            image
+                .global_variable_indices
+                .insert(field, image.variables.len() - 1);
+        }
 
         // An initializer plan contains only declarations with an explicit
         // `=` expression. BYOND still installs every plain instance variable
@@ -695,15 +1165,29 @@ impl RuntimeImage {
             .flat_map(|plan| plan.steps.iter())
             .collect::<Vec<_>>();
         instance_steps.sort_by_key(|step| step.ordinal);
-        image.refresh_execution_metadata();
+        let instance_step_count = instance_steps.len();
         let mut state = image.take_execution_state();
         for step in instance_steps {
             let entry = &registry.entries()[step.entry_index];
             match &step.evaluation {
                 ConstantEvaluation::Value(ConstantValue::List(_))
-                | ConstantEvaluation::Unsupported(_) => image
-                    .instance_initializers
-                    .push((entry.clone(), step.clone())),
+                | ConstantEvaluation::Unsupported(_) => {
+                    let owner = entry
+                        .owner
+                        .as_ref()
+                        .ok_or_else(|| RuntimeImageError::MissingOwner(step.path.clone()))?;
+                    let owner = parse_type_path(&owner.path)?;
+                    let index = image.instance_initializers.len();
+                    image
+                        .instance_initializers
+                        .push((entry.clone(), step.clone()));
+                    image
+                        .instance_initializer_indices_by_owner
+                        .entry(owner)
+                        .or_default()
+                        .push(index);
+                    image.stats.instance_initializer_candidates_indexed += 1;
+                }
                 ConstantEvaluation::Value(constant) => {
                     let value = image.convert_constant_in(constant, state.heap_mut())?;
                     image.apply_step_value(entry, step, value)?;
@@ -712,7 +1196,20 @@ impl RuntimeImage {
             }
         }
         image.restore_execution_state(state);
+        complete_runtime_phase(
+            &mut observer,
+            phase,
+            phase_started,
+            Some(instance_step_count),
+        );
+        // This is the sole whole-tree inherited-default snapshot. Neither
+        // world allocation nor global/static initialization mutates type
+        // defaults, so rebuilding it later only repeats O(types * inherited
+        // fields) cloning without changing execution semantics.
+        let phase = RuntimeImageConstructionPhase::ExecutionMetadata;
+        let phase_started = begin_runtime_phase(&mut observer, phase);
         image.refresh_execution_metadata();
+        complete_runtime_phase(&mut observer, phase, phase_started, Some(image.types.len()));
 
         // BYOND's canonical world singleton exists before global/static
         // initialization and remains the same object through Genesis. Its
@@ -747,19 +1244,86 @@ impl RuntimeImage {
         // Build the project procedure module once. Initializer entry points are
         // appended to this shared module, avoiding an O(module) clone per
         // declaration while retaining ordinary and dynamic call targets.
-        let mut initializer_module = ProcedureRegistry::build(compilation)
-            .compile_vm(compilation)
+        let mut initializer_frontier = InitializerProcedureFrontier::default();
+        for (entry, _) in &image.instance_initializers {
+            initializer_frontier.include(compilation, entry);
+        }
+        for step in &plans.global_steps {
+            if matches!(step.evaluation, ConstantEvaluation::Unsupported(_)) {
+                initializer_frontier.include(compilation, &registry.entries()[step.entry_index]);
+            }
+        }
+        image.stats.initializer_frontier_selectors = initializer_frontier.selectors.len();
+        image.stats.initializer_typed_constructor_targets =
+            initializer_frontier.constructed_types.len();
+        image.stats.initializer_dynamic_constructor_frontier =
+            usize::from(initializer_frontier.requires_dynamic_constructors);
+        image.stats.initializer_complete_symbol_inventory =
+            usize::from(initializer_frontier.requires_complete_inventory);
+        let registry_phase = RuntimeImageConstructionPhase::ProcedureRegistry;
+        let registry_started = begin_runtime_phase(&mut observer, registry_phase);
+        let procedures = ProcedureRegistry::build(compilation);
+        complete_runtime_phase(
+            &mut observer,
+            registry_phase,
+            registry_started,
+            Some(procedures.procedures().len()),
+        );
+        let phase = RuntimeImageConstructionPhase::InitializerModuleLink;
+        let phase_started = begin_runtime_phase(&mut observer, phase);
+        let initializer_executable = if initializer_frontier.requires_complete_inventory {
+            procedures.compile_vm_all_symbolic_deferred(compilation)
+        } else {
+            procedures.compile_vm_initializer_typed_frontier_symbolic_deferred(
+                compilation,
+                initializer_frontier.selectors.iter().map(String::as_str),
+                initializer_frontier.constructed_types.iter(),
+                initializer_frontier.requires_dynamic_constructors,
+            )
+        };
+        if let Ok(executable) = &initializer_executable {
+            image.stats.initializer_module_procedures = executable.stats().procedures;
+        }
+        let mut initializer_module = initializer_executable
             .ok()
             .map(|executable| executable.module().clone());
+        complete_runtime_phase(
+            &mut observer,
+            phase,
+            phase_started,
+            Some(image.stats.initializer_module_procedures),
+        );
+
+        let phase = RuntimeImageConstructionPhase::InstanceInitializerCompilation;
+        let phase_started = begin_runtime_phase(&mut observer, phase);
+        if let Some(module) = initializer_module.as_mut() {
+            image.vm_instance_initializers =
+                Arc::new(image.compile_vm_instance_initializers(module)?);
+            image.vm_instance_initializer_module = Some(Arc::new(module.clone()));
+            state.set_instance_initializers(
+                Arc::clone(&image.vm_instance_initializers),
+                image.vm_instance_initializer_module.clone(),
+            );
+        }
+        complete_runtime_phase(
+            &mut observer,
+            phase,
+            phase_started,
+            Some(image.vm_instance_initializers.values().map(Vec::len).sum()),
+        );
+
+        let phase = RuntimeImageConstructionPhase::GlobalInitializerExecution;
+        let phase_started = begin_runtime_phase(&mut observer, phase);
         let mut global_steps = plans.global_steps.iter().collect::<Vec<_>>();
         global_steps.sort_by_key(|step| step.ordinal);
+        let global_step_count = global_steps.len();
         for step in global_steps {
             let entry = &registry.entries()[step.entry_index];
             match &step.evaluation {
                 ConstantEvaluation::Value(constant) => {
                     let value = image.convert_constant_in(constant, state.heap_mut())?;
                     image.apply_step_value(entry, step, value)?;
-                    image.sync_initializer_global(step, &mut state)?;
+                    image.sync_initializer_global(entry, step, &mut state)?;
                     image.stats.constants_materialized += 1;
                 }
                 ConstantEvaluation::Unsupported(unsupported) => {
@@ -771,7 +1335,7 @@ impl RuntimeImage {
                     ) {
                         Ok(value) => {
                             image.apply_step_value(entry, step, value)?;
-                            image.sync_initializer_global(step, &mut state)?;
+                            image.sync_initializer_global(entry, step, &mut state)?;
                             image.stats.dynamic_initializers_materialized += 1;
                         }
                         Err(failure) => image.retain_dynamic_failure(
@@ -785,8 +1349,16 @@ impl RuntimeImage {
                 }
             }
         }
+        if let Some(module) = initializer_module.as_ref() {
+            image.stats.initializer_module_deferred_procedures = module.deferred_procedure_count();
+            image.stats.initializer_module_materialized_procedures =
+                module.materialized_deferred_procedure_count();
+        }
         image.restore_execution_state(state);
-        image.refresh_execution_metadata();
+        complete_runtime_phase(&mut observer, phase, phase_started, Some(global_step_count));
+
+        let phase = RuntimeImageConstructionPhase::Finalization;
+        let phase_started = begin_runtime_phase(&mut observer, phase);
         image.stats.runtime_variables = image.variables.len();
         image.stats.runtime_types = image.types.len();
         image.stats.default_layers = image
@@ -795,6 +1367,12 @@ impl RuntimeImage {
             .filter(|runtime_type| runtime_type.defaults.fields().len() != 0)
             .count();
         image.stats.unsupported_initializers = image.diagnostics.len();
+        complete_runtime_phase(
+            &mut observer,
+            phase,
+            phase_started,
+            Some(image.stats.runtime_variables),
+        );
         Ok(image)
     }
 
@@ -899,6 +1477,11 @@ impl RuntimeImage {
         state.set_shared_type_paths(Arc::clone(&self.type_paths));
         state.set_shared_type_parents(Arc::clone(&self.type_parents));
         state.set_shared_initial_values(Arc::clone(&self.initial_values));
+        state.set_shared_fields(Arc::clone(&self.shared_fields));
+        state.set_instance_initializers(
+            Arc::clone(&self.vm_instance_initializers),
+            self.vm_instance_initializer_module.clone(),
+        );
         state.set_project_root(self.project_root.clone());
         if let Some(world) = self.canonical_world {
             state.set_global(
@@ -964,6 +1547,10 @@ impl RuntimeImage {
         let plan = self.instance_initializer_plan(type_path, &allocation.ancestors)?;
         if !plan.is_empty() {
             let mut state = self.take_execution_state();
+            state.set_instance_initializers(
+                Arc::new(BTreeMap::new()),
+                self.vm_instance_initializer_module.clone(),
+            );
             let result: Result<(), RuntimeImageError> = (|| {
                 for initializer in plan.iter() {
                     let value = execute_module_in_context(
@@ -1020,6 +1607,8 @@ impl RuntimeImage {
         )?;
         materialize_builtin_world_defaults(state.heap_mut(), datum, type_path, &self.world_name)?;
         let plan = self.instance_initializer_plan(type_path, &allocation.ancestors)?;
+        let retained_vm_initializers =
+            state.replace_instance_initializers(Arc::new(BTreeMap::new()));
         for initializer in plan.iter() {
             let value = execute_module_in_context(
                 initializer.program.module(),
@@ -1036,6 +1625,10 @@ impl RuntimeImage {
                 .heap_mut()
                 .set_datum_field(datum, initializer.field.clone(), value)?;
         }
+        state.set_instance_initializers(
+            retained_vm_initializers,
+            self.vm_instance_initializer_module.clone(),
+        );
         self.stats.dynamic_initializers_materialized += plan.len();
         self.stats.datums_allocated += 1;
         self.stats.stateful_datums_allocated += 1;
@@ -1089,18 +1682,23 @@ impl RuntimeImage {
             return Ok(plan.clone());
         }
 
-        let applicable = self
-            .instance_initializers
+        let mut applicable = ancestors
             .iter()
-            .filter(|(entry, _)| {
-                entry.owner.as_ref().is_some_and(|owner| {
-                    TypePath::parse(&owner.path).is_ok_and(|owner| ancestors.contains(&owner))
-                })
-            })
-            .cloned()
+            .filter_map(|owner| self.instance_initializer_indices_by_owner.get(owner))
+            .flatten()
+            .copied()
             .collect::<Vec<_>>();
+        // `instance_initializers` is in global source-ordinal order. Sorting
+        // its stable indices therefore preserves the exact ordering of the old
+        // full-vector filter regardless of ancestor path ordering.
+        applicable.sort_unstable();
         let mut plan = Vec::with_capacity(applicable.len());
-        for (entry, step) in applicable {
+        for index in applicable {
+            if let Some(initializer) = self.compiled_instance_initializers.get(&index) {
+                plan.push(initializer.clone());
+                continue;
+            }
+            let (entry, step) = self.instance_initializers[index].clone();
             let initializer = entry
                 .initializer
                 .as_ref()
@@ -1118,17 +1716,62 @@ impl RuntimeImage {
                         message: error.message,
                     }
                 })?;
-            plan.push(CompiledInstanceInitializer {
+            let compiled = CompiledInstanceInitializer {
                 path: step.path.clone(),
                 field: variable_field(&step.path)?,
                 program: Arc::new(program),
-            });
+            };
+            self.compiled_instance_initializers
+                .insert(index, compiled.clone());
+            self.stats.instance_initializer_unique_programs_compiled += 1;
+            plan.push(compiled);
         }
+        self.stats.instance_initializer_plan_references += plan.len();
         let plan = Arc::<[CompiledInstanceInitializer]>::from(plan);
         self.instance_initializer_plans
             .insert(type_path.clone(), Arc::clone(&plan));
         self.stats.instance_initializer_plans_compiled += 1;
         Ok(plan)
+    }
+
+    fn compile_vm_instance_initializers(
+        &mut self,
+        module: &mut Module,
+    ) -> Result<BTreeMap<TypePath, Vec<InstanceInitializer>>, RuntimeImageError> {
+        let mut catalog = BTreeMap::<TypePath, Vec<InstanceInitializer>>::new();
+        for index in 0..self.instance_initializers.len() {
+            let (entry, step) = self.instance_initializers[index].clone();
+            let owner = entry
+                .owner
+                .as_ref()
+                .ok_or_else(|| RuntimeImageError::MissingOwner(entry.path.clone()))?;
+            let initializer = entry
+                .initializer
+                .as_ref()
+                .ok_or_else(|| RuntimeImageError::MissingInitializer(step.path.clone()))?;
+            let bindings = self.initializer_bindings(&entry).map_err(|failure| {
+                RuntimeImageError::InstanceInitializer {
+                    path: step.path.clone(),
+                    message: failure.message,
+                }
+            })?;
+            let Ok(program) =
+                compile_initializer_into_module(&initializer.tokens, &bindings, module)
+            else {
+                // Preserve lazy preflight behavior for invalid/unreachable
+                // type defaults; the existing per-type plan reports the
+                // source-mapped error when that type is requested.
+                continue;
+            };
+            catalog
+                .entry(parse_type_path(&owner.path)?)
+                .or_default()
+                .push(InstanceInitializer {
+                    field: variable_field(&step.path)?,
+                    entry: program,
+                });
+        }
+        Ok(catalog)
     }
 
     /// Conservatively evaluates and applies one expression to a live datum field.
@@ -1333,14 +1976,12 @@ impl RuntimeImage {
             runtime_type.defaults.set(field, value);
             return Ok(());
         }
-        if let Some(variable) = self
-            .variables
-            .iter_mut()
-            .find(|variable| variable.path == step.path)
-        {
+        if let Some(index) = self.runtime_variable_indices.get(&step.path).copied() {
+            let variable = &mut self.variables[index];
             variable.value = value;
             variable.ordinal = step.ordinal;
             variable.storage = step.storage;
+            self.stats.indexed_runtime_variable_updates += 1;
             return Ok(());
         }
         self.variables.push(RuntimeVariable {
@@ -1349,8 +1990,10 @@ impl RuntimeImage {
             value,
             ordinal: step.ordinal,
         });
+        self.runtime_variable_indices
+            .insert(step.path.clone(), self.variables.len() - 1);
         if step.storage != StorageClass::Instance {
-            let field = if step.storage == StorageClass::Global {
+            let field = if step.storage == StorageClass::Global && entry.owner.is_none() {
                 variable_field(&step.path)?
             } else {
                 FieldName::static_storage(&step.path)
@@ -1362,30 +2005,32 @@ impl RuntimeImage {
     }
 
     fn sync_initializer_global(
-        &self,
+        &mut self,
+        entry: &VariableEntry,
         step: &InitializationStep,
         state: &mut ExecutionState,
     ) -> Result<(), RuntimeImageError> {
         if step.storage == StorageClass::Instance {
             return Ok(());
         }
-        let field = if step.storage == StorageClass::Global {
+        let field = if step.storage == StorageClass::Global && entry.owner.is_none() {
             variable_field(&step.path)?
         } else {
             FieldName::static_storage(&step.path)
         };
-        let value = self
-            .variables
-            .iter()
-            .find(|variable| variable.path == step.path)
-            .map(|variable| variable.value.clone())
+        let index = self
+            .runtime_variable_indices
+            .get(&step.path)
+            .copied()
             .ok_or_else(|| RuntimeImageError::MissingInitializer(step.path.clone()))?;
+        let value = self.variables[index].value.clone();
+        self.stats.indexed_runtime_variable_reads += 1;
         state.set_global(field, value);
         Ok(())
     }
 
     fn execute_dynamic_initializer(
-        &self,
+        &mut self,
         entry: &VariableEntry,
         step: &InitializationStep,
         state: &mut ExecutionState,
@@ -1473,44 +2118,68 @@ impl RuntimeImage {
     }
 
     fn initializer_bindings(
-        &self,
+        &mut self,
         entry: &VariableEntry,
     ) -> Result<BTreeMap<String, InitializerBinding>, DynamicInitializerFailure> {
-        let mut bindings = self
-            .binding_index
-            .globals
-            .iter()
-            .map(|(name, field)| (name.clone(), InitializerBinding::Global(field.clone())))
-            .collect::<BTreeMap<_, _>>();
-        // `type` and `parent_type` are implicit datum variables in DM. They
-        // participate in initializer expressions just like declared fields;
-        // notably, TG code uses `parent_type::field` to inherit a constant
-        // value without constructing an instance of the parent.
-        for builtin in ["type", "parent_type"] {
-            let field = FieldName::parse(builtin).expect("built-in datum field is valid");
-            bindings.insert(builtin.to_owned(), InitializerBinding::SrcField(field));
-        }
-        if let Some(owner) = &entry.owner {
-            let mut owners = Vec::new();
-            let mut current = TypePath::parse(&owner.path).ok();
-            while let Some(path) = current.take() {
-                owners.push(path.clone());
-                current = self.types.get(&path).and_then(|ty| ty.parent.clone());
+        let initializer = entry
+            .initializer
+            .as_ref()
+            .ok_or_else(|| DynamicInitializerFailure {
+                phase: InitializerFailurePhase::Lowering,
+                message: format!("initializer is absent for {:?}", entry.path),
+                expanded_span: entry.span,
+            })?;
+        let references = initializer_binding_references(&initializer.tokens);
+        let mut bindings = BTreeMap::new();
+        let mut lookups = 0usize;
+
+        for name in &references.bare {
+            lookups += 1;
+            if let Some(field) = self.binding_index.globals.get(name) {
+                bindings.insert(name.clone(), InitializerBinding::Global(field.clone()));
             }
-            owners.reverse();
-            for owner in owners {
-                let marker = format!("{}/var/", owner.as_str());
-                for (path, storage) in &self.binding_index.statics {
-                    if let Some(name) = path.strip_prefix(&marker)
-                        && !name.contains('/')
-                    {
-                        bindings
-                            .insert(name.to_owned(), InitializerBinding::Global(storage.clone()));
-                    }
+        }
+        for (receiver, name) in &references.qualified {
+            lookups += 1;
+            let storage = self
+                .global_types
+                .get(receiver)
+                .and_then(|type_path| self.shared_fields.get(type_path))
+                .and_then(|fields| {
+                    FieldName::parse(name)
+                        .ok()
+                        .and_then(|name| fields.get(&name))
+                });
+            if let Some(storage) = storage {
+                bindings.insert(
+                    format!("{receiver}.{name}"),
+                    InitializerBinding::Global(storage.clone()),
+                );
+            }
+        }
+        for builtin in ["type", "parent_type"] {
+            if references.bare.contains(builtin) {
+                let field = FieldName::parse(builtin).expect("built-in datum field is valid");
+                bindings.insert(builtin.to_owned(), InitializerBinding::SrcField(field));
+            }
+        }
+
+        if let Some(owner) = &entry.owner
+            && let Ok(owner) = TypePath::parse(&owner.path)
+            && let Some(fields) = self.shared_fields.get(&owner)
+        {
+            for name in &references.bare {
+                lookups += 1;
+                if let Ok(field) = FieldName::parse(name)
+                    && let Some(storage) = fields.get(&field)
+                {
+                    bindings.insert(name.clone(), InitializerBinding::Global(storage.clone()));
                 }
             }
         }
         if entry.storage != StorageClass::Instance {
+            self.stats.initializer_binding_index_lookups += lookups;
+            self.stats.initializer_bindings_emitted += bindings.len();
             return Ok(bindings);
         }
 
@@ -1536,11 +2205,16 @@ impl RuntimeImage {
         owners.reverse();
         for owner in owners {
             if let Some(fields) = self.binding_index.instance_fields.get(owner.as_str()) {
-                for (name, field) in fields {
-                    bindings.insert(name.clone(), InitializerBinding::SrcField(field.clone()));
+                for name in &references.bare {
+                    lookups += 1;
+                    if let Some(field) = fields.get(name) {
+                        bindings.insert(name.clone(), InitializerBinding::SrcField(field.clone()));
+                    }
                 }
             }
         }
+        self.stats.initializer_binding_index_lookups += lookups;
+        self.stats.initializer_bindings_emitted += bindings.len();
         Ok(bindings)
     }
 
@@ -1826,11 +2500,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use dm_compiler::CompilerDatabase;
-    use dm_globals::{StorageClass, UnsupportedCategory};
+    use dm_globals::{StorageClass, UnsupportedCategory, VariableRegistry};
     use dm_value::{FieldName, TypePath, Value};
 
     use super::{
-        ConstantFieldApplication, InitializerFailurePhase, RuntimeImage, RuntimeImageError,
+        ConstantFieldApplication, InitializerFailurePhase, InitializerProcedureFrontier,
+        RuntimeImage, RuntimeImageConstructionPhase, RuntimeImageError,
     };
 
     static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
@@ -1958,6 +2633,40 @@ mod tests {
     }
 
     #[test]
+    fn typed_null_global_receiver_reads_owner_shared_slots_in_static_initializer() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "var/global/datum/controller/global_vars/GLOB\n/datum/controller/global_vars\n\tvar/global/list/common = list(1)\n\tvar/global/list/rare = list(2)\n/datum/controller/royale\n\tvar/static/list/loot = list(\"common\" = GLOB.common, \"rare\" = GLOB.rare)\n",
+        );
+        let image = fixture.image();
+        assert!(image.diagnostics().is_empty(), "{:?}", image.diagnostics());
+        let loot = image
+            .variables()
+            .iter()
+            .find(|variable| variable.path.ends_with("/loot"))
+            .expect("loot static");
+        let Value::List(loot) = loot.value else {
+            panic!("loot must be list");
+        };
+        let values = image.heap().list(loot).unwrap();
+        for name in ["common", "rare"] {
+            let expected = &image
+                .variables()
+                .iter()
+                .find(|variable| variable.path.ends_with(&format!("/{name}")))
+                .unwrap()
+                .value;
+            assert!(
+                values
+                    .get_key(&Value::text(name))
+                    .is_ok_and(|value| value.semantic_eq(expected))
+            );
+        }
+    }
+
+    #[test]
     fn dynamic_global_datum_initializer_is_materialized_and_visible_to_later_steps() {
         let fixture = Fixture::new();
         fixture.write("world.dme", "#include \"types.dm\"\n");
@@ -1970,6 +2679,22 @@ mod tests {
         let second = image.variable("/var/second").expect("second global");
         assert!(matches!(first.value, Value::Datum(_)));
         assert_eq!(second.value, first.value);
+        let Value::Datum(first_datum) = &first.value else {
+            unreachable!("checked above")
+        };
+        assert_eq!(
+            image
+                .heap()
+                .datum(*first_datum)
+                .and_then(|datum| datum.field(&field("value"))),
+            Ok(&Value::number(8.0)),
+            "global new must see the completed inherited-default snapshot"
+        );
+        assert_eq!(
+            image.stats().execution_metadata_builds,
+            1,
+            "the whole type tree should be snapshotted exactly once"
+        );
         assert!(image.diagnostics().is_empty(), "{:?}", image.diagnostics());
     }
 
@@ -2037,7 +2762,95 @@ mod tests {
             image.variables(),
             image.diagnostics()
         );
+        assert_eq!(image.stats().initializer_module_deferred_procedures, 1);
+        assert_eq!(
+            image.stats().initializer_module_materialized_procedures,
+            1,
+            "the initializer's reachable callee should lower exactly once"
+        );
         assert!(image.diagnostics().is_empty(), "{:?}", image.diagnostics());
+    }
+
+    #[test]
+    fn global_redeclaration_updates_and_syncs_through_exact_path_index() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/var/global/value\n/var/value = 7\n/var/global/copy = value\n",
+        );
+        let image = fixture.image();
+        assert_eq!(
+            image
+                .variable("/var/value")
+                .and_then(|variable| variable.value.as_number()),
+            Some(7.0)
+        );
+        assert_eq!(
+            image
+                .variable("/var/copy")
+                .and_then(|variable| variable.value.as_number()),
+            Some(7.0),
+            "the indexed update must be visible in the shared initializer state"
+        );
+        assert_eq!(image.stats().indexed_runtime_variable_updates, 1);
+        assert_eq!(image.stats().indexed_runtime_variable_reads, 2);
+    }
+
+    #[test]
+    fn indirect_call_initializer_falls_back_to_complete_symbol_inventory() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/proc/reached()\n\treturn 7\n/proc/unrelated()\n\treturn 99\n/var/global/target = /proc/reached\n/var/global/result = call(target)()\n",
+        );
+        let image = fixture.image();
+        assert_eq!(
+            image
+                .variable("/var/result")
+                .and_then(|variable| variable.value.as_number()),
+            Some(7.0)
+        );
+        assert_eq!(image.stats().initializer_complete_symbol_inventory, 1);
+        assert_eq!(image.stats().initializer_module_deferred_procedures, 2);
+        assert_eq!(
+            image.stats().initializer_module_materialized_procedures,
+            1,
+            "the complete inventory remains body-lazy"
+        );
+    }
+
+    #[test]
+    fn typed_initializer_construction_narrows_new_frontier_and_calls_inherited_override() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/datum/base\n\tvar/marker\n\tNew(value)\n\t\tmarker = value\n/datum/base/child\n\tNew(value)\n\t\t..()\n\t\tmarker += 1\n/datum/base/child/grandchild\n/datum/unrelated\n\tNew()\n\t\treturn 99\n/var/global/datum/base/child/explicit = new /datum/base/child(4)\n/var/global/datum/base/child/grandchild/inferred = new(5)\n",
+        );
+        let image = fixture.image();
+        let marker = |path: &str| {
+            let Value::Datum(datum) = &image.variable(path).expect("constructed global").value
+            else {
+                panic!("{path} should contain a datum");
+            };
+            image
+                .heap()
+                .datum_field(*datum, &field("marker"))
+                .expect("marker")
+                .as_number()
+        };
+        assert_eq!(marker("/var/explicit"), Some(5.0));
+        assert_eq!(marker("/var/inferred"), Some(6.0));
+        assert_eq!(image.stats().initializer_typed_constructor_targets, 2);
+        assert_eq!(image.stats().initializer_dynamic_constructor_frontier, 0);
+        assert_eq!(
+            image.stats().initializer_module_deferred_procedures,
+            2,
+            "only child New and its exact parent-call target should be retained"
+        );
+        assert_eq!(image.stats().initializer_module_materialized_procedures, 2);
     }
 
     #[test]
@@ -2253,6 +3066,30 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_initializer_construction_retains_all_new_candidates() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/datum/one\n\tvar/marker\n\tNew()\n\t\tmarker = 1\n/datum/two\n\tNew()\n\t\treturn 2\n/var/global/type_to_make = /datum/one\n/var/global/result = new type_to_make()\n",
+        );
+        let image = fixture.image();
+        let Value::Datum(result) = &image.variable("/var/result").expect("result").value else {
+            panic!("dynamic new should construct a datum");
+        };
+        assert_eq!(
+            image
+                .heap()
+                .datum_field(*result, &field("marker"))
+                .expect("marker"),
+            &Value::number(1.0)
+        );
+        assert_eq!(image.stats().initializer_dynamic_constructor_frontier, 1);
+        assert_eq!(image.stats().initializer_module_deferred_procedures, 2);
+        assert_eq!(image.stats().initializer_module_materialized_procedures, 1);
+    }
+
+    #[test]
     fn macro_generated_semicolon_assignments_have_distinct_initializers() {
         let fixture = Fixture::new();
         fixture.write("world.dme", "#include \"types.dm\"\n");
@@ -2380,6 +3217,58 @@ mod tests {
     }
 
     #[test]
+    fn sibling_preflight_shares_compiled_ancestor_initializer_program() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/datum/base\n\tvar/list/items = list(1)\n/datum/base/alpha\n/datum/base/beta\n",
+        );
+        let mut image = fixture.image();
+        let stats = image
+            .preflight_instance_initializers([
+                type_path("/datum/base/beta"),
+                type_path("/datum/base/alpha"),
+            ])
+            .expect("sibling plans should preflight");
+        assert_eq!(stats.types, 2);
+        assert_eq!(stats.plans_compiled, 2);
+        assert_eq!(image.stats().instance_initializer_candidates_indexed, 1);
+        assert_eq!(
+            image.stats().instance_initializer_unique_programs_compiled,
+            1,
+            "the inherited source initializer must compile only once"
+        );
+        assert_eq!(image.stats().instance_initializer_plan_references, 2);
+
+        let alpha = image
+            .allocate_datum(&type_path("/datum/base/alpha"))
+            .expect("alpha should allocate");
+        let beta = image
+            .allocate_datum(&type_path("/datum/base/beta"))
+            .expect("beta should allocate");
+        let alpha_items = image
+            .heap()
+            .datum_field(alpha, &field("items"))
+            .expect("alpha items");
+        let beta_items = image
+            .heap()
+            .datum_field(beta, &field("items"))
+            .expect("beta items");
+        assert!(matches!(alpha_items, Value::List(_)));
+        assert!(matches!(beta_items, Value::List(_)));
+        assert_ne!(
+            alpha_items, beta_items,
+            "sharing compiled code must not share per-instance list values"
+        );
+        assert_eq!(
+            image.stats().instance_initializer_unique_programs_compiled,
+            1,
+            "allocation must reuse the preflighted shared program"
+        );
+    }
+
+    #[test]
     fn preflight_aggregates_failures_in_canonical_type_order() {
         let fixture = Fixture::new();
         fixture.write("world.dme", "#include \"types.dm\"\n");
@@ -2434,6 +3323,20 @@ mod tests {
         );
         assert_eq!(datum.field(&field("layer")).unwrap().as_number(), Some(1.0));
         assert_eq!(datum.field(&field("plane")).unwrap().as_number(), Some(0.0));
+        for name in [
+            "pixel_x",
+            "pixel_y",
+            "pixel_w",
+            "pixel_z",
+            "maptext_x",
+            "maptext_y",
+        ] {
+            assert_eq!(
+                datum.field(&field(name)).unwrap().as_number(),
+                Some(0.0),
+                "{name} should have its engine-owned atom default",
+            );
+        }
         assert_eq!(datum.field(&field("transform")), Ok(&Value::Null));
     }
 
@@ -2825,6 +3728,52 @@ mod tests {
     }
 
     #[test]
+    fn subsystem_typepath_initial_order_inherits_and_overrides_for_sorting() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/datum/controller/subsystem\n\tvar/init_order = 40\n/datum/controller/subsystem/inherited\n/datum/controller/subsystem/overridden\n\tinit_order = 90\n",
+        );
+        let mut image = fixture.image();
+        let state = image.take_execution_state();
+        let base = type_path("/datum/controller/subsystem");
+        let inherited = type_path("/datum/controller/subsystem/inherited");
+        let overridden = type_path("/datum/controller/subsystem/overridden");
+        let init_order = field("init_order");
+
+        assert_eq!(
+            state.initial_value(&base, &init_order),
+            Some(&Value::number(40.0))
+        );
+        assert_eq!(
+            state.initial_value(&inherited, &init_order),
+            Some(&Value::number(40.0))
+        );
+        assert_eq!(
+            state.initial_value(&overridden, &init_order),
+            Some(&Value::number(90.0))
+        );
+
+        // cmp_subsystem_init(a, b) is `initial(b.init_order) -
+        // initial(a.init_order)`, so the override sorts before the inherited
+        // parent value while an unmodified subtype compares equal to it.
+        let compare = |a: &TypePath, b: &TypePath| {
+            state
+                .initial_value(b, &init_order)
+                .and_then(Value::as_number)
+                .unwrap_or_default()
+                - state
+                    .initial_value(a, &init_order)
+                    .and_then(Value::as_number)
+                    .unwrap_or_default()
+        };
+        assert_eq!(compare(&base, &inherited), 0.0);
+        assert_eq!(compare(&inherited, &overridden), 50.0);
+        assert_eq!(compare(&overridden, &inherited), -50.0);
+    }
+
+    #[test]
     fn execution_states_share_the_image_type_catalog() {
         let fixture = Fixture::new();
         fixture.write("world.dme", "#include \"types.dm\"\n");
@@ -2866,5 +3815,131 @@ mod tests {
             .allocate_datum(&type_path("/datum/base/child"))
             .expect("repeated dynamic defaults should allocate");
         assert_eq!(image.stats().execution_metadata_builds, builds);
+    }
+
+    #[test]
+    fn construction_observer_emits_deterministic_phase_boundaries() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/proc/value()\n\treturn 7\n/datum/base\n\tvar/list/items = list(1)\n/var/global/result = value()\n",
+        );
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.0.join("world.dme"))
+            .expect("fixture should compile");
+        let mut events = Vec::new();
+        RuntimeImage::from_compilation_with_observer(&compilation, |event| {
+            events.push((event.phase, event.completed));
+        })
+        .expect("image should build");
+        let phases = [
+            RuntimeImageConstructionPhase::VariableRegistry,
+            RuntimeImageConstructionPhase::TypeInventory,
+            RuntimeImageConstructionPhase::InstanceConstants,
+            RuntimeImageConstructionPhase::ExecutionMetadata,
+            RuntimeImageConstructionPhase::ProcedureRegistry,
+            RuntimeImageConstructionPhase::InitializerModuleLink,
+            RuntimeImageConstructionPhase::InstanceInitializerCompilation,
+            RuntimeImageConstructionPhase::GlobalInitializerExecution,
+            RuntimeImageConstructionPhase::Finalization,
+        ];
+        assert_eq!(
+            events,
+            phases
+                .into_iter()
+                .flat_map(|phase| [(phase, false), (phase, true)])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn initializer_binding_work_depends_on_references_not_global_inventory() {
+        let build = |unused_globals: usize| {
+            let fixture = Fixture::new();
+            fixture.write("world.dme", "#include \"types.dm\"\n");
+            let mut source =
+                "var/global/used = 7\n/datum/base\n\tvar/list/items = list(used)\n".to_owned();
+            for index in 0..unused_globals {
+                source.push_str(&format!("var/global/unused_{index} = {index}\n"));
+            }
+            fixture.write("types.dm", &source);
+            let image = fixture.image();
+            (
+                image.stats().initializer_binding_index_lookups,
+                image.stats().initializer_bindings_emitted,
+            )
+        };
+        assert_eq!(
+            build(2),
+            build(200),
+            "unreferenced globals must not increase initializer binding work"
+        );
+    }
+
+    #[test]
+    fn initializer_frontier_uses_call_syntax_not_unrelated_identifiers() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/proc/real_call()\n/proc/ref_target()\n/proc/text_target()\n/datum/holder/proc/member_call()\n/var/global/unrelated_identifier = 1\n/var/global/datum/holder/holder\n/var/global/list/test = list(unrelated_identifier, /datum/noise, \"ordinary_string\", real_call(), holder.member_call(), /proc/ref_target, text2path(\"/proc/text_target\"))\n",
+        );
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.0.join("world.dme"))
+            .expect("fixture should compile");
+        let registry = VariableRegistry::build(&compilation);
+        let entry = registry
+            .entries()
+            .iter()
+            .find(|entry| entry.path == "/var/test")
+            .expect("test initializer");
+        let mut frontier = InitializerProcedureFrontier::default();
+        frontier.include(&compilation, entry);
+
+        for selector in [
+            "list",
+            "real_call",
+            "member_call",
+            "ref_target",
+            "text2path",
+            "text_target",
+        ] {
+            assert!(frontier.selectors.contains(selector), "missing {selector}");
+        }
+        for false_selector in [
+            "unrelated_identifier",
+            "datum",
+            "noise",
+            "holder",
+            "ordinary_string",
+        ] {
+            assert!(
+                !frontier.selectors.contains(false_selector),
+                "non-call identifier {false_selector} must not become a procedure root"
+            );
+        }
+        assert!(!frontier.requires_complete_inventory);
+    }
+
+    #[test]
+    fn initializer_frontier_preserves_indirect_call_fallback() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "world.dme",
+            "/var/global/target\n/var/global/result = call(target)()\n",
+        );
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.0.join("world.dme"))
+            .expect("fixture should compile");
+        let registry = VariableRegistry::build(&compilation);
+        let entry = registry
+            .entries()
+            .iter()
+            .find(|entry| entry.path == "/var/result")
+            .expect("result initializer");
+        let mut frontier = InitializerProcedureFrontier::default();
+        frontier.include(&compilation, entry);
+        assert!(frontier.requires_complete_inventory);
     }
 }

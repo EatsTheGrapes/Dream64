@@ -10,6 +10,7 @@
 
 #![cfg_attr(not(test), deny(missing_docs))]
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use dm_compiler::Compilation;
@@ -21,6 +22,9 @@ use dm_syntax::DefinitionKind;
 use dm_value::{FieldName, TypePath};
 
 const STANDARD_BUILTINS: &str = concat!(
+    // Headless servers have no authenticated BYOND membership session.
+    // Preserve the engine query as a callable predicate with a false result.
+    "/proc/IsByondMember()\n\treturn 0\n",
     "/proc/isarea(...)\n",
     "\tfor(var/location in args)\n",
     "\t\tif(!istype(location, /area))\n",
@@ -194,6 +198,14 @@ pub struct ProcedureRegistry {
     dynamic_selectors: BTreeMap<ProcedureImplementationId, BTreeSet<String>>,
     exact_member_targets: BTreeMap<ProcedureImplementationId, BTreeSet<ProcedureImplementationId>>,
     typed_virtual_targets: BTreeMap<ProcedureImplementationId, BTreeSet<ProcedureImplementationId>>,
+    build_stats: ProcedureRegistryBuildStats,
+}
+
+/// Deterministic counters for project procedure indexing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProcedureRegistryBuildStats {
+    /// Static procedure references resolved through the canonical path index.
+    pub static_proc_reference_index_lookups: usize,
 }
 
 /// Deterministic counters for one dependency-closure resolution.
@@ -228,6 +240,13 @@ pub struct ExecutableProcedureStats {
     pub global_field_bindings: usize,
     /// Full variable-registry passes used to index static fields.
     pub static_registry_builds: usize,
+    /// Referenced identifiers probed against the global-field index.
+    pub global_binding_index_lookups: usize,
+    /// Referenced identifiers probed against the typed-global index.
+    pub typed_global_index_lookups: usize,
+    /// Referenced field names resolved through owner ancestry without
+    /// materializing whole inherited-field maps per procedure owner.
+    pub inherited_field_name_lookups: usize,
 }
 
 impl ExecutableProcedures {
@@ -272,6 +291,10 @@ impl ProcedureRegistry {
             .iter()
             .map(|node| (node.path.clone(), by_node[&node.id]))
             .collect();
+        let by_text_path = procedure_nodes
+            .iter()
+            .map(|node| (node.path.to_string(), by_node[&node.id]))
+            .collect::<BTreeMap<_, _>>();
 
         let mut procedures: Vec<_> = procedure_nodes
             .into_iter()
@@ -365,6 +388,9 @@ impl ProcedureRegistry {
         let mut typed_virtual_targets = BTreeMap::new();
         let global_types = declared_global_types(compilation);
         let field_types = declared_field_types(compilation);
+        let new_targets_by_ancestor =
+            constructor_targets_by_ancestor(compilation, &procedures, &by_owner_name);
+        let mut build_stats = ProcedureRegistryBuildStats::default();
         for procedure in &procedures {
             for implementation in &procedure.implementations {
                 if let Some(definition) = compilation
@@ -372,7 +398,7 @@ impl ProcedureRegistry {
                     .and_then(|syntax| syntax.definitions.get(implementation.definition_index))
                 {
                     static_selectors.insert(implementation.id, static_call_selectors(definition));
-                    let (member_targets, virtual_targets, unresolved_members) =
+                    let (mut member_targets, virtual_targets, unresolved_members) =
                         member_call_dependencies(
                             definition,
                             procedure.owner_type,
@@ -383,7 +409,27 @@ impl ProcedureRegistry {
                             &dynamic_targets,
                             &procedures,
                         );
+                    for referenced_path in static_proc_reference_paths(definition) {
+                        build_stats.static_proc_reference_index_lookups += 1;
+                        if let Some(target) = by_text_path
+                            .get(&referenced_path)
+                            .and_then(|procedure| procedures[procedure.index()].effective_target)
+                        {
+                            member_targets.insert(target);
+                        }
+                    }
                     let mut dynamic = dynamic_call_literal_selectors(definition);
+                    let construction = construction_dependencies(
+                        definition,
+                        compilation,
+                        &procedures,
+                        &by_owner_name,
+                        &new_targets_by_ancestor,
+                    );
+                    member_targets.extend(construction.targets);
+                    if construction.unbounded {
+                        dynamic.insert("New".to_owned());
+                    }
                     dynamic.extend(unresolved_members);
                     dynamic_selectors.insert(implementation.id, dynamic);
                     exact_member_targets.insert(implementation.id, member_targets);
@@ -401,6 +447,7 @@ impl ProcedureRegistry {
             dynamic_selectors,
             exact_member_targets,
             typed_virtual_targets,
+            build_stats,
         }
     }
 
@@ -408,6 +455,12 @@ impl ProcedureRegistry {
     #[must_use]
     pub fn procedures(&self) -> &[Procedure] {
         &self.procedures
+    }
+
+    /// Returns deterministic procedure-index construction counters.
+    #[must_use]
+    pub const fn build_stats(&self) -> &ProcedureRegistryBuildStats {
+        &self.build_stats
     }
 
     /// Looks up a canonical procedure by registry identity.
@@ -494,6 +547,148 @@ impl ProcedureRegistry {
         self.compile_vm_selected_deferred(compilation, selected, &eager)
     }
 
+    /// Links every registered implementation while deferring all procedure
+    /// bodies until their first runtime dispatch.
+    ///
+    /// This is useful for bootstrap expression modules whose entry points are
+    /// appended after linking. Those expressions may name any project
+    /// procedure, so the complete symbol graph is required, but eagerly
+    /// lowering every unrelated body would make image construction scale with
+    /// the entire project rather than the procedures actually reached during
+    /// initialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`dm_vm::CompileError`] when retained procedure metadata cannot
+    /// be represented by the VM. A body-specific lowering error remains
+    /// attached to its deferred symbol and is reported if that body is called.
+    pub fn compile_vm_all_symbolic_deferred(
+        &self,
+        compilation: &Compilation,
+    ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
+        let selected = self.procedures.iter().flat_map(|procedure| {
+            procedure
+                .implementations
+                .iter()
+                .map(|implementation| implementation.id)
+        });
+        self.compile_vm_selected_deferred(compilation, selected, &BTreeSet::new())
+    }
+
+    /// Links the conservative procedure frontier named by bootstrap
+    /// initializer expressions while deferring every selected project body.
+    ///
+    /// Each selector retains every implementation with that leaf procedure
+    /// name. The ordinary semantic closure then adds exact parents, static
+    /// callees, typed virtual targets, and dynamic candidates reachable from
+    /// those roots. This preserves runtime dispatch without preprocessing
+    /// unrelated procedures merely because they exist in the project.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`dm_vm::CompileError`] when retained symbol metadata cannot be
+    /// represented by the VM. Body-specific failures remain deferred.
+    pub fn compile_vm_initializer_frontier_symbolic_deferred<'name>(
+        &self,
+        compilation: &Compilation,
+        selectors: impl IntoIterator<Item = &'name str>,
+    ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
+        let roots = selectors
+            .into_iter()
+            .flat_map(|selector| {
+                self.dynamic_targets
+                    .get(
+                        selector
+                            .trim_matches('/')
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(selector),
+                    )
+                    .into_iter()
+                    .flatten()
+                    .copied()
+            })
+            .collect::<BTreeSet<_>>();
+        let selected = self.implementation_closure(compilation, roots);
+        self.compile_vm_selected_deferred(compilation, selected, &BTreeSet::new())
+    }
+
+    /// Links an initializer frontier with construction targets narrowed to
+    /// statically known datum types. Genuinely dynamic construction can opt in
+    /// to every `New` implementation without broadening other selectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`dm_vm::CompileError`] under the same conditions as
+    /// [`Self::compile_vm_initializer_frontier_symbolic_deferred`].
+    pub fn compile_vm_initializer_typed_frontier_symbolic_deferred<'name, 'type_path>(
+        &self,
+        compilation: &Compilation,
+        selectors: impl IntoIterator<Item = &'name str>,
+        constructed_types: impl IntoIterator<Item = &'type_path TypePath>,
+        include_dynamic_constructors: bool,
+    ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
+        let mut roots = selectors
+            .into_iter()
+            .flat_map(|selector| {
+                self.dynamic_targets
+                    .get(
+                        selector
+                            .trim_matches('/')
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(selector),
+                    )
+                    .into_iter()
+                    .flatten()
+                    .copied()
+            })
+            .collect::<BTreeSet<_>>();
+        if include_dynamic_constructors && let Some(constructors) = self.dynamic_targets.get("New")
+        {
+            roots.extend(constructors.iter().copied());
+        }
+        for type_path in constructed_types {
+            if let Some(constructor) = self.effective_type_member(compilation, type_path, "New") {
+                roots.insert(constructor);
+            }
+        }
+        let selected = self.implementation_closure(compilation, roots);
+        self.compile_vm_selected_deferred(compilation, selected, &BTreeSet::new())
+    }
+
+    fn effective_type_member(
+        &self,
+        compilation: &Compilation,
+        type_path: &TypePath,
+        selector: &str,
+    ) -> Option<ProcedureImplementationId> {
+        let path = dm_syntax::DefinitionPath::new(
+            type_path
+                .as_str()
+                .trim_matches('/')
+                .split('/')
+                .map(str::to_owned)
+                .collect(),
+        );
+        let mut current = compilation.code_tree().find(&path);
+        while let Some(owner) = current {
+            if let Some(procedure) = self
+                .by_owner_name
+                .get(&(Some(owner), selector.to_owned()))
+                .and_then(|procedure| self.procedure(*procedure))
+                .and_then(|procedure| procedure.effective_target)
+            {
+                return Some(procedure);
+            }
+            current = compilation
+                .code_tree()
+                .node(owner)
+                .and_then(|node| node.parent_type);
+        }
+        None
+    }
+
     /// Resolves the bodies that a symbolic module must compile eagerly:
     /// roots, exact parents, statically resolved calls, and typed member
     /// targets. Genuinely untyped dynamic candidates are intentionally absent.
@@ -554,6 +749,7 @@ impl ProcedureRegistry {
         let mut stats = ProcedureClosureStats::default();
         let mut selected: BTreeSet<_> = implementations.into_iter().collect();
         let mut pending: Vec<_> = selected.iter().copied().collect();
+        let mut resolved_dynamic_selectors = BTreeSet::new();
         while let Some(implementation) = pending.pop() {
             stats.bodies_visited += 1;
             if let Some(parent) = self
@@ -592,9 +788,12 @@ impl ProcedureRegistry {
                 .into_iter()
                 .flatten()
             {
-                stats.dynamic_selectors_resolved += 1;
                 let selector = selector.trim_matches('/');
                 let selector = selector.rsplit('/').next().unwrap_or(selector);
+                if !resolved_dynamic_selectors.insert(selector.to_owned()) {
+                    continue;
+                }
+                stats.dynamic_selectors_resolved += 1;
                 if let Some(targets) = self.dynamic_targets.get(selector) {
                     stats.dynamic_candidates_considered += targets.len();
                     for &target in targets {
@@ -636,8 +835,8 @@ impl ProcedureRegistry {
         ProcedureImplementationId,
         Result<ExecutableProcedures, dm_vm::CompileError>,
     )> {
-        let direct_fields = direct_instance_fields(compilation);
         let static_registry = VariableRegistry::build(compilation);
+        let direct_fields = direct_instance_fields(&static_registry);
         let direct_static_fields = direct_static_fields(&static_registry);
         let global_fields = declared_global_fields(compilation);
         let global_types = declared_global_types(compilation);
@@ -672,8 +871,8 @@ impl ProcedureRegistry {
         compilation: &Compilation,
         selected: impl IntoIterator<Item = ProcedureImplementationId>,
     ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
-        let direct_fields = direct_instance_fields(compilation);
         let static_registry = VariableRegistry::build(compilation);
+        let direct_fields = direct_instance_fields(&static_registry);
         let direct_static_fields = direct_static_fields(&static_registry);
         let global_fields = declared_global_fields(compilation);
         let global_types = declared_global_types(compilation);
@@ -701,8 +900,8 @@ impl ProcedureRegistry {
         selected: impl IntoIterator<Item = ProcedureImplementationId>,
         eager: &BTreeSet<ProcedureImplementationId>,
     ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
-        let direct_fields = direct_instance_fields(compilation);
         let static_registry = VariableRegistry::build(compilation);
+        let direct_fields = direct_instance_fields(&static_registry);
         let direct_static_fields = direct_static_fields(&static_registry);
         let global_fields = declared_global_fields(compilation);
         let global_types = declared_global_types(compilation);
@@ -730,9 +929,9 @@ impl ProcedureRegistry {
         compilation: &Compilation,
         selected: impl IntoIterator<Item = ProcedureImplementationId>,
         direct_fields: &BTreeMap<NodeId, BTreeMap<String, FieldName>>,
-        inherited_field_cache: &mut BTreeMap<NodeId, BTreeMap<String, FieldName>>,
+        _inherited_field_cache: &mut BTreeMap<NodeId, BTreeMap<String, FieldName>>,
         direct_static_fields: &BTreeMap<NodeId, BTreeMap<String, FieldName>>,
-        inherited_static_field_cache: &mut BTreeMap<NodeId, BTreeMap<String, FieldName>>,
+        _inherited_static_field_cache: &mut BTreeMap<NodeId, BTreeMap<String, FieldName>>,
         global_fields: &BTreeMap<String, FieldName>,
         global_types: &BTreeMap<String, TypePath>,
         const_bindings: &ConstBindings,
@@ -842,6 +1041,9 @@ impl ProcedureRegistry {
                 )
             })
             .collect::<BTreeMap<_, _>>();
+        let global_binding_index_lookups = Cell::new(0usize);
+        let typed_global_index_lookups = Cell::new(0usize);
+        let inherited_field_name_lookups = Cell::new(0usize);
         let mut specs: Vec<_> = ordered
             .iter()
             .enumerate()
@@ -896,17 +1098,18 @@ impl ProcedureRegistry {
                 let mut src_fields: BTreeMap<String, FieldName> = procedure
                     .owner_type
                     .map(|owner| {
-                        inherited_fields(
+                        inherited_field_name_lookups.set(
+                            inherited_field_name_lookups.get() + referenced.len(),
+                        );
+                        referenced_inherited_fields(
                             compilation,
-                            owner,
+                            Some(owner),
                             direct_fields,
-                            inherited_field_cache,
+                            &referenced,
+                            true,
                         )
                     })
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|(name, _)| referenced.contains(name))
-                    .collect();
+                    .unwrap_or_default();
                 if procedure.owner_type.is_some() {
                     for builtin in ["type", "parent_type"] {
                         if referenced.contains(builtin) {
@@ -918,19 +1121,29 @@ impl ProcedureRegistry {
                         }
                     }
                 }
-                let referenced_globals = global_fields
+                global_binding_index_lookups.set(
+                    global_binding_index_lookups.get() + referenced.len(),
+                );
+                let referenced_globals = referenced
                     .iter()
-                    .filter(|(name, _)| referenced.contains(*name))
-                    .map(|(name, field)| (name.clone(), field.clone()))
+                    .filter_map(|name| {
+                        global_fields
+                            .get(name)
+                            .map(|field| (name.clone(), field.clone()))
+                    })
                     .collect();
                 let mut referenced_globals: BTreeMap<String, FieldName> = referenced_globals;
-                for (name, field) in inherited_static_fields(
+                inherited_field_name_lookups.set(
+                    inherited_field_name_lookups.get() + referenced.len(),
+                );
+                for (name, field) in referenced_inherited_fields(
                     compilation,
                     procedure.owner_type,
                     direct_static_fields,
-                    inherited_static_field_cache,
+                    &referenced,
+                    false,
                 ) {
-                    if referenced.contains(&name) {
+                    if referenced.contains(&name) && !src_fields.contains_key(&name) {
                         // Type statics use a qualified VM slot and shadow a
                         // project global of the same bare name.
                         referenced_globals.insert(name.clone(), field.clone());
@@ -939,13 +1152,53 @@ impl ProcedureRegistry {
                 }
                 for (receiver, path) in declared_receiver_types(definition) {
                     if let Some(type_id) = compilation.code_tree().find(&path) {
-                        for (name, field) in inherited_static_fields(
+                        inherited_field_name_lookups.set(
+                            inherited_field_name_lookups.get() + referenced.len(),
+                        );
+                        for (name, field) in referenced_inherited_fields(
                             compilation,
                             Some(type_id),
                             direct_static_fields,
-                            inherited_static_field_cache,
+                            &referenced,
+                            false,
                         ) {
-                            referenced_globals.insert(format!("{receiver}.{name}"), field);
+                            if referenced.contains(&name) {
+                                referenced_globals.insert(format!("{receiver}.{name}"), field);
+                            }
+                        }
+                    }
+                }
+                // A typed project global is also a statically known receiver.
+                // BYOND resolves type-owned `var/global` members through their
+                // qualified storage even while the receiver value itself is
+                // null during early bootstrap (notably GLOB log fields).
+                typed_global_index_lookups
+                    .set(typed_global_index_lookups.get() + referenced.len());
+                for receiver in &referenced {
+                    let Some(path) = global_types.get(receiver) else {
+                        continue;
+                    };
+                    let path = dm_syntax::DefinitionPath::new(
+                        path.as_str()
+                            .trim_matches('/')
+                            .split('/')
+                            .map(str::to_owned)
+                            .collect(),
+                    );
+                    if let Some(type_id) = compilation.code_tree().find(&path) {
+                        inherited_field_name_lookups.set(
+                            inherited_field_name_lookups.get() + referenced.len(),
+                        );
+                        for (name, field) in referenced_inherited_fields(
+                            compilation,
+                            Some(type_id),
+                            direct_static_fields,
+                            &referenced,
+                            false,
+                        ) {
+                            if referenced.contains(&name) {
+                                referenced_globals.insert(format!("{receiver}.{name}"), field);
+                            }
                         }
                     }
                 }
@@ -984,10 +1237,14 @@ impl ProcedureRegistry {
             .iter()
             .map(|definition| {
                 let referenced = referenced_identifiers(definition);
-                global_types
+                typed_global_index_lookups.set(typed_global_index_lookups.get() + referenced.len());
+                referenced
                     .iter()
-                    .filter(|(name, _)| referenced.contains(*name))
-                    .map(|(name, path)| (name.clone(), path.clone()))
+                    .filter_map(|name| {
+                        global_types
+                            .get(name)
+                            .map(|path| (name.clone(), path.clone()))
+                    })
                     .collect::<BTreeMap<_, _>>()
             })
             .collect::<Vec<_>>();
@@ -1038,6 +1295,9 @@ impl ProcedureRegistry {
             src_field_bindings: specs.iter().map(|spec| spec.src_fields.len()).sum(),
             global_field_bindings: specs.iter().map(|spec| spec.global_fields.len()).sum(),
             static_registry_builds: 1,
+            global_binding_index_lookups: global_binding_index_lookups.get(),
+            typed_global_index_lookups: typed_global_index_lookups.get(),
+            inherited_field_name_lookups: inherited_field_name_lookups.get(),
         };
         Ok(ExecutableProcedures {
             module,
@@ -1684,6 +1944,15 @@ fn validate_const_assignments(
             .collect();
 
         if identifiers.first() == Some(&"var") {
+            // A comma-separated declaration introduces every declarator. The
+            // final declarator may own the initializer (`var/i, ch, len = 3`),
+            // but preceding bare names must still be visible to flow checks.
+            for grouped_name in grouped_local_declaration_names(tokens) {
+                locals.insert(grouped_name.clone());
+                scalar_types
+                    .entry(grouped_name)
+                    .or_insert(ScalarConstraint::exact(ScalarType::Dynamic));
+            }
             let name_index = identifiers
                 .iter()
                 .position(|name| *name == "as")
@@ -2722,6 +2991,32 @@ fn declared_type_path(
         .position(|token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="))
         .unwrap_or(tokens.len());
     let header = &tokens[..assignment];
+    // In `var/i, ch, len = ...`, slash segments belonging to earlier
+    // declarators are not a type prefix for `len`. Restrict type inference to
+    // the declarator containing the requested name while retaining `var` as
+    // the declaration marker.
+    let name_position = header.iter().position(
+        |token| matches!(&token.kind, TokenKind::Identifier(name) if name == variable_name),
+    )?;
+    let mut depth = 0usize;
+    let mut declarator_start = 0usize;
+    for (index, token) in header[..name_position].iter().enumerate() {
+        match token.kind {
+            TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+            TokenKind::Punctuation(')' | ']' | '}') => depth = depth.saturating_sub(1),
+            TokenKind::Punctuation(',') if depth == 0 => declarator_start = index + 1,
+            _ => {}
+        }
+    }
+    let owned_header;
+    let header = if declarator_start == 0 {
+        header
+    } else {
+        owned_header = std::iter::once(tokens[0].clone())
+            .chain(header[declarator_start..].iter().cloned())
+            .collect::<Vec<_>>();
+        &owned_header
+    };
     if let Some(name_index) = header.iter().position(
         |token| matches!(&token.kind, TokenKind::Identifier(name) if name == variable_name),
     ) && matches!(
@@ -2779,6 +3074,45 @@ fn declared_type_path(
         return Some(dm_syntax::DefinitionPath::new(vec![segments[0].clone()]));
     }
     Some(dm_syntax::DefinitionPath::new(segments))
+}
+
+fn grouped_local_declaration_names(tokens: &[dm_lexer::SpannedToken]) -> Vec<String> {
+    let assignment = tokens
+        .iter()
+        .position(|token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="))
+        .unwrap_or(tokens.len());
+    let mut start = 1usize;
+    let mut depth = 0usize;
+    let mut names = Vec::new();
+    for end in 1..=assignment {
+        let separator = end == assignment
+            || (depth == 0
+                && matches!(
+                    tokens.get(end).map(|token| &token.kind),
+                    Some(TokenKind::Punctuation(','))
+                ));
+        if separator {
+            if let Some(name) =
+                tokens[start..end]
+                    .iter()
+                    .rev()
+                    .find_map(|token| match &token.kind {
+                        TokenKind::Identifier(name) if name != "as" => Some(name.clone()),
+                        _ => None,
+                    })
+            {
+                names.push(name);
+            }
+            start = end + 1;
+            continue;
+        }
+        match tokens[end].kind {
+            TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+            TokenKind::Punctuation(')' | ']' | '}') => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    names
 }
 
 fn procedure_return_type_node(
@@ -2857,7 +3191,10 @@ fn direct_static_fields(
     for entry in registry
         .entries()
         .iter()
-        .filter(|entry| entry.storage == StorageClass::Static)
+        // DM spells type-owned shared storage both `var/static` and
+        // `var/global`.  The registry preserves that spelling as distinct
+        // storage classes, but both lower to the same owner-qualified VM slot.
+        .filter(|entry| matches!(entry.storage, StorageClass::Static | StorageClass::Global))
     {
         let Some(owner) = entry.owner.as_ref().map(|owner| owner.node) else {
             continue;
@@ -2873,6 +3210,7 @@ fn direct_static_fields(
     fields
 }
 
+#[cfg(test)]
 fn inherited_static_fields(
     compilation: &Compilation,
     owner: Option<NodeId>,
@@ -2900,6 +3238,46 @@ fn inherited_static_fields(
         }
     }
     cache.insert(owner, fields.clone());
+    fields
+}
+
+fn referenced_inherited_fields(
+    compilation: &Compilation,
+    owner: Option<NodeId>,
+    direct_fields: &BTreeMap<NodeId, BTreeMap<String, FieldName>>,
+    referenced: &BTreeSet<String>,
+    include_standard: bool,
+) -> BTreeMap<String, FieldName> {
+    let Some(mut current) = owner else {
+        return BTreeMap::new();
+    };
+    let tree = compilation.code_tree();
+    let mut unresolved = referenced.clone();
+    let mut fields = BTreeMap::new();
+    while !unresolved.is_empty() {
+        let mut available = direct_fields.get(&current).cloned().unwrap_or_default();
+        if include_standard {
+            standard_instance_fields(tree.node(current).map(|node| &node.path), &mut available);
+        }
+        if !available.is_empty() {
+            let resolved = unresolved
+                .iter()
+                .filter_map(|name| {
+                    available
+                        .get(name)
+                        .map(|field| (name.clone(), field.clone()))
+                })
+                .collect::<Vec<_>>();
+            for (name, field) in resolved {
+                unresolved.remove(&name);
+                fields.insert(name, field);
+            }
+        }
+        let Some(parent) = tree.node(current).and_then(|node| node.parent_type) else {
+            break;
+        };
+        current = parent;
+    }
     fields
 }
 
@@ -3096,6 +3474,263 @@ fn dynamic_call_literal_selectors(definition: &dm_syntax::Definition) -> BTreeSe
         }
     }
     selectors
+}
+
+#[derive(Default)]
+struct ConstructionDependencies {
+    targets: BTreeSet<ProcedureImplementationId>,
+    unbounded: bool,
+}
+
+fn constructor_targets_by_ancestor(
+    compilation: &Compilation,
+    procedures: &[Procedure],
+    by_owner_name: &BTreeMap<(Option<NodeId>, String), ProcedureId>,
+) -> BTreeMap<NodeId, BTreeSet<ProcedureImplementationId>> {
+    let mut result = BTreeMap::<NodeId, BTreeSet<ProcedureImplementationId>>::new();
+    for ((owner, name), procedure) in by_owner_name {
+        if name != "New" {
+            continue;
+        }
+        let Some(mut ancestor) = *owner else {
+            continue;
+        };
+        let Some(target) = procedures[procedure.index()].effective_target else {
+            continue;
+        };
+        loop {
+            result.entry(ancestor).or_default().insert(target);
+            let Some(parent) = compilation
+                .code_tree()
+                .node(ancestor)
+                .and_then(|node| node.parent_type)
+            else {
+                break;
+            };
+            ancestor = parent;
+        }
+    }
+    result
+}
+
+fn effective_constructor_target(
+    compilation: &Compilation,
+    procedures: &[Procedure],
+    by_owner_name: &BTreeMap<(Option<NodeId>, String), ProcedureId>,
+    mut owner: NodeId,
+) -> Option<ProcedureImplementationId> {
+    loop {
+        if let Some(target) = by_owner_name
+            .get(&(Some(owner), "New".to_owned()))
+            .and_then(|procedure| procedures[procedure.index()].effective_target)
+        {
+            return Some(target);
+        }
+        owner = compilation.code_tree().node(owner)?.parent_type?;
+    }
+}
+
+fn construction_dependencies(
+    definition: &dm_syntax::Definition,
+    compilation: &Compilation,
+    procedures: &[Procedure],
+    by_owner_name: &BTreeMap<(Option<NodeId>, String), ProcedureId>,
+    targets_by_ancestor: &BTreeMap<NodeId, BTreeSet<ProcedureImplementationId>>,
+) -> ConstructionDependencies {
+    let mut result = ConstructionDependencies::default();
+    let declared = declared_receiver_types(definition)
+        .into_iter()
+        .filter_map(|(name, path)| compilation.code_tree().find(&path).map(|node| (name, node)))
+        .collect::<BTreeMap<_, _>>();
+    let mut families = declared.clone();
+
+    // A loop variable drawn from typesof/subtypesof(/base) is a type path
+    // bounded to that hierarchy even when the loop declaration itself omits a
+    // datum annotation (a common tgstation bootstrap idiom).
+    for line in &definition.body {
+        let tokens = &line.tokens;
+        let Some(in_index) = tokens
+            .iter()
+            .position(|token| matches!(&token.kind, TokenKind::Identifier(name) if name == "in"))
+        else {
+            continue;
+        };
+        let Some(variable) = tokens[..in_index]
+            .iter()
+            .rev()
+            .find_map(|token| match &token.kind {
+                TokenKind::Identifier(name)
+                    if !matches!(name.as_str(), "for" | "var" | "as" | "anything") =>
+                {
+                    Some(name.clone())
+                }
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        let source = &tokens[in_index + 1..];
+        let Some(function_index) = source.iter().position(|token| {
+            matches!(&token.kind, TokenKind::Identifier(name) if matches!(name.as_str(), "typesof" | "subtypesof" | "typecacheof"))
+        }) else {
+            continue;
+        };
+        let path_start = source[function_index + 1..]
+            .iter()
+            .position(
+                |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "/"),
+            )
+            .map(|offset| function_index + 1 + offset);
+        let Some(path_start) = path_start else {
+            continue;
+        };
+        if let Some(owner) = type_node_from_tokens(compilation, source, path_start) {
+            families.insert(variable, owner);
+        }
+    }
+
+    for line in &definition.body {
+        let tokens = &line.tokens;
+        for new_index in tokens.iter().enumerate().filter_map(|(index, token)| {
+            matches!(&token.kind, TokenKind::Identifier(name) if name == "new").then_some(index)
+        }) {
+            let next = new_index + 1;
+            if matches!(tokens.get(next).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "/")
+            {
+                if let Some(owner) = type_node_from_tokens(compilation, tokens, next)
+                    && let Some(target) =
+                        effective_constructor_target(compilation, procedures, by_owner_name, owner)
+                {
+                    result.targets.insert(target);
+                }
+                continue;
+            }
+            if let Some(TokenKind::Identifier(name)) = tokens.get(next).map(|token| &token.kind) {
+                if let Some(owner) = families.get(name)
+                    && let Some(targets) = targets_by_ancestor.get(owner)
+                {
+                    result.targets.extend(targets.iter().copied());
+                } else {
+                    result.unbounded = true;
+                }
+                continue;
+            }
+            // Bare `new(...)` is destination-typed. Recover a declared local
+            // type from the assignment target; otherwise remain conservative.
+            let assignment = tokens[..new_index].iter().rposition(
+                |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
+            );
+            let destination = assignment.and_then(|assignment| {
+                tokens[..assignment]
+                    .iter()
+                    .rev()
+                    .find_map(|token| match &token.kind {
+                        TokenKind::Identifier(name) if name != "var" => Some(name),
+                        _ => None,
+                    })
+            });
+            if let Some(owner) = destination.and_then(|name| declared.get(name)) {
+                if let Some(target) =
+                    effective_constructor_target(compilation, procedures, by_owner_name, *owner)
+                {
+                    result.targets.insert(target);
+                }
+            } else {
+                result.unbounded = true;
+            }
+        }
+    }
+    result
+}
+
+fn type_node_from_tokens(
+    compilation: &Compilation,
+    tokens: &[dm_lexer::SpannedToken],
+    mut index: usize,
+) -> Option<NodeId> {
+    let mut segments = Vec::new();
+    while matches!(tokens.get(index).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "/")
+    {
+        let TokenKind::Identifier(segment) = tokens.get(index + 1).map(|token| &token.kind)? else {
+            break;
+        };
+        segments.push(segment.clone());
+        index += 2;
+    }
+    (!segments.is_empty())
+        .then(|| {
+            compilation
+                .code_tree()
+                .find(&dm_syntax::DefinitionPath::new(segments))
+        })
+        .flatten()
+}
+
+fn static_proc_reference_paths(definition: &dm_syntax::Definition) -> BTreeSet<String> {
+    fn collect(tokens: &[dm_lexer::SpannedToken], paths: &mut BTreeSet<String>) {
+        let mut index = 0usize;
+        while index < tokens.len() {
+            if let TokenKind::String(value) | TokenKind::RawString(value) = &tokens[index].kind {
+                let segments = value
+                    .strip_prefix('/')
+                    .map(|path| path.split('/').collect::<Vec<_>>())
+                    .unwrap_or_default();
+                if let Some(proc_index) = segments.iter().position(|segment| *segment == "proc")
+                    && proc_index + 1 < segments.len()
+                    && segments
+                        .iter()
+                        .all(|segment| !segment.is_empty() && is_identifier_text(segment))
+                {
+                    paths.insert(value.clone());
+                }
+            }
+            if !matches!(&tokens[index].kind, TokenKind::Operator(operator) if operator == "/") {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            let mut segments = Vec::new();
+            while index + 1 < tokens.len()
+                && matches!(&tokens[index].kind, TokenKind::Operator(operator) if operator == "/")
+            {
+                let TokenKind::Identifier(segment) = &tokens[index + 1].kind else {
+                    break;
+                };
+                segments.push(segment.clone());
+                index += 2;
+            }
+            if let Some(proc_index) = segments.iter().position(|segment| segment == "proc")
+                && proc_index + 1 < segments.len()
+            {
+                paths.insert(format!("/{}", segments.join("/")));
+            }
+            if index == start {
+                index += 1;
+            }
+        }
+    }
+
+    let mut paths = BTreeSet::new();
+    // The full header begins with this procedure's own canonical `/proc/...`
+    // declaration path. Treating that syntax as a first-class reference made
+    // every body retain itself and, before path indexing, triggered one full
+    // registry scan per procedure. Parameter token lists retain the only
+    // header expressions that can genuinely reference another procedure.
+    for parameter in &definition.parameters {
+        collect(&parameter.tokens, &mut paths);
+    }
+    for line in &definition.body {
+        collect(&line.tokens, &mut paths);
+    }
+    paths
+}
+
+fn is_identifier_text(value: &str) -> bool {
+    let mut characters = value.chars();
+    characters
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 fn member_call_dependencies(
@@ -3559,53 +4194,27 @@ fn ternary_colon(tokens: &[dm_lexer::SpannedToken], colon: usize) -> bool {
 }
 
 fn direct_instance_fields(
-    compilation: &Compilation,
+    registry: &VariableRegistry,
 ) -> BTreeMap<NodeId, BTreeMap<String, FieldName>> {
-    let tree = compilation.code_tree();
     let mut fields = BTreeMap::<NodeId, BTreeMap<String, FieldName>>::new();
-    for node in tree
-        .nodes()
+    for entry in registry
+        .entries()
         .iter()
-        .filter(|node| node.kind == NodeKind::Variable)
+        .filter(|entry| entry.storage == StorageClass::Instance)
     {
-        let Some(owner) = node.owner_type else {
+        let Some(owner) = entry.owner.as_ref().map(|owner| owner.node) else {
             continue;
         };
-        let Some(name) = node.path.segments().last() else {
+        let Some(name) = entry.path.rsplit('/').next() else {
             continue;
         };
         if let Ok(field) = FieldName::parse(name) {
-            fields.entry(owner).or_default().insert(name.clone(), field);
+            fields
+                .entry(owner)
+                .or_default()
+                .insert(name.to_owned(), field);
         }
     }
-    fields
-}
-
-fn inherited_fields(
-    compilation: &Compilation,
-    owner: NodeId,
-    direct_fields: &BTreeMap<NodeId, BTreeMap<String, FieldName>>,
-    cache: &mut BTreeMap<NodeId, BTreeMap<String, FieldName>>,
-) -> BTreeMap<String, FieldName> {
-    if let Some(fields) = cache.get(&owner) {
-        return fields.clone();
-    }
-    let tree = compilation.code_tree();
-    let mut hierarchy = Vec::new();
-    let mut current = Some(owner);
-    while let Some(node) = current {
-        hierarchy.push(node);
-        current = tree.node(node).and_then(|type_node| type_node.parent_type);
-    }
-    hierarchy.reverse();
-    let mut fields = BTreeMap::new();
-    for node in hierarchy {
-        if let Some(direct) = direct_fields.get(&node) {
-            fields.extend(direct.clone());
-        }
-        standard_instance_fields(tree.node(node).map(|node| &node.path), &mut fields);
-    }
-    cache.insert(owner, fields.clone());
     fields
 }
 
@@ -3672,6 +4281,7 @@ fn standard_instance_fields(path: Option<&CodePath>, fields: &mut BTreeMap<Strin
         ],
         "/atom" => &[
             "alpha",
+            "appearance",
             "appearance_flags",
             "blend_mode",
             "color",
@@ -3680,6 +4290,7 @@ fn standard_instance_fields(path: Option<&CodePath>, fields: &mut BTreeMap<Strin
             "desc",
             "dir",
             "gender",
+            "filters",
             "icon",
             "icon_state",
             "invisibility",
@@ -3697,6 +4308,8 @@ fn standard_instance_fields(path: Option<&CodePath>, fields: &mut BTreeMap<Strin
             "overlays",
             "particles",
             "plane",
+            "pixel_x",
+            "pixel_y",
             "pixel_w",
             "pixel_z",
             "render_source",
@@ -3716,13 +4329,26 @@ fn standard_instance_fields(path: Option<&CodePath>, fields: &mut BTreeMap<Strin
             "bound_x",
             "bound_y",
             "glide_size",
-            "pixel_x",
-            "pixel_y",
             "screen_loc",
+            "step_x",
+            "step_y",
             "step_size",
         ],
         "/mob" => &["ckey", "client", "key", "see_invisible", "sight"],
-        "/client" => &["ckey", "key", "mob"],
+        "/client" => &[
+            "address",
+            "ckey",
+            "computer_id",
+            "connection",
+            "byond_build",
+            "byond_version",
+            "key",
+            "mob",
+            "screen",
+            "verbs",
+            "view",
+        ],
+        "/matrix" => &["a", "b", "c", "d", "e", "f"],
         // `/image` is an engine-owned appearance datum rather than an atom,
         // but BYOND exposes the same mutable appearance surface used by
         // overlays. These fields exist without user declarations.
@@ -3790,7 +4416,7 @@ mod tests {
 
     use dm_compiler::{Compilation, CompilerDatabase};
     use dm_globals::VariableRegistry;
-    use dm_value::TypePath;
+    use dm_value::{FieldName, TypePath};
     use dm_vm::{
         ExecutionContext, ExecutionState, Instruction, RuntimeError, Value, execute_module,
         execute_module_in_context,
@@ -4203,6 +4829,16 @@ mod tests {
     }
 
     #[test]
+    fn comma_grouped_bare_locals_do_not_form_a_fake_type_path() {
+        let compilation = TestProject::compile(
+            "/proc/is_guest_key(key)\n\tvar/i, ch, len = 3\n\ti = 1\n\tch = 2\n\treturn i + ch + len\n",
+        );
+        ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("grouped bare locals must remain independent untyped declarations");
+    }
+
+    #[test]
     fn narrows_truthy_ternaries_and_invalidates_facts_on_dynamic_writes() {
         let narrowed = TestProject::compile(
             "/datum/test1\n/datum/test2/proc/meep() as num\n\treturn 5\n/datum/test3/proc/meep() as text\n\treturn \"bad\"\n/proc/read() as num\n\tvar/datum/test1/T1 = new\n\tvar/datum/test2/T2 = new\n\tvar/datum/test3/T3 = new\n\treturn (T1 ? T2 : T3).meep()\n",
@@ -4450,6 +5086,93 @@ mod tests {
     }
 
     #[test]
+    fn typed_global_receiver_static_access_does_not_dereference_null() {
+        let compilation = TestProject::compile(
+            "var/global/datum/globals/GLOB\n/datum/globals\n\tvar/global/config_error_log\n/world/Genesis()\n\tGLOB.config_error_log = \"early.log\"\n\treturn GLOB.config_error_log\n",
+        );
+        assert_eq!(
+            super::declared_global_types(&compilation)
+                .get("GLOB")
+                .map(dm_value::TypePath::as_str),
+            Some("/datum/globals")
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let executable = registry
+            .compile_vm(&compilation)
+            .expect("typed global static");
+        let procedure = procedure_by_path(&registry, "/world/proc/Genesis")
+            .effective_target
+            .and_then(|id| executable.implementation(id))
+            .expect("Genesis implementation");
+        let instructions = &executable
+            .module()
+            .procedure(procedure)
+            .unwrap()
+            .instructions;
+        let qualified = dm_value::FieldName::static_storage("/datum/globals/var/config_error_log");
+        assert!(instructions.iter().any(
+            |instruction| matches!(instruction, dm_vm::Instruction::StoreGlobal(field) if field == &qualified)
+        ), "{instructions:?}");
+        assert!(instructions.iter().any(
+            |instruction| matches!(instruction, dm_vm::Instruction::LoadGlobal(field) if field == &qualified)
+        ));
+        assert!(!instructions.iter().any(|instruction| matches!(
+            instruction,
+            dm_vm::Instruction::LoadField(_) | dm_vm::Instruction::StoreField(_)
+        )));
+    }
+
+    #[test]
+    fn bare_type_static_in_owner_method_uses_qualified_shared_slot() {
+        let compilation = TestProject::compile(
+            "/datum/controller/master\n\tvar/static/random_seed\n/datum/controller/master/New()\n\tif(!random_seed)\n\t\trandom_seed = 7\n\treturn random_seed\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let executable = registry.compile_vm(&compilation).expect("master static");
+        let procedure = procedure_by_path(&registry, "/datum/controller/master/proc/New")
+            .effective_target
+            .and_then(|id| executable.implementation(id))
+            .expect("New implementation");
+        let instructions = &executable
+            .module()
+            .procedure(procedure)
+            .unwrap()
+            .instructions;
+        let qualified =
+            dm_value::FieldName::static_storage("/datum/controller/master/var/random_seed");
+        assert!(instructions.iter().any(
+            |instruction| matches!(instruction, dm_vm::Instruction::LoadGlobal(field) if field == &qualified)
+        ), "{instructions:?}");
+        assert!(instructions.iter().any(
+            |instruction| matches!(instruction, dm_vm::Instruction::StoreGlobal(field) if field == &qualified)
+        ), "{instructions:?}");
+    }
+
+    #[test]
+    fn true_instance_field_wins_over_inherited_same_name_static() {
+        let compilation = TestProject::compile(
+            "/datum/base\n\tvar/static/value\n/datum/base/child\n\tvar/value\n/datum/base/child/proc/Run()\n\tvalue = 4\n\treturn value\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let executable = registry.compile_vm(&compilation).expect("field collision");
+        let procedure = procedure_by_path(&registry, "/datum/base/child/proc/Run")
+            .effective_target
+            .and_then(|id| executable.implementation(id))
+            .expect("Run implementation");
+        let instructions = &executable
+            .module()
+            .procedure(procedure)
+            .unwrap()
+            .instructions;
+        assert!(instructions.iter().any(
+            |instruction| matches!(instruction, dm_vm::Instruction::StoreField(field) if field.as_str() == "value")
+        ));
+        assert!(instructions.iter().any(
+            |instruction| matches!(instruction, dm_vm::Instruction::LoadField(field) if field.as_str() == "value")
+        ));
+    }
+
+    #[test]
     fn resolves_upward_search_path_expressions_before_vm_lowering() {
         let cases = [
             (
@@ -4683,7 +5406,7 @@ GLOBAL_REAL(Master, /datum/controller/master)
     #[test]
     fn lowers_standard_atom_fields_only_for_their_builtin_hierarchy() {
         let compilation = TestProject::compile(
-            "/obj/example\n\tproc/read()\n\t\tloc = src\n\t\tpixel_x += 1\n\t\talpha -= 1\n\t\treturn list(dir, color, desc, blend_mode, alpha, appearance_flags, layer, plane, transform, overlays, underlays, vis_contents, x, y, z)\n/datum/example\n\tproc/read()\n\t\treturn alpha\n",
+            "/atom/proc/offsets()\n\tif(pixel_x == 0 && pixel_y == 0)\n\t\treturn list(pixel_w, pixel_z)\n/obj/example\n\tproc/read()\n\t\tloc = src\n\t\tpixel_x += 1\n\t\talpha -= 1\n\t\treturn list(dir, color, desc, blend_mode, alpha, appearance_flags, layer, plane, transform, overlays, underlays, vis_contents, x, y, z)\n/datum/example\n\tproc/read()\n\t\treturn alpha\n",
         );
         let registry = ProcedureRegistry::build(&compilation);
         let object = procedure_by_path(&registry, "/obj/example/proc/read");
@@ -4693,6 +5416,13 @@ GLOBAL_REAL(Master, /datum/controller/master)
                 object.implementations.iter().map(|body| body.id),
             )
             .expect("standard atom fields should compile as src fields");
+        let atom = procedure_by_path(&registry, "/atom/proc/offsets");
+        registry
+            .compile_vm_implementations(
+                &compilation,
+                atom.implementations.iter().map(|body| body.id),
+            )
+            .expect("pixel offsets are engine fields on /atom itself");
 
         let datum = procedure_by_path(&registry, "/datum/example/proc/read");
         let error = registry
@@ -4715,6 +5445,28 @@ GLOBAL_REAL(Master, /datum/controller/master)
         );
         let registry = ProcedureRegistry::build(&compilation);
         for path in ["/image/proc/update", "/mob/proc/update_vision"] {
+            let procedure = procedure_by_path(&registry, path);
+            registry
+                .compile_vm_implementations(
+                    &compilation,
+                    [procedure.effective_target.expect("procedure body")],
+                )
+                .unwrap_or_else(|error| panic!("{path} should bind engine fields: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn lowers_client_matrix_and_atom_appearance_engine_fields() {
+        let compilation = TestProject::compile(
+            "/client/proc/read_engine_state()\n\treturn list(connection, address, computer_id, view, screen, verbs)\n/matrix/proc/read_components()\n\treturn a + b + c + d + e + f\n/atom/proc/read_appearance()\n\treturn list(appearance, filters)\n/atom/movable/proc/read_step_offsets()\n\treturn step_x + step_y\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        for path in [
+            "/client/proc/read_engine_state",
+            "/matrix/proc/read_components",
+            "/atom/proc/read_appearance",
+            "/atom/movable/proc/read_step_offsets",
+        ] {
             let procedure = procedure_by_path(&registry, path);
             registry
                 .compile_vm_implementations(
@@ -5040,6 +5792,142 @@ GLOBAL_REAL(Master, /datum/controller/master)
     }
 
     #[test]
+    fn all_symbolic_bootstrap_module_defers_unreachable_invalid_body() {
+        let compilation = TestProject::compile(
+            "/proc/reached()\n\treturn 7\n/proc/unreachable_invalid()\n\tvar/const/answer = 42\n\tanswer = 9\n\treturn answer\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let reached = procedure_by_path(&registry, "/proc/reached")
+            .effective_target
+            .expect("reached implementation");
+        let invalid = procedure_by_path(&registry, "/proc/unreachable_invalid")
+            .effective_target
+            .expect("invalid implementation");
+        let executable = registry
+            .compile_vm_all_symbolic_deferred(&compilation)
+            .expect("unreached body errors must remain deferred");
+        assert_eq!(executable.module().deferred_procedure_count(), 2);
+        assert_eq!(
+            executable.module().materialized_deferred_procedure_count(),
+            0
+        );
+
+        let mut state = ExecutionState::new();
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(reached).unwrap(),
+                &[],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::number(7.0))
+        );
+        assert_eq!(
+            executable.module().materialized_deferred_procedure_count(),
+            1,
+            "only the reached initializer callee should lower"
+        );
+        assert!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(invalid).unwrap(),
+                &[],
+                &mut state,
+                &ExecutionContext::default(),
+            )
+            .is_err(),
+            "the deferred validation error must surface if the bad body is reached"
+        );
+    }
+
+    #[test]
+    fn initializer_frontier_omits_unrelated_procedure_specs() {
+        let compilation = TestProject::compile(
+            "/proc/reached()\n\treturn helper()\n/proc/helper()\n\treturn 7\n/proc/unrelated_invalid()\n\tvar/const/answer = 42\n\tanswer = 9\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let reached = procedure_by_path(&registry, "/proc/reached")
+            .effective_target
+            .expect("reached implementation");
+        let invalid = procedure_by_path(&registry, "/proc/unrelated_invalid")
+            .effective_target
+            .expect("invalid implementation");
+        let executable = registry
+            .compile_vm_initializer_frontier_symbolic_deferred(&compilation, ["reached"])
+            .expect("frontier should link");
+        assert_eq!(
+            executable.module().deferred_procedure_count(),
+            2,
+            "the named root and its static callee should be retained"
+        );
+        assert!(
+            executable.implementation(invalid).is_none(),
+            "an unrelated body must not even receive a bootstrap module spec"
+        );
+        let mut state = ExecutionState::new();
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(reached).unwrap(),
+                &[],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::number(7.0))
+        );
+        assert_eq!(
+            executable.module().materialized_deferred_procedure_count(),
+            2
+        );
+    }
+
+    #[test]
+    fn construction_closure_narrows_typed_and_subtypesof_families() {
+        let compilation = TestProject::compile(
+            "/proc/from_loop()\n\tfor(var/path in subtypesof(/datum/base))\n\t\tvar/datum/value = new path\n/proc/from_typesof()\n\tfor(var/path in typesof(/datum/base))\n\t\tvar/datum/value = new path\n/proc/from_typecache()\n\tfor(var/datum/base/path as anything in typecacheof(path = /datum/base, ignore_root_path = TRUE))\n\t\tvar/datum/value = new path\n/proc/from_typed(datum/base/path)\n\tvar/datum/value = new path\n/proc/from_unknown(path)\n\tvar/datum/value = new path\n/datum/base/New()\n/datum/base/child/New()\n/datum/unrelated/New()\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let target = |path| {
+            procedure_by_path(&registry, path)
+                .effective_target
+                .expect("implementation")
+        };
+        let base_new = target("/datum/base/proc/New");
+        let child_new = target("/datum/base/child/proc/New");
+        let unrelated_new = target("/datum/unrelated/proc/New");
+
+        for entry in [
+            "/proc/from_loop",
+            "/proc/from_typesof",
+            "/proc/from_typecache",
+            "/proc/from_typed",
+        ] {
+            let closure = registry.implementation_closure(&compilation, [target(entry)]);
+            assert!(
+                closure.contains(&base_new),
+                "{entry} should retain base New"
+            );
+            assert!(
+                closure.contains(&child_new),
+                "{entry} should retain descendant New"
+            );
+            assert!(
+                !closure.contains(&unrelated_new),
+                "{entry} must omit unrelated New"
+            );
+        }
+
+        let unknown = registry.implementation_closure(&compilation, [target("/proc/from_unknown")]);
+        assert!(unknown.contains(&base_new));
+        assert!(unknown.contains(&child_new));
+        assert!(
+            unknown.contains(&unrelated_new),
+            "a genuinely untyped construction must retain all New candidates"
+        );
+    }
+
+    #[test]
     fn typed_virtual_overrides_are_symbolic_but_declared_base_is_eager() {
         let compilation = TestProject::compile(
             "/proc/entry(datum/base/receiver)\n\treturn receiver.Log()\n/datum/base/proc/Log()\n\treturn 1\n/datum/base/child/Log()\n\treturn expensive_helper()\n/datum/base/child/proc/expensive_helper()\n\treturn 2\n",
@@ -5142,6 +6030,146 @@ GLOBAL_REAL(Master, /datum/controller/master)
             "unrelated procedures must not be scanned as dynamic candidates"
         );
         assert_eq!(stats.bodies_visited, 3);
+    }
+
+    #[test]
+    fn first_class_proc_path_links_through_local_argument_and_field_call() {
+        let compilation = TestProject::compile(
+            "/datum/sorter\n\tvar/cmp\n/datum/sorter/proc/run(comparator)\n\tvar/local_cmp = comparator\n\tsrc.cmp = local_cmp\n\treturn call(src.cmp)(2, 7)\n/proc/cmp_subsystem_init(a, b)\n\treturn b - a\n/proc/unrelated()\n\treturn 99\n/proc/entry(comparator = /proc/cmp_subsystem_init)\n\tvar/list/refs = list(/proc/cmp_subsystem_init, /datum/sorter)\n\tvar/datum/sorter/sorter = new\n\treturn sorter.run(refs[1] || comparator)\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/proc/entry")
+            .effective_target
+            .unwrap();
+        let comparator = procedure_by_path(&registry, "/proc/cmp_subsystem_init")
+            .effective_target
+            .unwrap();
+        let unrelated = procedure_by_path(&registry, "/proc/unrelated")
+            .effective_target
+            .unwrap();
+        let closure = registry.implementation_closure(&compilation, [entry]);
+        assert!(closure.contains(&comparator));
+        assert!(!closure.contains(&unrelated));
+
+        let executable = registry
+            .compile_vm_implementations(&compilation, [entry])
+            .expect("first-class comparator reference should link");
+        let mut state = ExecutionState::new();
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(entry).unwrap(),
+                &[],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::number(5.0))
+        );
+    }
+
+    #[test]
+    fn literal_text2path_proc_reference_retains_inferable_symbol() {
+        let compilation = TestProject::compile(
+            "/proc/cmp_value(a, b)\n\treturn a - b\n/proc/entry()\n\tvar/cmp = text2path(\"/proc/cmp_value\")\n\treturn call(cmp)(9, 4)\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        assert_eq!(
+            registry.build_stats().static_proc_reference_index_lookups,
+            1,
+            "one literal reference should require one indexed lookup regardless of registry size"
+        );
+        let entry = procedure_by_path(&registry, "/proc/entry")
+            .effective_target
+            .unwrap();
+        let comparator = procedure_by_path(&registry, "/proc/cmp_value")
+            .effective_target
+            .unwrap();
+        assert!(
+            registry
+                .implementation_closure(&compilation, [entry])
+                .contains(&comparator)
+        );
+        let executable = registry
+            .compile_vm_implementations(&compilation, [entry])
+            .unwrap();
+        let mut state = ExecutionState::new();
+        state.set_type_paths([TypePath::parse("/proc/cmp_value").unwrap()]);
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(entry).unwrap(),
+                &[],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::number(5.0))
+        );
+    }
+
+    #[test]
+    fn explicit_construction_links_and_runs_glob_new_before_returning() {
+        let compilation = TestProject::compile(
+            "/var/global/datum/controller/global_vars/GLOB\n/datum/controller/global_vars/New(marker)\n\tGLOB = src\n\tsrc.marker = marker\n/proc/entry()\n\tvar/datum/controller/global_vars/created = new /datum/controller/global_vars(17)\n\treturn GLOB == created && created.marker == 17\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/proc/entry")
+            .effective_target
+            .unwrap();
+        let constructor = procedure_by_path(&registry, "/datum/controller/global_vars/proc/New")
+            .effective_target
+            .unwrap();
+        let closure = registry.implementation_closure(&compilation, [entry]);
+        assert!(closure.contains(&constructor));
+
+        let executable = registry
+            .compile_vm_implementations(&compilation, [entry])
+            .expect("constructor dependency should link");
+        let mut state = ExecutionState::new();
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(entry).unwrap(),
+                &[],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::number(1.0))
+        );
+    }
+
+    #[test]
+    fn subtype_construction_uses_inherited_new_once_with_arguments() {
+        let compilation = TestProject::compile(
+            "/var/global/constructor_calls = 0\n/datum/base\n\tvar/marker\n/datum/base/New(marker)\n\tconstructor_calls += 1\n\tsrc.marker = marker\n/datum/base/child\n/proc/entry()\n\tvar/datum/base/child/created = new /datum/base/child(23)\n\treturn constructor_calls * 100 + created.marker\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/proc/entry")
+            .effective_target
+            .unwrap();
+        let inherited = procedure_by_path(&registry, "/datum/base/proc/New")
+            .effective_target
+            .unwrap();
+        let closure = registry.implementation_closure(&compilation, [entry]);
+        assert!(closure.contains(&inherited));
+
+        let executable = registry
+            .compile_vm_implementations(&compilation, [entry])
+            .expect("inherited constructor dependency should link");
+        let mut state = ExecutionState::new();
+        state.set_global(
+            FieldName::parse("constructor_calls").unwrap(),
+            Value::number(0.0),
+        );
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(entry).unwrap(),
+                &[],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::number(123.0))
+        );
     }
 
     #[test]
@@ -5280,6 +6308,60 @@ GLOBAL_REAL(Master, /datum/controller/master)
     }
 
     #[test]
+    fn module_binding_lookup_work_depends_on_references_not_global_inventory() {
+        let compile = |unused_globals: usize| {
+            let mut source = "var/global/used = 4\n/proc/run()\n\treturn used\n".to_owned();
+            for index in 0..unused_globals {
+                source.push_str(&format!("var/global/unused_{index} = {index}\n"));
+            }
+            let compilation = TestProject::compile(&source);
+            let registry = ProcedureRegistry::build(&compilation);
+            let run = procedure_by_path(&registry, "/proc/run")
+                .effective_target
+                .expect("run implementation");
+            let executable = registry
+                .compile_vm_implementations(&compilation, [run])
+                .expect("run should link");
+            (
+                executable.stats().global_binding_index_lookups,
+                executable.stats().typed_global_index_lookups,
+                executable.stats().global_field_bindings,
+            )
+        };
+
+        assert_eq!(
+            compile(2),
+            compile(200),
+            "unreferenced project globals must not increase per-body binding work"
+        );
+    }
+
+    #[test]
+    fn inherited_field_binding_work_depends_on_references_not_owner_inventory() {
+        let compile = |unused_fields: usize| {
+            let mut source = "/datum/base\n\tvar/used = 4\n".to_owned();
+            for index in 0..unused_fields {
+                source.push_str(&format!("\tvar/unused_{index} = {index}\n"));
+            }
+            source.push_str("/datum/base/child/proc/read()\n\treturn used\n");
+            let compilation = TestProject::compile(&source);
+            let registry = ProcedureRegistry::build(&compilation);
+            let read = procedure_by_path(&registry, "/datum/base/child/proc/read")
+                .effective_target
+                .expect("read implementation");
+            let executable = registry
+                .compile_vm_implementations(&compilation, [read])
+                .expect("inherited field should link");
+            (
+                executable.stats().inherited_field_name_lookups,
+                executable.stats().src_field_bindings,
+            )
+        };
+
+        assert_eq!(compile(2), compile(200));
+    }
+
+    #[test]
     fn indexed_static_fields_preserve_inheritance_shadowing_and_build_once() {
         let compilation = TestProject::compile(
             "/datum/base\n\tvar/static/shared = 1\n\tproc/read_base()\n\t\treturn shared\n/datum/child\n\tparent_type = /datum/base\n\tvar/static/shared = 2\n\tproc/read_child()\n\t\treturn shared\n/datum/reader/proc/read_receiver(datum/base/value)\n\treturn value.shared\n",
@@ -5324,6 +6406,32 @@ GLOBAL_REAL(Master, /datum/controller/master)
     }
 
     #[test]
+    fn owner_static_binds_in_new_assignment_and_increment() {
+        let compilation = TestProject::compile(
+            "/datum/conversation\n\tvar/static/uid = 0\n\tvar/id\n/datum/conversation/New()\n\tid = uid\n\tuid++\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let variables = VariableRegistry::build(&compilation);
+        let direct = direct_static_fields(&variables);
+        assert!(
+            direct.values().any(|fields| fields.contains_key("uid")),
+            "registry entries: {:?}",
+            variables.entries()
+        );
+        let new = procedure_by_path(&registry, "/datum/conversation/proc/New");
+        let mut cache = BTreeMap::new();
+        let inherited = inherited_static_fields(&compilation, new.owner_type, &direct, &mut cache);
+        assert!(
+            inherited.contains_key("uid"),
+            "owner={:?} inherited={inherited:?}",
+            new.owner_type
+        );
+        registry
+            .compile_vm_implementations(&compilation, [new.effective_target.expect("New body")])
+            .expect("owner static should bind as a qualified global slot");
+    }
+
+    #[test]
     fn world_profile_override_parent_call_reaches_engine_native() {
         let compilation =
             TestProject::compile("/world/Profile(command, type, format)\n\treturn ..()\n");
@@ -5353,6 +6461,20 @@ GLOBAL_REAL(Master, /datum/controller/master)
             panic!("non-JSON profile data should be a list");
         };
         assert_eq!(state.heap().list(profile).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn headless_byond_membership_query_is_callable_and_false() {
+        let compilation =
+            TestProject::compile("/client/proc/check_member()\n\treturn IsByondMember()\n");
+        let registry = ProcedureRegistry::build(&compilation);
+        let procedure = procedure_by_path(&registry, "/client/proc/check_member");
+        registry
+            .compile_vm_implementations(
+                &compilation,
+                [procedure.effective_target.expect("procedure body")],
+            )
+            .expect("the engine membership query should link in headless mode");
     }
 
     #[test]

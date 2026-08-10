@@ -19,6 +19,7 @@ use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::Component;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dm_value::{DatumId, FieldName, ListId, TypePath, Value};
@@ -31,11 +32,13 @@ pub(super) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
         | "arcsin" | "arccos" | "length_char" | "lowertext" | "uppertext" | "trimtext"
         | "ascii2text" | "text2path" | "isinf" | "isnan" | "ckey" | "fexists" | "file2text"
         | "lentext" | "list2params" | "params2list" | "file" | "html_encode" | "html_decode"
-        | "isfile" | "fdel" | "del" | "rand_seed" => (1, 1),
+        | "isfile" | "fdel" | "del" | "rand_seed" | "link" => (1, 1),
         "flist" => (0, 1),
         "fcopy_rsc" | "REGEX_QUOTE" | "REGEX_QUOTE_REPLACEMENT" => (1, 1),
         "browse" => (1, 2),
+        "browse_rsc" | "ftp" => (1, 2),
         "winset" => (2, 3),
+        "winget" => (2, 3),
         "winexists" => (2, 2),
         "alert" => (1, 6),
         "input" => (0, 4),
@@ -46,7 +49,7 @@ pub(super) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
         "json_encode" => (0, 2),
         "log" | "arctan" | "text2ascii" | "text2ascii_char" | "text2num" => (1, 2),
         "image" | "sort_list" | "qdel" | "typecacheof" | "icon" => (0, 5),
-        "view" | "oview" | "viewers" | "hearers" => (1, 2),
+        "view" | "oview" | "viewers" | "oviewers" | "hearers" => (1, 2),
         "step" => (2, 3),
         "sound" => (0, 7),
         "icon_states" => (1, 2),
@@ -137,10 +140,17 @@ pub(super) fn execute_standard_builtin(
         "uppertext" => text_map(arguments, state, str::to_uppercase),
         "trimtext" => text_map(arguments, state, |value| value.trim().to_owned()),
         "fcopy_rsc" => Ok(arguments.first().cloned().unwrap_or(Value::Null)),
+        // `link()` wraps a URL for BYOND's output operator. Headless output
+        // retains the URL value itself, which is sufficient to preserve the
+        // observable redirect payload without a client browser.
+        "link" => Ok(arguments.first().cloned().unwrap_or(Value::Null)),
         "REGEX_QUOTE" => regex_quote(arguments, state, false),
         "REGEX_QUOTE_REPLACEMENT" => regex_quote(arguments, state, true),
         "browse" => headless_browse(arguments, state),
+        "browse_rsc" => headless_transfer("browse_rsc", arguments, state),
+        "ftp" => headless_transfer("ftp", arguments, state),
         "winset" => headless_winset(arguments, state),
+        "winget" => headless_winget(arguments, state),
         "winexists" => headless_winexists(arguments, state),
         "alert" => headless_alert(arguments),
         "FLOOR" => floor_multiple(arguments),
@@ -209,6 +219,7 @@ pub(super) fn execute_standard_builtin(
         "view" => spatial_query(arguments, state, false, false),
         "oview" => spatial_query(arguments, state, false, true),
         "viewers" | "hearers" => spatial_query(arguments, state, true, false),
+        "oviewers" => spatial_query(arguments, state, true, true),
         "step" => step_builtin(arguments, state),
         "file" => match &arguments[0] {
             Value::Text(path) => Ok(Value::text(path.to_string())),
@@ -275,12 +286,45 @@ pub(super) fn execute_external_call(
         ));
     }
     match function.as_str() {
+        "get_version" if arguments.is_empty() => {
+            Ok(Value::text(concat!(env!("CARGO_PKG_VERSION"), "-dream64")))
+        }
         "unix_timestamp" if arguments.is_empty() => {
             let seconds = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|error| format!("unix_timestamp failed: {error}"))?
                 .as_secs();
             Ok(Value::text(seconds.to_string()))
+        }
+        "rg_git_revparse" if arguments.len() == 1 => {
+            let revision = strict_text(&arguments[0], state, "rg_git_revparse revision")?;
+            validate_git_revision(&revision)?;
+            run_git_bridge(
+                state,
+                &["rev-parse", "--verify", "--end-of-options", &revision],
+            )
+        }
+        "rg_git_commit_date" if matches!(arguments.len(), 1 | 2) => {
+            let revision = strict_text(&arguments[0], state, "rg_git_commit_date revision")?;
+            validate_git_revision(&revision)?;
+            let format = arguments
+                .get(1)
+                .map(|value| strict_text(value, state, "rg_git_commit_date format"))
+                .transpose()?
+                .unwrap_or_else(|| "%F".to_owned());
+            validate_git_date_format(&format)?;
+            let date = format!("--date=format:{format}");
+            run_git_bridge(
+                state,
+                &[
+                    "log",
+                    "-1",
+                    "--format=%ad",
+                    &date,
+                    "--end-of-options",
+                    &revision,
+                ],
+            )
         }
         "file_write" | "file_append" if arguments.len() == 2 => {
             let text = strict_text(&arguments[0], state, function.as_str())?;
@@ -298,6 +342,18 @@ pub(super) fn execute_external_call(
             }
             // rust-g's void file helpers yield BYOND null on success.
             Ok(Value::Null)
+        }
+        "file_exists" if arguments.len() == 1 => {
+            let path = resolved_file_path(arguments, state, "file_exists")?;
+            Ok(Value::text(if path.exists() { "true" } else { "false" }))
+        }
+        "file_read" if arguments.len() == 1 => {
+            let path = resolved_file_path(arguments, state, "file_read")?;
+            match fs::read_to_string(path) {
+                Ok(text) => Ok(Value::text(text)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
+                Err(error) => Err(format!("file_read failed: {error}")),
+            }
         }
         "toml_file_to_json" if arguments.len() == 1 => {
             let result = resolved_file_path(arguments, state, "toml_file_to_json")
@@ -329,6 +385,53 @@ pub(super) fn execute_external_call(
             "external call {library}::{function} requires an installed host bridge"
         )),
     }
+}
+
+fn validate_git_revision(revision: &str) -> Result<(), String> {
+    if revision.is_empty()
+        || revision.len() > 256
+        || revision.starts_with('-')
+        || revision.contains("..")
+        || revision.contains("//")
+        || revision.chars().any(|character| {
+            !(character.is_ascii_alphanumeric()
+                || matches!(character, '/' | '.' | '_' | '-' | '^' | '~'))
+        })
+    {
+        return Err("git revision contains unsafe syntax".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_git_date_format(format: &str) -> Result<(), String> {
+    if format.is_empty()
+        || format.len() > 128
+        || format
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '\0' | '\r' | '\n'))
+    {
+        return Err("git date format contains unsafe syntax".to_owned());
+    }
+    Ok(())
+}
+
+fn run_git_bridge(state: &ExecutionState, arguments: &[&str]) -> Result<Value, String> {
+    let root = state
+        .project_root()
+        .ok_or_else(|| "git bridge requires a configured project root".to_owned())?
+        .canonicalize()
+        .map_err(|error| format!("git bridge project root is unavailable: {error}"))?;
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("git bridge failed to start: {error}"))?;
+    if !output.status.success() {
+        return Ok(Value::Null);
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|error| format!("git bridge returned non-UTF-8 output: {error}"))?;
+    Ok(Value::text(text.trim_end_matches(['\r', '\n']).to_owned()))
 }
 
 fn parse_toml_document(source: &str) -> Result<serde_json::Value, String> {
@@ -1626,6 +1729,29 @@ fn headless_browse(arguments: &[Value], state: &mut ExecutionState) -> Result<Va
     Ok(Value::List(descriptor))
 }
 
+fn headless_transfer(
+    kind: &str,
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    let descriptor = state.heap.allocate_list();
+    state.mark_associative_list(descriptor);
+    let list = state
+        .heap
+        .list_mut(descriptor)
+        .map_err(|error| error.to_string())?;
+    list.set_key(Value::text("kind"), Value::text(kind));
+    list.set_key(
+        Value::text("resource"),
+        arguments.first().cloned().unwrap_or(Value::Null),
+    );
+    list.set_key(
+        Value::text("name"),
+        arguments.get(1).cloned().unwrap_or(Value::Null),
+    );
+    Ok(Value::List(descriptor))
+}
+
 fn headless_winset(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
     let Some(Value::Datum(client)) = arguments.first() else {
         // BYOND accepts null when no client is available; a headless server
@@ -1652,6 +1778,44 @@ fn headless_winset(arguments: &[Value], state: &mut ExecutionState) -> Result<Va
         .map_err(|error| error.to_string())?
         .set_key(control, params);
     Ok(Value::Null)
+}
+
+fn headless_winget(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
+    let (client, control, property) = match arguments {
+        [Value::Datum(client), control, property] => (*client, control, property),
+        _ => return Ok(Value::text("")),
+    };
+    let Some(Value::List(settings)) = state
+        .heap
+        .datum_field(
+            client,
+            &FieldName::parse("_dream64_winset").expect("headless UI field is valid"),
+        )
+        .ok()
+    else {
+        return Ok(Value::text(""));
+    };
+    let Some(control) = value_text(control) else {
+        return Ok(Value::text(""));
+    };
+    let Some(property) = value_text(property) else {
+        return Ok(Value::text(""));
+    };
+    let settings = state
+        .heap
+        .list(*settings)
+        .map_err(|error| error.to_string())?;
+    let Ok(value) = settings.get_key(&Value::text(control)) else {
+        return Ok(Value::text(""));
+    };
+    let Some(parameters) = value_text(value) else {
+        return Ok(Value::text(""));
+    };
+    let value = parameters.split(';').find_map(|entry| {
+        let (name, value) = entry.split_once('=')?;
+        (name.trim() == property).then(|| value.trim().to_owned())
+    });
+    Ok(Value::text(value.unwrap_or_default()))
 }
 
 fn headless_winexists(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
@@ -1942,16 +2106,21 @@ fn find_match(text: &str, needle: &str, exact: bool, reverse: bool) -> Option<us
 
 fn findtext(
     arguments: &[Value],
-    state: &ExecutionState,
+    state: &mut ExecutionState,
     exact: bool,
     character_indices: bool,
     reverse: bool,
 ) -> Result<Value, String> {
     let haystack = strict_text(&arguments[0], state, "findtext haystack")?;
-    if matches!(arguments[1], Value::Datum(_)) {
-        return Err(
-            "regex needles in findtext are not yet supported by the headless VM".to_owned(),
-        );
+    if let Value::Datum(regex) = arguments[1] {
+        let start = signed_position(arguments.get(2), 1)?.max(1) as usize;
+        let end = signed_position(arguments.get(3), 0)?;
+        let end = if end <= 0 {
+            haystack.len() + 1
+        } else {
+            end as usize
+        };
+        return regex_find(regex, &haystack, start, end, false, state);
     }
     let needle = strict_text(&arguments[1], state, "findtext needle")?;
     if reverse {
@@ -1994,6 +2163,153 @@ fn findtext(
         byte + 1
     };
     Ok(Value::number(position as f32))
+}
+
+pub(super) fn is_regex_datum(datum: DatumId, state: &ExecutionState) -> bool {
+    state
+        .heap()
+        .datum(datum)
+        .is_ok_and(|value| value.type_path().as_str() == "/regex")
+}
+
+pub(super) fn execute_regex_method(
+    datum: DatumId,
+    method: &str,
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    if method != "Find" || arguments.is_empty() || arguments.len() > 3 {
+        return Err(format!("unknown or invalid /regex procedure {method:?}"));
+    }
+    let haystack = strict_text(&arguments[0], state, "regex.Find haystack")?;
+    let start = signed_position(arguments.get(1), 1)?.max(1) as usize;
+    let end = signed_position(arguments.get(2), 0)?;
+    let end = if end <= 0 {
+        haystack.len() + 1
+    } else {
+        end as usize
+    };
+    regex_find(datum, &haystack, start, end, true, state)
+}
+
+fn regex_find(
+    datum: DatumId,
+    haystack: &str,
+    requested_start: usize,
+    requested_end: usize,
+    honor_global_cursor: bool,
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    let field = |name| FieldName::parse(name).expect("regex field is valid");
+    let pattern = state
+        .heap()
+        .datum_field(datum, &field("text"))
+        .map_err(|error| error.to_string())?
+        .clone();
+    let pattern = strict_text(&pattern, state, "regex pattern")?;
+    let flags = state
+        .heap()
+        .datum_field(datum, &field("flags"))
+        .ok()
+        .and_then(value_text)
+        .unwrap_or("")
+        .to_owned();
+    let global = flags.contains('g') && honor_global_cursor;
+    let previous = state
+        .heap()
+        .datum_field(datum, &field("_dream64_haystack"))
+        .ok()
+        .and_then(value_text);
+    let cursor = state
+        .heap()
+        .datum_field(datum, &field("_dream64_cursor"))
+        .ok()
+        .and_then(Value::as_number)
+        .unwrap_or(0.0) as usize;
+    let start = if global && previous == Some(haystack) && cursor > 0 {
+        cursor
+    } else {
+        requested_start.saturating_sub(1)
+    };
+    let end = requested_end.saturating_sub(1).min(haystack.len());
+    let found = regex_search(&pattern, &flags, haystack, start.min(end), end)?;
+    let Some((begin, finish, captures)) = found else {
+        for (name, value) in [
+            ("match", Value::Null),
+            ("index", Value::number(0.0)),
+            ("group", Value::Null),
+            ("_dream64_cursor", Value::number(0.0)),
+            ("_dream64_haystack", Value::Null),
+        ] {
+            state
+                .heap_mut()
+                .set_datum_field(datum, field(name), value)
+                .map_err(|e| e.to_string())?;
+        }
+        return Ok(Value::number(0.0));
+    };
+    let groups = state.heap_mut().allocate_list();
+    for capture in captures {
+        state
+            .heap_mut()
+            .list_mut(groups)
+            .map_err(|error| error.to_string())?
+            .add(capture.map_or(Value::Null, Value::text));
+    }
+    let next = if finish > begin {
+        finish
+    } else {
+        finish.saturating_add(1)
+    };
+    for (name, value) in [
+        ("match", Value::text(&haystack[begin..finish])),
+        ("index", Value::number((begin + 1) as f32)),
+        ("group", Value::List(groups)),
+        ("_dream64_cursor", Value::number(next as f32)),
+        ("_dream64_haystack", Value::text(haystack)),
+    ] {
+        state
+            .heap_mut()
+            .set_datum_field(datum, field(name), value)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(Value::number((begin + 1) as f32))
+}
+
+fn regex_search(
+    pattern: &str,
+    flags: &str,
+    haystack: &str,
+    start: usize,
+    end: usize,
+) -> Result<Option<(usize, usize, Vec<Option<String>>)>, String> {
+    let mut builder = fancy_regex::RegexBuilder::new(pattern);
+    builder
+        .case_insensitive(flags.contains('i'))
+        .multi_line(flags.contains('m'));
+    let regex = builder
+        .build()
+        .map_err(|error| format!("invalid regex {pattern:?}: {error}"))?;
+    let captures = regex
+        .captures_from_pos(haystack, start)
+        .map_err(|error| format!("regex match failed for {pattern:?}: {error}"))?;
+    let Some(captures) = captures else {
+        return Ok(None);
+    };
+    let Some(whole) = captures.get(0) else {
+        return Ok(None);
+    };
+    if whole.end() > end {
+        return Ok(None);
+    }
+    let groups = (1..captures.len())
+        .map(|index| {
+            captures
+                .get(index)
+                .map(|capture| capture.as_str().to_owned())
+        })
+        .collect();
+    Ok(Some((whole.start(), whole.end(), groups)))
 }
 
 fn splittext(
@@ -2756,6 +3072,51 @@ fn list_add(
         return Err("list.Add requires at least one item".to_owned());
     }
     let values = flattened_list_arguments(arguments, state)?;
+    if let Some(owner) = state.contents_owner(list) {
+        let owner_path = state
+            .heap
+            .datum(owner)
+            .map_err(|error| error.to_string())?
+            .type_path()
+            .as_str()
+            .to_owned();
+        if owner_path == "/area" || owner_path.starts_with("/area/") {
+            for value in values {
+                let Value::Datum(turf) = value else {
+                    return Err("area.contents.Add requires a turf".to_owned());
+                };
+                let path = state
+                    .heap
+                    .datum(turf)
+                    .map_err(|error| error.to_string())?
+                    .type_path()
+                    .as_str();
+                if path != "/turf" && !path.starts_with("/turf/") {
+                    return Err("area.contents.Add requires a turf".to_owned());
+                }
+                move_turf_to_area(state, turf, owner)?;
+            }
+            return Ok(Value::Null);
+        }
+        if owner_path == "/turf" || owner_path.starts_with("/turf/") {
+            for value in values {
+                let Value::Datum(movable) = value else {
+                    return Err("turf.contents.Add requires a movable atom".to_owned());
+                };
+                let path = state
+                    .heap
+                    .datum(movable)
+                    .map_err(|error| error.to_string())?
+                    .type_path()
+                    .as_str();
+                if !is_movable_path(path) {
+                    return Err("turf.contents.Add requires a movable atom".to_owned());
+                }
+                move_movable_to_turf(state, movable, owner)?;
+            }
+            return Ok(Value::Null);
+        }
+    }
     let associative_only = state.is_associative_list(list);
     let target = state
         .heap
@@ -2773,6 +3134,122 @@ fn list_add(
     Ok(Value::Null)
 }
 
+pub(super) fn is_movable_path(path: &str) -> bool {
+    path == "/obj"
+        || path.starts_with("/obj/")
+        || path == "/mob"
+        || path.starts_with("/mob/")
+        || path == "/atom/movable"
+        || path.starts_with("/atom/movable/")
+}
+
+pub(super) fn move_movable_to_turf(
+    state: &mut ExecutionState,
+    movable: DatumId,
+    turf: DatumId,
+) -> Result<(), String> {
+    let loc = FieldName::parse("loc").expect("built-in loc field");
+    let old_loc = state
+        .heap
+        .datum_field(movable, &loc)
+        .ok()
+        .and_then(|value| match value {
+            Value::Datum(datum) => Some(*datum),
+            _ => None,
+        });
+    if old_loc != Some(turf) {
+        synchronize_moved_atom_contents(state, movable, old_loc, Some(turf))?;
+    }
+    let coordinates =
+        ["x", "y", "z"].map(|name| FieldName::parse(name).expect("built-in coordinate field"));
+    let values = coordinates
+        .iter()
+        .map(|field| {
+            state
+                .heap
+                .datum_field(turf, field)
+                .cloned()
+                .unwrap_or(Value::Null)
+        })
+        .collect::<Vec<_>>();
+    state
+        .heap
+        .set_datum_field(movable, loc, Value::Datum(turf))
+        .map_err(|error| error.to_string())?;
+    for (field, value) in coordinates.into_iter().zip(values) {
+        state
+            .heap
+            .set_datum_field(movable, field, value)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn move_turf_to_area(
+    state: &mut ExecutionState,
+    turf: DatumId,
+    new_area: DatumId,
+) -> Result<(), String> {
+    let loc = FieldName::parse("loc").expect("built-in loc field");
+    let contents = FieldName::parse("contents").expect("built-in contents field");
+    let old_area = state
+        .heap
+        .datum_field(turf, &loc)
+        .ok()
+        .and_then(|value| match value {
+            Value::Datum(area) => Some(*area),
+            _ => None,
+        });
+    if old_area == Some(new_area) {
+        return Ok(());
+    }
+    let contained = state
+        .heap
+        .datum_field(turf, &contents)
+        .ok()
+        .and_then(|value| match value {
+            Value::List(list) => state.heap.list(*list).ok(),
+            _ => None,
+        })
+        .map(|list| {
+            list.positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(old_area) = old_area
+        && let Ok(Value::List(list)) = state.heap.datum_field(old_area, &contents)
+    {
+        let list = *list;
+        let values = std::iter::once(Value::Datum(turf)).chain(contained.iter().cloned());
+        let target = state
+            .heap
+            .list_mut(list)
+            .map_err(|error| error.to_string())?;
+        for value in values {
+            target.remove_first(&value);
+        }
+    }
+    let new_contents = state.ensure_contents(new_area)?;
+    {
+        let target = state
+            .heap
+            .list_mut(new_contents)
+            .map_err(|error| error.to_string())?;
+        for value in std::iter::once(Value::Datum(turf)).chain(contained) {
+            if !target.contains(&value) {
+                target.add(value);
+            }
+        }
+    }
+    state
+        .heap
+        .set_datum_field(turf, loc, Value::Datum(new_area))
+        .map_err(|error| error.to_string())?;
+    state.note_turf_area(turf, new_area);
+    Ok(())
+}
+
 fn list_copy(
     list: ListId,
     arguments: &[Value],
@@ -2781,6 +3258,7 @@ fn list_copy(
     if arguments.len() > 2 {
         return Err("list.Copy accepts Start and End only".to_owned());
     }
+    state.refresh_vars_proxy(list)?;
     let source = state.heap.list(list).map_err(|error| error.to_string())?;
     let len = source.len();
     let start = list_boundary(
@@ -3139,7 +3617,47 @@ fn resolved_file_path(
 }
 
 fn fexists(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
-    let path = resolved_file_path(arguments, state, "fexists")?;
+    let raw = strict_text(&arguments[0], state, "fexists")?;
+    let relative = PathBuf::from(raw);
+    let root = state
+        .project_root()
+        .ok_or_else(|| "fexists requires a configured project root".to_owned())?
+        .canonicalize()
+        .map_err(|error| format!("fexists project root is unavailable: {error}"))?;
+    let has_parent_traversal = relative
+        .components()
+        .any(|component| component == Component::ParentDir);
+    let invalid_relative_root = !relative.is_absolute()
+        && relative
+            .components()
+            .any(|component| matches!(component, Component::RootDir | Component::Prefix(_)));
+    if has_parent_traversal || invalid_relative_root {
+        return Err("fexists path escapes the project root".to_owned());
+    }
+    let path = if relative.is_absolute() {
+        relative
+    } else {
+        root.join(relative)
+    };
+
+    // A missing intermediate directory is an ordinary negative existence
+    // result in BYOND. Canonicalize the nearest existing ancestor so that the
+    // relaxed lookup still rejects symlink and absolute-path escapes.
+    let mut ancestor = path.as_path();
+    let resolved_ancestor = loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => break ancestor.canonicalize().map_err(|error| error.to_string())?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| "fexists path has no existing ancestor".to_owned())?;
+            }
+            Err(error) => return Err(format!("fexists path is unavailable: {error}")),
+        }
+    };
+    if !resolved_ancestor.starts_with(&root) {
+        return Err("fexists path escapes the project root".to_owned());
+    }
     Ok(Value::number(f32::from(path.exists())))
 }
 
@@ -3157,7 +3675,9 @@ fn fdel(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
     let directory = raw.ends_with('/') || raw.ends_with('\\');
     let path = resolved_file_path(arguments, state, "fdel")?;
     let result = if directory {
-        fs::remove_dir(path)
+        // BYOND treats a trailing slash as explicit authorization to remove
+        // the entire directory tree, including nested files/directories.
+        fs::remove_dir_all(path)
     } else {
         fs::remove_file(path)
     };
@@ -3167,18 +3687,19 @@ fn fdel(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
 fn text2file(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
     let text = strict_text(&arguments[0], state, "text2file text")?;
     let path = resolved_file_path(&arguments[1..], state, "text2file")?;
-    let append = arguments.get(2).is_some_and(truthy);
+    // BYOND appends by default. A false optional compatibility flag requests
+    // replacement, matching the existing extended arity accepted here.
+    let append = arguments.get(2).is_none_or(truthy);
     let mut options = OpenOptions::new();
     options
         .create(true)
         .write(true)
         .append(append)
         .truncate(!append);
-    options
+    let result = options
         .open(path)
-        .and_then(|mut file| file.write_all(text.as_bytes()))
-        .map_err(|error| format!("text2file failed: {error}"))?;
-    Ok(Value::number(1.0))
+        .and_then(|mut file| file.write_all(text.as_bytes()));
+    Ok(Value::number(f32::from(result.is_ok())))
 }
 
 fn fcopy(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
@@ -3228,6 +3749,27 @@ pub(super) fn execute_output(
     value: &Value,
     state: &mut ExecutionState,
 ) -> Result<(), String> {
+    if let Value::Datum(target) = target {
+        let field = FieldName::parse("_dream64_output_events")
+            .expect("headless output event field is valid");
+        let events = match state.heap.datum_field(*target, &field) {
+            Ok(Value::List(events)) => *events,
+            _ => {
+                let events = state.heap.allocate_list();
+                state
+                    .heap
+                    .set_datum_field(*target, field, Value::List(events))
+                    .map_err(|error| error.to_string())?;
+                events
+            }
+        };
+        state
+            .heap
+            .list_mut(events)
+            .map_err(|error| error.to_string())?
+            .add(value.clone());
+        return Ok(());
+    }
     let Value::Text(_) = target else {
         return Ok(());
     };
@@ -3700,7 +4242,67 @@ mod color_text_file_tests {
             panic!("flist should return a list");
         };
         assert_eq!(state.heap().list(files).unwrap().len(), 2);
+        assert_eq!(
+            fexists(&[Value::text("data/logs/runtime.log")], &state),
+            Ok(Value::number(1.0))
+        );
+        assert_eq!(
+            fexists(&[Value::text("data/not-created/deeper/dummy.sav")], &state),
+            Ok(Value::number(0.0))
+        );
         assert!(fexists(&[Value::text("../outside")], &state).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fdel_trailing_slash_removes_a_nonempty_directory_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "dream64-vm-fdel-tree-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("tmp/nested")).unwrap();
+        fs::write(root.join("tmp/nested/value.txt"), "value").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_project_root(root.clone());
+
+        assert_eq!(
+            fdel(&[Value::text("tmp/")], &state).unwrap(),
+            Value::number(1.0)
+        );
+        assert!(!root.join("tmp").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn text2file_appends_by_default_and_reports_io_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "dream64-vm-text2file-contract-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("data")).unwrap();
+        let mut state = ExecutionState::new();
+        state.set_project_root(root.clone());
+
+        assert_eq!(
+            text2file(&[Value::text("one"), Value::text("data/value.txt")], &state).unwrap(),
+            Value::number(1.0)
+        );
+        assert_eq!(
+            text2file(&[Value::text("two"), Value::text("data/value.txt")], &state).unwrap(),
+            Value::number(1.0)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("data/value.txt")).unwrap(),
+            "onetwo"
+        );
+        assert_eq!(
+            text2file(&[Value::text("bad"), Value::text("data")], &state).unwrap(),
+            Value::number(0.0)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3713,9 +4315,14 @@ mod color_text_file_tests {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("data")).unwrap();
+        fs::create_dir_all(root.join("config")).unwrap();
         let mut state = ExecutionState::new();
         state.set_project_root(root.clone());
         let library = Value::text("rust_g");
+        assert_eq!(
+            execute_external_call(&library, &Value::text("get_version"), &[], &mut state),
+            Ok(Value::text(concat!(env!("CARGO_PKG_VERSION"), "-dream64")))
+        );
 
         assert_eq!(
             execute_external_call(
@@ -3729,6 +4336,44 @@ mod color_text_file_tests {
         assert_eq!(
             fs::read_to_string(root.join("data/runtime.log")).unwrap(),
             "first"
+        );
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("file_exists"),
+                &[Value::text("data/runtime.log")],
+                &mut state,
+            ),
+            Ok(Value::text("true"))
+        );
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("file_read"),
+                &[Value::text("data/runtime.log")],
+                &mut state,
+            ),
+            Ok(Value::text("first"))
+        );
+        // Plexora compares this exact rust-g text result to `"true"` before
+        // attempting to read its legacy config.
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("file_exists"),
+                &[Value::text("config/plexora.json")],
+                &mut state,
+            ),
+            Ok(Value::text("false"))
+        );
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("file_read"),
+                &[Value::text("data/missing.log")],
+                &mut state,
+            ),
+            Ok(Value::Null)
         );
         execute_external_call(
             &library,
@@ -3761,6 +4406,17 @@ mod color_text_file_tests {
             )
             .is_err()
         );
+        for function in ["file_exists", "file_read"] {
+            assert!(
+                execute_external_call(
+                    &library,
+                    &Value::text(function),
+                    &[Value::text("../escape.log")],
+                    &mut state,
+                )
+                .is_err()
+            );
+        }
         let outside = std::env::temp_dir().join(format!(
             "dream64-rust-g-outside-{}-{:?}.log",
             std::process::id(),
@@ -3788,6 +4444,107 @@ mod color_text_file_tests {
         assert!(execute_external_call(&library, &Value::text("unknown"), &[], &mut state).is_err());
         fs::remove_dir_all(root).unwrap();
         fs::remove_file(outside).unwrap();
+    }
+
+    #[test]
+    fn rust_g_git_bridge_resolves_head_formats_dates_and_rejects_unsafe_revisions() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "dream64-rust-g-git-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let git = |arguments: &[&str]| {
+            Command::new("git")
+                .args(arguments)
+                .current_dir(&root)
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "--quiet"]).status.success());
+        assert!(
+            git(&["config", "user.name", "Dream64 Test"])
+                .status
+                .success()
+        );
+        assert!(
+            git(&["config", "user.email", "dream64@example.invalid"])
+                .status
+                .success()
+        );
+        fs::write(root.join("tracked.txt"), "fixture").unwrap();
+        assert!(git(&["add", "tracked.txt"]).status.success());
+        let status = Command::new("git")
+            .args(["commit", "--quiet", "-m", "fixture"])
+            .current_dir(&root)
+            .env("GIT_AUTHOR_DATE", "2020-01-02T03:04:05Z")
+            .env("GIT_COMMITTER_DATE", "2020-01-02T03:04:05Z")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let mut state = ExecutionState::new();
+        state.set_project_root(root.clone());
+        let library = Value::text("rust_g");
+        let Value::Text(head) = execute_external_call(
+            &library,
+            &Value::text("rg_git_revparse"),
+            &[Value::text("HEAD")],
+            &mut state,
+        )
+        .unwrap() else {
+            panic!("HEAD should resolve to text");
+        };
+        assert_eq!(head.len(), 40);
+        assert!(head.chars().all(|character| character.is_ascii_hexdigit()));
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("rg_git_revparse"),
+                &[Value::text("refs/heads/does-not-exist")],
+                &mut state,
+            ),
+            Ok(Value::Null)
+        );
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("rg_git_commit_date"),
+                &[Value::text("HEAD"), Value::text("%F")],
+                &mut state,
+            ),
+            Ok(Value::text("2020-01-02"))
+        );
+        for unsafe_revision in [
+            "--help",
+            "../../outside",
+            "HEAD;status",
+            "HEAD refs/heads/x",
+        ] {
+            assert!(
+                execute_external_call(
+                    &library,
+                    &Value::text("rg_git_revparse"),
+                    &[Value::text(unsafe_revision)],
+                    &mut state,
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            execute_external_call(
+                &library,
+                &Value::text("rg_git_commit_date"),
+                &[Value::text("HEAD"), Value::text("%F\n--pretty=%s")],
+                &mut state,
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3913,6 +4670,82 @@ mod spatial_tests {
             panic!()
         };
         assert_eq!(state.heap.list(oview).unwrap().len(), 2);
+
+        let Value::List(oviewers) = execute_standard_builtin(
+            "oviewers",
+            &[Value::number(1.0), Value::Datum(center)],
+            &mut state,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(state.heap.list(oviewers).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn headless_ui_retains_window_and_resource_transport_state() {
+        let mut state = ExecutionState::new();
+        let client = state
+            .heap
+            .allocate_datum(TypePath::parse("/client").unwrap());
+        assert_eq!(
+            execute_standard_builtin(
+                "winset",
+                &[
+                    Value::Datum(client),
+                    Value::text("mapwindow"),
+                    Value::text("size=640x480;focus=true"),
+                ],
+                &mut state,
+            ),
+            Ok(Value::Null)
+        );
+        assert_eq!(
+            execute_standard_builtin(
+                "winget",
+                &[
+                    Value::Datum(client),
+                    Value::text("mapwindow"),
+                    Value::text("size"),
+                ],
+                &mut state,
+            ),
+            Ok(Value::text("640x480"))
+        );
+
+        for (builtin, resource, name) in [
+            ("browse_rsc", "icons/a.dmi", "a.dmi"),
+            ("ftp", "data/report.txt", "report.txt"),
+        ] {
+            let event = execute_standard_builtin(
+                builtin,
+                &[Value::text(resource), Value::text(name)],
+                &mut state,
+            )
+            .unwrap();
+            execute_output(&Value::Datum(client), &event, &mut state).unwrap();
+        }
+        let Value::List(events) = state
+            .heap
+            .datum_field(client, &FieldName::parse("_dream64_output_events").unwrap())
+            .unwrap()
+        else {
+            panic!("headless client output should retain transport events")
+        };
+        assert_eq!(state.heap.list(*events).unwrap().len(), 2);
+        for (index, kind) in [(1, "browse_rsc"), (2, "ftp")] {
+            let Value::List(event) = state.heap.list(*events).unwrap().get(index).unwrap() else {
+                panic!("transport event should be an associative descriptor")
+            };
+            assert_eq!(
+                state
+                    .heap
+                    .list(*event)
+                    .unwrap()
+                    .get_key(&Value::text("kind")),
+                Ok(&Value::text(kind))
+            );
+        }
     }
 
     #[test]

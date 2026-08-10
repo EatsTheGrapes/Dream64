@@ -242,6 +242,88 @@ pub struct LifecycleIndex {
 }
 
 impl LifecycleIndex {
+    /// Builds lifecycle dispatch metadata directly from compiler type nodes.
+    /// This compile-only variant avoids constructing a [`RuntimeImage`] when
+    /// auditing procedure compatibility before boot.
+    #[must_use]
+    pub fn build_compile_only(compilation: &Compilation, procedures: &ProcedureRegistry) -> Self {
+        let direct = direct_lifecycle_procedures(procedures);
+        let mut diagnostics = Vec::new();
+        let mut types = compilation
+            .code_tree()
+            .nodes()
+            .iter()
+            .filter(|node| node.kind == NodeKind::Type)
+            .map(|node| {
+                let path = node.path.to_string();
+                let targets = LifecycleTargets {
+                    genesis: resolve_target(
+                        compilation,
+                        procedures,
+                        &direct,
+                        node.id,
+                        LifecycleKind::Genesis,
+                    ),
+                    new_target: resolve_target(
+                        compilation,
+                        procedures,
+                        &direct,
+                        node.id,
+                        LifecycleKind::New,
+                    ),
+                    initialize: resolve_target(
+                        compilation,
+                        procedures,
+                        &direct,
+                        node.id,
+                        LifecycleKind::Initialize,
+                    ),
+                    late_initialize: resolve_target(
+                        compilation,
+                        procedures,
+                        &direct,
+                        node.id,
+                        LifecycleKind::LateInitialize,
+                    ),
+                    destroy: resolve_target(
+                        compilation,
+                        procedures,
+                        &direct,
+                        node.id,
+                        LifecycleKind::Destroy,
+                    ),
+                };
+                collect_target_diagnostics(&path, &targets, &mut diagnostics);
+                TypeLifecycle {
+                    node: node.id,
+                    path,
+                    parent: node
+                        .parent_type
+                        .and_then(|parent| compilation.code_tree().node(parent))
+                        .map(|parent| parent.path.to_string()),
+                    targets,
+                }
+            })
+            .collect::<Vec<_>>();
+        types.sort_by(|left, right| left.path.cmp(&right.path));
+        let by_node = types
+            .iter()
+            .enumerate()
+            .map(|(index, lifecycle)| (lifecycle.node, index))
+            .collect();
+        let by_path = types
+            .iter()
+            .enumerate()
+            .map(|(index, lifecycle)| (lifecycle.path.clone(), index))
+            .collect();
+        Self {
+            types,
+            by_node,
+            by_path,
+            diagnostics,
+        }
+    }
+
     /// Builds lifecycle dispatch metadata without compiling or executing bodies.
     #[must_use]
     pub fn build(
@@ -2095,12 +2177,15 @@ mod tests {
     #[test]
     fn genesis_infers_all_typed_global_bare_new_destinations() {
         let source = concat!(
+            "var/global/datum/controller/global_vars/GLOB = null\n",
             "var/global/datum/tracy/Tracy = null\n",
             "var/global/datum/debugger/Debugger = null\n",
             "var/global/datum/log_holder/logger = null\n",
             "var/global/datum/controller/master/Master = null\n",
-            "/world/Genesis()\n\tTracy = new\n\tDebugger = new\n\tlogger = new\n\tMaster = new\n",
-            "/datum/tracy\n/datum/debugger\n/datum/log_holder\n/datum/controller/master\n",
+            "/world/Genesis()\n\tGLOB.config_error_log = \"early.log\"\n\tTracy = new\n\tDebugger = new\n\tlogger = new\n\tMaster = new\n",
+            "/datum/controller/global_vars\n\tvar/global/config_error_log\n",
+            "/datum/tracy\n/datum/debugger\n/datum/log_holder\n/datum/controller/master\n\tvar/static/random_seed\n",
+            "/datum/controller/master/New()\n\tif(!random_seed)\n\t\trandom_seed = 29051994\n",
             "/area/test\n/turf/test\n",
         );
         let (_fixture, compilation, mut runtime, index) = index(source);
@@ -2123,6 +2208,17 @@ mod tests {
         )
         .expect("typed global bare new should execute");
 
+        assert_eq!(
+            runtime
+                .variables()
+                .iter()
+                .find(|variable| variable.path.ends_with("/config_error_log"))
+                .map(|variable| &variable.value),
+            Some(&Value::text("early.log")),
+            "a typed global receiver must bind owner-qualified static storage even while its datum value is null; vars={:?}",
+            runtime.variables(),
+        );
+
         for (name, expected) in [
             ("Tracy", "/datum/tracy"),
             ("Debugger", "/datum/debugger"),
@@ -2143,6 +2239,119 @@ mod tests {
                 expected
             );
         }
+        assert_eq!(
+            runtime
+                .variables()
+                .iter()
+                .find(|variable| variable.path.ends_with("/random_seed"))
+                .map(|variable| &variable.value),
+            Some(&Value::number(29_051_994.0)),
+        );
+    }
+
+    #[test]
+    fn glob_style_datum_vars_is_live_stable_and_copies_a_snapshot() {
+        let source = concat!(
+            "var/global/observed = 0\n",
+            "/datum/globals\n\tvar/value = 1\n\tvar/global/shared = 2\n",
+            "/datum/globals/proc/TestReflection()\n\tvalue = 3\n\tvar/list/reflection = vars\n\tvar/same_proxy = (reflection == vars)\n\treflection[\"value\"] += 2\n\treflection[\"shared\"] = 7\n\tvar/list/snapshot = reflection.Copy()\n\tvalue = 9\n\tglobal.observed = same_proxy + reflection[\"value\"] + reflection[\"shared\"] + snapshot[\"value\"] + snapshot[\"shared\"]\n",
+            "/world/Genesis()\n\tvar/datum/globals/controller = new\n\tcontroller.TestReflection()\n",
+            "/area/test\n/turf/test\n",
+        );
+        let (_fixture, compilation, mut runtime, index) = index(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse("\"a\" = (/turf/test, /area/test)\n(1,1,1) = {\"\na\n\"}\n")
+            .expect("map should parse");
+        let world = build_plan(&map, &compilation);
+        let plan = build_initialization_plan(&runtime, &index, &world, "test.dmm");
+        let allocation = allocate_world(&world, &mut runtime).expect("world should allocate");
+        execute_initialization_plan(
+            &compilation,
+            &procedures,
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+        )
+        .expect("datum vars reflection should execute during Genesis");
+        assert_eq!(
+            runtime
+                .variables()
+                .iter()
+                .find(|variable| variable.path.ends_with("/observed"))
+                .map(|variable| &variable.value),
+            Some(&Value::number(29.0))
+        );
+    }
+
+    #[test]
+    fn sort_instance_list_defaults_exist_before_new_and_tim_sort() {
+        let source = concat!(
+            "var/global/datum/sort_instance/sorter = new /datum/sort_instance\n",
+            "var/global/observed = 0\n",
+            "/datum/sort_instance\n\tvar/list/runBases = list()\n\tvar/list/runLens = list()\n",
+            "/datum/sort_instance/New()\n\trunBases.Add(1)\n",
+            "/datum/sort_instance/proc/timSort()\n\trunBases.Cut()\n\trunLens.Cut()\n\treturn runBases.len + runLens.len\n",
+            "/world/Genesis()\n\tglobal.observed = sorter.timSort()\n",
+            "/area/test\n/turf/test\n",
+        );
+        let (_fixture, compilation, mut runtime, index) = index(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse("\"a\" = (/turf/test, /area/test)\n(1,1,1) = {\"\na\n\"}\n")
+            .expect("map should parse");
+        let world = build_plan(&map, &compilation);
+        let plan = build_initialization_plan(&runtime, &index, &world, "test.dmm");
+        let allocation = allocate_world(&world, &mut runtime).expect("world should allocate");
+        execute_initialization_plan(
+            &compilation,
+            &procedures,
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+        )
+        .expect("sort instance defaults should precede New and timSort");
+        assert_eq!(
+            runtime
+                .variables()
+                .iter()
+                .find(|variable| variable.path.ends_with("/observed"))
+                .map(|variable| &variable.value),
+            Some(&Value::number(0.0))
+        );
+    }
+
+    #[test]
+    fn runtime_new_links_inherited_call_and_nested_new_defaults_before_constructor() {
+        let source = concat!(
+            "var/global/observed = 0\n/proc/make_base()\n\treturn 3\n/proc/make_child()\n\treturn 8\n",
+            "/datum/token\n/datum/base\n\tvar/x = make_base()\n\tvar/datum/token/token = new /datum/token\n",
+            "/datum/base/child\n\tx = make_child()\n/datum/base/child/New()\n\tglobal.observed = x + istype(token, /datum/token)\n",
+            "/world/Genesis()\n\tnew /datum/base/child\n/area/test\n/turf/test\n",
+        );
+        let (_fixture, compilation, mut runtime, index) = index(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse("\"a\" = (/turf/test, /area/test)\n(1,1,1) = {\"\na\n\"}\n").unwrap();
+        let world = build_plan(&map, &compilation);
+        let plan = build_initialization_plan(&runtime, &index, &world, "test.dmm");
+        let allocation = allocate_world(&world, &mut runtime).unwrap();
+        execute_initialization_plan(
+            &compilation,
+            &procedures,
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+        )
+        .unwrap();
+        assert_eq!(
+            runtime
+                .variables()
+                .iter()
+                .find(|v| v.path.ends_with("/observed"))
+                .map(|v| &v.value),
+            Some(&Value::number(9.0))
+        );
     }
 
     #[test]
