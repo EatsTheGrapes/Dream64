@@ -6,8 +6,11 @@ target/
 /boot*-trace*.log
 /deferred-lifecycle-*.log
 /deferred-lifecycle-*.tsv
+/*.log
 
 # Local BYOND/OpenDream oracle workspaces and generated artifacts.
 /tmp/
 /_oracle_*/
 /_oracle_*.dmb
+/_*_oracle.dm
+/_*_oracle.dme
