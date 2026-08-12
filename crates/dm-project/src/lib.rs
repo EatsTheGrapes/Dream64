@@ -5,9 +5,10 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::str;
+use std::time::UNIX_EPOCH;
 
 use dm_core::{FileId, SourceSpan};
 
@@ -43,6 +44,65 @@ impl Project {
     /// directory.
     pub fn load(root_file: impl AsRef<Path>) -> Result<Self, ProjectError> {
         Loader::new(root_file.as_ref())?.load()
+    }
+
+    /// Loads a project through a persistent preprocessing cache.
+    ///
+    /// A cache hit is accepted only when the canonical root and every cached
+    /// project's current file size and modification timestamp match a compact
+    /// sidecar manifest. This avoids rereading the complete source/resource
+    /// tree merely to validate a warm cache. Corrupt, incomplete, or stale
+    /// cache data is ignored and replaced after a normal load. Cache I/O is
+    /// deliberately best-effort and never makes a valid project fail to
+    /// compile.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same project discovery and source errors as [`Self::load`]
+    /// when a fresh load is required.
+    pub fn load_cached(
+        root_file: impl AsRef<Path>,
+        cache_file: impl AsRef<Path>,
+    ) -> Result<(Self, bool), ProjectError> {
+        let root_file = root_file.as_ref();
+        let canonical_root = fs::canonicalize(root_file).map_err(|source| ProjectError::Io {
+            path: root_file.to_path_buf(),
+            source,
+        })?;
+        let cache_file = cache_file.as_ref();
+        let manifest_file = cache_manifest_path(cache_file);
+        if let Ok(manifest_bytes) = fs::read(&manifest_file)
+            && let Some(manifest) = decode_cache_manifest(&manifest_bytes)
+            && manifest.root_file == canonical_root
+            && manifest.entries.iter().all(|entry| {
+                file_fingerprint(&entry.path).is_some_and(|current| current == entry.fingerprint)
+            })
+            && let Ok(bytes) = fs::read(cache_file)
+            && bytes.len() as u64 == manifest.cache_length
+            && let Some(project) = decode_cached_project(&bytes)
+            && project
+                .files
+                .first()
+                .is_some_and(|file| file.path == canonical_root)
+            && project
+                .files
+                .iter()
+                .map(|file| &file.path)
+                .eq(manifest.entries.iter().map(|entry| &entry.path))
+        {
+            return Ok((project, true));
+        }
+        let project = Self::load(&canonical_root)?;
+        if let Some(parent) = cache_file.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let encoded = encode_cached_project(&project);
+        if fs::write(cache_file, &encoded).is_ok()
+            && let Some(manifest) = CacheManifest::from_project(&project, encoded.len() as u64)
+        {
+            let _ = fs::write(manifest_file, encode_cache_manifest(&manifest));
+        }
+        Ok((project, false))
     }
 
     /// Retrieves a file by its stable project-local identity.
@@ -131,6 +191,350 @@ impl Project {
         }
         segments
     }
+}
+
+const PROJECT_CACHE_MAGIC: &[u8] = b"DREAM64-PROJECT-CACHE\0\x01";
+const PROJECT_CACHE_MANIFEST_MAGIC: &[u8] = b"DREAM64-PROJECT-MANIFEST\0\x01";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileFingerprint {
+    length: u64,
+    modified_seconds: u64,
+    modified_nanos: u32,
+}
+
+#[derive(Debug)]
+struct CacheManifestEntry {
+    path: PathBuf,
+    fingerprint: FileFingerprint,
+}
+
+#[derive(Debug)]
+struct CacheManifest {
+    root_file: PathBuf,
+    cache_length: u64,
+    entries: Vec<CacheManifestEntry>,
+}
+
+impl CacheManifest {
+    fn from_project(project: &Project, cache_length: u64) -> Option<Self> {
+        let root_file = project.files.first()?.path.clone();
+        let entries = project
+            .files
+            .iter()
+            .map(|file| {
+                Some(CacheManifestEntry {
+                    path: file.path.clone(),
+                    fingerprint: file_fingerprint(&file.path)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            root_file,
+            cache_length,
+            entries,
+        })
+    }
+}
+
+fn cache_manifest_path(cache_file: &Path) -> PathBuf {
+    let mut name = cache_file.file_name().unwrap_or_default().to_os_string();
+    name.push(".manifest");
+    cache_file.with_file_name(name)
+}
+
+fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some(FileFingerprint {
+        length: metadata.len(),
+        modified_seconds: modified.as_secs(),
+        modified_nanos: modified.subsec_nanos(),
+    })
+}
+
+fn encode_cache_manifest(manifest: &CacheManifest) -> Vec<u8> {
+    let mut output = PROJECT_CACHE_MANIFEST_MAGIC.to_vec();
+    write_path(&mut output, &manifest.root_file);
+    output.extend_from_slice(&manifest.cache_length.to_le_bytes());
+    write_len(&mut output, manifest.entries.len());
+    for entry in &manifest.entries {
+        write_path(&mut output, &entry.path);
+        output.extend_from_slice(&entry.fingerprint.length.to_le_bytes());
+        output.extend_from_slice(&entry.fingerprint.modified_seconds.to_le_bytes());
+        output.extend_from_slice(&entry.fingerprint.modified_nanos.to_le_bytes());
+    }
+    output
+}
+
+fn decode_cache_manifest(bytes: &[u8]) -> Option<CacheManifest> {
+    let mut input = Cursor::new(bytes);
+    let mut magic = vec![0; PROJECT_CACHE_MANIFEST_MAGIC.len()];
+    input.read_exact(&mut magic).ok()?;
+    if magic != PROJECT_CACHE_MANIFEST_MAGIC {
+        return None;
+    }
+    let root_file = read_path(&mut input)?;
+    let cache_length = read_u64(&mut input)?;
+    let entry_count = read_len(&mut input)?;
+    let mut entries = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        entries.push(CacheManifestEntry {
+            path: read_path(&mut input)?,
+            fingerprint: FileFingerprint {
+                length: read_u64(&mut input)?,
+                modified_seconds: read_u64(&mut input)?,
+                modified_nanos: read_u32(&mut input)?,
+            },
+        });
+    }
+    (input.position() == bytes.len() as u64).then_some(CacheManifest {
+        root_file,
+        cache_length,
+        entries,
+    })
+}
+
+fn read_u64(input: &mut Cursor<&[u8]>) -> Option<u64> {
+    let mut bytes = [0; 8];
+    input.read_exact(&mut bytes).ok()?;
+    Some(u64::from_le_bytes(bytes))
+}
+
+fn read_u32(input: &mut Cursor<&[u8]>) -> Option<u32> {
+    let mut bytes = [0; 4];
+    input.read_exact(&mut bytes).ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+fn encode_cached_project(project: &Project) -> Vec<u8> {
+    let mut output = PROJECT_CACHE_MAGIC.to_vec();
+    write_path(&mut output, &project.root_directory);
+    write_len(&mut output, project.files.len());
+    for file in &project.files {
+        write_path(&mut output, &file.path);
+        write_path(&mut output, &file.relative_path);
+        output.push(match file.kind {
+            FileKind::Environment => 0,
+            FileKind::Source => 1,
+            FileKind::Map => 2,
+            FileKind::Interface => 3,
+            FileKind::Resource => 4,
+        });
+        write_bytes(&mut output, &file.contents);
+        match &file.compiler_contents {
+            Some(contents) => {
+                output.push(1);
+                write_bytes(&mut output, contents);
+            }
+            None => output.push(0),
+        }
+        write_len(&mut output, file.compiler_source_map.len());
+        for mapping in &file.compiler_source_map {
+            write_span(&mut output, mapping.expanded);
+            write_span(&mut output, mapping.original);
+        }
+    }
+    write_len(&mut output, project.includes.len());
+    for include in &project.includes {
+        write_len(&mut output, include.source.index());
+        match &include.target {
+            IncludeTarget::File(target) => {
+                output.push(0);
+                write_len(&mut output, target.index());
+            }
+            IncludeTarget::System(name) => {
+                output.push(1);
+                write_string(&mut output, name);
+            }
+        }
+        write_string(&mut output, &include.spelling);
+        write_span(&mut output, include.span);
+    }
+    write_len(&mut output, project.diagnostic_pragmas.len());
+    for pragma in &project.diagnostic_pragmas {
+        write_string(&mut output, &pragma.name);
+        output.push(match pragma.severity {
+            PragmaSeverity::Disabled => 0,
+            PragmaSeverity::Notice => 1,
+            PragmaSeverity::Warning => 2,
+            PragmaSeverity::Error => 3,
+        });
+        write_len(&mut output, pragma.source.index());
+        write_span(&mut output, pragma.span);
+    }
+    let mut macros = project.object_macros.iter().collect::<Vec<_>>();
+    macros.sort_by(|left, right| left.0.cmp(right.0));
+    write_len(&mut output, macros.len());
+    for (name, replacement) in macros {
+        write_string(&mut output, name);
+        write_string(&mut output, replacement);
+    }
+    output
+}
+
+fn decode_cached_project(bytes: &[u8]) -> Option<Project> {
+    let mut input = Cursor::new(bytes);
+    let mut magic = vec![0; PROJECT_CACHE_MAGIC.len()];
+    input.read_exact(&mut magic).ok()?;
+    if magic != PROJECT_CACHE_MAGIC {
+        return None;
+    }
+    let root_directory = read_path(&mut input)?;
+    let file_count = read_len(&mut input)?;
+    let mut files = Vec::with_capacity(file_count);
+    for index in 0..file_count {
+        let path = read_path(&mut input)?;
+        let relative_path = read_path(&mut input)?;
+        let kind = match read_byte(&mut input)? {
+            0 => FileKind::Environment,
+            1 => FileKind::Source,
+            2 => FileKind::Map,
+            3 => FileKind::Interface,
+            4 => FileKind::Resource,
+            _ => return None,
+        };
+        let contents = read_bytes(&mut input)?;
+        let compiler_contents = match read_byte(&mut input)? {
+            0 => None,
+            1 => Some(read_bytes(&mut input)?),
+            _ => return None,
+        };
+        let mapping_count = read_len(&mut input)?;
+        let mut compiler_source_map = Vec::with_capacity(mapping_count);
+        for _ in 0..mapping_count {
+            compiler_source_map.push(SourceMapping {
+                expanded: read_span(&mut input)?,
+                original: read_span(&mut input)?,
+            });
+        }
+        files.push(ProjectFile {
+            id: FileId::from_index(index),
+            path,
+            relative_path,
+            kind,
+            contents,
+            compiler_contents,
+            compiler_source_map,
+        });
+    }
+    let include_count = read_len(&mut input)?;
+    let mut includes = Vec::with_capacity(include_count);
+    for _ in 0..include_count {
+        let source = FileId::from_index(read_len(&mut input)?);
+        let target = match read_byte(&mut input)? {
+            0 => IncludeTarget::File(FileId::from_index(read_len(&mut input)?)),
+            1 => IncludeTarget::System(read_string(&mut input)?),
+            _ => return None,
+        };
+        includes.push(IncludeEdge {
+            source,
+            target,
+            spelling: read_string(&mut input)?,
+            span: read_span(&mut input)?,
+        });
+    }
+    let pragma_count = read_len(&mut input)?;
+    let mut diagnostic_pragmas = Vec::with_capacity(pragma_count);
+    for _ in 0..pragma_count {
+        let name = read_string(&mut input)?;
+        let severity = match read_byte(&mut input)? {
+            0 => PragmaSeverity::Disabled,
+            1 => PragmaSeverity::Notice,
+            2 => PragmaSeverity::Warning,
+            3 => PragmaSeverity::Error,
+            _ => return None,
+        };
+        diagnostic_pragmas.push(DiagnosticPragma {
+            name,
+            severity,
+            source: FileId::from_index(read_len(&mut input)?),
+            span: read_span(&mut input)?,
+        });
+    }
+    let macro_count = read_len(&mut input)?;
+    let mut object_macros = HashMap::with_capacity(macro_count);
+    for _ in 0..macro_count {
+        object_macros.insert(read_string(&mut input)?, read_string(&mut input)?);
+    }
+    if input.position() != bytes.len() as u64
+        || files.iter().enumerate().any(|(index, file)| file.id.index() != index)
+        || includes.iter().any(|include| {
+            include.source.index() >= files.len()
+                || matches!(include.target, IncludeTarget::File(target) if target.index() >= files.len())
+        })
+    {
+        return None;
+    }
+    Some(Project {
+        root_directory,
+        files,
+        includes,
+        diagnostic_pragmas,
+        object_macros,
+    })
+}
+
+fn write_len(output: &mut Vec<u8>, value: usize) {
+    output.extend_from_slice(&(value as u64).to_le_bytes());
+}
+
+fn read_len(input: &mut Cursor<&[u8]>) -> Option<usize> {
+    let mut bytes = [0; 8];
+    input.read_exact(&mut bytes).ok()?;
+    usize::try_from(u64::from_le_bytes(bytes)).ok()
+}
+
+fn write_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
+    write_len(output, bytes.len());
+    output.extend_from_slice(bytes);
+}
+
+fn read_bytes(input: &mut Cursor<&[u8]>) -> Option<Vec<u8>> {
+    let length = read_len(input)?;
+    let remaining = input
+        .get_ref()
+        .len()
+        .saturating_sub(input.position() as usize);
+    if length > remaining {
+        return None;
+    }
+    let mut bytes = vec![0; length];
+    input.read_exact(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+fn write_string(output: &mut Vec<u8>, value: &str) {
+    write_bytes(output, value.as_bytes());
+}
+
+fn read_string(input: &mut Cursor<&[u8]>) -> Option<String> {
+    String::from_utf8(read_bytes(input)?).ok()
+}
+
+fn write_path(output: &mut Vec<u8>, path: &Path) {
+    write_string(output, &path.to_string_lossy());
+}
+
+fn read_path(input: &mut Cursor<&[u8]>) -> Option<PathBuf> {
+    Some(PathBuf::from(read_string(input)?))
+}
+
+fn write_span(output: &mut Vec<u8>, span: SourceSpan) {
+    write_len(output, span.start);
+    write_len(output, span.end);
+}
+
+fn read_span(input: &mut Cursor<&[u8]>) -> Option<SourceSpan> {
+    let start = read_len(input)?;
+    let end = read_len(input)?;
+    (start <= end).then(|| SourceSpan::new(start, end))
+}
+
+fn read_byte(input: &mut Cursor<&[u8]>) -> Option<u8> {
+    let mut byte = [0];
+    input.read_exact(&mut byte).ok()?;
+    Some(byte[0])
 }
 
 /// Severity selected by a Dream Maker `#pragma` diagnostic policy.
@@ -1555,11 +1959,23 @@ fn substitute_function_macro(
                 .join(", "),
         );
     }
+    // Function arguments are macro-expanded before the invoked macro is
+    // disabled for rescanning its replacement. This distinction is what lets
+    // `WRAP(WRAP(value))` expand both invocations without permitting a truly
+    // recursive `#define WRAP(x) WRAP(x)` replacement to loop forever.
+    let argument_stack = &stack[..stack.len().saturating_sub(1)];
     let expanded_substitutions = substitutions
         .iter()
         .map(|(parameter, argument)| {
-            expand_replacement(argument, macros, stack, file_macro, line_macro)
-                .map(|expanded| (*parameter, expanded))
+            let mut argument_stack = argument_stack.to_vec();
+            expand_replacement(
+                argument,
+                macros,
+                &mut argument_stack,
+                file_macro,
+                line_macro,
+            )
+            .map(|expanded| (*parameter, expanded))
         })
         .collect::<Result<HashMap<_, _>, _>>()?;
 
@@ -1695,6 +2111,15 @@ fn substitute_macro_parameter_fragment(
                 output.push_str(protected);
             }
             offset = end;
+            continue;
+        }
+        // Inside a DM interpolation, `##parameter` has the same raw token
+        // paste meaning as it does in ordinary replacement text. In
+        // particular, tgstation uses `\[[##value]0\]` to place the caller's
+        // identifier inside a JSON-shaped interpolated string. Do not treat
+        // the second `#` as stringification.
+        if fragment[offset..].starts_with("##") {
+            offset += 2;
             continue;
         }
         // DreamMaker applies the function-macro stringification operator in
@@ -2178,8 +2603,15 @@ fn parse_directive_line(line: &str) -> Option<DirectiveKind> {
     match keyword {
         "include" => parse_include(value),
         "define" => {
+            // A continued object-like macro may put the continuation slash
+            // directly after its name (`#define CHECK\\\n ...`). The slash
+            // terminates the identifier; treating it as part of the name
+            // registers `CHECK\\` and leaves every later `CHECK` untouched.
             let name_end = value
-                .find(|character: char| character.is_whitespace() || character == '(')
+                .char_indices()
+                .find_map(|(index, character)| {
+                    (!(character == '_' || character.is_ascii_alphanumeric())).then_some(index)
+                })
                 .unwrap_or(value.len());
             let name = value[..name_end].to_owned();
             if name.is_empty() {
@@ -2598,6 +3030,43 @@ mod tests {
     }
 
     #[test]
+    fn persistent_cache_hits_exact_sources_and_invalidates_changed_include() {
+        let scratch = ScratchDirectory::new();
+        let environment = scratch.path().join("world.dme");
+        let included = scratch.path().join("types.dm");
+        let cache = scratch.path().join("cache/project.bin");
+        fs::write(&environment, "#define VALUE 1\n#include \"types.dm\"\n")
+            .expect("environment should be written");
+        fs::write(&included, "/datum/example\n\tvar/value = VALUE\n")
+            .expect("include should be written");
+
+        let (cold, cold_hit) =
+            Project::load_cached(&environment, &cache).expect("cold cached load should succeed");
+        assert!(!cold_hit);
+        assert!(cache.is_file());
+        let (warm, warm_hit) = Project::load_cached(&environment, &cache)
+            .expect("unchanged cached load should succeed");
+        assert!(warm_hit);
+        assert_eq!(warm.files.len(), cold.files.len());
+        assert_eq!(
+            warm.files[1].compiler_text().unwrap(),
+            cold.files[1].compiler_text().unwrap()
+        );
+
+        fs::write(&included, "/datum/example\n\tvar/value = 2\n")
+            .expect("changed include should be written");
+        let (changed, changed_hit) =
+            Project::load_cached(&environment, &cache).expect("changed cached load should rebuild");
+        assert!(!changed_hit);
+        assert!(
+            changed.files[1]
+                .compiler_text()
+                .unwrap()
+                .contains("value = 2")
+        );
+    }
+
+    #[test]
     fn loads_quoted_includes_once_in_first_discovery_order() {
         let scratch = ScratchDirectory::new();
         let nested = scratch.path().join("nested");
@@ -2808,6 +3277,27 @@ mod tests {
     }
 
     #[test]
+    fn continued_object_macro_without_space_after_name_expands() {
+        let scratch = ScratchDirectory::new();
+        fs::write(
+            scratch.path().join("world.dme"),
+            "#define CHECK\\\n\tif(state != 1) { \\\n\t\treturn;\\\n\t};\n/proc/run()\n\tCHECK\n",
+        )
+        .expect("environment should be written");
+        let project = Project::load(scratch.path().join("world.dme"))
+            .expect("continued object macro should load");
+        let expanded = project.files[0].compiler_text().expect("UTF-8 source");
+        assert!(
+            !expanded.contains("\tCHECK"),
+            "expanded source was {expanded:?}"
+        );
+        assert!(
+            expanded.contains("if(state != 1)"),
+            "expanded source was {expanded:?}"
+        );
+    }
+
+    #[test]
     fn expands_nested_object_macros_across_includes_with_source_mapping() {
         let scratch = ScratchDirectory::new();
         fs::write(
@@ -2883,7 +3373,7 @@ mod tests {
     #[test]
     fn expands_function_macros_with_nested_and_variadic_arguments() {
         let scratch = ScratchDirectory::new();
-        let source = "#define ROOT /datum\n#define WRAP(first, second) list(first, second)\n#define FORWARD(arguments...) WRAP(arguments)\n#define STRINGIFY(value) #value\n#define INTERPOLATED_STRINGIFY(value) \"[#value]\"\n#define OUTER(value) use(\"prefix [value] suffix\")\n#define NESTED_STRINGIFY(value) OUTER(\"[copytext(#value, 1, length(#value))]\")\n#define TYPE(value) ROOT/##value\n#define INTERPOLATE(value) \"key=[value]\"\n#define AREACOORD(value) value.x\nWRAP(call(1, 2), \"comma, text\")\nFORWARD(alpha, list(beta, gamma))\nSTRINGIFY(alpha + beta)\nINTERPOLATED_STRINGIFY(alpha + beta)\nNESTED_STRINGIFY(config_error_log)\nTYPE(example)\nINTERPOLATE(1 + 2)\n\"location [AREACOORD(src)]\"\n";
+        let source = "#define ROOT /datum\n#define WRAP(first, second) list(first, second)\n#define SPAN(value) (\"<span>\" + value + \"</span>\")\n#define FORWARD(arguments...) WRAP(arguments)\n#define STRINGIFY(value) #value\n#define INTERPOLATED_STRINGIFY(value) \"[#value]\"\n#define OUTER(value) use(\"prefix [value] suffix\")\n#define NESTED_STRINGIFY(value) OUTER(\"[copytext(#value, 1, length(#value))]\")\n#define TYPE(value) ROOT/##value\n#define INTERPOLATE(value) \"key=[value]\"\n#define AREACOORD(value) value.x\nWRAP(call(1, 2), \"comma, text\")\nSPAN(SPAN(\"nested\"))\nFORWARD(alpha, list(beta, gamma))\nSTRINGIFY(alpha + beta)\nINTERPOLATED_STRINGIFY(alpha + beta)\nNESTED_STRINGIFY(config_error_log)\nTYPE(example)\nINTERPOLATE(1 + 2)\n\"location [AREACOORD(src)]\"\n";
         fs::write(scratch.path().join("world.dme"), source)
             .expect("function macros should be written");
 
@@ -2894,6 +3384,10 @@ mod tests {
             .expect("expanded functions should be UTF-8");
 
         assert!(expanded.contains("list(call(1, 2), \"comma, text\")"));
+        assert!(
+            expanded
+                .contains("(\"<span>\" + (\"<span>\" + \"nested\" + \"</span>\") + \"</span>\")")
+        );
         assert!(expanded.contains("list(alpha, list(beta, gamma))"));
         assert!(expanded.contains("\"alpha + beta\""));
         assert!(expanded.contains("\"[\\\"alpha + beta\\\"]\""));
@@ -2943,6 +3437,27 @@ mod tests {
             !expanded.contains("DISABLED"),
             "expanded source: {expanded}"
         );
+    }
+
+    #[test]
+    fn token_paste_inside_interpolation_substitutes_raw_parameter() {
+        let scratch = ScratchDirectory::new();
+        let source = concat!(
+            "#define UNWRAP(value) json_decode(\"\\[[##value]0\\]\")\n",
+            "#define APPLY(target) var/txt_signature = target; UNWRAP(txt_signature)\n",
+            "APPLY(\"-1,\")\n",
+        );
+        fs::write(scratch.path().join("world.dme"), source)
+            .expect("macro fixture should be written");
+        let project = Project::load(scratch.path().join("world.dme"))
+            .expect("interpolated token paste should expand");
+        let expanded = project.files[0].compiler_text().expect("expanded UTF-8");
+
+        assert!(
+            expanded.contains("json_decode(\"\\[[txt_signature]0\\]\")"),
+            "expanded source: {expanded}",
+        );
+        assert!(!expanded.contains("#\\\"txt_signature\\\""));
     }
 
     #[test]

@@ -94,11 +94,46 @@ pub struct RuntimeType {
     defaults: DatumDefaults,
 }
 
+fn builtin_mob_defaults() -> [(&'static str, Value); 9] {
+    [
+        ("client", Value::Null),
+        ("eye", Value::Null),
+        ("key", Value::Null),
+        ("ckey", Value::Null),
+        ("perspective", Value::number(0.0)),
+        ("see_in_dark", Value::number(2.0)),
+        ("see_infrared", Value::number(0.0)),
+        ("see_invisible", Value::number(0.0)),
+        ("sight", Value::number(0.0)),
+    ]
+}
+
+fn builtin_client_defaults() -> [(&'static str, Value); 12] {
+    [
+        ("control_freak", Value::number(0.0)),
+        ("dir", Value::number(2.0)),
+        ("eye", Value::Null),
+        ("gender", Value::text("neuter")),
+        ("inactivity", Value::number(0.0)),
+        ("mob", Value::Null),
+        ("perspective", Value::number(0.0)),
+        ("pixel_x", Value::number(0.0)),
+        ("pixel_y", Value::number(0.0)),
+        ("pixel_z", Value::number(0.0)),
+        ("pixel_w", Value::number(0.0)),
+        ("statobj", Value::Null),
+    ]
+}
+
 fn materialize_builtin_atom_defaults(
     heap: &mut ValueHeap,
     datum: DatumId,
     is_atom: bool,
     is_movable: bool,
+    is_mob: bool,
+    is_client: bool,
+    is_particles: bool,
+    is_image: bool,
 ) -> Result<(), ValueError> {
     // Every /datum has BYOND's built-in tag field, even though it has no
     // source declaration in user projects.
@@ -106,7 +141,15 @@ fn materialize_builtin_atom_defaults(
     if heap.datum_field(datum, &tag).is_err() {
         heap.set_datum_field(datum, tag, Value::Null)?;
     }
-    if !is_atom {
+    if is_particles {
+        for (name, value) in particle_defaults() {
+            let field = FieldName::parse(name).expect("built-in particle field");
+            if heap.datum_field(datum, &field).is_err() {
+                heap.set_datum_field(datum, field, value.clone())?;
+            }
+        }
+    }
+    if !is_atom && !is_client && !is_image {
         return Ok(());
     }
     // These names exist without source declarations in BYOND's built-in atom
@@ -114,25 +157,30 @@ fn materialize_builtin_atom_defaults(
     // descendant retains its normal inherited/default-layer precedence.
     let atom_defaults: &[(&str, Value)] = &[
         ("alpha", Value::number(255.0)),
+        ("appearance", Value::Null),
         ("appearance_flags", Value::number(0.0)),
         ("blend_mode", Value::number(0.0)),
         ("color", Value::Null),
         ("density", Value::number(0.0)),
+        ("desc", Value::Null),
         ("dir", Value::number(2.0)),
+        ("gender", Value::text("neuter")),
         ("icon", Value::Null),
         ("icon_state", Value::Null),
         ("invisibility", Value::number(0.0)),
         ("layer", Value::number(1.0)),
         ("loc", Value::Null),
+        ("luminosity", Value::number(0.0)),
         ("maptext", Value::Null),
         ("maptext_height", Value::number(32.0)),
         ("maptext_width", Value::number(32.0)),
         ("maptext_x", Value::number(0.0)),
         ("maptext_y", Value::number(0.0)),
         ("mouse_opacity", Value::number(1.0)),
+        ("mouse_over_pointer", Value::Null),
         ("name", Value::Null),
         ("opacity", Value::number(0.0)),
-        ("overlays", Value::Null),
+        ("particles", Value::Null),
         ("plane", Value::number(0.0)),
         ("pixel_x", Value::number(0.0)),
         ("pixel_y", Value::number(0.0)),
@@ -140,9 +188,8 @@ fn materialize_builtin_atom_defaults(
         ("pixel_z", Value::number(0.0)),
         ("render_source", Value::Null),
         ("render_target", Value::Null),
+        ("suffix", Value::Null),
         ("transform", Value::Null),
-        ("underlays", Value::Null),
-        ("vis_contents", Value::Null),
         ("vis_flags", Value::number(0.0)),
         ("x", Value::number(0.0)),
         ("y", Value::number(0.0)),
@@ -156,18 +203,154 @@ fn materialize_builtin_atom_defaults(
         ("bound_y", Value::number(0.0)),
         ("glide_size", Value::number(0.0)),
         ("screen_loc", Value::Null),
+        ("step_x", Value::number(0.0)),
+        ("step_y", Value::number(0.0)),
         ("step_size", Value::number(32.0)),
     ];
-    for (name, value) in atom_defaults
-        .iter()
+    let mob_defaults = builtin_mob_defaults();
+    let client_defaults = builtin_client_defaults();
+    let image_defaults: &[(&str, Value)] = &[
+        ("alpha", Value::number(255.0)),
+        ("appearance", Value::Null),
+        ("appearance_flags", Value::number(0.0)),
+        ("blend_mode", Value::number(0.0)),
+        ("color", Value::Null),
+        ("dir", Value::number(2.0)),
+        ("icon", Value::Null),
+        ("icon_state", Value::Null),
+        ("layer", Value::number(0.0)),
+        ("loc", Value::Null),
+        ("name", Value::Null),
+        ("plane", Value::number(0.0)),
+        ("transform", Value::Null),
+    ];
+    for (name, value) in is_atom
+        .then_some(atom_defaults)
+        .into_iter()
+        .flatten()
         .chain(is_movable.then_some(movable_defaults).into_iter().flatten())
+        .chain(
+            is_mob
+                .then_some(mob_defaults.as_slice())
+                .into_iter()
+                .flatten(),
+        )
+        .chain(
+            is_client
+                .then_some(client_defaults.as_slice())
+                .into_iter()
+                .flatten(),
+        )
+        .chain(is_image.then_some(image_defaults).into_iter().flatten())
     {
         let name = FieldName::parse(name).expect("built-in atom field name is valid");
         if heap.datum_field(datum, &name).is_err() {
             heap.set_datum_field(datum, name, value.clone())?;
         }
     }
+    // Spatial contents owns live membership and therefore exists immediately.
+    // BYOND/OpenDream lazily create an atom's appearance, verb, and visibility
+    // collection wrappers on first access; allocating those six empty lists for
+    // every map atom creates millions of permanently rooted heap identities.
+    let list_fields: &[&str] = if is_client {
+        &["images", "screen", "verbs"]
+    } else if is_image {
+        &["overlays", "underlays", "vis_contents"]
+    } else {
+        &["contents"]
+    };
+    for name in list_fields {
+        let field = FieldName::parse(name).expect("built-in atom list field is valid");
+        if heap.datum_field(datum, &field).is_err() {
+            let list = heap.allocate_list();
+            heap.set_datum_field(datum, field, Value::List(list))?;
+        }
+    }
     Ok(())
+}
+
+fn particle_defaults() -> &'static [(&'static str, Value)] {
+    static DEFAULTS: std::sync::OnceLock<Vec<(&str, Value)>> = std::sync::OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        [
+            "color",
+            "width",
+            "height",
+            "count",
+            "spawning",
+            "bound1",
+            "bound2",
+            "gravity",
+            "gradient",
+            "transform",
+            "icon",
+            "icon_state",
+            "lifespan",
+            "fadein",
+            "fade",
+            "position",
+            "velocity",
+            "scale",
+            "grow",
+            "rotation",
+            "spin",
+            "friction",
+            "drift",
+        ]
+        .into_iter()
+        .map(|name| (name, Value::Null))
+        .collect()
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WorldClockValues {
+    realtime_deciseconds: f32,
+    timeofday_deciseconds: f32,
+    timezone_hours: f32,
+}
+
+fn world_clock_values(
+    unix_millis: i64,
+    local_hour: u16,
+    local_minute: u16,
+    local_second: u16,
+    local_millis: u16,
+    utc_offset_seconds: i64,
+) -> WorldClockValues {
+    const BYOND_EPOCH_UNIX_MILLIS: i64 = 946_684_800_000;
+    let realtime_deciseconds = (unix_millis - BYOND_EPOCH_UNIX_MILLIS).div_euclid(100);
+    let timeofday_deciseconds = i64::from(local_hour) * 36_000
+        + i64::from(local_minute) * 600
+        + i64::from(local_second) * 10
+        + i64::from(local_millis) / 100;
+    WorldClockValues {
+        realtime_deciseconds: realtime_deciseconds as f32,
+        timeofday_deciseconds: timeofday_deciseconds as f32,
+        timezone_hours: utc_offset_seconds as f32 / 3_600.0,
+    }
+}
+
+fn host_world_clock_values() -> WorldClockValues {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let unix_millis = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
+    let day_millis = unix_millis.rem_euclid(86_400_000);
+    // Rust's standard library deliberately exposes no host civil-time API. A
+    // headless Dream64 world therefore uses UTC as its coherent local zone
+    // unless a future host adapter supplies a civil clock. This keeps
+    // `timeofday` and `timezone` mutually correct without shelling out or
+    // introducing a platform-specific unsafe dependency.
+    world_clock_values(
+        unix_millis,
+        u16::try_from(day_millis / 3_600_000).unwrap_or_default(),
+        u16::try_from(day_millis / 60_000 % 60).unwrap_or_default(),
+        u16::try_from(day_millis / 1_000 % 60).unwrap_or_default(),
+        u16::try_from(day_millis % 1_000).unwrap_or_default(),
+        0,
+    )
 }
 
 fn materialize_builtin_world_defaults(
@@ -176,6 +359,7 @@ fn materialize_builtin_world_defaults(
     type_path: &TypePath,
     world_name: &str,
 ) -> Result<(), ValueError> {
+    let clock = host_world_clock_values();
     if type_path.as_str() != "/world" {
         return Ok(());
     }
@@ -222,11 +406,11 @@ fn materialize_builtin_world_defaults(
         ("icon_size", Value::number(32.0)),
         ("tick_lag", Value::number(1.0)),
         ("fps", Value::number(10.0)),
-        ("timezone", Value::number(0.0)),
+        ("timezone", Value::number(clock.timezone_hours)),
         ("cpu", Value::number(0.0)),
         ("time", Value::number(0.0)),
-        ("timeofday", Value::number(0.0)),
-        ("realtime", Value::number(0.0)),
+        ("timeofday", Value::number(clock.timeofday_deciseconds)),
+        ("realtime", Value::number(clock.realtime_deciseconds)),
     ];
     for (name, value) in defaults {
         let name = FieldName::parse(name).expect("built-in world field is valid");
@@ -263,27 +447,39 @@ fn builtin_initial_fields(path: &TypePath, world_name: &str) -> BTreeMap<FieldNa
         );
     };
     match path.as_str() {
-        "/datum" => insert("tag", Value::Null),
+        "/datum" => {
+            insert("datum_flags", Value::number(0.0));
+            insert("tag", Value::Null);
+        }
         "/atom" => {
             for (name, value) in [
                 ("alpha", Value::number(255.0)),
+                ("appearance", Value::Null),
                 ("appearance_flags", Value::number(0.0)),
                 ("blend_mode", Value::number(0.0)),
                 ("color", Value::Null),
+                ("contents", Value::Null),
                 ("density", Value::number(0.0)),
+                ("desc", Value::Null),
                 ("dir", Value::number(2.0)),
+                ("gender", Value::text("neuter")),
                 ("icon", Value::Null),
                 ("icon_state", Value::Null),
                 ("invisibility", Value::number(0.0)),
                 ("layer", Value::number(1.0)),
                 ("loc", Value::Null),
+                ("luminosity", Value::number(0.0)),
                 ("maptext", Value::Null),
                 ("maptext_height", Value::number(32.0)),
                 ("maptext_width", Value::number(32.0)),
                 ("maptext_x", Value::number(0.0)),
                 ("maptext_y", Value::number(0.0)),
                 ("mouse_opacity", Value::number(1.0)),
+                ("mouse_over_pointer", Value::Null),
+                ("name", Value::Null),
                 ("opacity", Value::number(0.0)),
+                ("particles", Value::Null),
+                ("filters", Value::Null),
                 ("overlays", Value::Null),
                 ("plane", Value::number(0.0)),
                 ("pixel_x", Value::number(0.0)),
@@ -292,10 +488,13 @@ fn builtin_initial_fields(path: &TypePath, world_name: &str) -> BTreeMap<FieldNa
                 ("pixel_z", Value::number(0.0)),
                 ("render_source", Value::Null),
                 ("render_target", Value::Null),
+                ("suffix", Value::Null),
                 ("transform", Value::Null),
                 ("underlays", Value::Null),
                 ("vis_contents", Value::Null),
+                ("vis_locs", Value::Null),
                 ("vis_flags", Value::number(0.0)),
+                ("verbs", Value::Null),
                 ("x", Value::number(0.0)),
                 ("y", Value::number(0.0)),
                 ("z", Value::number(0.0)),
@@ -312,18 +511,32 @@ fn builtin_initial_fields(path: &TypePath, world_name: &str) -> BTreeMap<FieldNa
                 ("bound_y", Value::number(0.0)),
                 ("glide_size", Value::number(0.0)),
                 ("screen_loc", Value::Null),
+                ("step_x", Value::number(0.0)),
+                ("step_y", Value::number(0.0)),
                 ("step_size", Value::number(32.0)),
             ] {
                 insert(name, value);
             }
         }
         "/mob" => {
-            insert("see_invisible", Value::number(0.0));
-            insert("sight", Value::number(0.0));
+            for (name, value) in builtin_mob_defaults() {
+                insert(name, value);
+            }
+        }
+        "/client" => {
+            for (name, value) in builtin_client_defaults() {
+                insert(name, value);
+            }
+        }
+        "/particles" => {
+            for (name, value) in particle_defaults() {
+                insert(name, value.clone());
+            }
         }
         "/image" => {
             for (name, value) in [
                 ("alpha", Value::number(255.0)),
+                ("appearance", Value::Null),
                 ("appearance_flags", Value::number(0.0)),
                 ("blend_mode", Value::number(0.0)),
                 ("color", Value::Null),
@@ -585,30 +798,60 @@ pub struct RuntimeImage {
     runtime_variable_indices: BTreeMap<String, usize>,
     global_variable_indices: BTreeMap<FieldName, usize>,
     diagnostics: Vec<RuntimeInitializerDiagnostic>,
-    instance_initializers: Vec<(VariableEntry, InitializationStep)>,
+    instance_initializers: Vec<InstanceInitializerCandidate>,
     instance_initializer_indices_by_owner: BTreeMap<TypePath, Vec<usize>>,
     compiled_instance_initializers: BTreeMap<usize, CompiledInstanceInitializer>,
     vm_instance_initializers: Arc<BTreeMap<TypePath, Vec<InstanceInitializer>>>,
     vm_instance_initializer_module: Option<Arc<Module>>,
     instance_initializer_plans: BTreeMap<TypePath, Arc<[CompiledInstanceInitializer]>>,
     datum_allocation_plans: BTreeMap<TypePath, DatumAllocationPlan>,
+    procedure_static_locals: BTreeMap<(String, u16), Value>,
     project_root: PathBuf,
     stats: RuntimeImageStats,
+}
+
+/// Counts of rebuildable allocation caches released after bulk preflight and
+/// world materialization.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeCacheReleaseStats {
+    /// Per-type inherited initializer plans.
+    pub initializer_plans: usize,
+    /// Standalone initializer programs referenced by those plans.
+    pub initializer_programs: usize,
+    /// Per-type inherited default/allocation plans.
+    pub allocation_plans: usize,
 }
 
 #[derive(Clone)]
 struct CompiledInstanceInitializer {
     path: String,
     field: FieldName,
-    program: Arc<InitializerProgram>,
+    action: CompiledInstanceInitializerAction,
+}
+
+#[derive(Clone)]
+enum CompiledInstanceInitializerAction {
+    Constant(Value),
+    Program(Arc<InitializerProgram>),
+}
+
+#[derive(Clone)]
+struct InstanceInitializerCandidate {
+    entry: VariableEntry,
+    path: String,
+    constant: Option<Value>,
 }
 
 #[derive(Clone)]
 struct DatumAllocationPlan {
     defaults: Arc<[DatumDefaults]>,
-    ancestors: Arc<BTreeSet<TypePath>>,
+    ancestors: Arc<[TypePath]>,
     is_atom: bool,
     is_movable: bool,
+    is_mob: bool,
+    is_client: bool,
+    is_particles: bool,
+    is_image: bool,
 }
 
 struct DynamicInitializerFailure {
@@ -704,6 +947,42 @@ fn execution_metadata(
         initial_values.insert(path.clone(), values);
     }
     (type_parents, initial_values)
+}
+
+fn inherited_runtime_initializer_precedes(
+    types: &BTreeMap<TypePath, RuntimeType>,
+    runtime_fields: &BTreeMap<TypePath, BTreeMap<FieldName, Vec<usize>>>,
+    owner: &TypePath,
+    ordinal: usize,
+) -> bool {
+    if runtime_fields.get(owner).is_some_and(|fields| {
+        fields
+            .values()
+            .flatten()
+            .any(|candidate| *candidate < ordinal)
+    }) {
+        return true;
+    }
+
+    let mut current = types
+        .get(owner)
+        .and_then(|runtime_type| runtime_type.parent.clone());
+    let mut visited = BTreeSet::new();
+    while let Some(path) = current {
+        if !visited.insert(path.clone()) {
+            break;
+        }
+        if runtime_fields
+            .get(&path)
+            .is_some_and(|fields| !fields.is_empty())
+        {
+            return true;
+        }
+        current = types
+            .get(&path)
+            .and_then(|runtime_type| runtime_type.parent.clone());
+    }
+    false
 }
 
 fn type_parent_metadata(
@@ -1085,6 +1364,7 @@ impl RuntimeImage {
             vm_instance_initializer_module: None,
             instance_initializer_plans: BTreeMap::new(),
             datum_allocation_plans: BTreeMap::new(),
+            procedure_static_locals: BTreeMap::new(),
             project_root: compilation.project().root_directory.clone(),
             stats: RuntimeImageStats {
                 variables: registry.entries().len(),
@@ -1166,6 +1446,28 @@ impl RuntimeImage {
             .collect::<Vec<_>>();
         instance_steps.sort_by_key(|step| step.ordinal);
         let instance_step_count = instance_steps.len();
+        let mut runtime_initializer_fields =
+            BTreeMap::<TypePath, BTreeMap<FieldName, Vec<usize>>>::new();
+        for step in &instance_steps {
+            if !matches!(
+                step.evaluation,
+                ConstantEvaluation::Value(ConstantValue::List(_))
+                    | ConstantEvaluation::Unsupported(_)
+            ) {
+                continue;
+            }
+            let entry = &registry.entries()[step.entry_index];
+            let owner = entry
+                .owner
+                .as_ref()
+                .ok_or_else(|| RuntimeImageError::MissingOwner(step.path.clone()))?;
+            runtime_initializer_fields
+                .entry(parse_type_path(&owner.path)?)
+                .or_default()
+                .entry(variable_field(&step.path)?)
+                .or_default()
+                .push(step.ordinal);
+        }
         let mut state = image.take_execution_state();
         for step in instance_steps {
             let entry = &registry.entries()[step.entry_index];
@@ -1180,7 +1482,11 @@ impl RuntimeImage {
                     let index = image.instance_initializers.len();
                     image
                         .instance_initializers
-                        .push((entry.clone(), step.clone()));
+                        .push(InstanceInitializerCandidate {
+                            entry: entry.clone(),
+                            path: step.path.clone(),
+                            constant: None,
+                        });
                     image
                         .instance_initializer_indices_by_owner
                         .entry(owner)
@@ -1190,10 +1496,78 @@ impl RuntimeImage {
                 }
                 ConstantEvaluation::Value(constant) => {
                     let value = image.convert_constant_in(constant, state.heap_mut())?;
-                    image.apply_step_value(entry, step, value)?;
+                    let owner = entry
+                        .owner
+                        .as_ref()
+                        .ok_or_else(|| RuntimeImageError::MissingOwner(step.path.clone()))?;
+                    let owner = parse_type_path(&owner.path)?;
+                    let replay = inherited_runtime_initializer_precedes(
+                        &image.types,
+                        &runtime_initializer_fields,
+                        &owner,
+                        step.ordinal,
+                    );
+                    image.apply_step_value(entry, step, value.clone())?;
+                    if replay {
+                        let index = image.instance_initializers.len();
+                        image
+                            .instance_initializers
+                            .push(InstanceInitializerCandidate {
+                                entry: entry.clone(),
+                                path: step.path.clone(),
+                                constant: Some(value),
+                            });
+                        image
+                            .instance_initializer_indices_by_owner
+                            .entry(owner)
+                            .or_default()
+                            .push(index);
+                        image.stats.instance_initializer_candidates_indexed += 1;
+                    }
                     image.stats.constants_materialized += 1;
                 }
             }
+        }
+        // A subtype may explicitly redeclare an inherited runtime-initialized
+        // field without `=`, which is a real null override in BYOND rather than
+        // an absent assignment. Retain that null at its source position when
+        // an earlier same-field runtime initializer could overwrite it.
+        for entry in registry.entries().iter().filter(|entry| {
+            entry.storage == StorageClass::Instance
+                && entry.assignment == dm_globals::AssignmentKind::Declaration
+                && entry.initializer.is_none()
+        }) {
+            let owner = entry
+                .owner
+                .as_ref()
+                .ok_or_else(|| RuntimeImageError::MissingOwner(entry.path.clone()))?;
+            let owner = parse_type_path(&owner.path)?;
+            if !inherited_runtime_initializer_precedes(
+                &image.types,
+                &runtime_initializer_fields,
+                &owner,
+                entry.ordinal,
+            ) {
+                continue;
+            }
+            let index = image.instance_initializers.len();
+            image
+                .instance_initializers
+                .push(InstanceInitializerCandidate {
+                    entry: entry.clone(),
+                    path: entry.path.clone(),
+                    constant: Some(Value::Null),
+                });
+            image
+                .instance_initializer_indices_by_owner
+                .entry(owner)
+                .or_default()
+                .push(index);
+            image.stats.instance_initializer_candidates_indexed += 1;
+        }
+        let candidates = &image.instance_initializers;
+        for indices in image.instance_initializer_indices_by_owner.values_mut() {
+            indices.sort_by_key(|index| candidates[*index].entry.ordinal);
         }
         image.restore_execution_state(state);
         complete_runtime_phase(
@@ -1245,8 +1619,10 @@ impl RuntimeImage {
         // appended to this shared module, avoiding an O(module) clone per
         // declaration while retaining ordinary and dynamic call targets.
         let mut initializer_frontier = InitializerProcedureFrontier::default();
-        for (entry, _) in &image.instance_initializers {
-            initializer_frontier.include(compilation, entry);
+        for candidate in &image.instance_initializers {
+            if candidate.constant.is_none() {
+                initializer_frontier.include(compilation, &candidate.entry);
+            }
         }
         for step in &plans.global_steps {
             if matches!(step.evaluation, ConstantEvaluation::Unsupported(_)) {
@@ -1465,6 +1841,26 @@ impl RuntimeImage {
         }
     }
 
+    /// Releases rebuildable caches populated by initializer preflight and bulk
+    /// world allocation.
+    ///
+    /// The source initializer inventory and shared VM initializer module remain
+    /// intact. A later [`Self::allocate_datum`] call therefore remains correct;
+    /// it simply rebuilds the requested type's compact plans lazily. This is
+    /// useful before a separate large compilation phase once bulk map
+    /// allocation has completed.
+    pub fn release_allocation_caches(&mut self) -> RuntimeCacheReleaseStats {
+        let stats = RuntimeCacheReleaseStats {
+            initializer_plans: self.instance_initializer_plans.len(),
+            initializer_programs: self.compiled_instance_initializers.len(),
+            allocation_plans: self.datum_allocation_plans.len(),
+        };
+        self.instance_initializer_plans.clear();
+        self.compiled_instance_initializers.clear();
+        self.datum_allocation_plans.clear();
+        stats
+    }
+
     /// Transfers the shared heap and materialized DM globals into VM state.
     ///
     /// # Panics
@@ -1483,6 +1879,7 @@ impl RuntimeImage {
             self.vm_instance_initializer_module.clone(),
         );
         state.set_project_root(self.project_root.clone());
+        state.set_procedure_static_locals(std::mem::take(&mut self.procedure_static_locals));
         if let Some(world) = self.canonical_world {
             state.set_global(
                 FieldName::parse("world").expect("built-in world global name is valid"),
@@ -1517,12 +1914,13 @@ impl RuntimeImage {
     ///
     /// Values written to globals unknown to this image are retained only by the
     /// supplied state; declared globals are synchronized by their DM field name.
-    pub fn restore_execution_state(&mut self, state: ExecutionState) {
+    pub fn restore_execution_state(&mut self, mut state: ExecutionState) {
         for (field, index) in &self.global_variable_indices {
             if let Some(value) = state.global(field) {
                 self.variables[*index].value.clone_from(value);
             }
         }
+        self.procedure_static_locals = state.take_procedure_static_locals();
         self.heap = state.into_heap();
     }
 
@@ -1542,30 +1940,35 @@ impl RuntimeImage {
             datum,
             allocation.is_atom,
             allocation.is_movable,
+            allocation.is_mob,
+            allocation.is_client,
+            allocation.is_particles,
+            allocation.is_image,
         )?;
         materialize_builtin_world_defaults(&mut self.heap, datum, type_path, &self.world_name)?;
         let plan = self.instance_initializer_plan(type_path, &allocation.ancestors)?;
         if !plan.is_empty() {
             let mut state = self.take_execution_state();
-            state.set_instance_initializers(
-                Arc::new(BTreeMap::new()),
-                self.vm_instance_initializer_module.clone(),
-            );
             let result: Result<(), RuntimeImageError> = (|| {
                 for initializer in plan.iter() {
-                    let value = execute_module_in_context(
-                        initializer.program.module(),
-                        initializer.program.entry(),
-                        &[],
-                        &mut state,
-                        &ExecutionContext::new(Value::Datum(datum), Value::Null),
-                    )
-                    .map_err(|error| {
-                        RuntimeImageError::InstanceInitializer {
-                            path: initializer.path.clone(),
-                            message: error.message,
+                    let value = match &initializer.action {
+                        CompiledInstanceInitializerAction::Constant(value) => value.clone(),
+                        CompiledInstanceInitializerAction::Program(program) => {
+                            execute_module_in_context(
+                                program.module(),
+                                program.entry(),
+                                &[],
+                                &mut state,
+                                &ExecutionContext::new(Value::Datum(datum), Value::Null),
+                            )
+                            .map_err(|error| {
+                                RuntimeImageError::InstanceInitializer {
+                                    path: initializer.path.clone(),
+                                    message: error.message,
+                                }
+                            })?
                         }
-                    })?;
+                    };
                     state
                         .heap_mut()
                         .set_datum_field(datum, initializer.field.clone(), value)?;
@@ -1604,31 +2007,32 @@ impl RuntimeImage {
             datum,
             allocation.is_atom,
             allocation.is_movable,
+            allocation.is_mob,
+            allocation.is_client,
+            allocation.is_particles,
+            allocation.is_image,
         )?;
         materialize_builtin_world_defaults(state.heap_mut(), datum, type_path, &self.world_name)?;
         let plan = self.instance_initializer_plan(type_path, &allocation.ancestors)?;
-        let retained_vm_initializers =
-            state.replace_instance_initializers(Arc::new(BTreeMap::new()));
         for initializer in plan.iter() {
-            let value = execute_module_in_context(
-                initializer.program.module(),
-                initializer.program.entry(),
-                &[],
-                state,
-                &ExecutionContext::new(Value::Datum(datum), Value::Null),
-            )
-            .map_err(|error| RuntimeImageError::InstanceInitializer {
-                path: initializer.path.clone(),
-                message: error.message,
-            })?;
+            let value = match &initializer.action {
+                CompiledInstanceInitializerAction::Constant(value) => value.clone(),
+                CompiledInstanceInitializerAction::Program(program) => execute_module_in_context(
+                    program.module(),
+                    program.entry(),
+                    &[],
+                    state,
+                    &ExecutionContext::new(Value::Datum(datum), Value::Null),
+                )
+                .map_err(|error| RuntimeImageError::InstanceInitializer {
+                    path: initializer.path.clone(),
+                    message: error.message,
+                })?,
+            };
             state
                 .heap_mut()
                 .set_datum_field(datum, initializer.field.clone(), value)?;
         }
-        state.set_instance_initializers(
-            retained_vm_initializers,
-            self.vm_instance_initializer_module.clone(),
-        );
         self.stats.dynamic_initializers_materialized += plan.len();
         self.stats.datums_allocated += 1;
         self.stats.stateful_datums_allocated += 1;
@@ -1647,6 +2051,10 @@ impl RuntimeImage {
         let mut visited = BTreeSet::new();
         let mut is_atom = false;
         let mut is_movable = false;
+        let mut is_mob = false;
+        let mut is_client = false;
+        let mut is_particles = false;
+        let mut is_image = false;
         while let Some(path) = current.take() {
             if !visited.insert(path.clone()) {
                 return Err(RuntimeImageError::InheritanceCycle(path));
@@ -1657,15 +2065,27 @@ impl RuntimeImage {
                 .ok_or_else(|| RuntimeImageError::UnknownType(path.clone()))?;
             is_atom |= path.as_str() == "/atom";
             is_movable |= path.as_str() == "/atom/movable";
+            is_mob |= path.as_str() == "/mob";
+            is_client |= path.as_str() == "/client";
+            is_particles |= path.as_str() == "/particles";
+            is_image |= path.as_str() == "/image";
             chain.push(runtime_type.defaults.clone());
             current.clone_from(&runtime_type.parent);
         }
         chain.reverse();
+        let ancestors = chain
+            .iter()
+            .map(|defaults| defaults.type_path().clone())
+            .collect::<Vec<_>>();
         let plan = DatumAllocationPlan {
             defaults: Arc::from(chain),
-            ancestors: Arc::new(visited),
+            ancestors: Arc::from(ancestors),
             is_atom,
             is_movable,
+            is_mob,
+            is_client,
+            is_particles,
+            is_image,
         };
         self.datum_allocation_plans
             .insert(type_path.clone(), plan.clone());
@@ -1676,50 +2096,59 @@ impl RuntimeImage {
     fn instance_initializer_plan(
         &mut self,
         type_path: &TypePath,
-        ancestors: &BTreeSet<TypePath>,
+        ancestors: &[TypePath],
     ) -> Result<Arc<[CompiledInstanceInitializer]>, RuntimeImageError> {
         if let Some(plan) = self.instance_initializer_plans.get(type_path) {
             return Ok(plan.clone());
         }
 
-        let mut applicable = ancestors
+        let applicable = ancestors
             .iter()
             .filter_map(|owner| self.instance_initializer_indices_by_owner.get(owner))
             .flatten()
             .copied()
             .collect::<Vec<_>>();
-        // `instance_initializers` is in global source-ordinal order. Sorting
-        // its stable indices therefore preserves the exact ordering of the old
-        // full-vector filter regardless of ancestor path ordering.
-        applicable.sort_unstable();
         let mut plan = Vec::with_capacity(applicable.len());
         for index in applicable {
             if let Some(initializer) = self.compiled_instance_initializers.get(&index) {
                 plan.push(initializer.clone());
                 continue;
             }
-            let (entry, step) = self.instance_initializers[index].clone();
+            let candidate = self.instance_initializers[index].clone();
+            let entry = candidate.entry;
+            let path = candidate.path;
+            if let Some(value) = candidate.constant {
+                let compiled = CompiledInstanceInitializer {
+                    path: path.clone(),
+                    field: variable_field(&path)?,
+                    action: CompiledInstanceInitializerAction::Constant(value),
+                };
+                self.compiled_instance_initializers
+                    .insert(index, compiled.clone());
+                plan.push(compiled);
+                continue;
+            }
             let initializer = entry
                 .initializer
                 .as_ref()
-                .ok_or_else(|| RuntimeImageError::MissingInitializer(step.path.clone()))?;
+                .ok_or_else(|| RuntimeImageError::MissingInitializer(path.clone()))?;
             let bindings = self.initializer_bindings(&entry).map_err(|failure| {
                 RuntimeImageError::InstanceInitializer {
-                    path: step.path.clone(),
+                    path: path.clone(),
                     message: failure.message,
                 }
             })?;
             let program =
                 compile_initializer(&initializer.tokens, &bindings, None).map_err(|error| {
                     RuntimeImageError::InstanceInitializer {
-                        path: step.path.clone(),
+                        path: path.clone(),
                         message: error.message,
                     }
                 })?;
             let compiled = CompiledInstanceInitializer {
-                path: step.path.clone(),
-                field: variable_field(&step.path)?,
-                program: Arc::new(program),
+                path: path.clone(),
+                field: variable_field(&path)?,
+                action: CompiledInstanceInitializerAction::Program(Arc::new(program)),
             };
             self.compiled_instance_initializers
                 .insert(index, compiled.clone());
@@ -1739,19 +2168,36 @@ impl RuntimeImage {
         module: &mut Module,
     ) -> Result<BTreeMap<TypePath, Vec<InstanceInitializer>>, RuntimeImageError> {
         let mut catalog = BTreeMap::<TypePath, Vec<InstanceInitializer>>::new();
-        for index in 0..self.instance_initializers.len() {
-            let (entry, step) = self.instance_initializers[index].clone();
+        let ordered = self
+            .instance_initializer_indices_by_owner
+            .iter()
+            .flat_map(|(owner, indices)| indices.iter().map(|index| (owner.clone(), *index)))
+            .collect::<Vec<_>>();
+        for (catalog_owner, index) in ordered {
+            let candidate = self.instance_initializers[index].clone();
+            let entry = candidate.entry;
+            let path = candidate.path;
             let owner = entry
                 .owner
                 .as_ref()
                 .ok_or_else(|| RuntimeImageError::MissingOwner(entry.path.clone()))?;
+            let owner = parse_type_path(&owner.path)?;
+            debug_assert_eq!(owner, catalog_owner);
+            let field = variable_field(&path)?;
+            if let Some(value) = candidate.constant {
+                catalog
+                    .entry(owner)
+                    .or_default()
+                    .push(InstanceInitializer::Constant { field, value });
+                continue;
+            }
             let initializer = entry
                 .initializer
                 .as_ref()
-                .ok_or_else(|| RuntimeImageError::MissingInitializer(step.path.clone()))?;
+                .ok_or_else(|| RuntimeImageError::MissingInitializer(path.clone()))?;
             let bindings = self.initializer_bindings(&entry).map_err(|failure| {
                 RuntimeImageError::InstanceInitializer {
-                    path: step.path.clone(),
+                    path: path.clone(),
                     message: failure.message,
                 }
             })?;
@@ -1764,10 +2210,10 @@ impl RuntimeImage {
                 continue;
             };
             catalog
-                .entry(parse_type_path(&owner.path)?)
+                .entry(owner)
                 .or_default()
-                .push(InstanceInitializer {
-                    field: variable_field(&step.path)?,
+                .push(InstanceInitializer::Program {
+                    field,
                     entry: program,
                 });
         }
@@ -1925,6 +2371,59 @@ impl RuntimeImage {
         .map_err(RuntimeImageError::ExpressionExecution)
     }
 
+    /// Evaluates a live-datum expression by appending its entry point to an
+    /// existing executable module.
+    ///
+    /// Existing procedure identities and deferred bodies remain unchanged;
+    /// this is intended for map overrides discovered only after world
+    /// allocation, when rebuilding the lifecycle closure would be wasteful.
+    /// The appended expression retains its expanded source spans and may call
+    /// global project procedures already linked in `module`.
+    pub fn evaluate_datum_expression_linked(
+        &self,
+        datum: DatumId,
+        expression: &str,
+        state: &mut ExecutionState,
+        module: &mut Module,
+    ) -> Result<Value, RuntimeImageError> {
+        let tokens = lex(expression).map_err(|error| RuntimeImageError::ExpressionLowering {
+            message: error.message,
+            source_span: error.span,
+        })?;
+        let tokens = tokens
+            .into_iter()
+            .filter(|token| {
+                !matches!(
+                    token.kind,
+                    TokenKind::LineStart { .. } | TokenKind::Newline | TokenKind::LineContinuation
+                )
+            })
+            .collect::<Vec<_>>();
+        let type_path = state.heap().datum(datum)?.type_path().clone();
+        let bindings = self.datum_expression_bindings(&type_path)?;
+        let entry =
+            compile_initializer_into_module(&tokens, &bindings, module).map_err(|error| {
+                let source_span = tokens
+                    .first()
+                    .zip(tokens.last())
+                    .map_or(SourceSpan::new(0, 0), |(first, last)| {
+                        SourceSpan::new(first.span.start, last.span.end)
+                    });
+                RuntimeImageError::ExpressionLowering {
+                    message: error.message,
+                    source_span,
+                }
+            })?;
+        execute_module_in_context(
+            module,
+            entry,
+            &[],
+            state,
+            &ExecutionContext::new(Value::Datum(datum), Value::Null),
+        )
+        .map_err(RuntimeImageError::ExpressionExecution)
+    }
+
     fn convert_constant_in(
         &mut self,
         constant: &ConstantValue,
@@ -1969,6 +2468,7 @@ impl RuntimeImage {
                 .ok_or_else(|| RuntimeImageError::MissingOwner(step.path.clone()))?;
             let owner = parse_type_path(&owner.path)?;
             let field = variable_field(&step.path)?;
+            let value = normalize_engine_instance_value(&owner, &field, value);
             let runtime_type = self
                 .types
                 .get_mut(&owner)
@@ -2322,6 +2822,26 @@ impl RuntimeImage {
     }
 }
 
+fn normalize_engine_instance_value(owner: &TypePath, field: &FieldName, value: Value) -> Value {
+    if owner.as_str() != "/world" || field.as_str() != "view" {
+        return value;
+    }
+    let Value::Text(text) = &value else {
+        return value;
+    };
+    let Some((width, height)) = text.split_once('x').or_else(|| text.split_once('X')) else {
+        return value;
+    };
+    let (Ok(width), Ok(height)) = (width.trim().parse::<u32>(), height.trim().parse::<u32>())
+    else {
+        return value;
+    };
+    if width == height && width > 0 && width % 2 == 1 {
+        return Value::number((width.saturating_sub(1) / 2) as f32);
+    }
+    value
+}
+
 fn runtime_types(
     compilation: &Compilation,
 ) -> Result<BTreeMap<TypePath, RuntimeType>, RuntimeImageError> {
@@ -2344,6 +2864,15 @@ fn runtime_types(
                 parent,
             },
         );
+    }
+    let datum = TypePath::parse("/datum").expect("built-in datum path is valid");
+    if types.contains_key(&datum) {
+        for runtime_type in types.values_mut() {
+            let path = runtime_type.path.as_str();
+            if runtime_type.parent.is_none() && path != "/datum" && path != "/world" {
+                runtime_type.parent = Some(datum.clone());
+            }
+        }
     }
     Ok(types)
 }
@@ -2494,6 +3023,7 @@ impl std::error::Error for RuntimeImageLoadError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2501,14 +3031,34 @@ mod tests {
 
     use dm_compiler::CompilerDatabase;
     use dm_globals::{StorageClass, UnsupportedCategory, VariableRegistry};
+    use dm_lexer::{TokenKind, lex};
+    use dm_semantics::standard_instance_field_names;
     use dm_value::{FieldName, TypePath, Value};
+    use dm_vm::{compile_initializer, compile_module, execute_module_in_state};
 
     use super::{
         ConstantFieldApplication, InitializerFailurePhase, InitializerProcedureFrontier,
-        RuntimeImage, RuntimeImageConstructionPhase, RuntimeImageError,
+        RuntimeImage, RuntimeImageConstructionPhase, RuntimeImageError, builtin_client_defaults,
+        builtin_mob_defaults, world_clock_values,
     };
 
     static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn byond_world_clocks_share_a_deterministic_instant_and_local_offset() {
+        const BYOND_EPOCH_UNIX_MILLIS: i64 = 946_684_800_000;
+        let clock = world_clock_values(
+            BYOND_EPOCH_UNIX_MILLIS + 123_456_700,
+            23,
+            59,
+            59,
+            900,
+            -19_800,
+        );
+        assert_eq!(clock.realtime_deciseconds, 1_234_567.0);
+        assert_eq!(clock.timeofday_deciseconds, 863_999.0);
+        assert_eq!(clock.timezone_hours, -5.5);
+    }
 
     struct Fixture(PathBuf);
 
@@ -2547,6 +3097,38 @@ mod tests {
 
     fn type_path(path: &str) -> TypePath {
         TypePath::parse(path).expect("test type path should be valid")
+    }
+
+    #[test]
+    fn procedure_static_locals_survive_runtime_image_phase_transfer() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "var/global/seed = 1\n");
+        let mut image = fixture.image();
+        let syntax = dm_syntax::parse(
+            "/proc/get_protected(list/list_ref)\n\tvar/static/list/protected_lists\n\tif(list_ref)\n\t\tprotected_lists = list_ref\n\treturn protected_lists\n/proc/seed_storage()\n\tget_protected(list())\n/proc/update_storage()\n\tvar/list/protected = get_protected()\n\tprotected[\"ADMIN\"] = list(1, 2)\n\treturn protected[\"ADMIN\"]\n",
+        )
+        .unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+
+        let mut first_phase = image.take_execution_state();
+        execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/seed_storage").unwrap(),
+            &[],
+            &mut first_phase,
+        )
+        .unwrap();
+        image.restore_execution_state(first_phase);
+
+        let mut second_phase = image.take_execution_state();
+        let result = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/update_storage").unwrap(),
+            &[],
+            &mut second_phase,
+        )
+        .expect("procedure-static list should survive the phase boundary");
+        assert!(matches!(result, Value::List(_)));
     }
 
     #[test]
@@ -3016,6 +3598,27 @@ mod tests {
     }
 
     #[test]
+    fn square_text_world_view_materializes_as_byond_numeric_radius() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "/world\n\tview = \"15x15\"\n");
+        let mut image = fixture.image();
+        let world = image
+            .allocate_datum(&type_path("/world"))
+            .expect("world should allocate");
+        assert_eq!(
+            image.heap().datum_field(world, &field("view")),
+            Ok(&Value::number(7.0)),
+            "BYOND 516 exposes a 15x15 square view as radius 7"
+        );
+        let state = image.take_execution_state();
+        assert_eq!(
+            state.initial_value(&type_path("/world"), &field("view")),
+            Some(&Value::number(7.0)),
+            "initial(world.view) and the live engine field must agree"
+        );
+    }
+
+    #[test]
     fn instance_initializer_can_read_an_implicit_parent_type_field() {
         let fixture = Fixture::new();
         fixture.write("world.dme", "#include \"types.dm\"\n");
@@ -3090,6 +3693,83 @@ mod tests {
     }
 
     #[test]
+    fn inherited_runtime_default_yields_to_descendant_null_before_new() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/datum/map_template/shuttle\n\tvar/list/who_can_purchase = list(\"Captain\")\n\tvar/occupancy_limit\n/datum/map_template/shuttle/emergency\n\tNew()\n\t\tif(!occupancy_limit && who_can_purchase)\n\t\t\tCRASH(\"purchasable shuttle needs an occupancy limit\")\n/datum/map_template/shuttle/emergency/backup\n\twho_can_purchase = null\n/datum/map_template/shuttle/emergency/unlisted\n\tvar/who_can_purchase\n/datum/map_template/shuttle/emergency/for_sale\n\twho_can_purchase = list(\"Chief Engineer\")\n\toccupancy_limit = \"50\"\n/datum/interleave\n\tvar/list/value = list(\"first\")\n/datum/interleave\n\tvar/value\n/datum/interleave\n\tvalue = list(\"last\")\n/datum/side_effect\n\tvar/a = (b = 99)\n\tvar/b = 7\n/var/global/datum/map_template/shuttle/emergency/backup/vm_backup = new /datum/map_template/shuttle/emergency/backup\n/var/global/datum/map_template/shuttle/emergency/unlisted/vm_unlisted = new /datum/map_template/shuttle/emergency/unlisted\n/var/global/datum/map_template/shuttle/emergency/for_sale/vm_for_sale = new /datum/map_template/shuttle/emergency/for_sale\n/var/global/datum/interleave/vm_interleave = new /datum/interleave\n/var/global/datum/side_effect/vm_side_effect = new /datum/side_effect\n",
+        );
+
+        let mut image = fixture.image();
+        let read_global_field = |image: &RuntimeImage, suffix: &str, name: &str| {
+            let Value::Datum(datum) = image
+                .variables()
+                .iter()
+                .find(|variable| variable.path.ends_with(suffix))
+                .unwrap_or_else(|| panic!("missing global {suffix}"))
+                .value
+            else {
+                panic!("{suffix} should hold a datum")
+            };
+            image
+                .heap()
+                .datum_field(datum, &field(name))
+                .unwrap_or_else(|error| panic!("missing {name} on {suffix}: {error}"))
+                .clone()
+        };
+
+        assert_eq!(
+            read_global_field(&image, "/vm_backup", "who_can_purchase"),
+            Value::Null,
+            "VM dynamic new must apply the backup subtype's explicit null after the inherited list"
+        );
+        assert_eq!(
+            read_global_field(&image, "/vm_unlisted", "who_can_purchase"),
+            Value::Null,
+            "an explicit uninitialized descendant declaration is also a null override"
+        );
+        assert!(matches!(
+            read_global_field(&image, "/vm_for_sale", "who_can_purchase"),
+            Value::List(_)
+        ));
+        let Value::List(interleaved) = read_global_field(&image, "/vm_interleave", "value") else {
+            panic!("the final same-owner runtime initializer must follow the null declaration")
+        };
+        assert_eq!(
+            image.heap().list(interleaved).unwrap().get(1),
+            Ok(&Value::text("last")),
+            "VM catalog actions must retain same-owner source order"
+        );
+        assert_eq!(
+            read_global_field(&image, "/vm_side_effect", "b"),
+            Value::number(7.0),
+            "a later constant must follow an earlier initializer's cross-field side effect"
+        );
+
+        for path in [
+            "/datum/map_template/shuttle/emergency/backup",
+            "/datum/map_template/shuttle/emergency/unlisted",
+        ] {
+            let datum = image
+                .allocate_datum(&type_path(path))
+                .expect("host allocation should preserve descendant null ordering");
+            assert_eq!(
+                image.heap().datum_field(datum, &field("who_can_purchase")),
+                Ok(&Value::Null),
+                "host allocation must apply {path}'s null after the inherited list"
+            );
+        }
+        let side_effect = image
+            .allocate_datum(&type_path("/datum/side_effect"))
+            .expect("host allocation should preserve cross-field source order");
+        assert_eq!(
+            image.heap().datum_field(side_effect, &field("b")),
+            Ok(&Value::number(7.0))
+        );
+    }
+
+    #[test]
     fn macro_generated_semicolon_assignments_have_distinct_initializers() {
         let fixture = Fixture::new();
         fixture.write("world.dme", "#include \"types.dm\"\n");
@@ -3123,7 +3803,7 @@ mod tests {
         fixture.write("world.dme", "#include \"types.dm\"\n");
         fixture.write(
             "types.dm",
-            "/datum/base\n\tvar/list/items = list(1)\n\tvar/datum/base/child = new /datum/base\n/datum/base/sub\n\titems = list(2)\n\tchild = new /datum/base/sub\n",
+            "/datum/child\n\tvar/list/nested_items = list(9)\n/datum/base\n\tvar/list/items = list(1)\n\tvar/datum/child/child = new /datum/child\n/datum/base/sub\n\titems = list(2)\n\tchild = new /datum/child\n",
         );
 
         let mut image = fixture.image();
@@ -3186,8 +3866,19 @@ mod tests {
                 .unwrap()
                 .type_path()
                 .as_str(),
-            "/datum/base/sub"
+            "/datum/child"
         );
+        let first_nested = image
+            .heap()
+            .datum_field(first_child, &field("nested_items"))
+            .expect("nested new must execute its own instance defaults");
+        let second_nested = image
+            .heap()
+            .datum_field(second_child, &field("nested_items"))
+            .expect("second nested new must execute its own instance defaults");
+        assert!(matches!(first_nested, Value::List(_)));
+        assert!(matches!(second_nested, Value::List(_)));
+        assert_ne!(first_nested, second_nested, "nested lists must not alias");
     }
 
     #[test]
@@ -3214,6 +3905,40 @@ mod tests {
         assert_eq!(reused.plans_compiled, 0);
         assert_eq!(reused.plans_reused, 1);
         assert_eq!(image.stats().datums_allocated, 0);
+    }
+
+    #[test]
+    fn released_preflight_caches_rebuild_lazily_without_changing_defaults() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/datum/base\n\tvar/list/items = list(7)\n/datum/base/sub\n",
+        );
+        let mut image = fixture.image();
+        let subtype = type_path("/datum/base/sub");
+        image
+            .preflight_instance_initializers([subtype.clone()])
+            .expect("valid plan should preflight");
+        let released = image.release_allocation_caches();
+        assert_eq!(released.initializer_plans, 1);
+        assert_eq!(released.initializer_programs, 1);
+        assert_eq!(released.allocation_plans, 1);
+
+        let datum = image
+            .allocate_datum(&subtype)
+            .expect("allocation should lazily rebuild released plans");
+        let Value::List(items) = image
+            .heap()
+            .datum_field(datum, &field("items"))
+            .expect("dynamic inherited default should still materialize")
+        else {
+            panic!("items should remain a fresh list")
+        };
+        assert_eq!(
+            image.heap().list(*items).unwrap().get(1),
+            Ok(&Value::number(7.0))
+        );
     }
 
     #[test]
@@ -3309,9 +4034,15 @@ mod tests {
         fixture.write("types.dm", "/obj/example\n\talpha = 127\n");
 
         let mut image = fixture.image();
+        let lists_before = image.heap().live_list_count();
         let datum_id = image
             .allocate_datum(&type_path("/obj/example"))
             .expect("atom subtype should allocate");
+        assert_eq!(
+            image.heap().live_list_count(),
+            lists_before + 1,
+            "an untouched atom must allocate only its spatial contents list"
+        );
         let datum = image.heap().datum(datum_id).expect("datum should be live");
         assert_eq!(
             datum.field(&field("alpha")).unwrap().as_number(),
@@ -3338,6 +4069,212 @@ mod tests {
             );
         }
         assert_eq!(datum.field(&field("transform")), Ok(&Value::Null));
+        assert!(matches!(
+            datum.field(&field("contents")),
+            Ok(Value::List(_))
+        ));
+        for name in [
+            "filters",
+            "overlays",
+            "underlays",
+            "verbs",
+            "vis_contents",
+            "vis_locs",
+        ] {
+            assert!(
+                !matches!(datum.field(&field(name)), Ok(Value::List(_))),
+                "{name} must not allocate a list before the VM observes it",
+            );
+        }
+
+        let second = image
+            .allocate_datum(&type_path("/obj/example"))
+            .expect("second atom subtype should allocate");
+        assert_eq!(
+            image.heap().live_list_count(),
+            lists_before + 2,
+            "native appearance and visibility lists must not scale with untouched atoms"
+        );
+        assert_ne!(
+            image.heap().datum_field(datum_id, &field("contents")),
+            image.heap().datum_field(second, &field("contents")),
+            "eager spatial contents lists must not alias between instances",
+        );
+
+        let mob = image.allocate_datum(&type_path("/mob")).unwrap();
+        assert_eq!(
+            image.heap().datum_field(mob, &field("see_in_dark")),
+            Ok(&Value::number(2.0))
+        );
+        let client = image.allocate_datum(&type_path("/client")).unwrap();
+        for name in ["images", "screen", "verbs"] {
+            assert!(matches!(
+                image.heap().datum_field(client, &field(name)),
+                Ok(Value::List(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn dynamic_dummy_mob_exposes_null_client_during_initialize_add_verb() {
+        const PROCEDURES: &str = "/proc/add_verb(mob/target)\n\tif(!target.client)\n\t\treturn isnull(target.client)\n\treturn 0\n/mob/living/carbon/human/dummy/New()\n\tglobal.add_verb_result = Initialize()\n/mob/living/carbon/human/dummy/proc/Initialize()\n\treturn add_verb(src)\n/proc/run()\n\tnew /mob/living/carbon/human/dummy\n\treturn global.add_verb_result\n";
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            &format!("var/global/add_verb_result = 0\n{PROCEDURES}"),
+        );
+        let mut image = fixture.image();
+        let syntax = dm_syntax::parse(PROCEDURES).expect("dummy mob fixture should parse");
+        let module = compile_module(&syntax.definitions).expect("dummy mob fixture should lower");
+        let mob = image
+            .allocate_datum(&type_path("/mob"))
+            .expect("mob should allocate");
+        let client = image
+            .allocate_datum(&type_path("/client"))
+            .expect("client should allocate");
+        let mut state = image.take_execution_state();
+        let dummy = type_path("/mob/living/carbon/human/dummy");
+
+        for (path, datum, defaults) in [
+            (
+                type_path("/mob"),
+                mob,
+                builtin_mob_defaults().into_iter().collect::<Vec<_>>(),
+            ),
+            (
+                type_path("/client"),
+                client,
+                builtin_client_defaults().into_iter().collect::<Vec<_>>(),
+            ),
+        ] {
+            let semantic_fields = standard_instance_field_names(path.as_str());
+            for (name, expected) in defaults {
+                assert!(
+                    semantic_fields.contains(&name),
+                    "materialized engine field {path}.{name} must be in the semantic catalog",
+                );
+                assert_eq!(
+                    state.heap().datum_field(datum, &field(name)),
+                    Ok(&expected),
+                    "unexpected materialized engine default for {path}.{name}",
+                );
+                assert_eq!(
+                    state.initial_value(&path, &field(name)),
+                    Some(&expected),
+                    "transferred initial metadata must retain {path}.{name}",
+                );
+            }
+        }
+        assert_eq!(
+            state.initial_value(&dummy, &field("client")),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/run").expect("run procedure"),
+                &[],
+                &mut state,
+            )
+            .expect("headless dummy Initialize should read mob.client"),
+            Value::number(1.0),
+        );
+    }
+
+    #[test]
+    fn semantic_atom_and_movable_engine_field_catalogs_are_materialized() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/obj/example\n/particles/example\n/mutable_appearance/example\n",
+        );
+        let mut image = fixture.image();
+        let object = image
+            .allocate_datum(&type_path("/obj/example"))
+            .expect("object should allocate");
+
+        for type_path in ["/atom", "/atom/movable"] {
+            for name in standard_instance_field_names(type_path) {
+                if [
+                    "filters",
+                    "overlays",
+                    "underlays",
+                    "verbs",
+                    "vis_contents",
+                    "vis_locs",
+                ]
+                .contains(&name)
+                {
+                    assert!(
+                        !matches!(
+                            image.heap().datum_field(object, &field(name)),
+                            Ok(Value::List(_))
+                        ),
+                        "semantic engine field {type_path}.{name} must remain lazy",
+                    );
+                    continue;
+                }
+                assert!(
+                    image.heap().datum_field(object, &field(name)).is_ok(),
+                    "semantic engine field {type_path}.{name} must have runtime storage",
+                );
+            }
+        }
+        let particles = image
+            .allocate_datum(&type_path("/particles/example"))
+            .expect("particles should allocate");
+        for name in standard_instance_field_names("/particles") {
+            assert!(
+                image.heap().datum_field(particles, &field(name)).is_ok(),
+                "semantic particle field {name} must have runtime storage",
+            );
+        }
+        let appearance = image
+            .allocate_datum(&type_path("/mutable_appearance/example"))
+            .expect("mutable appearance should allocate");
+        for name in standard_instance_field_names("/image") {
+            assert!(
+                image.heap().datum_field(appearance, &field(name)).is_ok(),
+                "semantic image field {name} must have runtime storage",
+            );
+        }
+        for (name, expected) in [
+            ("appearance", Value::Null),
+            ("desc", Value::Null),
+            ("gender", Value::text("neuter")),
+            ("luminosity", Value::number(0.0)),
+            ("particles", Value::Null),
+            ("suffix", Value::Null),
+            ("step_x", Value::number(0.0)),
+            ("step_y", Value::number(0.0)),
+        ] {
+            assert_eq!(
+                image.heap().datum_field(object, &field(name)),
+                Ok(&expected),
+                "unexpected BYOND default for {name}",
+            );
+        }
+    }
+
+    #[test]
+    fn parentless_engine_types_inherit_base_datum_storage() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/datum\n\tvar/datum_flags = 0\n/regex/example\n/icon/example\n",
+        );
+        let mut image = fixture.image();
+        for path in ["/regex/example", "/icon/example"] {
+            let datum = image.allocate_datum(&type_path(path)).unwrap();
+            assert_eq!(
+                image.heap().datum_field(datum, &field("datum_flags")),
+                Ok(&Value::number(0.0)),
+                "{path} must inherit /datum fields",
+            );
+        }
     }
 
     #[test]
@@ -3700,6 +4637,51 @@ mod tests {
             RuntimeImageError::ExpressionExecution(ref error)
                 if error.source_span.is_some() && !error.call_stack.is_empty()
         ));
+    }
+
+    #[test]
+    fn linked_datum_expression_appends_without_renumbering_existing_entries() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "var/global/offset = 3\n/datum/base\n\tvar/base = 4\n",
+        );
+        let mut image = fixture.image();
+        let datum = image
+            .allocate_datum(&type_path("/datum/base"))
+            .expect("datum should allocate");
+        let mut state = image.take_execution_state();
+
+        let seed_tokens = lex("1")
+            .unwrap()
+            .into_iter()
+            .filter(|token| {
+                !matches!(
+                    token.kind,
+                    TokenKind::LineStart { .. } | TokenKind::Newline | TokenKind::LineContinuation
+                )
+            })
+            .collect::<Vec<_>>();
+        let seed = compile_initializer(&seed_tokens, &BTreeMap::new(), None).unwrap();
+        let mut module = seed.module().clone();
+        let original = module.procedure_id_at(0).expect("seed entry");
+
+        assert_eq!(
+            image
+                .evaluate_datum_expression_linked(datum, "base + offset", &mut state, &mut module,)
+                .expect("linked expression should execute"),
+            Value::number(7.0)
+        );
+        assert_eq!(module.procedure_id_at(0), Some(original));
+        let appended = module.procedure_id_at(1).expect("appended entry");
+        assert_eq!(module.procedure_path(appended), Some("<initializer>"));
+        assert!(module.procedure(appended).is_some_and(|program| {
+            program
+                .source_spans
+                .iter()
+                .all(|span| span.end > span.start)
+        }));
     }
 
     #[test]

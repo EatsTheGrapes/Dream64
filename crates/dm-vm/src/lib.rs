@@ -22,6 +22,29 @@ use dm_syntax::{Definition, DefinitionKind, SourceLine};
 pub use dm_value::Value;
 use dm_value::{DatumId, FieldName, ListId, ModifiedTypePath, TypePath, ValueError, ValueHeap};
 
+// Dream Maker compiles text macros to non-printing format characters. Keep
+// the same representation boundary in Dream64 so the formatter still has the
+// original interpolation value available for articles, ordinals, and gendered
+// pronouns.
+const TEXT_MACRO_THE: char = '\u{f100}';
+const TEXT_MACRO_THE_UPPER: char = '\u{f101}';
+const TEXT_MACRO_A: char = '\u{f102}';
+const TEXT_MACRO_A_UPPER: char = '\u{f103}';
+const TEXT_MACRO_PROPER: char = '\u{f104}';
+const TEXT_MACRO_IMPROPER: char = '\u{f105}';
+const TEXT_MACRO_ROMAN: char = '\u{f106}';
+const TEXT_MACRO_ROMAN_UPPER: char = '\u{f107}';
+const TEXT_MACRO_ORDINAL: char = '\u{f108}';
+const TEXT_MACRO_PLURAL: char = '\u{f109}';
+const TEXT_MACRO_SUBJECT: char = '\u{f10a}';
+const TEXT_MACRO_SUBJECT_UPPER: char = '\u{f10b}';
+const TEXT_MACRO_POSSESSIVE_ADJECTIVE: char = '\u{f10c}';
+const TEXT_MACRO_POSSESSIVE_ADJECTIVE_UPPER: char = '\u{f10d}';
+const TEXT_MACRO_OBJECT: char = '\u{f10e}';
+const TEXT_MACRO_REFLEXIVE: char = '\u{f10f}';
+const TEXT_MACRO_POSSESSIVE: char = '\u{f110}';
+const TEXT_MACRO_POSSESSIVE_UPPER: char = '\u{f111}';
+
 /// One instruction in the portable reference bytecode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Instruction {
@@ -31,6 +54,8 @@ pub enum Instruction {
     PushNumber(DmNumberBits),
     /// Pushes a text constant.
     PushText(String),
+    /// Pushes a first-class BYOND file/resource constant.
+    PushFile(String),
     /// Pushes a canonical absolute DM type path.
     PushTypePath(TypePath),
     /// Pushes a local's pointer cell, creating one on first address-of use.
@@ -64,10 +89,8 @@ pub enum Instruction {
         /// Number of already-evaluated constructor arguments (one or two).
         argument_count: u8,
     },
-    /// Constructs BYOND's built-in `/mutable_appearance` datum.
-    ///
-    /// Constructor arguments are discarded after evaluation; rendering and
-    /// appearance inheritance are outside this headless VM's scope.
+    /// Constructs BYOND's built-in `/mutable_appearance` datum when a project
+    /// has not replaced the call with its own global procedure.
     MakeMutableAppearance {
         /// Number of already-evaluated constructor arguments to discard.
         argument_count: u16,
@@ -131,6 +154,8 @@ pub enum Instruction {
     Animate {
         /// Name of each argument, or `None` for a positional argument.
         argument_names: Vec<Option<String>>,
+        /// Source argument positions supplied through `arglist()`.
+        expanded_indices: Vec<u16>,
     },
     /// Constructs a `/dm_filter` while retaining keyword property names.
     MakeFilter {
@@ -141,6 +166,9 @@ pub enum Instruction {
     },
     /// Reads a field's compile-time initial value from a datum or type path.
     InitialField(FieldName),
+    /// Reads an initial datum field selected by a runtime text key, as in
+    /// `initial(object.vars[name])`.
+    InitialDynamicField,
     /// Enumerates every materialized turf in an inclusive 3D rectangular block.
     Block {
         /// Number of supplied arguments: two turfs, or three through six coordinates.
@@ -200,7 +228,12 @@ pub enum Instruction {
     /// The catalog belongs to [`ExecutionState`], allowing the runtime image
     /// to provide the complete object tree without coupling bytecode to its
     /// materialization implementation.
-    TypesOf,
+    TypesOf {
+        /// Number of selectors whose inclusive type families are concatenated.
+        argument_count: u8,
+    },
+    /// Tests whether a receiver exposes a named procedure.
+    HasCall,
     /// Returns a snapshot list of live datums matching a type and descendants.
     TypeInstances(TypePath),
     /// Classifies a value using BYOND's simple predicate builtins.
@@ -238,8 +271,16 @@ pub enum Instruction {
     /// the current indexed value and the supplied value, then updates that
     /// list.
     CompoundListIndex(CompoundListIndexOperator),
+    /// Compound indexed assignment that leaves the assigned value as the
+    /// expression result.
+    CompoundListIndexKeep(CompoundListIndexOperator),
     /// Pops a list handle and pushes its deterministic iteration length.
     ListLength,
+    /// Converts an atom/world iterable to its live `contents` list. Lists and
+    /// null pass through unchanged.
+    PrepareIteration,
+    /// Tests whether an enumerated value can bind to a typed loop variable.
+    IterationTypeFilter(TypePath),
     /// Pushes a local value.
     LoadLocal(u16),
     /// Pops into a local slot.
@@ -438,6 +479,8 @@ pub enum Instruction {
         procedure: ProcedureId,
         /// Number of positional values supplied by the caller.
         argument_count: u16,
+        /// Optional BYOND keyword attached to each source argument.
+        argument_names: Vec<Option<String>>,
     },
     /// Calls the currently executing procedure.
     CallCurrent {
@@ -607,6 +650,9 @@ pub struct Program {
     pub wait_for: bool,
     /// Declared positional parameter count.
     pub parameter_count: usize,
+    /// Declared parameter names in positional order. Empty entries represent
+    /// unnamed varargs slots.
+    pub parameter_names: Vec<String>,
     /// Number of local slots, including parameters.
     pub local_count: usize,
     /// Portable instructions in execution order.
@@ -621,8 +667,10 @@ pub struct Module {
     procedures: Vec<Program>,
     paths: Vec<String>,
     names: HashMap<String, ProcedureId>,
+    /// Latest implementation for each canonical path with reopening suffixes removed.
+    dynamic_names: HashMap<String, ProcedureId>,
     deferred: Arc<HashMap<ProcedureId, DeferredProcedure>>,
-    procedure_types: BTreeSet<TypePath>,
+    procedure_types: Vec<TypePath>,
     initializer_call_names: Option<InitializerCallNameIndex>,
 }
 
@@ -650,13 +698,28 @@ pub struct InitializerProgram {
     entry: ProcedureId,
 }
 
-/// One per-instance initializer executed before `New()` on every allocation.
+/// One ordered per-instance initializer action executed before `New()`.
+///
+/// Constant actions are retained only when an earlier runtime initializer for
+/// the same inherited field could otherwise overwrite a descendant constant
+/// override. This preserves BYOND's ancestor-to-descendant default ordering
+/// without materializing every scalar default on compact engine turfs.
 #[derive(Clone)]
-pub struct InstanceInitializer {
-    /// Destination datum field.
-    pub field: FieldName,
-    /// Entry in the shared linked initializer module.
-    pub entry: ProcedureId,
+pub enum InstanceInitializer {
+    /// Reapply an immutable scalar value at its declared position.
+    Constant {
+        /// Destination datum field.
+        field: FieldName,
+        /// Declared scalar value.
+        value: Value,
+    },
+    /// Evaluate a fresh runtime expression and store its result.
+    Program {
+        /// Destination datum field.
+        field: FieldName,
+        /// Entry in the shared linked initializer module.
+        entry: ProcedureId,
+    },
 }
 
 impl InitializerProgram {
@@ -676,6 +739,16 @@ impl InitializerProgram {
 impl Module {
     fn resolve_procedure(&self, procedure: ProcedureId) -> Result<&Program, String> {
         if let Some(deferred) = self.deferred.get(&procedure) {
+            let pending = deferred.compiled.get().is_none();
+            let started = pending.then(Instant::now);
+            if pending && boot_trace_enabled() {
+                eprintln!(
+                    "boot-vm: deferred-materialize-begin path={}",
+                    self.paths
+                        .get(procedure.index())
+                        .map_or("<missing>", String::as_str),
+                );
+            }
             return deferred
                 .compiled
                 .get_or_init(|| {
@@ -691,7 +764,20 @@ impl Module {
                     )
                 })
                 .as_ref()
-                .map_err(|error| error.message.clone());
+                .map_err(|error| error.message.clone())
+                .inspect(|_| {
+                    if let Some(started) = started
+                        && boot_trace_enabled()
+                    {
+                        eprintln!(
+                            "boot-vm: deferred-materialized path={} elapsed_ms={}",
+                            self.paths
+                                .get(procedure.index())
+                                .map_or("<missing>", String::as_str),
+                            started.elapsed().as_millis(),
+                        );
+                    }
+                });
         }
         self.procedures
             .get(procedure.index())
@@ -752,6 +838,11 @@ impl Module {
         self.procedures.get(index)?;
         u32::try_from(index).ok().map(ProcedureId)
     }
+
+    /// Returns procedure paths exposed through BYOND's `typesof(/owner/proc)` catalog.
+    pub fn procedure_type_paths(&self) -> impl Iterator<Item = &TypePath> {
+        self.procedure_types.iter()
+    }
 }
 
 /// One independently identified procedure body supplied by a semantic layer.
@@ -774,6 +865,40 @@ pub struct ProcedureSpec<'definition> {
     /// Bare identifiers that resolve to persistent runtime globals when they
     /// do not name a parameter, local, or `src` field.
     pub global_fields: BTreeMap<String, FieldName>,
+}
+
+fn procedure_spec_is_type_path(spec: &ProcedureSpec<'_>) -> bool {
+    if spec.definition.kind == DefinitionKind::Procedure {
+        return true;
+    }
+    // Generated managed-global procedures can be reopened by a shorthand
+    // owner override. The effective spec then carries ProcedureOverride even
+    // though the canonical declaration is a real `/proc/InitGlobal*` member
+    // and BYOND includes it in typesof(owner/proc). Do not admit ordinary
+    // shorthand overrides such as Initialize/New into the procedure catalog.
+    spec.path
+        .split_once('@')
+        .map_or(spec.path.as_str(), |(path, _)| path)
+        .rsplit_once("/proc/")
+        .is_some_and(|(_, selector)| selector.starts_with("InitGlobal"))
+}
+
+fn procedure_type_catalog_from_specs(specs: &[ProcedureSpec<'_>]) -> Vec<TypePath> {
+    let mut catalog = specs
+        .iter()
+        .filter(|spec| procedure_spec_is_type_path(spec))
+        .filter_map(|spec| {
+            let (path, ordinal) = spec
+                .path
+                .rsplit_once('@')
+                .map_or((spec.path.as_str(), usize::MAX), |(path, ordinal)| {
+                    (path, ordinal.parse::<usize>().unwrap_or(usize::MAX))
+                });
+            TypePath::parse(path).ok().map(|path| (ordinal, path))
+        })
+        .collect::<Vec<_>>();
+    catalog.sort_by_key(|(ordinal, _)| *ordinal);
+    catalog.into_iter().map(|(_, path)| path).collect()
 }
 
 /// Failure while compiling the initial executable subset.
@@ -879,8 +1004,9 @@ pub fn compile_initializer(
         procedures: Vec::new(),
         paths: Vec::new(),
         names: HashMap::new(),
+        dynamic_names: HashMap::new(),
         deferred: Arc::new(HashMap::new()),
-        procedure_types: BTreeSet::new(),
+        procedure_types: Vec::new(),
         initializer_call_names: None,
     });
     let entry = compile_initializer_into_module(tokens, bindings, &mut module)?;
@@ -931,6 +1057,7 @@ pub fn compile_initializer_into_module(
     let program = Program {
         wait_for: true,
         parameter_count: 0,
+        parameter_names: Vec::new(),
         local_count: 0,
         source_spans: vec![source_span; instructions.len()],
         instructions,
@@ -938,6 +1065,9 @@ pub fn compile_initializer_into_module(
     let entry = ProcedureId::from_index(module.procedures.len())?;
     module.procedures.push(program);
     module.paths.push("<initializer>".to_owned());
+    module
+        .dynamic_names
+        .insert("<initializer>".to_owned(), entry);
     Ok(entry)
 }
 
@@ -1007,6 +1137,7 @@ pub fn compile_module_with_global_fields(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Module {
         procedures,
+        dynamic_names: dynamic_name_index(&paths)?,
         paths,
         names,
         deferred: Arc::new(HashMap::new()),
@@ -1096,21 +1227,11 @@ pub fn compile_module_specs_with_global_types(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Module {
         procedures,
+        dynamic_names: dynamic_name_index(&paths)?,
         paths,
         names,
         deferred: Arc::new(HashMap::new()),
-        procedure_types: specs
-            .iter()
-            .filter(|spec| spec.definition.kind == DefinitionKind::Procedure)
-            .filter_map(|spec| {
-                TypePath::parse(
-                    spec.path
-                        .split_once('@')
-                        .map_or(&spec.path, |(base, _)| base),
-                )
-                .ok()
-            })
-            .collect(),
+        procedure_types: procedure_type_catalog_from_specs(specs),
         initializer_call_names: None,
     })
 }
@@ -1188,6 +1309,7 @@ pub fn compile_module_specs_selective_with_errors(
             procedures.push(Program {
                 wait_for: true,
                 parameter_count: 0,
+                parameter_names: Vec::new(),
                 local_count: 0,
                 instructions: Vec::new(),
                 source_spans: Vec::new(),
@@ -1208,21 +1330,11 @@ pub fn compile_module_specs_selective_with_errors(
     }
     Ok(Module {
         procedures,
+        dynamic_names: dynamic_name_index(&paths)?,
         paths,
         names,
         deferred: Arc::new(deferred),
-        procedure_types: specs
-            .iter()
-            .filter(|spec| spec.definition.kind == DefinitionKind::Procedure)
-            .filter_map(|spec| {
-                TypePath::parse(
-                    spec.path
-                        .split_once('@')
-                        .map_or(&spec.path, |(base, _)| base),
-                )
-                .ok()
-            })
-            .collect(),
+        procedure_types: procedure_type_catalog_from_specs(specs),
         initializer_call_names: None,
     })
 }
@@ -1248,6 +1360,17 @@ fn resolved_spec_targets(
 
 struct SpecCallIndex {
     latest_by_base_path: HashMap<String, ProcedureId>,
+}
+
+fn dynamic_name_index(paths: &[String]) -> Result<HashMap<String, ProcedureId>, CompileError> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(position, path)| {
+            let base_path = path.split_once('@').map_or(path.as_str(), |(base, _)| base);
+            Ok((base_path.to_owned(), ProcedureId::from_index(position)?))
+        })
+        .collect()
 }
 
 impl SpecCallIndex {
@@ -1364,6 +1487,9 @@ fn compile_procedure_with_resolver_and_fields(
         // occupies an argument position, but cannot be referenced by name.
         if let Some(name) = parameter_name(&parameter.tokens) {
             locals.insert_parameter(name.to_owned(), to_local_index(index)?);
+            if let Some(type_path) = declared_parameter_type(&parameter.tokens, name) {
+                locals.set_type(name.to_owned(), type_path);
+            }
         }
     }
     locals.reserve_parameter_slots(definition.parameters.len())?;
@@ -1375,18 +1501,32 @@ fn compile_procedure_with_resolver_and_fields(
     let mut instructions = Vec::new();
     let mut source_spans = Vec::new();
     let mut loops = Vec::new();
-    push_instruction(
-        &mut instructions,
-        &mut source_spans,
-        Instruction::MakeArgs,
-        definition.span,
-    );
-    push_instruction(
-        &mut instructions,
-        &mut source_spans,
-        Instruction::StoreLocal(args_slot),
-        definition.span,
-    );
+    // BYOND exposes `args` as a per-call list, but materializing it eagerly in
+    // every procedure turns short hot-path calls (notably map loading and
+    // InitAtom) into millions of otherwise unreachable list identities. The
+    // value is unobservable when the special local is never referenced, so
+    // retain exact behavior while allocating it only for procedures whose
+    // expanded syntax can read or write `args`.
+    let uses_args = definition
+        .parameters
+        .iter()
+        .flat_map(|parameter| parameter.tokens.iter())
+        .chain(definition.body.iter().flat_map(|line| line.tokens.iter()))
+        .any(|token| matches!(&token.kind, TokenKind::Identifier(name) if name == "args"));
+    if uses_args {
+        push_instruction(
+            &mut instructions,
+            &mut source_spans,
+            Instruction::MakeArgs,
+            definition.span,
+        );
+        push_instruction(
+            &mut instructions,
+            &mut source_spans,
+            Instruction::StoreLocal(args_slot),
+            definition.span,
+        );
+    }
     compile_parameter_defaults(
         definition,
         &locals,
@@ -1399,7 +1539,14 @@ fn compile_procedure_with_resolver_and_fields(
     // helper, for example, becomes `qdel(x); x = null`.  Keep statement
     // separators out of the expression parser by turning only top-level
     // semicolons into ordinary logical lines before lowering the body.
-    let mut body = normalize_labeled_loops(split_top_level_semicolon_statements(&definition.body));
+    let joined_body = join_delimited_physical_lines(&definition.body);
+    let mut body = normalize_labeled_loops(split_top_level_semicolon_statements(&joined_body));
+    // A backslash joins physical DM lines before parsing.  Syntax retains the
+    // marker for source mapping, but it has no expression-level meaning.
+    for line in &mut body {
+        line.tokens
+            .retain(|token| !matches!(token.kind, TokenKind::LineContinuation));
+    }
     if definition.kind == DefinitionKind::Verb {
         // `set hidden/category/name/...` lines on verbs are declaration
         // metadata, not executable assignments.
@@ -1444,9 +1591,48 @@ fn compile_procedure_with_resolver_and_fields(
     Ok(Program {
         wait_for: procedure_wait_for(definition),
         parameter_count: definition.parameters.len(),
+        parameter_names: definition
+            .parameters
+            .iter()
+            .map(|parameter| {
+                parameter_name(&parameter.tokens)
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect(),
         local_count: locals.slot_count,
         instructions,
         source_spans,
+    })
+}
+
+/// Joins physical source lines while a parenthesized/bracketed expression is
+/// still open. Dream Maker treats their indentation and leading commas as
+/// whitespace inside the expression rather than as new statements.
+fn join_delimited_physical_lines(lines: &[SourceLine]) -> Vec<SourceLine> {
+    let mut result = Vec::new();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let mut line = lines[index].clone();
+        let mut depth = delimiter_delta(&line.tokens);
+        while depth > 0 && index + 1 < lines.len() {
+            index += 1;
+            let continuation = &lines[index];
+            depth += delimiter_delta(&continuation.tokens);
+            line.tokens.extend(continuation.tokens.iter().cloned());
+            line.span = SourceSpan::new(line.span.start, continuation.span.end);
+        }
+        result.push(line);
+        index += 1;
+    }
+    result
+}
+
+fn delimiter_delta(tokens: &[SpannedToken]) -> isize {
+    tokens.iter().fold(0isize, |depth, token| match token.kind {
+        TokenKind::Punctuation('(' | '[') => depth + 1,
+        TokenKind::Punctuation(')' | ']') => depth - 1,
+        _ => depth,
     })
 }
 
@@ -1597,7 +1783,7 @@ fn normalize_labeled_loops(mut lines: Vec<SourceLine>) -> Vec<SourceLine> {
             if matches!(
                 lines[cursor].tokens.as_slice(),
                 [SpannedToken { kind: TokenKind::Identifier(keyword), .. }, SpannedToken { kind: TokenKind::Identifier(target), .. }]
-                    if keyword == "break" && target == &label
+                    if matches!(keyword.as_str(), "break" | "continue") && target == &label
             ) {
                 lines[cursor].tokens[1].kind =
                     TokenKind::Number(active_loop_indents.len().to_string());
@@ -1611,6 +1797,7 @@ fn normalize_labeled_loops(mut lines: Vec<SourceLine>) -> Vec<SourceLine> {
 
 struct LocalTable<'fields> {
     names: HashMap<String, u16>,
+    types: HashMap<String, TypePath>,
     src_fields: &'fields BTreeMap<String, FieldName>,
     global_fields: &'fields BTreeMap<String, FieldName>,
     global_types: &'fields BTreeMap<String, TypePath>,
@@ -1635,6 +1822,7 @@ impl<'fields> LocalTable<'fields> {
     ) -> Self {
         Self {
             names: HashMap::new(),
+            types: HashMap::new(),
             src_fields,
             global_fields,
             global_types,
@@ -1674,6 +1862,14 @@ impl<'fields> LocalTable<'fields> {
         self.names.get(name).copied()
     }
 
+    fn set_type(&mut self, name: String, type_path: TypePath) {
+        self.types.insert(name, type_path);
+    }
+
+    fn local_type(&self, name: &str) -> Option<&TypePath> {
+        self.types.get(name)
+    }
+
     fn src_field(&self, name: &str) -> Option<&FieldName> {
         self.src_fields.get(name)
     }
@@ -1699,6 +1895,7 @@ impl<'fields> LocalTable<'fields> {
 
     fn remove(&mut self, name: &str) {
         self.names.remove(name);
+        self.types.remove(name);
     }
 }
 
@@ -1933,12 +2130,21 @@ fn compile_block_inner(
                 falls_through = false;
             }
             TokenKind::Identifier(keyword) if keyword == "continue" => {
-                if line.tokens.len() != 1 {
+                if loops.is_empty() {
+                    return Err(compile_error("continue outside a loop"));
+                }
+                let depth = match line.tokens.as_slice() {
+                    [_] => 1,
+                    [_, SpannedToken { kind: TokenKind::Number(depth), .. }] => depth
+                        .parse::<usize>()
+                        .map_err(|_| compile_error("invalid labeled continue depth"))?,
+                    _ => return Err(compile_error("continue does not accept an expression")),
+                };
+                if depth == 0 || depth > loops.len() {
                     return Err(compile_error("continue does not accept an expression"));
                 }
-                let Some(loop_context) = loops.last_mut() else {
-                    return Err(compile_error("continue outside a loop"));
-                };
+                let target_loop = loops.len() - depth;
+                let loop_context = &mut loops[target_loop];
                 let target = loop_context.continue_target.unwrap_or(usize::MAX);
                 let jump = instructions.len();
                 push_instruction(
@@ -1955,7 +2161,11 @@ fn compile_block_inner(
             TokenKind::Identifier(keyword) if keyword == "return" => {
                 let first_instruction = instructions.len();
                 if line.tokens.len() == 1 {
-                    instructions.push(Instruction::PushNull);
+                    // A bare DM `return` returns the procedure's current
+                    // special result value (`.`), just like falling through.
+                    // This is relied upon by cache-hit patterns that assign
+                    // `.` and then use `if(.) return`.
+                    instructions.push(Instruction::LoadResult);
                 } else {
                     compile_expression(&line.tokens[1..], locals, instructions, procedures)?;
                 }
@@ -2033,18 +2243,65 @@ fn compile_block_inner(
             TokenKind::Identifier(_) if top_level_input(&line.tokens).is_some() => {
                 let first_instruction = instructions.len();
                 let input = top_level_input(&line.tokens).expect("input index was checked");
-                compile_expression(&line.tokens[..input], locals, instructions, procedures)?;
-                instructions.push(Instruction::Input);
                 let target = ExpressionParser::new(&line.tokens[input + 1..]).parse()?;
                 match target {
                     Expression::Local(name) => {
                         if let Some(slot) = locals.get(&name) {
+                            compile_expression(
+                                &line.tokens[..input],
+                                locals,
+                                instructions,
+                                procedures,
+                            )?;
+                            instructions.push(Instruction::Input);
                             instructions.push(Instruction::StoreLocal(slot));
+                        } else if let Some(field) = locals.src_field(&name) {
+                            instructions.push(Instruction::LoadSrc);
+                            compile_expression(
+                                &line.tokens[..input],
+                                locals,
+                                instructions,
+                                procedures,
+                            )?;
+                            instructions.push(Instruction::Input);
+                            instructions.push(Instruction::StoreField(field.clone()));
+                        } else if let Some(global) = locals.global_field(&name) {
+                            compile_expression(
+                                &line.tokens[..input],
+                                locals,
+                                instructions,
+                                procedures,
+                            )?;
+                            instructions.push(Instruction::Input);
+                            instructions.push(Instruction::StoreGlobal(global.clone()));
                         } else {
                             return Err(compile_error(format!(
                                 "savefile input target {name:?} is not writable"
                             )));
                         }
+                    }
+                    Expression::Field { receiver, name } => {
+                        emit_expression(&receiver, locals, instructions, procedures)?;
+                        compile_expression(
+                            &line.tokens[..input],
+                            locals,
+                            instructions,
+                            procedures,
+                        )?;
+                        instructions.push(Instruction::Input);
+                        instructions.push(Instruction::StoreField(name));
+                    }
+                    Expression::Index { list, index } => {
+                        emit_expression(&list, locals, instructions, procedures)?;
+                        emit_expression(&index, locals, instructions, procedures)?;
+                        compile_expression(
+                            &line.tokens[..input],
+                            locals,
+                            instructions,
+                            procedures,
+                        )?;
+                        instructions.push(Instruction::Input);
+                        instructions.push(Instruction::SetListIndex);
                     }
                     _ => return Err(compile_error("savefile input target is not writable")),
                 }
@@ -2517,7 +2774,14 @@ fn compile_assignment_statement(
             if operator != "=" {
                 instructions.push(Instruction::LoadLocal(slot));
             }
-            compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
+            let mut value = ExpressionParser::new(&tokens[assignment + 1..]).parse()?;
+            if let Expression::New { type_path, .. } = &mut value
+                && type_path.is_none()
+                && let Some(inferred) = locals.local_type(&name)
+            {
+                *type_path = Some(Box::new(Expression::TypePath(inferred.clone())));
+            }
+            emit_expression(&value, locals, instructions, procedures)?;
             if operator != "=" {
                 instructions.push(compound_instruction(operator)?);
             }
@@ -2956,6 +3220,7 @@ fn compile_for(
             true,
             &[],
             Some(&type_path),
+            Some(&type_path),
         );
     }
     if let Some((first, second, iterable, declared)) = for_assoc_parts(&line.tokens)? {
@@ -2993,7 +3258,7 @@ fn compile_for(
             step,
         );
     }
-    if let Some((local_name, declared, iterable)) = for_in_parts(&line.tokens)? {
+    if let Some((local_name, declared, iterable, declared_type)) = for_in_parts(&line.tokens)? {
         return compile_for_in(
             lines,
             line_index,
@@ -3007,6 +3272,7 @@ fn compile_for(
             declared,
             iterable,
             None,
+            declared_type.as_ref(),
         );
     }
     let [initializer, condition, increment] = for_clauses(&line.tokens)?;
@@ -3297,17 +3563,30 @@ fn compile_for_in(
     declared: bool,
     iterable: &[SpannedToken],
     type_instances: Option<&TypePath>,
+    filter_type: Option<&TypePath>,
 ) -> Result<usize, CompileError> {
     let line = &lines[line_index];
     let result_target = !declared && local_name == ".";
+    let field_target = (!declared && !result_target)
+        .then(|| locals.src_field(local_name).cloned())
+        .flatten();
+    let global_target = (!declared && !result_target && field_target.is_none())
+        .then(|| locals.global_field(local_name).cloned())
+        .flatten();
     let item_slot = if result_target {
         locals.declare_hidden()?
     } else if declared {
-        locals.declare(local_name.to_owned())?
+        let slot = locals.declare(local_name.to_owned())?;
+        if let Some(type_path) = filter_type {
+            locals.set_type(local_name.to_owned(), type_path.clone());
+        }
+        slot
+    } else if let Some(slot) = locals.get(local_name) {
+        slot
+    } else if field_target.is_some() || global_target.is_some() {
+        locals.declare_hidden()?
     } else {
-        locals
-            .get(local_name)
-            .ok_or_else(|| compile_error(format!("unknown local {local_name:?}")))?
+        return Err(compile_error(format!("unknown local {local_name:?}")));
     };
     let list_slot = locals.declare_hidden()?;
     let index_slot = locals.declare_hidden()?;
@@ -3318,6 +3597,7 @@ fn compile_for_in(
     } else {
         compile_expression(iterable, locals, instructions, procedures)?;
     }
+    instructions.push(Instruction::PrepareIteration);
     instructions.push(Instruction::StoreLocal(list_slot));
     instructions.push(Instruction::PushNumber(DmNumberBits::from_f32(1.0)));
     instructions.push(Instruction::StoreLocal(index_slot));
@@ -3383,6 +3663,44 @@ fn compile_for_in(
         Instruction::StoreLocal(item_slot),
         line.span,
     );
+    let filter_jump = filter_type.map(|type_path| {
+        for instruction in [
+            Instruction::LoadLocal(item_slot),
+            Instruction::IterationTypeFilter(type_path.clone()),
+        ] {
+            push_instruction(instructions, source_spans, instruction, line.span);
+        }
+        let jump = instructions.len();
+        push_instruction(
+            instructions,
+            source_spans,
+            Instruction::JumpIfFalse(usize::MAX),
+            line.span,
+        );
+        jump
+    });
+    if let Some(field) = &field_target {
+        for instruction in [
+            Instruction::LoadSrc,
+            Instruction::LoadLocal(item_slot),
+            Instruction::StoreField(field.clone()),
+        ] {
+            push_instruction(instructions, source_spans, instruction, line.span);
+        }
+    } else if let Some(global) = &global_target {
+        push_instruction(
+            instructions,
+            source_spans,
+            Instruction::LoadLocal(item_slot),
+            line.span,
+        );
+        push_instruction(
+            instructions,
+            source_spans,
+            Instruction::StoreGlobal(global.clone()),
+            line.span,
+        );
+    }
     if result_target {
         push_instruction(
             instructions,
@@ -3441,6 +3759,9 @@ fn compile_for_in(
     let (after_body, _) = body?;
 
     let increment_target = instructions.len();
+    if let Some(filter_jump) = filter_jump {
+        patch_jump(instructions, filter_jump, increment_target)?;
+    }
     for continue_jump in loop_context.continue_jumps {
         patch_jump(instructions, continue_jump, increment_target)?;
     }
@@ -3488,6 +3809,7 @@ fn compile_for_assoc(
     let value_slot = locals.declare_hidden()?;
     let start = instructions.len();
     compile_expression(iterable, locals, instructions, procedures)?;
+    instructions.push(Instruction::PrepareIteration);
     instructions.push(Instruction::StoreLocal(list_slot));
     instructions.push(Instruction::PushNumber(DmNumberBits::from_f32(1.0)));
     instructions.push(Instruction::StoreLocal(index_slot));
@@ -3526,29 +3848,45 @@ fn compile_for_assoc(
         line.span,
         instructions.len() - source_spans.len(),
     ));
-    let child_index = line_index + 1;
-    let child = lines
-        .get(child_index)
-        .ok_or_else(|| compile_error("for-in statement requires an indented body"))?;
-    let child_indent = indentation(child);
-    if child_indent <= block_indentation {
-        return Err(compile_error("for-in statement requires an indented body"));
-    }
     loops.push(LoopContext {
         continue_target: None,
         continue_jumps: Vec::new(),
         break_jumps: Vec::new(),
     });
-    let body = compile_block(
-        lines,
-        child_index,
-        child_indent,
-        locals,
-        instructions,
-        source_spans,
-        procedures,
-        loops,
-    );
+    let body = if let Some(body) = inline_conditional_body(&line.tokens) {
+        let mut inline_line = line.clone();
+        inline_line.tokens = body.to_vec();
+        compile_block(
+            std::slice::from_ref(&inline_line),
+            0,
+            block_indentation,
+            locals,
+            instructions,
+            source_spans,
+            procedures,
+            loops,
+        )
+        .map(|(_, falls_through)| (line_index + 1, falls_through))
+    } else {
+        let child_index = line_index + 1;
+        let child = lines
+            .get(child_index)
+            .ok_or_else(|| compile_error("for-in statement requires an indented body"))?;
+        let child_indent = indentation(child);
+        if child_indent <= block_indentation {
+            return Err(compile_error("for-in statement requires an indented body"));
+        }
+        compile_block(
+            lines,
+            child_index,
+            child_indent,
+            locals,
+            instructions,
+            source_spans,
+            procedures,
+            loops,
+        )
+    };
     let context = loops.pop().expect("assoc loop context pushed");
     let (after_body, _) = body?;
     let increment = instructions.len();
@@ -3607,11 +3945,22 @@ fn emit_for_target_store(
 ) -> Result<(), CompileError> {
     match target {
         Expression::Local(name) => {
-            let target = locals
-                .get(name)
-                .ok_or_else(|| compile_error(format!("unknown local {name:?}")))?;
-            instructions.push(Instruction::LoadLocal(slot));
-            instructions.push(Instruction::StoreLocal(target));
+            if let Some(target) = locals.get(name) {
+                instructions.push(Instruction::LoadLocal(slot));
+                instructions.push(Instruction::StoreLocal(target));
+            } else if let Some(field) = locals.src_field(name) {
+                // An undeclared associative-loop target follows normal DM
+                // assignment lookup. It may therefore name an existing src
+                // field (`for(cointype in typesof(...))`) rather than a local.
+                instructions.push(Instruction::LoadSrc);
+                instructions.push(Instruction::LoadLocal(slot));
+                instructions.push(Instruction::StoreField(field.clone()));
+            } else if let Some(global) = locals.global_field(name) {
+                instructions.push(Instruction::LoadLocal(slot));
+                instructions.push(Instruction::StoreGlobal(global.clone()));
+            } else {
+                return Err(compile_error(format!("unknown local {name:?}")));
+            }
         }
         Expression::Index { list, index } => {
             emit_expression(list, locals, instructions, procedures)?;
@@ -3685,13 +4034,28 @@ fn for_assoc_parts(
     if !matches!(
         header.first().map(|t| &t.kind),
         Some(TokenKind::Punctuation('('))
-    ) || !matches!(
-        header.last().map(|t| &t.kind),
-        Some(TokenKind::Punctuation(')'))
     ) {
         return Ok(None);
     }
-    let inner = &header[1..header.len() - 1];
+    let mut depth = 0usize;
+    let mut closing = None;
+    for (index, token) in header.iter().enumerate() {
+        match token.kind {
+            TokenKind::Punctuation('(') => depth += 1,
+            TokenKind::Punctuation(')') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    closing = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(closing) = closing else {
+        return Ok(None);
+    };
+    let inner = &header[1..closing];
     let Some(in_pos) = inner
         .iter()
         .position(|t| matches!(&t.kind, TokenKind::Identifier(n) if n == "in"))
@@ -3730,7 +4094,7 @@ fn for_assoc_parts(
 
 fn for_in_parts(
     tokens: &[SpannedToken],
-) -> Result<Option<(String, bool, &[SpannedToken])>, CompileError> {
+) -> Result<Option<(String, bool, &[SpannedToken], Option<TypePath>)>, CompileError> {
     let header = &tokens[1..];
     if !matches!(
         header.first().map(|token| &token.kind),
@@ -3812,7 +4176,19 @@ fn for_in_parts(
             TokenKind::Identifier(identifier) if identifier != "var" => Some(identifier.clone()),
             _ => None,
         }) } .ok_or_else(|| compile_error("for-in variable declaration has no name"))?;
-    Ok(Some((local_name, declared, iterable)))
+    let iterates_as_anything = declaration.windows(2).any(|tokens| {
+        matches!(&tokens[0].kind, TokenKind::Identifier(identifier) if identifier == "as")
+            && matches!(&tokens[1].kind, TokenKind::Identifier(identifier) if identifier == "anything")
+    });
+    // `as anything` explicitly disables the declaration's runtime type
+    // filter. This is commonly used for typed loop variables that iterate
+    // type paths (for example `var/datum/language/T as anything in
+    // typesof(...)`). The declared type remains useful to the semantic pass,
+    // but the VM must not discard those non-datum values here.
+    let declared_type = (!iterates_as_anything && declared)
+        .then(|| declared_local_type(declaration, &local_name))
+        .flatten();
+    Ok(Some((local_name, declared, iterable, declared_type)))
 }
 
 /// Recognizes `for(var/name in first to last [step increment])`, rather than treating the
@@ -3830,50 +4206,51 @@ fn for_to_parts(
     )>,
     CompileError,
 > {
-    let (local_name, declared, iterable) = if let Some(parts) = for_in_parts(tokens)? {
-        parts
-    } else {
-        let header = &tokens[1..];
-        if !matches!(
-            header.first().map(|token| &token.kind),
-            Some(TokenKind::Punctuation('('))
-        ) || !matches!(
-            header.last().map(|token| &token.kind),
-            Some(TokenKind::Punctuation(')'))
-        ) {
-            return Ok(None);
-        }
-        let clauses = &header[1..header.len() - 1];
-        let separators = top_level_keyword_positions(clauses, "to");
-        let [to_separator] = separators.as_slice() else {
-            return Ok(None);
+    let (local_name, declared, iterable) =
+        if let Some((name, declared, iterable, _)) = for_in_parts(tokens)? {
+            (name, declared, iterable)
+        } else {
+            let header = &tokens[1..];
+            if !matches!(
+                header.first().map(|token| &token.kind),
+                Some(TokenKind::Punctuation('('))
+            ) || !matches!(
+                header.last().map(|token| &token.kind),
+                Some(TokenKind::Punctuation(')'))
+            ) {
+                return Ok(None);
+            }
+            let clauses = &header[1..header.len() - 1];
+            let separators = top_level_keyword_positions(clauses, "to");
+            let [to_separator] = separators.as_slice() else {
+                return Ok(None);
+            };
+            let before_to = &clauses[..*to_separator];
+            let Some(assignment) = before_to.iter().rposition(
+                |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
+            ) else {
+                return Ok(None);
+            };
+            let declaration = &before_to[..assignment];
+            let declared = matches!(
+                declaration.first().map(|token| &token.kind),
+                Some(TokenKind::Identifier(identifier)) if identifier == "var"
+            );
+            let local_name = declaration
+                .iter()
+                .rev()
+                .find_map(|token| match &token.kind {
+                    TokenKind::Identifier(identifier) if identifier != "var" => {
+                        Some(identifier.clone())
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| compile_error("for-to variable declaration has no name"))?;
+            let start = &before_to[assignment + 1..];
+            let iterable = &clauses[assignment + 1..];
+            debug_assert!(iterable.starts_with(start));
+            (local_name, declared, iterable)
         };
-        let before_to = &clauses[..*to_separator];
-        let Some(assignment) = before_to.iter().rposition(
-            |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
-        ) else {
-            return Ok(None);
-        };
-        let declaration = &before_to[..assignment];
-        let declared = matches!(
-            declaration.first().map(|token| &token.kind),
-            Some(TokenKind::Identifier(identifier)) if identifier == "var"
-        );
-        let local_name = declaration
-            .iter()
-            .rev()
-            .find_map(|token| match &token.kind {
-                TokenKind::Identifier(identifier) if identifier != "var" => {
-                    Some(identifier.clone())
-                }
-                _ => None,
-            })
-            .ok_or_else(|| compile_error("for-to variable declaration has no name"))?;
-        let start = &before_to[assignment + 1..];
-        let iterable = &clauses[assignment + 1..];
-        debug_assert!(iterable.starts_with(start));
-        (local_name, declared, iterable)
-    };
     let separators = top_level_keyword_positions(iterable, "to");
     let [separator] = separators.as_slice() else {
         return Ok(None);
@@ -4236,6 +4613,9 @@ fn parse_catch_local(tokens: &[SpannedToken]) -> Result<Option<String>, CompileE
         return Err(compile_error("catch variable requires parentheses"));
     }
     let inner = &tokens[2..tokens.len() - 1];
+    if inner.is_empty() {
+        return Ok(None);
+    }
     if !matches!(inner.first().map(|token| &token.kind), Some(TokenKind::Identifier(keyword)) if keyword == "var")
     {
         return Err(compile_error(
@@ -4597,7 +4977,15 @@ fn emit_switch_case_condition(
     if alternatives.is_empty() {
         return Err(compile_error("switch case requires at least one value"));
     }
-    for (alternative_index, alternative) in alternatives.iter().enumerate() {
+    let alternative_count = alternatives
+        .last()
+        .is_some_and(|alternative| alternative.is_empty())
+        .then(|| alternatives.len().saturating_sub(1))
+        .unwrap_or(alternatives.len());
+    if alternative_count == 0 {
+        return Err(compile_error("switch case requires at least one value"));
+    }
+    for (alternative_index, alternative) in alternatives[..alternative_count].iter().enumerate() {
         if alternative.is_empty() {
             return Err(compile_error("switch case contains an empty value"));
         }
@@ -4910,7 +5298,11 @@ fn compile_local(
             _ => None,
         })
         .ok_or_else(|| compile_error("local declaration has no name"))?;
+    let declared_type = declared_local_type(tokens, &name);
     let slot = locals.declare(name.clone())?;
+    if let Some(type_path) = declared_type.clone() {
+        locals.set_type(name.clone(), type_path);
+    }
     let is_static = tokens[1..declaration_end].iter().any(
         |token| matches!(&token.kind, TokenKind::Identifier(identifier) if identifier == "static"),
     );
@@ -4926,7 +5318,7 @@ fn compile_local(
         let mut value = ExpressionParser::new(&tokens[assignment + 1..]).parse()?;
         if let Expression::New { type_path, .. } = &mut value
             && type_path.is_none()
-            && let Some(inferred) = declared_local_type(tokens, &name)
+            && let Some(inferred) = declared_type
         {
             *type_path = Some(Box::new(Expression::TypePath(inferred)));
         }
@@ -4976,7 +5368,14 @@ fn compile_local(
 }
 
 fn declared_local_type(tokens: &[SpannedToken], name: &str) -> Option<TypePath> {
-    let name_index = tokens.iter().rposition(
+    let declaration_end = tokens
+        .iter()
+        .position(|token| {
+            matches!(&token.kind, TokenKind::Operator(operator) if operator == "=")
+                || matches!(&token.kind, TokenKind::Identifier(identifier) if matches!(identifier.as_str(), "as" | "in"))
+        })
+        .unwrap_or(tokens.len());
+    let name_index = tokens[..declaration_end].iter().rposition(
         |token| matches!(&token.kind, TokenKind::Identifier(identifier) if identifier == name),
     )?;
     let var_index = tokens[..name_index].iter().position(
@@ -4993,9 +5392,22 @@ fn declared_local_type(tokens: &[SpannedToken], name: &str) -> Option<TypePath> 
             _ => None,
         })
         .collect::<Vec<_>>();
-    (!segments.is_empty())
-        .then(|| TypePath::parse(&format!("/{}", segments.join("/"))).ok())
-        .flatten()
+    declared_type_path(&segments)
+}
+
+fn declared_type_path(segments: &[String]) -> Option<TypePath> {
+    if segments.is_empty() {
+        return None;
+    }
+    // In `list/datum/member/items`, only `list` is the variable's runtime
+    // type. The remaining path is BYOND's optional element-type annotation;
+    // `/list/datum/member` is not a list subtype.
+    let segments = if segments.first().is_some_and(|segment| segment == "list") {
+        &segments[..1]
+    } else {
+        segments
+    };
+    TypePath::parse(&format!("/{}", segments.join("/"))).ok()
 }
 
 fn compile_local_declarations(
@@ -5035,7 +5447,10 @@ fn compile_local_declarations(
 fn parameter_name(tokens: &[SpannedToken]) -> Option<&str> {
     let end = tokens
         .iter()
-        .position(|token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="))
+        .position(|token| {
+            matches!(&token.kind, TokenKind::Operator(operator) if operator == "=")
+                || matches!(&token.kind, TokenKind::Identifier(identifier) if matches!(identifier.as_str(), "as" | "in"))
+        })
         .unwrap_or(tokens.len());
     tokens[..end]
         .iter()
@@ -5044,6 +5459,52 @@ fn parameter_name(tokens: &[SpannedToken]) -> Option<&str> {
             TokenKind::Identifier(identifier) => Some(identifier.as_str()),
             _ => None,
         })
+}
+
+fn declared_parameter_type(tokens: &[SpannedToken], name: &str) -> Option<TypePath> {
+    let declaration_end = tokens
+        .iter()
+        .position(|token| {
+            matches!(&token.kind, TokenKind::Operator(operator) if operator == "=")
+                || matches!(&token.kind, TokenKind::Identifier(identifier) if matches!(identifier.as_str(), "as" | "in"))
+        })
+        .unwrap_or(tokens.len());
+    let name_index = tokens[..declaration_end].iter().rposition(
+        |token| matches!(&token.kind, TokenKind::Identifier(identifier) if identifier == name),
+    )?;
+    let segments = tokens[..name_index]
+        .iter()
+        .filter_map(|token| match &token.kind {
+            TokenKind::Identifier(identifier)
+                if !matches!(
+                    identifier.as_str(),
+                    "var" | "static" | "global" | "tmp" | "final"
+                ) =>
+            {
+                Some(identifier.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    declared_type_path(&segments)
+}
+
+fn expression_static_type(expression: &Expression, locals: &LocalTable<'_>) -> Option<TypePath> {
+    match expression {
+        Expression::Local(name) => locals
+            .local_type(name)
+            .or_else(|| locals.global_type(name))
+            .cloned(),
+        Expression::GlobalField(name) => locals.global_type(name.as_str()).cloned(),
+        Expression::New {
+            type_path: Some(type_path),
+            ..
+        } => match type_path.as_ref() {
+            Expression::TypePath(path) => Some(path.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn to_local_index(index: usize) -> Result<u16, CompileError> {
@@ -5065,6 +5526,7 @@ enum Expression {
     Null,
     Number(DmNumberBits),
     Text(String),
+    File(String),
     TypePath(TypePath),
     ModifiedTypePath {
         base: TypePath,
@@ -5152,7 +5614,11 @@ enum Expression {
         arguments: Vec<Self>,
     },
     TypesOf {
-        value: Box<Self>,
+        arguments: Vec<Self>,
+    },
+    HasCall {
+        receiver: Box<Self>,
+        selector: Box<Self>,
     },
     TypePredicate {
         kind: TypePredicateKind,
@@ -5177,6 +5643,10 @@ enum Expression {
     Call {
         procedure: String,
         arguments: Vec<Self>,
+    },
+    NamedArgument {
+        name: String,
+        value: Box<Self>,
     },
     /// A list expansion used only in an enclosing call or constructor
     /// argument list (`target(arglist(values))`).
@@ -5241,6 +5711,15 @@ enum Expression {
     },
 }
 
+fn expression_null_propagates(expression: &Expression) -> bool {
+    matches!(
+        expression,
+        Expression::SafeField { .. }
+            | Expression::SafeIndex { .. }
+            | Expression::SafeDynamicCall { .. }
+    )
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ListExpressionEntry {
     Positional(Expression),
@@ -5276,11 +5755,17 @@ fn dm_builtin_numeric_constant(identifier: &str) -> Option<f32> {
         | "NO_STEPS"
         | "PROFILE_START"
         | "PROFILE_REFRESH"
-        | "FILTER_OVERLAY"
+        | "FILTER_COLOR_RGB"
         | "ICON_ADD" => Some(0.0),
         "FLOAT_LAYER" => Some(-1.0),
         "TRUE"
+        | "SOUND_STREAM"
+        | "NORMAL_RAND"
         | "MASK_INVERSE"
+        | "FILTER_OVERLAY"
+        | "FILTER_COLOR_HSV"
+        | "OUTLINE_SHARP"
+        | "WAVE_SIDEWAYS"
         | "ICON_SUBTRACT"
         | "BLEND_OVERLAY"
         | "KEEP_TOGETHER"
@@ -5299,6 +5784,11 @@ fn dm_builtin_numeric_constant(identifier: &str) -> Option<f32> {
         "CONTROL_FREAK_MACROS" => Some(2.0),
         "JSON_PRETTY_PRINT" => Some(1.0),
         "BLEND_ADD"
+        | "MASK_SWAP"
+        | "FILTER_UNDERLAY"
+        | "FILTER_COLOR_HSL"
+        | "OUTLINE_SQUARE"
+        | "WAVE_BOUNDED"
         | "KEEP_APART"
         | "SOUTH"
         | "EDGE_PERSPECTIVE"
@@ -5311,11 +5801,12 @@ fn dm_builtin_numeric_constant(identifier: &str) -> Option<f32> {
         | "PROFILE_CLEAR"
         | "PROFILE_RESTART"
         | "ICON_MULTIPLY" => Some(2.0),
-        "BLEND_SUBTRACT" | "OBJ_LAYER" | "CUBIC_EASING" | "COLORSPACE_HCY"
+        "BLEND_SUBTRACT" | "FILTER_COLOR_HCY" | "OBJ_LAYER" | "CUBIC_EASING" | "COLORSPACE_HCY"
         | "MOUSE_DRAG_POINTER" | "SYNC_STEPS" | "ICON_OVERLAY" => Some(3.0),
         "BLEND_MULTIPLY" | "LONG_GLIDE" | "EAST" | "MATRIX_INVERT" | "MOB_LAYER"
         | "BOUNCE_EASING" | "ANIMATION_PARALLEL" | "VIS_INHERIT_DIR" | "MOUSE_DROP_POINTER"
         | "SEE_MOBS" | "SEEMOBS" | "PROFILE_AVERAGE" => Some(4.0),
+        "SOUND_UPDATE" => Some(16.0),
         "BLEND_INSET_OVERLAY"
         | "NORTHEAST"
         | "MATRIX_ROTATE"
@@ -5596,7 +6087,7 @@ impl<'a> ExpressionParser<'a> {
                     return Err(compile_error("expected ']' after list index"));
                 }
                 self.index += 1;
-                expression = if safe_list_index {
+                expression = if safe_list_index || expression_null_propagates(&expression) {
                     Expression::SafeIndex {
                         list: Box::new(expression),
                         index: Box::new(index),
@@ -5659,9 +6150,10 @@ impl<'a> ExpressionParser<'a> {
                 let name =
                     FieldName::parse(name).map_err(|error| compile_error(error.to_string()))?;
                 self.index += 1;
+                let propagate_null = safe_member || expression_null_propagates(&expression);
                 expression = if matches!(expression, Expression::GlobalNamespace) {
                     Expression::GlobalField(name)
-                } else if safe_member {
+                } else if propagate_null {
                     Expression::SafeField {
                         receiver: Box::new(expression),
                         name,
@@ -5684,14 +6176,14 @@ impl<'a> ExpressionParser<'a> {
                 Some(TokenKind::Identifier(keyword)) if keyword == "as"
             ) {
                 self.index += 1;
-                while !matches!(
-                    self.tokens.get(self.index).map(|token| &token.kind),
-                    Some(TokenKind::Identifier(keyword)) if keyword == "in"
-                ) {
-                    if self.index >= self.tokens.len() {
-                        return Ok(expression);
+                loop {
+                    match self.tokens.get(self.index).map(|token| &token.kind) {
+                        Some(TokenKind::Identifier(keyword)) if keyword == "in" => break,
+                        Some(TokenKind::Punctuation(',' | ')' | ']' | '}')) | None => {
+                            return Ok(expression);
+                        }
+                        _ => self.index += 1,
                     }
-                    self.index += 1;
                 }
                 self.index += 1;
                 let _choices = self.parse_assignment()?;
@@ -5842,17 +6334,16 @@ impl<'a> ExpressionParser<'a> {
             }
             TokenKind::Operator(operator) if operator == "." => Ok(Expression::Result),
             TokenKind::Number(spelling) => parse_number(spelling).map(Expression::Number),
-            // A resource literal is a first-class DM value.  The headless VM
-            // has no asset loader, so preserve its canonical path as text;
-            // this allows resource-valued arguments and field assignments to
-            // compile while retaining a deterministic value for inspection.
+            // Resource literals are first-class file values. Keep them
+            // distinct from ordinary text so BYOND's `isfile()` contract is
+            // observable by project code such as the runtime DMM reader.
             TokenKind::String(text) => parse_interpolated_string(text),
             TokenKind::RawString(text) | TokenKind::TextBlock(text) => {
                 Ok(Expression::Text(text.clone()))
             }
             TokenKind::Resource(text) => {
                 let normalized = text.replace('\\', "/");
-                Ok(Expression::Text(
+                Ok(Expression::File(
                     normalized
                         .strip_prefix("./")
                         .unwrap_or(&normalized)
@@ -5995,8 +6486,28 @@ impl<'a> ExpressionParser<'a> {
                     // Do not delegate this to `parse_unary`: its ordinary
                     // identifier rule interprets the following `(` as a
                     // static procedure call. Here it belongs to `new`.
-                    let type_path = Expression::Local(type_name.clone());
+                    let mut type_path = if type_name == "src" {
+                        Expression::Src
+                    } else {
+                        Expression::Local(type_name.clone())
+                    };
                     self.index += 1;
+                    while matches!(self.current_operator(), Some(".")) {
+                        self.index += 1;
+                        let Some(TokenKind::Identifier(field)) =
+                            self.tokens.get(self.index).map(|token| &token.kind)
+                        else {
+                            return Err(compile_error(
+                                "runtime new type field access requires an identifier",
+                            ));
+                        };
+                        type_path = Expression::Field {
+                            receiver: Box::new(type_path),
+                            name: FieldName::parse(field)
+                                .map_err(|error| compile_error(error.to_string()))?,
+                        };
+                        self.index += 1;
+                    }
                     let arguments = if matches!(
                         self.tokens.get(self.index).map(|token| &token.kind),
                         Some(TokenKind::Punctuation('('))
@@ -6251,19 +6762,27 @@ impl<'a> ExpressionParser<'a> {
                     }
                     Ok(Expression::Block { arguments })
                 } else if identifier == "typesof" {
-                    let mut arguments = self.parse_call_arguments()?;
-                    if arguments.len() != 1 {
+                    let arguments = self.parse_call_arguments()?;
+                    if arguments.is_empty() || arguments.len() > usize::from(u8::MAX) {
                         return Err(compile_error(format!(
-                            "typesof requires exactly one type argument, received {} arguments",
+                            "typesof requires between one and 255 type arguments, received {} arguments",
                             arguments.len()
                         )));
                     }
-                    Ok(Expression::TypesOf {
-                        value: Box::new(
-                            arguments
-                                .pop()
-                                .expect("typesof argument count was validated"),
-                        ),
+                    Ok(Expression::TypesOf { arguments })
+                } else if identifier == "hascall" {
+                    let mut arguments = self.parse_call_arguments()?;
+                    if arguments.len() != 2 {
+                        return Err(compile_error(format!(
+                            "hascall requires a receiver and procedure selector, received {} arguments",
+                            arguments.len()
+                        )));
+                    }
+                    let selector = arguments.pop().expect("hascall arity was validated");
+                    let receiver = arguments.pop().expect("hascall arity was validated");
+                    Ok(Expression::HasCall {
+                        receiver: Box::new(receiver),
+                        selector: Box::new(selector),
                     })
                 } else if identifier == "rand" {
                     let arguments = self.parse_call_arguments()?;
@@ -6343,6 +6862,11 @@ impl<'a> ExpressionParser<'a> {
                         | "DrawBox"
                         | "Insert"
                         | "GetPixel"
+                        | "Add"
+                        | "Subtract"
+                        | "Multiply"
+                        | "Translate"
+                        | "Invert"
                         | "Turn"
                 ) {
                     Ok(Expression::NativeSrcMethod {
@@ -6434,7 +6958,12 @@ impl<'a> ExpressionParser<'a> {
         Ok(self
             .parse_named_call_arguments()?
             .into_iter()
-            .map(|(_, expression)| expression)
+            .map(|(name, expression)| {
+                name.map_or(expression.clone(), |name| Expression::NamedArgument {
+                    name,
+                    value: Box::new(expression),
+                })
+            })
             .collect())
     }
 
@@ -6729,15 +7258,42 @@ fn parse_number(spelling: &str) -> Result<DmNumberBits, CompileError> {
 }
 
 fn parse_interpolated_string(text: &str) -> Result<Expression, CompileError> {
-    let mut arguments = Vec::new();
+    const ESCAPED_OPEN: char = '\u{e000}';
+    const ESCAPED_CLOSE: char = '\u{e001}';
+    // Protect escaped brackets before looking for interpolation holes. This
+    // must consume escape pairs rather than using `str::replace`: in
+    // `\\\\[value]` the first pair denotes a literal backslash and the
+    // bracket still begins interpolation.
+    let mut protected = String::with_capacity(text.len());
+    let mut characters = text.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            protected.push(character);
+            continue;
+        }
+        let Some(escaped) = characters.next() else {
+            protected.push('\\');
+            break;
+        };
+        match escaped {
+            '[' => protected.push(ESCAPED_OPEN),
+            ']' => protected.push(ESCAPED_CLOSE),
+            _ => {
+                protected.push('\\');
+                protected.push(escaped);
+            }
+        }
+    }
+    let text = protected;
+    let literal = |text: &str| {
+        decode_quoted_text_fragment(&text.replace(ESCAPED_OPEN, "[").replace(ESCAPED_CLOSE, "]"))
+    };
+    let mut template = String::with_capacity(text.len());
+    let mut interpolations = Vec::new();
     let mut cursor = 0_usize;
     while let Some(relative_open) = text[cursor..].find('[') {
         let open = cursor + relative_open;
-        if open > 0 && text.as_bytes()[open - 1] == b'\\' {
-            cursor = open + 1;
-            continue;
-        }
-        let Some(close) = interpolated_expression_close(text, open + 1) else {
+        let Some(close) = interpolated_expression_close(&text, open + 1) else {
             break;
         };
         if text[open + 1..close].trim().is_empty() {
@@ -6745,34 +7301,125 @@ fn parse_interpolated_string(text: &str) -> Result<Expression, CompileError> {
             continue;
         }
         if open > cursor {
-            arguments.push(Expression::Text(text[cursor..open].to_owned()));
+            template.push_str(&literal(&text[cursor..open]));
         }
         let tokens = lex(&text[open + 1..close])
             .map_err(|error| {
                 compile_error(format!("invalid embedded expression: {}", error.message))
             })?
             .into_iter()
-            .filter(|token| !matches!(token.kind, TokenKind::LineStart { .. } | TokenKind::Newline))
+            .filter(|token| {
+                !matches!(
+                    token.kind,
+                    TokenKind::LineStart { .. } | TokenKind::Newline | TokenKind::LineContinuation
+                )
+            })
             .collect::<Vec<_>>();
-        arguments.push(Expression::StandardBuiltin {
-            name: "text".to_owned(),
-            arguments: vec![
-                Expression::Text("[]".to_owned()),
-                ExpressionParser::new(&tokens).parse()?,
-            ],
-        });
+        template.push_str("[]");
+        interpolations.push(ExpressionParser::new(&tokens).parse()?);
         cursor = close + 1;
     }
-    if arguments.is_empty() {
-        return Ok(Expression::Text(text.to_owned()));
+    if interpolations.is_empty() {
+        return Ok(Expression::Text(literal(&text)));
     }
     if cursor < text.len() {
-        arguments.push(Expression::Text(text[cursor..].to_owned()));
+        template.push_str(&literal(&text[cursor..]));
     }
+    let mut arguments = Vec::with_capacity(interpolations.len() + 1);
+    arguments.push(Expression::Text(template));
+    arguments.extend(interpolations);
     Ok(Expression::StandardBuiltin {
-        name: "addtext".to_owned(),
+        name: "text".to_owned(),
         arguments,
     })
+}
+
+/// Decode escapes in an ordinary double-quoted DM string fragment. Raw
+/// strings are represented by a different token kind and intentionally never
+/// pass through this function.
+fn decode_quoted_text_fragment(text: &str) -> String {
+    let mut decoded = String::with_capacity(text.len());
+    let mut cursor = 0_usize;
+    while cursor < text.len() {
+        let character = text[cursor..]
+            .chars()
+            .next()
+            .expect("cursor is inside quoted text");
+        cursor += character.len_utf8();
+        if character != '\\' {
+            decoded.push(character);
+            continue;
+        }
+        if cursor == text.len() {
+            decoded.push('\\');
+            break;
+        }
+
+        // Text macros win over their single-character escape prefixes:
+        // `\\the` and `\\th` are format operations, while `\\t` is a tab.
+        let remaining = &text[cursor..];
+        let macro_match = [
+            ("improper", TEXT_MACRO_IMPROPER, true),
+            ("himself", TEXT_MACRO_REFLEXIVE, false),
+            ("Himself", TEXT_MACRO_REFLEXIVE, false),
+            ("herself", TEXT_MACRO_REFLEXIVE, false),
+            ("Herself", TEXT_MACRO_REFLEXIVE, false),
+            ("proper", TEXT_MACRO_PROPER, true),
+            ("Roman", TEXT_MACRO_ROMAN_UPPER, true),
+            ("roman", TEXT_MACRO_ROMAN, true),
+            ("Hers", TEXT_MACRO_POSSESSIVE_UPPER, false),
+            ("hers", TEXT_MACRO_POSSESSIVE, false),
+            ("The", TEXT_MACRO_THE_UPPER, true),
+            ("the", TEXT_MACRO_THE, true),
+            ("She", TEXT_MACRO_SUBJECT_UPPER, false),
+            ("she", TEXT_MACRO_SUBJECT, false),
+            ("His", TEXT_MACRO_POSSESSIVE_ADJECTIVE_UPPER, false),
+            ("his", TEXT_MACRO_POSSESSIVE_ADJECTIVE, false),
+            ("him", TEXT_MACRO_OBJECT, false),
+            ("An", TEXT_MACRO_A_UPPER, true),
+            ("an", TEXT_MACRO_A, true),
+            ("He", TEXT_MACRO_SUBJECT_UPPER, false),
+            ("he", TEXT_MACRO_SUBJECT, false),
+            ("th", TEXT_MACRO_ORDINAL, false),
+            ("A", TEXT_MACRO_A_UPPER, true),
+            ("a", TEXT_MACRO_A, true),
+            ("s", TEXT_MACRO_PLURAL, false),
+        ]
+        .into_iter()
+        .find(|(spelling, _, _)| remaining.starts_with(spelling));
+        if let Some((spelling, marker, prefix)) = macro_match {
+            decoded.push(marker);
+            cursor += spelling.len();
+            if prefix && text[cursor..].starts_with(' ') {
+                cursor += 1;
+            }
+            continue;
+        }
+
+        let escaped = text[cursor..]
+            .chars()
+            .next()
+            .expect("checked escaped text exists");
+        cursor += escaped.len_utf8();
+        match escaped {
+            'n' => decoded.push('\n'),
+            'r' => decoded.push('\r'),
+            't' => decoded.push('\t'),
+            '\\' => decoded.push('\\'),
+            '"' => decoded.push('"'),
+            '[' => decoded.push('['),
+            ']' => decoded.push(']'),
+            // BYOND has additional display-format escapes (for example
+            // `\\the` and `\\proper`). Keep those intact until the text
+            // formatting layer interprets them instead of silently deleting
+            // their escape marker.
+            other => {
+                decoded.push('\\');
+                decoded.push(other);
+            }
+        }
+    }
+    decoded
 }
 
 fn interpolated_expression_close(text: &str, start: usize) -> Option<usize> {
@@ -6869,6 +7516,8 @@ fn emit_call_arguments(
         if let Expression::ArgList(value) = argument {
             expanded_indices.push(to_local_index(index)?);
             emit_expression(value, locals, instructions, procedures)?;
+        } else if let Expression::NamedArgument { value, .. } = argument {
+            emit_expression(value, locals, instructions, procedures)?;
         } else {
             emit_expression(argument, locals, instructions, procedures)?;
         }
@@ -6892,9 +7541,13 @@ fn emit_expression(
     procedures: &HashMap<String, ProcedureId>,
 ) -> Result<(), CompileError> {
     match expression {
+        Expression::NamedArgument { value, .. } => {
+            emit_expression(value, locals, instructions, procedures)?;
+        }
         Expression::Null => instructions.push(Instruction::PushNull),
         Expression::Number(number) => instructions.push(Instruction::PushNumber(*number)),
         Expression::Text(text) => instructions.push(Instruction::PushText(text.clone())),
+        Expression::File(path) => instructions.push(Instruction::PushFile(path.clone())),
         Expression::TypePath(path) => instructions.push(Instruction::PushTypePath(path.clone())),
         Expression::ModifiedTypePath { base, overrides } => {
             instructions.push(Instruction::PushTypePath(base.clone()));
@@ -6938,14 +7591,38 @@ fn emit_expression(
             });
         }
         Expression::MutableAppearance { arguments } => {
-            for argument in arguments {
-                emit_expression(argument, locals, instructions, procedures)?;
+            // SS13 projects commonly provide `/proc/mutable_appearance` as a
+            // behavior-rich helper around the engine datum. Just like qdel
+            // and the other engine fallbacks, that project procedure wins.
+            // This is especially important for named arguments: Monkestation's
+            // human overlay path supplies `layer` and `appearance_flags`, and
+            // the helper also applies its omitted defaults before returning.
+            if let Some(procedure) = procedures.get("mutable_appearance").copied() {
+                let argument_count =
+                    emit_call_arguments(arguments, locals, instructions, procedures)?;
+                instructions.push(Instruction::Call {
+                    procedure,
+                    argument_count,
+                    argument_names: arguments
+                        .iter()
+                        .map(|argument| match argument {
+                            Expression::NamedArgument { name, .. } => Some(name.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                });
+            } else {
+                for argument in arguments {
+                    emit_expression(argument, locals, instructions, procedures)?;
+                }
+                instructions.push(Instruction::MakeMutableAppearance {
+                    argument_count: u16::try_from(arguments.len()).map_err(|_| {
+                        compile_error(
+                            "mutable_appearance has more than 65535 constructor arguments",
+                        )
+                    })?,
+                });
             }
-            instructions.push(Instruction::MakeMutableAppearance {
-                argument_count: u16::try_from(arguments.len()).map_err(|_| {
-                    compile_error("mutable_appearance has more than 65535 constructor arguments")
-                })?,
-            });
         }
         Expression::Matrix { arguments } => {
             for argument in arguments {
@@ -7029,9 +7706,19 @@ fn emit_expression(
                     .expect("range argument count was validated by the parser"),
             });
         }
-        Expression::TypesOf { value } => {
-            emit_expression(value, locals, instructions, procedures)?;
-            instructions.push(Instruction::TypesOf);
+        Expression::TypesOf { arguments } => {
+            for argument in arguments {
+                emit_expression(argument, locals, instructions, procedures)?;
+            }
+            instructions.push(Instruction::TypesOf {
+                argument_count: u8::try_from(arguments.len())
+                    .expect("typesof argument count was validated by the parser"),
+            });
+        }
+        Expression::HasCall { receiver, selector } => {
+            emit_expression(receiver, locals, instructions, procedures)?;
+            emit_expression(selector, locals, instructions, procedures)?;
+            instructions.push(Instruction::HasCall);
         }
         Expression::Rand { arguments } => {
             for argument in arguments {
@@ -7079,9 +7766,16 @@ fn emit_expression(
             for argument in arguments {
                 emit_expression(argument, locals, instructions, procedures)?;
             }
+            let inferred_type = (*kind == TypePredicateKind::IsType && arguments.len() == 1)
+                .then(|| expression_static_type(&arguments[0], locals))
+                .flatten();
+            let argument_count = arguments.len() + usize::from(inferred_type.is_some());
+            if let Some(type_path) = inferred_type {
+                instructions.push(Instruction::PushTypePath(type_path));
+            }
             instructions.push(Instruction::TypePredicate {
                 kind: *kind,
-                argument_count: u8::try_from(arguments.len())
+                argument_count: u8::try_from(argument_count)
                     .expect("predicate argument count was validated by the parser"),
             });
         }
@@ -7165,6 +7859,13 @@ fn emit_expression(
                 instructions.push(Instruction::Call {
                     procedure,
                     argument_count,
+                    argument_names: arguments
+                        .iter()
+                        .map(|argument| match argument {
+                            Expression::NamedArgument { name, .. } => Some(name.clone()),
+                            _ => None,
+                        })
+                        .collect(),
                 });
             } else {
                 instructions.push(Instruction::StandardBuiltin {
@@ -7200,11 +7901,18 @@ fn emit_expression(
             });
         }
         Expression::Animate { arguments } => {
-            for (_, argument) in arguments {
-                emit_expression(argument, locals, instructions, procedures)?;
+            let mut expanded_indices = Vec::new();
+            for (index, (_, argument)) in arguments.iter().enumerate() {
+                if let Expression::ArgList(value) = argument {
+                    expanded_indices.push(to_local_index(index)?);
+                    emit_expression(value, locals, instructions, procedures)?;
+                } else {
+                    emit_expression(argument, locals, instructions, procedures)?;
+                }
             }
             instructions.push(Instruction::Animate {
                 argument_names: arguments.iter().map(|(name, _)| name.clone()).collect(),
+                expanded_indices,
             });
         }
         Expression::Filter { arguments } => {
@@ -7259,6 +7967,15 @@ fn emit_expression(
                 let end = instructions.len();
                 instructions[null_jump] = Instruction::JumpIfNull(end);
             }
+            Expression::Index { list, index } if matches!(list.as_ref(), Expression::Field { name, .. } if name.as_str() == "vars") =>
+            {
+                let Expression::Field { receiver, .. } = list.as_ref() else {
+                    unreachable!("vars index guard established a field receiver")
+                };
+                emit_expression(receiver, locals, instructions, procedures)?;
+                emit_expression(index, locals, instructions, procedures)?;
+                instructions.push(Instruction::InitialDynamicField);
+            }
             _ => return Err(compile_error("initial requires a field reference")),
         },
         Expression::Call {
@@ -7273,6 +7990,13 @@ fn emit_expression(
             instructions.push(Instruction::Call {
                 procedure: target,
                 argument_count,
+                argument_names: arguments
+                    .iter()
+                    .map(|argument| match argument {
+                        Expression::NamedArgument { name, .. } => Some(name.clone()),
+                        _ => None,
+                    })
+                    .collect(),
             });
         }
         Expression::Locate { arguments } => {
@@ -7571,12 +8295,41 @@ fn emit_mutation_expression(
             prefix,
         }),
         Expression::Field { receiver, name } => {
-            emit_expression(receiver, locals, instructions, procedures)?;
-            instructions.push(Instruction::MutateField {
-                name: name.clone(),
-                delta,
-                prefix,
-            });
+            if let Some(storage) = locals.receiver_static(receiver.as_ref(), name) {
+                instructions.push(Instruction::MutateGlobal {
+                    name: storage.clone(),
+                    delta,
+                    prefix,
+                });
+            } else {
+                emit_expression(receiver, locals, instructions, procedures)?;
+                instructions.push(Instruction::MutateField {
+                    name: name.clone(),
+                    delta,
+                    prefix,
+                });
+            }
+        }
+        Expression::SafeField { receiver, name } => {
+            if let Some(storage) = locals.receiver_static(receiver.as_ref(), name) {
+                instructions.push(Instruction::MutateGlobal {
+                    name: storage.clone(),
+                    delta,
+                    prefix,
+                });
+            } else {
+                emit_expression(receiver, locals, instructions, procedures)?;
+                instructions.push(Instruction::Duplicate);
+                let null_jump = instructions.len();
+                instructions.push(Instruction::JumpIfNull(usize::MAX));
+                instructions.push(Instruction::MutateField {
+                    name: name.clone(),
+                    delta,
+                    prefix,
+                });
+                let end = instructions.len();
+                instructions[null_jump] = Instruction::JumpIfNull(end);
+            }
         }
         Expression::Index { list, index } => {
             emit_expression(list, locals, instructions, procedures)?;
@@ -7639,8 +8392,7 @@ fn emit_assignment_expression(
                 if operator != "=" {
                     instructions.push(compound_instruction(operator)?);
                 }
-                instructions.push(Instruction::Duplicate);
-                instructions.push(Instruction::StoreField(field.clone()));
+                instructions.push(Instruction::StoreFieldKeep(field.clone()));
             } else if let Some(global) = locals.global_field(name) {
                 if operator != "=" {
                     instructions.push(Instruction::LoadGlobal(global.clone()));
@@ -7710,13 +8462,9 @@ fn emit_assignment_expression(
                 emit_expression(value, locals, instructions, procedures)?;
                 instructions.push(Instruction::SetListIndexKeep);
             } else {
-                // CompoundListIndex consumes the list, key, and right operand
-                // and leaves no value, so retain an independent copy of the
-                // computed result is not possible without a temporary. Keep
-                // compound assignment expressions explicit until the VM has a
-                // value-preserving variant.
-                return Err(compile_error(
-                    "compound list assignment is not supported as an expression",
+                emit_expression(value, locals, instructions, procedures)?;
+                instructions.push(Instruction::CompoundListIndexKeep(
+                    compound_list_index_operator(operator)?,
                 ));
             }
         }
@@ -7770,6 +8518,9 @@ fn bind_initializer_expression(
                 bind_initializer_expression(receiver, bindings)?;
             }
         }
+        Expression::NamedArgument { value, .. } => {
+            bind_initializer_expression(value, bindings)?;
+        }
         Expression::Call { arguments, .. }
         | Expression::StandardBuiltin { arguments, .. }
         | Expression::NativeSrcMethod { arguments, .. }
@@ -7811,9 +8562,17 @@ fn bind_initializer_expression(
                 bind_initializer_expression(argument, bindings)?;
             }
         }
+        Expression::TypesOf { arguments } => {
+            for argument in arguments {
+                bind_initializer_expression(argument, bindings)?;
+            }
+        }
+        Expression::HasCall { receiver, selector } => {
+            bind_initializer_expression(receiver, bindings)?;
+            bind_initializer_expression(selector, bindings)?;
+        }
         Expression::Length { value }
         | Expression::Ref { value }
-        | Expression::TypesOf { value }
         | Expression::Initial(value)
         | Expression::Sleep(value)
         | Expression::Crash(value) => {
@@ -7940,6 +8699,7 @@ fn bind_initializer_expression(
         Expression::Null
         | Expression::Number(_)
         | Expression::Text(_)
+        | Expression::File(_)
         | Expression::TypePath(_)
         | Expression::Src
         | Expression::Usr
@@ -7960,7 +8720,9 @@ fn compile_error(message: impl Into<String>) -> CompileError {
 pub struct ExecutionLimits {
     /// Maximum number of simultaneously active procedure frames.
     pub max_call_depth: usize,
-    /// Maximum total bytecode instructions executed across all call frames.
+    /// Maximum bytecode instructions executed across all call frames in one
+    /// interpreter dispatch. Standalone exhaustion is an error; scheduled
+    /// exhaustion retains the continuation for a same-tick dispatch slice.
     pub max_steps: u64,
 }
 
@@ -7988,6 +8750,8 @@ pub struct ExecutionState {
     datum_vars_proxies: HashMap<ListId, DatumId>,
     datum_vars_by_datum: HashMap<DatumId, ListId>,
     contents_owners: HashMap<ListId, DatumId>,
+    vis_contents_owners: HashMap<ListId, DatumId>,
+    vis_locs_owners: HashMap<ListId, DatumId>,
     shared_fields: Arc<BTreeMap<TypePath, BTreeMap<FieldName, FieldName>>>,
     instance_initializers: Arc<BTreeMap<TypePath, Vec<InstanceInitializer>>>,
     instance_initializer_module: Option<Arc<Module>>,
@@ -7996,18 +8760,40 @@ pub struct ExecutionState {
     type_paths: Arc<std::collections::BTreeSet<TypePath>>,
     type_parents: Arc<BTreeMap<TypePath, Option<TypePath>>>,
     initial_values: Arc<BTreeMap<TypePath, BTreeMap<FieldName, Value>>>,
+    // Engine-created turfs keep immutable effective defaults in
+    // `initial_values` and materialize only per-cell state and overrides.
+    compact_default_datums: HashSet<DatumId>,
     project_root: Option<Arc<PathBuf>>,
     random_state: u64,
     scheduler_tick: u64,
     scheduler_sequence: u64,
     scheduled_spawns: Vec<ScheduledSpawn>,
+    // Due tasks are moved here while one scheduler dispatch is running. They
+    // must remain visible to list GC until each continuation becomes active;
+    // otherwise a collection in an earlier same-tick task can reclaim values
+    // held only by a later due frame.
+    scheduler_inflight: Vec<ScheduledSpawn>,
+    // Wall-clock origin for the scheduler tick currently dispatching DM work.
+    // Standalone execution leaves this disabled.
+    scheduler_tick_started: Option<Instant>,
     // Datums whose BYOND `Del()` hook is currently executing. This prevents a
     // reentrant `del(src)` from dispatching the same hook indefinitely.
     deleting_datums: HashSet<DatumId>,
     last_animation_target: Option<Value>,
     environment_overrides: BTreeMap<String, Option<Value>>,
     external_timers: BTreeMap<String, Instant>,
+    iconforge_jobs: BTreeMap<String, (bool, String)>,
+    iconforge_next_job: u64,
+    iconforge_gags_configs: BTreeSet<String>,
+    sql_jobs: BTreeMap<String, (bool, String)>,
+    sql_next_job: u64,
     procedure_static_locals: BTreeMap<(String, u16), Value>,
+    // Values returned across the public execution boundary remain valid until
+    // the host explicitly replaces the execution state. DM has no API for the
+    // host to announce that it dropped a returned list handle, so retain those
+    // sparse roots while collecting the far more numerous frame temporaries.
+    host_value_roots: Vec<Value>,
+    next_list_collection: usize,
     /// Authoritative coordinate-to-cell identities for the mutable headless map.
     world_turfs: BTreeMap<(i32, i32, i32), DatumId>,
     world_areas: BTreeMap<(i32, i32, i32), DatumId>,
@@ -8040,6 +8826,8 @@ impl ExecutionState {
             datum_vars_proxies: HashMap::new(),
             datum_vars_by_datum: HashMap::new(),
             contents_owners: HashMap::new(),
+            vis_contents_owners: HashMap::new(),
+            vis_locs_owners: HashMap::new(),
             shared_fields: Arc::new(BTreeMap::new()),
             instance_initializers: Arc::new(BTreeMap::new()),
             instance_initializer_module: None,
@@ -8048,16 +8836,26 @@ impl ExecutionState {
             type_paths: Arc::new(std::collections::BTreeSet::new()),
             type_parents: Arc::new(BTreeMap::new()),
             initial_values: Arc::new(BTreeMap::new()),
+            compact_default_datums: HashSet::new(),
             project_root: None,
             random_state: 0,
             scheduler_tick: 0,
             scheduler_sequence: 0,
             scheduled_spawns: Vec::new(),
+            scheduler_inflight: Vec::new(),
+            scheduler_tick_started: None,
             deleting_datums: HashSet::new(),
             last_animation_target: None,
             environment_overrides: BTreeMap::new(),
             external_timers: BTreeMap::new(),
+            iconforge_jobs: BTreeMap::new(),
+            iconforge_next_job: 0,
+            iconforge_gags_configs: BTreeSet::new(),
+            sql_jobs: BTreeMap::new(),
+            sql_next_job: 0,
             procedure_static_locals: BTreeMap::new(),
+            host_value_roots: Vec::new(),
+            next_list_collection: 262_144,
             world_turfs: BTreeMap::new(),
             world_areas: BTreeMap::new(),
             default_world_area: None,
@@ -8070,10 +8868,20 @@ impl ExecutionState {
         self.world_turfs.clear();
         self.world_areas.clear();
         self.contents_owners.clear();
+        self.vis_contents_owners.clear();
+        self.vis_locs_owners.clear();
         let contents = FieldName::parse("contents").expect("built-in contents field");
+        let vis_contents = FieldName::parse("vis_contents").expect("built-in vis_contents field");
+        let vis_locs = FieldName::parse("vis_locs").expect("built-in vis_locs field");
         for (id, datum) in self.heap.datums() {
             if let Ok(Value::List(list)) = datum.field(&contents) {
                 self.contents_owners.insert(*list, id);
+            }
+            if let Ok(Value::List(list)) = datum.field(&vis_contents) {
+                self.vis_contents_owners.insert(*list, id);
+            }
+            if let Ok(Value::List(list)) = datum.field(&vis_locs) {
+                self.vis_locs_owners.insert(*list, id);
             }
         }
         let x = FieldName::parse("x").expect("built-in coordinate field");
@@ -8158,6 +8966,166 @@ impl ExecutionState {
         self.contents_owners.get(&list).copied()
     }
 
+    fn visibility_owner(&self, list: ListId) -> Option<(DatumId, bool)> {
+        self.vis_contents_owners
+            .get(&list)
+            .copied()
+            .map(|owner| (owner, true))
+            .or_else(|| {
+                self.vis_locs_owners
+                    .get(&list)
+                    .copied()
+                    .map(|owner| (owner, false))
+            })
+    }
+
+    pub(crate) fn is_visibility_list(&self, list: ListId) -> bool {
+        self.visibility_owner(list).is_some()
+    }
+
+    pub(crate) fn visibility_list_accepts(&self, value: &Value) -> bool {
+        let Value::Datum(datum) = value else {
+            return matches!(value, Value::Null);
+        };
+        self.heap.datum(*datum).is_ok_and(|datum| {
+            let path = datum.type_path().as_str();
+            path == "/atom"
+                || path.starts_with("/atom/")
+                || path == "/obj"
+                || path.starts_with("/obj/")
+                || path == "/mob"
+                || path.starts_with("/mob/")
+                || path == "/turf"
+                || path.starts_with("/turf/")
+                || path == "/area"
+                || path.starts_with("/area/")
+        })
+    }
+
+    pub(crate) fn visibility_members(&self, list: ListId) -> Result<Vec<DatumId>, String> {
+        Ok(self
+            .heap
+            .list(list)
+            .map_err(|error| error.to_string())?
+            .positions()
+            .filter_map(|(_, value)| match value {
+                Value::Datum(datum) => Some(*datum),
+                _ => None,
+            })
+            .collect())
+    }
+
+    fn ensure_visibility_list(
+        &mut self,
+        datum: DatumId,
+        vis_contents: bool,
+    ) -> Result<ListId, String> {
+        let name = if vis_contents {
+            "vis_contents"
+        } else {
+            "vis_locs"
+        };
+        let field = FieldName::parse(name).expect("built-in visibility field");
+        if let Ok(Value::List(list)) = self.heap.datum_field(datum, &field) {
+            let list = *list;
+            if vis_contents {
+                self.vis_contents_owners.insert(list, datum);
+            } else {
+                self.vis_locs_owners.insert(list, datum);
+            }
+            return Ok(list);
+        }
+        let list = self.heap.allocate_list();
+        self.heap
+            .set_datum_field(datum, field, Value::List(list))
+            .map_err(|error| error.to_string())?;
+        if vis_contents {
+            self.vis_contents_owners.insert(list, datum);
+        } else {
+            self.vis_locs_owners.insert(list, datum);
+        }
+        Ok(list)
+    }
+
+    pub(crate) fn synchronize_visibility_list(
+        &mut self,
+        list: ListId,
+        before: &[DatumId],
+    ) -> Result<(), String> {
+        let Some((owner, is_vis_contents)) = self.visibility_owner(list) else {
+            return Ok(());
+        };
+        let after = self.visibility_members(list)?;
+        for removed in before {
+            if after.contains(removed) {
+                continue;
+            }
+            let reciprocal = self.ensure_visibility_list(*removed, !is_vis_contents)?;
+            let reciprocal = self
+                .heap
+                .list_mut(reciprocal)
+                .map_err(|error| error.to_string())?;
+            while reciprocal.remove_last(&Value::Datum(owner)).is_some() {}
+        }
+        for added in after {
+            if before.contains(&added) {
+                continue;
+            }
+            let reciprocal = self.ensure_visibility_list(added, !is_vis_contents)?;
+            let reciprocal = self
+                .heap
+                .list_mut(reciprocal)
+                .map_err(|error| error.to_string())?;
+            if !reciprocal.contains(&Value::Datum(owner)) {
+                reciprocal.add(Value::Datum(owner));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn normalize_and_synchronize_visibility_list(
+        &mut self,
+        list: ListId,
+        before: &[DatumId],
+    ) -> Result<(), String> {
+        if !self.is_visibility_list(list) {
+            return Ok(());
+        }
+        let values = self
+            .heap
+            .list(list)
+            .map_err(|error| error.to_string())?
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        let mut normalized = Vec::new();
+        for value in values {
+            if matches!(value, Value::Null) {
+                continue;
+            }
+            if !self.visibility_list_accepts(&value) {
+                return Err(format!(
+                    "visibility lists can only contain atoms, received {value}"
+                ));
+            }
+            if !normalized
+                .iter()
+                .any(|existing: &Value| existing.semantic_eq(&value))
+            {
+                normalized.push(value);
+            }
+        }
+        let target = self
+            .heap
+            .list_mut(list)
+            .map_err(|error| error.to_string())?;
+        target.resize(0).map_err(|error| error.to_string())?;
+        for value in normalized {
+            target.add(value);
+        }
+        self.synchronize_visibility_list(list, before)
+    }
+
     fn default_area_for_world(&mut self, world: DatumId) -> Result<DatumId, String> {
         if let Some(area) = self.default_world_area
             && self.heap.datum(area).is_ok()
@@ -8235,7 +9203,6 @@ impl ExecutionState {
         let area = self.default_area_for_world(world)?;
         let turf_path = self.world_type_field(world, "turf", "/turf")?;
         let area_contents = self.ensure_contents(area)?;
-        let world_contents = self.ensure_contents(world)?;
         let coordinate_fields = ["x", "y", "z"]
             .map(|name| FieldName::parse(name).expect("built-in coordinate field is valid"));
         let loc = FieldName::parse("loc").expect("built-in loc field is valid");
@@ -8258,10 +9225,6 @@ impl ExecutionState {
                     self.ensure_contents(turf)?;
                     self.heap
                         .list_mut(area_contents)
-                        .map_err(|error| error.to_string())?
-                        .add(Value::Datum(turf));
-                    self.heap
-                        .list_mut(world_contents)
                         .map_err(|error| error.to_string())?
                         .add(Value::Datum(turf));
                     self.world_turfs.insert(coordinate, turf);
@@ -8314,6 +9277,22 @@ impl ExecutionState {
         self.heap
     }
 
+    /// Transfers persistent procedure-static local storage out of this state.
+    ///
+    /// Runtime image/lifecycle phase boundaries temporarily separate the heap
+    /// from VM execution metadata. BYOND procedure statics outlive those
+    /// boundaries and must travel with the materialized world rather than be
+    /// recreated as null on the next phase.
+    pub fn take_procedure_static_locals(&mut self) -> BTreeMap<(String, u16), Value> {
+        std::mem::take(&mut self.procedure_static_locals)
+    }
+
+    /// Restores persistent procedure-static locals captured from an earlier
+    /// execution phase.
+    pub fn set_procedure_static_locals(&mut self, locals: BTreeMap<(String, u16), Value>) {
+        self.procedure_static_locals = locals;
+    }
+
     /// Returns the shared value heap.
     #[must_use]
     pub const fn heap(&self) -> &ValueHeap {
@@ -8344,6 +9323,64 @@ impl ExecutionState {
             .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0)
     }
 
+    pub(crate) fn external_timer_microseconds(&self, name: &str) -> f64 {
+        self.external_timers
+            .get(name)
+            .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1_000_000.0)
+    }
+
+    pub(crate) fn enqueue_iconforge_job(&mut self, result: String) -> String {
+        self.iconforge_next_job = self.iconforge_next_job.saturating_add(1);
+        let id = format!("dream64-iconforge-{}", self.iconforge_next_job);
+        self.iconforge_jobs.insert(id.clone(), (false, result));
+        id
+    }
+
+    pub(crate) fn poll_iconforge_job(&mut self, id: &str) -> Option<String> {
+        let (polled, _) = self.iconforge_jobs.get(id)?;
+        if !*polled {
+            // Jobs are launched concurrently. One pending observation advances
+            // the deterministic headless worker so the caller's next sweep can
+            // collect every completed result without one sleep per job.
+            for (polled, _) in self.iconforge_jobs.values_mut() {
+                *polled = true;
+            }
+            return Some("NO RESULTS YET".to_owned());
+        }
+        self.iconforge_jobs.remove(id).map(|(_, result)| result)
+    }
+
+    pub(crate) fn load_iconforge_gags_config(&mut self, path: String) {
+        self.iconforge_gags_configs.insert(path);
+    }
+
+    pub(crate) fn has_iconforge_gags_config(&self, path: &str) -> bool {
+        self.iconforge_gags_configs.contains(path)
+    }
+
+    pub(crate) fn clear_iconforge(&mut self) {
+        self.iconforge_jobs.clear();
+        self.iconforge_gags_configs.clear();
+    }
+
+    pub(crate) fn enqueue_sql_job(&mut self, result: String) -> String {
+        self.sql_next_job = self.sql_next_job.saturating_add(1);
+        let id = format!("dream64-sql-{}", self.sql_next_job);
+        self.sql_jobs.insert(id.clone(), (false, result));
+        id
+    }
+
+    pub(crate) fn poll_sql_job(&mut self, id: &str) -> Option<String> {
+        let (polled, _) = self.sql_jobs.get(id)?;
+        if !*polled {
+            for (polled, _) in self.sql_jobs.values_mut() {
+                *polled = true;
+            }
+            return Some("NO RESULTS YET".to_owned());
+        }
+        self.sql_jobs.remove(id).map(|(_, result)| result)
+    }
+
     pub(crate) fn is_associative_list(&self, list: ListId) -> bool {
         self.associative_lists.contains(&list)
     }
@@ -8368,10 +9405,14 @@ impl ExecutionState {
                 continue;
             };
             let field = FieldName::parse(name).map_err(|error| error.to_string())?;
-            let value = datum_shared_storage(self, datum, &field)
-                .and_then(|storage| self.global(&storage).cloned())
-                .or_else(|| self.heap.datum_field(datum, &field).ok().cloned())
-                .unwrap_or(Value::Null);
+            let value = if let Some(value) = lazy_atom_list_field(self, datum, &field)? {
+                value
+            } else {
+                datum_shared_storage(self, datum, &field)
+                    .and_then(|storage| self.global(&storage).cloned())
+                    .or_else(|| datum_field_or_initial(self, datum, &field).ok())
+                    .unwrap_or(Value::Null)
+            };
             self.heap
                 .list_mut(list)
                 .map_err(|error| error.to_string())?
@@ -8524,6 +9565,101 @@ impl ExecutionState {
     pub fn next_scheduled_tick(&self) -> Option<u64> {
         self.scheduled_spawns.iter().map(|task| task.due_tick).min()
     }
+
+    fn maybe_collect_unreachable_lists(&mut self, active_frames: &[CallFrame]) {
+        const MINIMUM_COLLECTION_INTERVAL: usize = 262_144;
+        if self.next_list_collection == 0 {
+            self.next_list_collection = MINIMUM_COLLECTION_INTERVAL;
+        }
+        let before = self.heap.live_list_count();
+        if before < self.next_list_collection {
+            return;
+        }
+
+        let mut roots = Vec::new();
+        roots.extend(self.globals.values().cloned());
+        roots.extend(self.initial_globals.values().cloned());
+        roots.extend(
+            self.initial_values
+                .values()
+                .flat_map(BTreeMap::values)
+                .cloned(),
+        );
+        roots.extend(self.procedure_static_locals.values().cloned());
+        roots.extend(
+            self.savefiles
+                .values()
+                .flat_map(|savefile| savefile.entries.values())
+                .cloned(),
+        );
+        roots.extend(self.environment_overrides.values().flatten().cloned());
+        roots.extend(self.last_animation_target.iter().cloned());
+        roots.extend(self.host_value_roots.iter().cloned());
+        roots.extend(self.global_vars_proxy.map(Value::List));
+        roots.extend(
+            self.datum_vars_by_datum
+                .iter()
+                .filter(|(datum, _)| self.heap.datum(**datum).is_ok())
+                .map(|(_, list)| Value::List(*list)),
+        );
+
+        let mut add_frame_roots = |frame: &CallFrame| {
+            roots.extend(frame.locals.iter().cloned());
+            roots.extend(frame.stack.iter().cloned());
+            roots.push(frame.result.clone());
+            roots.push(frame.src.clone());
+            roots.push(frame.usr.clone());
+            roots.extend(frame.arguments.iter().cloned());
+            roots.extend(frame.caller_result_override.iter().cloned());
+        };
+        for frame in active_frames {
+            add_frame_roots(frame);
+        }
+        for spawn in &self.scheduled_spawns {
+            for frame in &spawn.frames {
+                add_frame_roots(frame);
+            }
+        }
+        for spawn in &self.scheduler_inflight {
+            for frame in &spawn.frames {
+                add_frame_roots(frame);
+            }
+        }
+
+        let reclaimed = self.heap.collect_unreachable_lists(&roots);
+        let heap = &self.heap;
+        self.associative_lists
+            .retain(|list| heap.list(*list).is_ok());
+        self.reference_lists.retain(|list| heap.list(*list).is_ok());
+        self.datum_vars_proxies
+            .retain(|list, datum| heap.list(*list).is_ok() && heap.datum(*datum).is_ok());
+        self.datum_vars_by_datum
+            .retain(|datum, list| heap.list(*list).is_ok() && heap.datum(*datum).is_ok());
+        self.contents_owners
+            .retain(|list, datum| heap.list(*list).is_ok() && heap.datum(*datum).is_ok());
+        self.vis_contents_owners
+            .retain(|list, datum| heap.list(*list).is_ok() && heap.datum(*datum).is_ok());
+        self.vis_locs_owners
+            .retain(|list, datum| heap.list(*list).is_ok() && heap.datum(*datum).is_ok());
+        self.compact_default_datums
+            .retain(|datum| heap.datum(*datum).is_ok());
+        if self
+            .global_vars_proxy
+            .is_some_and(|list| heap.list(list).is_err())
+        {
+            self.global_vars_proxy = None;
+        }
+
+        let after = self.heap.live_list_count();
+        self.next_list_collection =
+            after.saturating_add(after.saturating_div(2).max(MINIMUM_COLLECTION_INTERVAL));
+        if boot_trace_enabled() {
+            eprintln!(
+                "boot-vm: list-gc before={before} after={after} reclaimed={reclaimed} next={}",
+                self.next_list_collection
+            );
+        }
+    }
 }
 
 /// Entry-frame object context retained across a procedure call chain.
@@ -8574,11 +9710,19 @@ struct CallFrame {
     // Retain all supplied values for the future DM `args` list, including
     // extras beyond the declared parameter slots.
     arguments: Vec<Value>,
+    supplied_parameters: Vec<bool>,
     exception_handlers: Vec<ExceptionHandler>,
     // A waitfor=FALSE boundary detaches from its caller only once. Later
     // sleeps in the already-detached continuation yield normally.
     detached_waitfor: bool,
+    // Engine constructors return the allocated value to their caller rather
+    // than exposing the value returned by New(). Keeping this on the callee
+    // frame preserves that continuation across sleep()/scheduler resumption.
+    caller_result_override: Option<Value>,
     static_locals: HashSet<u16>,
+    boot_trace_started: Option<Instant>,
+    boot_trace_heap: Option<(usize, usize, usize)>,
+    boot_trace_step: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -8600,6 +9744,12 @@ struct ScheduledSpawn {
 enum FrameRunOutcome {
     Complete(Value),
     Yielded { frames: Vec<CallFrame>, delay: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StepBudgetBehavior {
+    Error,
+    YieldScheduledContinuation,
 }
 
 fn materialize_callee_chain(
@@ -8693,8 +9843,9 @@ pub fn execute_in_context(
         procedures: vec![program.clone()],
         paths: vec!["<standalone>".to_owned()],
         names: HashMap::new(),
+        dynamic_names: HashMap::new(),
         deferred: Arc::new(HashMap::new()),
-        procedure_types: BTreeSet::new(),
+        procedure_types: Vec::new(),
         initializer_call_names: None,
     };
     execute_module_with_limits_in_context(
@@ -8739,8 +9890,9 @@ pub fn execute_with_limits_in_state(
         procedures: vec![program.clone()],
         paths: vec!["<standalone>".to_owned()],
         names: HashMap::new(),
+        dynamic_names: HashMap::new(),
         deferred: Arc::new(HashMap::new()),
-        procedure_types: BTreeSet::new(),
+        procedure_types: Vec::new(),
         initializer_call_names: None,
     };
     execute_module_with_limits_in_state(&module, entry, arguments, limits, state)
@@ -8873,7 +10025,11 @@ pub fn execute_module_with_limits_in_context(
     }
 
     let frames = vec![make_frame(entry, program, arguments, context)];
-    finish_frame_run(module, run_frames(module, frames, limits, state)?, state)
+    finish_frame_run(
+        module,
+        run_frames(module, frames, limits, StepBudgetBehavior::Error, state)?,
+        state,
+    )
 }
 
 fn finish_frame_run(
@@ -8882,7 +10038,10 @@ fn finish_frame_run(
     state: &mut ExecutionState,
 ) -> Result<Value, RuntimeError> {
     match outcome {
-        FrameRunOutcome::Complete(value) => Ok(value),
+        FrameRunOutcome::Complete(value) => {
+            state.host_value_roots.push(value.clone());
+            Ok(value)
+        }
         FrameRunOutcome::Yielded { frames, delay } => {
             schedule_frames(state, frames, delay);
             let _ = module;
@@ -8911,34 +10070,63 @@ pub fn advance_scheduler(
     let due_count = state
         .scheduled_spawns
         .partition_point(|spawn| spawn.due_tick <= state.scheduler_tick);
-    let due = state
+    let mut due = state
         .scheduled_spawns
         .drain(..due_count)
         .collect::<Vec<_>>();
-    // BYOND exposes elapsed host-tick percentage. The deterministic headless
-    // VM has no wall-clock budget, so due work observes one fully active tick
-    // and the quiescent boundary observes zero.
-    set_world_numeric_field(
-        state,
-        "tick_usage",
-        if due.is_empty() { 0.0 } else { 100.0 },
-    );
+    // Pop in source order while retaining every not-yet-run due continuation
+    // inside ExecutionState, where the collector can traverse its frame roots.
+    due.reverse();
+    debug_assert!(state.scheduler_inflight.is_empty());
+    state.scheduler_inflight = due;
+    // BYOND/OpenDream expose elapsed host-tick percentage, which can exceed
+    // 100 when a proc overruns its tick. Monk deliberately raises its stage-2
+    // startup limit to about 196%, so pinning due work at exactly 100% prevents
+    // MAPLOADING_CHECK_TICK from ever reaching stoplag(). Track the actual
+    // dispatch slice instead, sampling outside the per-instruction hot path.
+    state.scheduler_tick_started = (!state.scheduler_inflight.is_empty()).then(Instant::now);
+    set_world_numeric_field(state, "tick_usage", 0.0);
     let mut completed = Vec::new();
-    for spawn in due {
-        let outcome = match run_frames(module, spawn.frames, limits, state) {
+    while let Some(spawn) = state.scheduler_inflight.pop() {
+        let outcome = match run_frames(
+            module,
+            spawn.frames,
+            limits,
+            StepBudgetBehavior::YieldScheduledContinuation,
+            state,
+        ) {
             Ok(outcome) => outcome,
             Err(error) => {
+                let remaining = std::mem::take(&mut state.scheduler_inflight);
+                state.scheduled_spawns.extend(remaining.into_iter().rev());
+                state.scheduler_tick_started = None;
                 set_world_numeric_field(state, "tick_usage", 0.0);
                 return Err(error);
             }
         };
         match outcome {
-            FrameRunOutcome::Complete(value) => completed.push(value),
+            FrameRunOutcome::Complete(value) => {
+                state.host_value_roots.push(value.clone());
+                completed.push(value);
+            }
             FrameRunOutcome::Yielded { frames, delay } => schedule_frames(state, frames, delay),
         }
     }
+    state.scheduler_tick_started = None;
     set_world_numeric_field(state, "tick_usage", 0.0);
     Ok(completed)
+}
+
+fn account_scheduler_tick_usage(state: &mut ExecutionState) {
+    let Some(started) = state.scheduler_tick_started else {
+        return;
+    };
+    let tick_lag = world_numeric_field(state, "tick_lag")
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(1.0);
+    let tick_duration = f64::from(tick_lag) / 10.0;
+    let usage = (started.elapsed().as_secs_f64() / tick_duration * 100.0) as f32;
+    set_world_numeric_field(state, "tick_usage", usage);
 }
 
 fn schedule_frames(state: &mut ExecutionState, frames: Vec<CallFrame>, delay: u64) {
@@ -9007,10 +10195,28 @@ fn run_frames(
     module: &Module,
     mut frames: Vec<CallFrame>,
     limits: ExecutionLimits,
+    step_budget_behavior: StepBudgetBehavior,
     state: &mut ExecutionState,
 ) -> Result<FrameRunOutcome, RuntimeError> {
     let mut remaining_steps = limits.max_steps;
+    let mut executed_steps = 0u64;
+    let mut heartbeat = Instant::now();
+    let mut prior_instruction: Option<(Instant, ProcedureId, usize)> = None;
     loop {
+        if boot_trace_enabled()
+            && let Some((started, prior_procedure, prior_index)) = prior_instruction.take()
+            && started.elapsed().as_millis() >= 250
+        {
+            eprintln!(
+                "boot-vm: slow-instruction elapsed_ms={} procedure={} instruction={}",
+                started.elapsed().as_millis(),
+                module
+                    .paths
+                    .get(prior_procedure.index())
+                    .map_or("<missing>", String::as_str),
+                prior_index,
+            );
+        }
         let frame_index = frames.len() - 1;
         let procedure = frames[frame_index].procedure;
         let instruction_index = frames[frame_index].instruction;
@@ -9025,6 +10231,22 @@ fn run_frames(
             ));
         };
         if remaining_steps == 0 {
+            if step_budget_behavior == StepBudgetBehavior::YieldScheduledContinuation {
+                if boot_trace_enabled() {
+                    eprintln!(
+                        "boot-vm: scheduler-step-slice steps={} depth={} procedure={} instruction={}",
+                        limits.max_steps,
+                        frames.len(),
+                        module
+                            .paths
+                            .get(procedure.index())
+                            .map_or("<missing>", String::as_str),
+                        instruction_index,
+                    );
+                }
+                state.maybe_collect_unreachable_lists(&frames);
+                return Ok(FrameRunOutcome::Yielded { frames, delay: 0 });
+            }
             return Err(execution_error(
                 module,
                 &frames,
@@ -9032,6 +10254,29 @@ fn run_frames(
             ));
         }
         remaining_steps -= 1;
+        executed_steps += 1;
+        if executed_steps.is_multiple_of(4_096) {
+            account_scheduler_tick_usage(state);
+        }
+        if boot_trace_enabled() {
+            prior_instruction = Some((Instant::now(), procedure, instruction_index));
+        }
+        if executed_steps.is_multiple_of(1_000_000)
+            && boot_trace_enabled()
+            && heartbeat.elapsed().as_secs() >= 30
+        {
+            eprintln!(
+                "boot-vm: heartbeat steps={} depth={} procedure={} instruction={}",
+                executed_steps,
+                frames.len(),
+                module
+                    .paths
+                    .get(procedure.index())
+                    .map_or("<missing>", String::as_str),
+                instruction_index,
+            );
+            heartbeat = Instant::now();
+        }
 
         match instruction {
             Instruction::PushNull => frames[frame_index].stack.push(Value::Null),
@@ -9039,6 +10284,7 @@ fn run_frames(
                 frames[frame_index].stack.push(Value::Number(number));
             }
             Instruction::PushText(text) => frames[frame_index].stack.push(Value::text(text)),
+            Instruction::PushFile(path) => frames[frame_index].stack.push(Value::file(path)),
             Instruction::PushTypePath(path) => {
                 frames[frame_index].stack.push(Value::TypePath(path));
             }
@@ -9156,11 +10402,18 @@ fn run_frames(
                         let datum = allocate_initialized_datum(state, type_path.clone())
                             .map_err(|message| execution_error(module, &frames, message))?;
                         for (name, value) in [
-                            ("text", arguments.first().cloned().unwrap_or(Value::Null)),
+                            (
+                                "_dream64_pattern",
+                                arguments.first().cloned().unwrap_or(Value::Null),
+                            ),
                             ("flags", arguments.get(1).cloned().unwrap_or(Value::Null)),
+                            ("text", Value::Null),
                             ("match", Value::Null),
                             ("index", Value::number(0.0)),
                             ("group", Value::Null),
+                            ("next", Value::Null),
+                            ("_dream64_cursor", Value::number(0.0)),
+                            ("_dream64_haystack", Value::Null),
                         ] {
                             state
                                 .heap_mut()
@@ -9193,32 +10446,42 @@ fn run_frames(
                 if let Value::Datum(datum) = &allocated {
                     if is_movable
                         && let Some(Value::Datum(location)) = arguments.first()
-                        && state.heap.datum(*location).is_ok_and(|datum| {
-                            let path = datum.type_path().as_str();
-                            path == "/turf" || path.starts_with("/turf/")
-                        })
+                        && state
+                            .heap
+                            .datum(*location)
+                            .is_ok_and(|datum| is_atom_type_path(datum.type_path()))
                     {
-                        builtins::move_movable_to_turf(state, *datum, *location)
+                        builtins::move_movable_to_atom(state, *datum, *location)
                             .map_err(|message| execution_error(module, &frames, message))?;
                     }
-                    invoke_constructor_if_present(
+                    if let Some((constructor, context)) = constructor_target_if_present(
                         module,
                         state,
                         *datum,
-                        &arguments,
                         &frame_context(&frames[frame_index]),
-                    )
-                    .map_err(|mut error| {
-                        error.call_stack.insert(
-                            0,
-                            trace(
+                    ) {
+                        if frames.len() >= limits.max_call_depth {
+                            return Err(execution_error(
                                 module,
-                                frames[frame_index].procedure,
-                                frames[frame_index].instruction.saturating_sub(1),
-                            ),
+                                &frames,
+                                format!("maximum call depth {} exceeded", limits.max_call_depth),
+                            ));
+                        }
+                        let constructor_program = module
+                            .resolve_procedure(constructor)
+                            .map_err(|message| execution_error(module, &frames, message))?;
+                        let mut constructor_frame =
+                            make_frame(constructor, constructor_program, &arguments, &context);
+                        constructor_frame.caller_result_override = Some(allocated.clone());
+                        mark_boot_trace_frame(
+                            &mut constructor_frame,
+                            module,
+                            state,
+                            executed_steps,
                         );
-                        error
-                    })?;
+                        frames.push(constructor_frame);
+                        continue;
+                    }
                 }
                 frames[frame_index].stack.push(allocated);
             }
@@ -9251,32 +10514,37 @@ fn run_frames(
                     .map_err(|message| execution_error(module, &frames, message))?;
                 if builtins::is_movable_path(type_path.as_str())
                     && let Some(Value::Datum(location)) = arguments.first()
-                    && state.heap.datum(*location).is_ok_and(|datum| {
-                        let path = datum.type_path().as_str();
-                        path == "/turf" || path.starts_with("/turf/")
-                    })
+                    && state
+                        .heap
+                        .datum(*location)
+                        .is_ok_and(|datum| is_atom_type_path(datum.type_path()))
                 {
-                    builtins::move_movable_to_turf(state, datum, *location)
+                    builtins::move_movable_to_atom(state, datum, *location)
                         .map_err(|message| execution_error(module, &frames, message))?;
                 }
-                invoke_constructor_if_present(
+                if let Some((constructor, context)) = constructor_target_if_present(
                     module,
                     state,
                     datum,
-                    &arguments,
                     &frame_context(&frames[frame_index]),
-                )
-                .map_err(|mut error| {
-                    error.call_stack.insert(
-                        0,
-                        trace(
+                ) {
+                    if frames.len() >= limits.max_call_depth {
+                        return Err(execution_error(
                             module,
-                            frames[frame_index].procedure,
-                            frames[frame_index].instruction.saturating_sub(1),
-                        ),
-                    );
-                    error
-                })?;
+                            &frames,
+                            format!("maximum call depth {} exceeded", limits.max_call_depth),
+                        ));
+                    }
+                    let constructor_program = module
+                        .resolve_procedure(constructor)
+                        .map_err(|message| execution_error(module, &frames, message))?;
+                    let mut constructor_frame =
+                        make_frame(constructor, constructor_program, &arguments, &context);
+                    constructor_frame.caller_result_override = Some(Value::Datum(datum));
+                    mark_boot_trace_frame(&mut constructor_frame, module, state, executed_steps);
+                    frames.push(constructor_frame);
+                    continue;
+                }
                 frames[frame_index].stack.push(Value::Datum(datum));
             }
             Instruction::MakeRegex { argument_count } => {
@@ -9296,19 +10564,49 @@ fn run_frames(
                 let flags = arguments.get(1).cloned().unwrap_or(Value::Null);
                 let type_path =
                     TypePath::parse("/regex").expect("the built-in regex type path is valid");
-                let text =
-                    FieldName::parse("text").expect("the built-in regex text field name is valid");
+                let pattern_name = FieldName::parse("_dream64_pattern")
+                    .expect("the built-in regex pattern field name is valid");
                 let flags_name = FieldName::parse("flags")
                     .expect("the built-in regex flags field name is valid");
-                let datum = state.heap.allocate_datum(type_path);
-                state
-                    .heap
-                    .set_datum_field(datum, text, pattern)
-                    .map_err(|error| execution_error(module, &frames, error.to_string()))?;
-                state
-                    .heap
-                    .set_datum_field(datum, flags_name, flags)
-                    .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                let datum = allocate_initialized_datum(state, type_path)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                for (name, value) in [
+                    (pattern_name, pattern),
+                    (flags_name, flags),
+                    (
+                        FieldName::parse("text").expect("regex field is valid"),
+                        Value::Null,
+                    ),
+                    (
+                        FieldName::parse("match").expect("regex field is valid"),
+                        Value::Null,
+                    ),
+                    (
+                        FieldName::parse("index").expect("regex field is valid"),
+                        Value::number(0.0),
+                    ),
+                    (
+                        FieldName::parse("group").expect("regex field is valid"),
+                        Value::Null,
+                    ),
+                    (
+                        FieldName::parse("next").expect("regex field is valid"),
+                        Value::Null,
+                    ),
+                    (
+                        FieldName::parse("_dream64_cursor").expect("regex field is valid"),
+                        Value::number(0.0),
+                    ),
+                    (
+                        FieldName::parse("_dream64_haystack").expect("regex field is valid"),
+                        Value::Null,
+                    ),
+                ] {
+                    state
+                        .heap
+                        .set_datum_field(datum, name, value)
+                        .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                }
                 frames[frame_index].stack.push(Value::Datum(datum));
             }
             Instruction::MakeMutableAppearance { argument_count } => {
@@ -9378,9 +10676,25 @@ fn run_frames(
                     let stack = &mut frames[frame_index].stack;
                     stack.split_off(stack.len() - count)
                 };
-                let value = replace_text_builtin(&arguments, exact, character_indices, &state.heap)
-                    .map_err(|message| execution_error(module, &frames, message))?;
-                frames[frame_index].stack.push(Value::text(value));
+                let value = if let Value::Datum(regex) = arguments[1]
+                    && is_regex_datum(regex, state)
+                {
+                    Value::text(
+                        replace_text_regex(
+                            module,
+                            state,
+                            regex,
+                            &arguments,
+                            character_indices,
+                            &frame_context(&frames[frame_index]),
+                        )
+                        .map_err(|message| execution_error(module, &frames, message))?,
+                    )
+                } else {
+                    replace_text_builtin(&arguments, exact, character_indices, &state.heap)
+                        .map_err(|message| execution_error(module, &frames, message))?
+                };
+                frames[frame_index].stack.push(value);
             }
             Instruction::CopyText {
                 argument_count,
@@ -9466,8 +10780,20 @@ fn run_frames(
                         execute_icon_method(src, method, &arguments, &mut state.heap)
                             .map_err(|message| execution_error(module, &frames, message))?
                     }
-                    "Turn" if is_matrix_datum(src, &state.heap) => {
-                        execute_matrix_method(src, "Turn", &arguments, &mut state.heap)
+                    method
+                        if is_matrix_datum(src, &state.heap)
+                            && matches!(
+                                method,
+                                "Add"
+                                    | "Subtract"
+                                    | "Multiply"
+                                    | "Scale"
+                                    | "Translate"
+                                    | "Turn"
+                                    | "Invert"
+                            ) =>
+                    {
+                        execute_matrix_method(src, method, &arguments, &mut state.heap)
                             .map_err(|message| execution_error(module, &frames, message))?
                     }
                     _ => {
@@ -9553,7 +10879,10 @@ fn run_frames(
                     .map_err(|message| execution_error(module, &frames, message))?;
                 frames[frame_index].stack.push(value);
             }
-            Instruction::Animate { argument_names } => {
+            Instruction::Animate {
+                argument_names,
+                expanded_indices,
+            } => {
                 let count = argument_names.len();
                 if count > frames[frame_index].stack.len() {
                     return Err(execution_error(module, &frames, "animate stack underflow"));
@@ -9562,7 +10891,42 @@ fn run_frames(
                     let stack = &mut frames[frame_index].stack;
                     stack.split_off(stack.len() - count)
                 };
-                let value = execute_animate(&argument_names, &arguments, state)
+                let mut names = Vec::new();
+                let mut values = Vec::new();
+                for (index, (name, value)) in argument_names.iter().zip(arguments).enumerate() {
+                    if expanded_indices
+                        .binary_search(
+                            &to_local_index(index).expect("animate argument count is u16"),
+                        )
+                        .is_ok()
+                    {
+                        let Value::List(list) = value else {
+                            return Err(execution_error(
+                                module,
+                                &frames,
+                                "arglist requires a list value",
+                            ));
+                        };
+                        let list = state
+                            .heap
+                            .list(list)
+                            .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                        for (_, positional) in list.positions() {
+                            names.push(None);
+                            values.push(positional.clone());
+                        }
+                        for (key, associated) in list.associations() {
+                            if let Value::Text(key) = key {
+                                names.push(Some(key.to_string()));
+                                values.push(associated.clone());
+                            }
+                        }
+                    } else {
+                        names.push(name.clone());
+                        values.push(value);
+                    }
+                }
+                let value = execute_animate(&names, &values, state)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 frames[frame_index].stack.push(value);
             }
@@ -9578,9 +10942,11 @@ fn run_frames(
                     let stack = &mut frames[frame_index].stack;
                     stack.split_off(stack.len() - count)
                 };
-                let filter = state
-                    .heap_mut()
-                    .allocate_datum(TypePath::parse("/dm_filter").expect("canonical filter path"));
+                let filter = allocate_initialized_datum(
+                    state,
+                    TypePath::parse("/dm_filter").expect("canonical filter path"),
+                )
+                .map_err(|message| execution_error(module, &frames, message))?;
                 let mut fields = Vec::new();
                 for (index, (name, value)) in argument_names.iter().zip(arguments).enumerate() {
                     if expanded_indices
@@ -9652,7 +11018,10 @@ fn run_frames(
                             .procedure(frame.procedure)
                             .is_some_and(|program| !program.wait_for)
                 }) {
-                    let detached_result = frames[detach_at].result.clone();
+                    let detached_result = frames[detach_at]
+                        .caller_result_override
+                        .clone()
+                        .unwrap_or_else(|| frames[detach_at].result.clone());
                     let mut detached = frames.split_off(detach_at);
                     detached[0].detached_waitfor = true;
                     schedule_frames(state, detached, delay);
@@ -9666,6 +11035,7 @@ fn run_frames(
                     }
                     return Ok(FrameRunOutcome::Complete(detached_result));
                 }
+                state.maybe_collect_unreachable_lists(&frames);
                 return Ok(FrameRunOutcome::Yielded { frames, delay });
             }
             Instruction::Length => {
@@ -9689,7 +11059,7 @@ fn run_frames(
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let source = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
-                let value = get_step_builtin(&source, &direction, &state.heap)
+                let value = get_step_builtin(&source, &direction, state)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 frames[frame_index].stack.push(value);
             }
@@ -9700,7 +11070,7 @@ fn run_frames(
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let direction = direction_towards_builtin(&source, &target, &state.heap)
                     .map_err(|message| execution_error(module, &frames, message))?;
-                let value = get_step_builtin(&source, &direction, &state.heap)
+                let value = get_step_builtin(&source, &direction, state)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 frames[frame_index].stack.push(value);
             }
@@ -9717,7 +11087,7 @@ fn run_frames(
                     let stack = &mut frames[frame_index].stack;
                     stack.split_off(stack.len() - count)
                 };
-                let value = range_builtin(&arguments, &frames[frame_index].src, &mut state.heap)
+                let value = range_builtin(&arguments, &frames[frame_index].src, state)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 frames[frame_index].stack.push(value);
             }
@@ -9736,38 +11106,65 @@ fn run_frames(
                     let stack = &mut frames[frame_index].stack;
                     stack.split_off(stack.len() - count)
                 };
-                let value = block_builtin(&arguments, &mut state.heap)
+                let value = block_builtin(&arguments, state)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 frames[frame_index].stack.push(value);
             }
-            Instruction::TypesOf => {
-                let selector = pop(&mut frames[frame_index].stack)
-                    .map_err(|message| execution_error(module, &frames, message))?;
-                let paths = if let Value::TypePath(root) = &selector
-                    && (root.as_str() == "/proc" || root.as_str().ends_with("/proc"))
-                {
-                    let prefix = format!("{}/", root.as_str());
-                    module
-                        .procedure_types
-                        .iter()
-                        .filter(|path| {
-                            path.as_str() == root.as_str() || path.as_str().starts_with(&prefix)
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>()
-                } else {
-                    typesof_builtin(&selector, &state.heap, &state.type_paths)
-                        .map_err(|message| execution_error(module, &frames, message))?
+            Instruction::TypesOf { argument_count } => {
+                let count = usize::from(argument_count);
+                if count == 0 || frames[frame_index].stack.len() < count {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "invalid typesof builtin stack",
+                    ));
+                }
+                let selectors = {
+                    let stack = &mut frames[frame_index].stack;
+                    stack.split_off(stack.len() - count)
                 };
                 let list = state.heap.allocate_list();
-                for path in paths {
-                    state
-                        .heap
-                        .list_mut(list)
-                        .expect("a newly allocated list handle must be live")
-                        .add(Value::TypePath(path));
+                let mut seen = BTreeSet::new();
+                for selector in selectors {
+                    let paths = if let Value::TypePath(root) = &selector
+                        && (root.as_str() == "/proc" || root.as_str().ends_with("/proc"))
+                    {
+                        let prefix = format!("{}/", root.as_str());
+                        module
+                            .procedure_types
+                            .iter()
+                            .filter(|path| {
+                                path.as_str() == root.as_str() || path.as_str().starts_with(&prefix)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    } else {
+                        typesof_builtin(&selector, &state.heap, &state.type_paths)
+                            .map_err(|message| execution_error(module, &frames, message))?
+                    };
+                    for path in paths {
+                        if !seen.insert(path.clone()) {
+                            continue;
+                        }
+                        state
+                            .heap
+                            .list_mut(list)
+                            .expect("a newly allocated list handle must be live")
+                            .add(Value::TypePath(path));
+                    }
                 }
                 frames[frame_index].stack.push(Value::List(list));
+            }
+            Instruction::HasCall => {
+                let selector = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let receiver = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index]
+                    .stack
+                    .push(Value::number(f32::from(hascall_builtin(
+                        module, state, &receiver, &selector,
+                    ))));
             }
             Instruction::TypeInstances(target) => {
                 let matches = state
@@ -10037,6 +11434,18 @@ fn run_frames(
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
+                if let Value::Text(text) = &receiver {
+                    let index = value_to_list_index(&key)
+                        .map_err(|message| execution_error(module, &frames, message))?;
+                    let value = text
+                        .chars()
+                        .nth(index - 1)
+                        .map(|character| Value::text(character.to_string()))
+                        .unwrap_or(Value::Null);
+                    frames[frame_index].stack.push(value);
+                    frames[frame_index].instruction += 1;
+                    continue;
+                }
                 if let Value::Datum(savefile) = receiver
                     && state.heap.datum(savefile).is_ok_and(|datum| {
                         let path = datum.type_path().as_str();
@@ -10075,7 +11484,7 @@ fn run_frames(
                             .ok()
                             .and_then(|name| state.global(&name).cloned())
                             .unwrap_or(Value::Null),
-                        _ => read_list_value(&state.heap, list, &key)
+                        _ => read_list_value(&state.heap, list, &key, false)
                             .cloned()
                             .unwrap_or(Value::Null),
                     }
@@ -10083,24 +11492,35 @@ fn run_frames(
                     match &key {
                         Value::Text(name) => {
                             let field = FieldName::parse(name).ok();
-                            let shared = field
+                            if let Some(value) = field
                                 .as_ref()
-                                .and_then(|field| datum_shared_storage(state, datum, field));
-                            shared
-                                .and_then(|storage| state.global(&storage).cloned())
-                                .or_else(|| {
-                                    field.and_then(|field| {
-                                        state.heap.datum_field(datum, &field).ok().cloned()
+                                .map(|field| lazy_atom_list_field(state, datum, field))
+                                .transpose()
+                                .map_err(|message| execution_error(module, &frames, message))?
+                                .flatten()
+                            {
+                                value
+                            } else {
+                                let shared = field
+                                    .as_ref()
+                                    .and_then(|field| datum_shared_storage(state, datum, field));
+                                shared
+                                    .and_then(|storage| state.global(&storage).cloned())
+                                    .or_else(|| {
+                                        field.and_then(|field| {
+                                            datum_field_or_initial(state, datum, &field).ok()
+                                        })
                                     })
-                                })
-                                .unwrap_or(Value::Null)
+                                    .unwrap_or(Value::Null)
+                            }
                         }
-                        _ => read_list_value(&state.heap, list, &key)
+                        _ => read_list_value(&state.heap, list, &key, false)
                             .cloned()
                             .unwrap_or(Value::Null),
                     }
                 } else {
-                    match read_list_value(&state.heap, list, &key) {
+                    match read_list_value(&state.heap, list, &key, state.is_associative_list(list))
+                    {
                         Ok(value) => value.clone(),
                         // BYOND associative lookup returns null for an absent key.
                         // Lazy-list idioms such as `lists[target] ||= list()` rely
@@ -10133,6 +11553,14 @@ fn run_frames(
                     }
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
+                if state.is_visibility_list(list) {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "cannot write to an index of a visibility relationship list",
+                    ));
+                }
+                let associative = state.is_associative_list(list);
                 if state.global_vars_proxy == Some(list) {
                     let Value::Text(name) = key else {
                         return Err(execution_error(
@@ -10147,7 +11575,9 @@ fn run_frames(
                 } else if let Some(datum) = state.datum_vars_proxies.get(&list).copied() {
                     write_datum_vars(state, datum, list, key, value)
                         .map_err(|message| execution_error(module, &frames, message))?;
-                } else if let Err(error) = write_list_value(&mut state.heap, list, key, value) {
+                } else if let Err(error) =
+                    write_list_value(&mut state.heap, list, key, value, associative)
+                {
                     return Err(execution_error(module, &frames, error.to_string()));
                 }
             }
@@ -10171,6 +11601,14 @@ fn run_frames(
                     }
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
+                if state.is_visibility_list(list) {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "cannot write to an index of a visibility relationship list",
+                    ));
+                }
+                let associative = state.is_associative_list(list);
                 if state.global_vars_proxy == Some(list) {
                     let Value::Text(name) = key else {
                         return Err(execution_error(
@@ -10186,13 +11624,15 @@ fn run_frames(
                     write_datum_vars(state, datum, list, key, value.clone())
                         .map_err(|message| execution_error(module, &frames, message))?;
                 } else if let Err(error) =
-                    write_list_value(&mut state.heap, list, key, value.clone())
+                    write_list_value(&mut state.heap, list, key, value.clone(), associative)
                 {
                     return Err(execution_error(module, &frames, error.to_string()));
                 }
                 frames[frame_index].stack.push(value);
             }
-            Instruction::CompoundListIndex(operator) => {
+            Instruction::CompoundListIndex(operator)
+            | Instruction::CompoundListIndexKeep(operator) => {
+                let keep = matches!(instruction, Instruction::CompoundListIndexKeep(_));
                 let right = match pop(&mut frames[frame_index].stack) {
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
@@ -10212,6 +11652,14 @@ fn run_frames(
                     }
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
+                if state.is_visibility_list(list) {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "cannot write to an index of a visibility relationship list",
+                    ));
+                }
+                let associative = state.is_associative_list(list);
                 let current = if state.global_vars_proxy == Some(list) {
                     let Value::Text(name) = &key else {
                         return Err(execution_error(
@@ -10236,10 +11684,10 @@ fn run_frames(
                         .map_err(|error| execution_error(module, &frames, error.to_string()))?;
                     datum_shared_storage(state, datum, &field)
                         .and_then(|storage| state.global(&storage).cloned())
-                        .or_else(|| state.heap.datum_field(datum, &field).ok().cloned())
+                        .or_else(|| datum_field_or_initial(state, datum, &field).ok())
                         .unwrap_or(Value::Null)
                 } else {
-                    match read_list_value(&state.heap, list, &key) {
+                    match read_list_value(&state.heap, list, &key, associative) {
                         Ok(value) => value.clone(),
                         Err(ValueError::MissingKey) => Value::Null,
                         Err(error) => {
@@ -10248,31 +11696,24 @@ fn run_frames(
                     }
                 };
                 let value = match (&current, &right, operator) {
-                    (Value::Null, Value::List(_), CompoundListIndexOperator::Add) => right,
-                    (Value::List(current), _, CompoundListIndexOperator::Add) => {
-                        execute_list_compound_operator(
-                            CompoundAssignmentOperator::Add,
-                            *current,
-                            &right,
-                            state,
-                        )
-                        .map_err(|message| execution_error(module, &frames, message))?
+                    (Value::Null, _, CompoundListIndexOperator::Add) => right,
+                    (_, Value::Null, CompoundListIndexOperator::Add) => current,
+                    (Value::Text(_), Value::Text(_), CompoundListIndexOperator::Add) => {
+                        execute_scalar_add(current, right)
+                            .map_err(|message| execution_error(module, &frames, message))?
                     }
+                    (Value::List(current), _, operator) => execute_list_compound_operator(
+                        compound_assignment_from_list_index(operator),
+                        *current,
+                        &right,
+                        state,
+                    )
+                    .map_err(|message| execution_error(module, &frames, message))?,
                     _ => {
-                        let left = current.as_number().ok_or_else(|| {
-                            execution_error(
-                                module,
-                                &frames,
-                                format!("numeric operation received {current}"),
-                            )
-                        })?;
-                        let right = right.as_number().ok_or_else(|| {
-                            execution_error(
-                                module,
-                                &frames,
-                                format!("numeric operation received {right}"),
-                            )
-                        })?;
+                        let left = scalar_number_string(current.clone())
+                            .map_err(|message| execution_error(module, &frames, message))?;
+                        let right = scalar_number_string(right.clone())
+                            .map_err(|message| execution_error(module, &frames, message))?;
                         Value::number(execute_compound_list_index_operation(operator, left, right))
                     }
                 };
@@ -10286,12 +11727,17 @@ fn run_frames(
                     };
                     let name = FieldName::parse(&name)
                         .map_err(|error| execution_error(module, &frames, error.to_string()))?;
-                    state.set_global(name, value);
+                    state.set_global(name, value.clone());
                 } else if let Some(datum) = state.datum_vars_proxies.get(&list).copied() {
-                    write_datum_vars(state, datum, list, key, value)
+                    write_datum_vars(state, datum, list, key, value.clone())
                         .map_err(|message| execution_error(module, &frames, message))?;
-                } else if let Err(error) = write_list_value(&mut state.heap, list, key, value) {
+                } else if let Err(error) =
+                    write_list_value(&mut state.heap, list, key, value.clone(), associative)
+                {
                     return Err(execution_error(module, &frames, error.to_string()));
+                }
+                if keep {
+                    frames[frame_index].stack.push(value);
                 }
             }
             Instruction::ListLength => {
@@ -10321,6 +11767,79 @@ fn run_frames(
                 })?;
                 frames[frame_index].stack.push(Value::number(length));
             }
+            Instruction::PrepareIteration => {
+                let iterable = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let world_contents = match &iterable {
+                    Value::Datum(datum) => state.heap.datum(*datum).is_ok_and(|datum| {
+                        let path = datum.type_path().as_str();
+                        path == "/world" || path.starts_with("/world/")
+                    }),
+                    Value::List(list) => state
+                        .contents_owners
+                        .get(list)
+                        .and_then(|owner| state.heap.datum(*owner).ok())
+                        .is_some_and(|datum| {
+                            let path = datum.type_path().as_str();
+                            path == "/world" || path.starts_with("/world/")
+                        }),
+                    _ => false,
+                };
+                let iterable = match iterable {
+                    Value::Datum(datum) => state
+                        .heap
+                        .datum_field(
+                            datum,
+                            &FieldName::parse("contents")
+                                .expect("built-in contents field is valid"),
+                        )
+                        .ok()
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    value => value,
+                };
+                // BYOND snapshots ordinary list values (and associative
+                // mappings) when entering a for-in loop. Mutating the source
+                // during the body must not skip shifted entries or append new
+                // entries to the active enumeration. OpenDream mirrors this
+                // with CopyToArray/CopyAssocValues before creating its
+                // enumerator. `world.contents` is the engine-owned exception:
+                // its observable order is mobs, other movables, areas, then
+                // turfs, independent of their allocation order.
+                let iterable = match iterable {
+                    Value::List(list) if world_contents => Value::List(
+                        world_contents_iteration_snapshot(state, list)
+                            .map_err(|error| execution_error(module, &frames, error))?,
+                    ),
+                    Value::List(list) => Value::List(
+                        state
+                            .heap
+                            .copy_list(list)
+                            .map_err(|error| execution_error(module, &frames, error.to_string()))?,
+                    ),
+                    // BYOND ignores floats, strings, type paths, files, null,
+                    // and other non-container values in a for-in header.
+                    // Model that as one fresh empty snapshot so the normal
+                    // loop machinery simply executes zero iterations.
+                    _ => Value::List(state.heap.allocate_list()),
+                };
+                frames[frame_index].stack.push(iterable);
+            }
+            Instruction::IterationTypeFilter(target) => {
+                let value = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let matches = match value {
+                    Value::Datum(datum) => state
+                        .heap()
+                        .datum(datum)
+                        .is_ok_and(|datum| is_subtype(state, datum.type_path(), &target)),
+                    Value::List(_) => target.as_str() == "/list" || target.as_str() == "/alist",
+                    _ => false,
+                };
+                frames[frame_index]
+                    .stack
+                    .push(Value::number(f32::from(matches)));
+            }
             Instruction::LoadSrc => {
                 let src = frames[frame_index].src.clone();
                 frames[frame_index].stack.push(src);
@@ -10349,10 +11868,32 @@ fn run_frames(
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
                 let value = match receiver {
-                    Value::TypePath(path) if name.as_str() == "parent_type" => state
-                        .type_parent(&path)
-                        .cloned()
-                        .map_or(Value::Null, Value::TypePath),
+                    Value::TypePath(path) => match name.as_str() {
+                        "type" => Value::TypePath(path),
+                        "parent_type" => state
+                            .type_parent(&path)
+                            .cloned()
+                            .map_or(Value::Null, Value::TypePath),
+                        _ => state
+                            .initial_value(&path, &name)
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    },
+                    Value::ModifiedTypePath(path) => match name.as_str() {
+                        "type" => Value::TypePath(path.base().clone()),
+                        "parent_type" => state
+                            .type_parent(path.base())
+                            .cloned()
+                            .map_or(Value::Null, Value::TypePath),
+                        _ => path
+                            .overrides()
+                            .iter()
+                            .rev()
+                            .find(|(field, _)| field == &name)
+                            .map(|(_, value)| value.clone())
+                            .or_else(|| state.initial_value(path.base(), &name).cloned())
+                            .unwrap_or(Value::Null),
+                    },
                     Value::List(list) if name.as_str() == "len" => {
                         let len = state
                             .heap
@@ -10381,6 +11922,10 @@ fn run_frames(
                                 .type_parent(&runtime_type)
                                 .cloned()
                                 .map_or(Value::Null, Value::TypePath)
+                        } else if let Some(value) = lazy_atom_list_field(state, datum, &name)
+                            .map_err(|message| execution_error(module, &frames, message))?
+                        {
+                            value
                         } else if runtime_type.as_str() == "/savefile"
                             || runtime_type.as_str().starts_with("/savefile/")
                         {
@@ -10425,8 +11970,8 @@ fn run_frames(
                                 },
                             }
                         } else {
-                            match state.heap.datum_field(datum, &name) {
-                                Ok(value) => value.clone(),
+                            match datum_field_or_initial(state, datum, &name) {
+                                Ok(value) => value,
                                 Err(error) => {
                                     return Err(execution_error(
                                         module,
@@ -10479,6 +12024,55 @@ fn run_frames(
                     .unwrap_or(Value::Null);
                 frames[frame_index].stack.push(value);
             }
+            Instruction::InitialDynamicField => {
+                let key = match pop(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let receiver = match pop(&mut frames[frame_index].stack) {
+                    Ok(value) => value,
+                    Err(message) => return Err(execution_error(module, &frames, message)),
+                };
+                let field = match key {
+                    Value::Text(name) => match FieldName::parse(name.as_ref()) {
+                        Ok(field) => field,
+                        Err(error) => {
+                            return Err(execution_error(module, &frames, error.to_string()));
+                        }
+                    },
+                    value => {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("initial vars index requires text, received {value}"),
+                        ));
+                    }
+                };
+                let runtime_type = match receiver {
+                    Value::TypePath(path) => path,
+                    Value::Datum(datum) => match state.heap.datum(datum) {
+                        Ok(datum) => datum.type_path().clone(),
+                        Err(error) => {
+                            return Err(execution_error(module, &frames, error.to_string()));
+                        }
+                    },
+                    value => {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!(
+                                "initial requires a datum or type path receiver, received {value}"
+                            ),
+                        ));
+                    }
+                };
+                frames[frame_index].stack.push(
+                    state
+                        .initial_value(&runtime_type, &field)
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
+            }
             Instruction::StoreField(ref name) | Instruction::StoreFieldKeep(ref name) => {
                 let keep = matches!(instruction, Instruction::StoreFieldKeep(_));
                 let value = match pop(&mut frames[frame_index].stack) {
@@ -10495,6 +12089,11 @@ fn run_frames(
                             .map_err(|message| execution_error(module, &frames, message))?;
                     }
                     Value::List(list) if name.as_str() == "len" => {
+                        let visibility_before = state
+                            .is_visibility_list(list)
+                            .then(|| state.visibility_members(list))
+                            .transpose()
+                            .map_err(|message| execution_error(module, &frames, message))?;
                         let new_len = match &value {
                             Value::Number(number) if number.to_f32().is_finite() => {
                                 let length = number.to_f32().trunc();
@@ -10522,6 +12121,11 @@ fn run_frames(
                             .and_then(|values| values.resize(new_len))
                         {
                             return Err(execution_error(module, &frames, error.to_string()));
+                        }
+                        if let Some(before) = visibility_before {
+                            state
+                                .normalize_and_synchronize_visibility_list(list, &before)
+                                .map_err(|message| execution_error(module, &frames, message))?;
                         }
                     }
                     Value::Null => {
@@ -10551,6 +12155,15 @@ fn run_frames(
                         format!("runtime global {name:?} is absent"),
                     ));
                 };
+                if boot_trace_enabled() && name.as_str() == "SSdcs" {
+                    eprintln!(
+                        "boot-vm: global-read name=SSdcs value={} procedure={}",
+                        value,
+                        module
+                            .procedure_path(frames[frame_index].procedure)
+                            .unwrap_or("<unknown>")
+                    );
+                }
                 frames[frame_index].stack.push(value);
             }
             Instruction::LoadGlobalVars => {
@@ -10592,6 +12205,18 @@ fn run_frames(
                         .map_err(|error| execution_error(module, &frames, error.to_string()))?
                         .type_path()
                         .clone();
+                    let initial = state
+                        .compact_default_datums
+                        .contains(&datum)
+                        .then(|| state.initial_values.get(&runtime_type))
+                        .flatten()
+                        .map(|values| {
+                            values
+                                .iter()
+                                .map(|(field, value)| (field.clone(), value.clone()))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
                     let instance = state
                         .heap
                         .datum_fields(datum)
@@ -10604,6 +12229,13 @@ fn run_frames(
                         .cloned()
                         .unwrap_or_default();
                     let list = state.heap.allocate_list();
+                    for (field, value) in initial {
+                        state
+                            .heap
+                            .list_mut(list)
+                            .expect("new datum.vars proxy is live")
+                            .set_key(Value::text(field.as_str()), value);
+                    }
                     for (field, value) in instance {
                         state
                             .heap
@@ -10639,6 +12271,15 @@ fn run_frames(
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
+                if boot_trace_enabled() && name.as_str() == "SSdcs" {
+                    eprintln!(
+                        "boot-vm: global-write name=SSdcs value={} procedure={}",
+                        value,
+                        module
+                            .procedure_path(frames[frame_index].procedure)
+                            .unwrap_or("<unknown>")
+                    );
+                }
                 state.set_global(name, value);
             }
             Instruction::MutateLocal {
@@ -10685,9 +12326,7 @@ fn run_frames(
                 let receiver = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let current = match &receiver {
-                    Value::Datum(datum) => state
-                        .heap
-                        .datum_field(*datum, &name)
+                    Value::Datum(datum) => datum_field_or_initial(state, *datum, &name)
                         .map_err(|error| execution_error(module, &frames, error.to_string()))?
                         .clone(),
                     Value::List(list) if name.as_str() == "len" => {
@@ -10718,6 +12357,11 @@ fn run_frames(
                             .map_err(|error| execution_error(module, &frames, error.to_string()))?;
                     }
                     Value::List(list) => {
+                        let visibility_before = state
+                            .is_visibility_list(list)
+                            .then(|| state.visibility_members(list))
+                            .transpose()
+                            .map_err(|message| execution_error(module, &frames, message))?;
                         let length = updated.as_number().unwrap_or(0.0).trunc();
                         if length < 0.0 {
                             return Err(execution_error(
@@ -10739,6 +12383,11 @@ fn run_frames(
                             .list_mut(list)
                             .and_then(|values| values.resize(new_len))
                             .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                        if let Some(before) = visibility_before {
+                            state
+                                .normalize_and_synchronize_visibility_list(list, &before)
+                                .map_err(|message| execution_error(module, &frames, message))?;
+                        }
                     }
                     _ => unreachable!("receiver was validated above"),
                 }
@@ -10758,12 +12407,20 @@ fn run_frames(
                     }
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                let current = read_list_value(&state.heap, list, &key)
+                if state.is_visibility_list(list) {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "cannot write to an index of a visibility relationship list",
+                    ));
+                }
+                let associative = state.is_associative_list(list);
+                let current = read_list_value(&state.heap, list, &key, associative)
                     .map_err(|error| execution_error(module, &frames, error.to_string()))?
                     .clone();
                 let (result, updated) = mutate_scalar_value(current, delta, prefix)
                     .map_err(|message| execution_error(module, &frames, message))?;
-                write_list_value(&mut state.heap, list, key, updated)
+                write_list_value(&mut state.heap, list, key, updated, associative)
                     .map_err(|error| execution_error(module, &frames, error.to_string()))?;
                 frames[frame_index].stack.push(result);
             }
@@ -11005,7 +12662,9 @@ fn run_frames(
                     return Err(execution_error(module, &frames, "bytecode stack underflow"));
                 }
                 let arguments = frames[frame_index].stack.split_off(stack_length - count);
-                let located = if let [x, y, z] = arguments.as_slice() {
+                let located = if let [search] = arguments.as_slice() {
+                    locate_single(search, state)
+                } else if let [x, y, z] = arguments.as_slice() {
                     let integer = |value: &Value| {
                         value.as_number().and_then(|value| {
                             (value.is_finite()
@@ -11039,8 +12698,14 @@ fn run_frames(
                 if count > stack_length {
                     return Err(execution_error(module, &frames, "bytecode stack underflow"));
                 }
-                frames[frame_index].stack.truncate(stack_length - count);
-                frames[frame_index].stack.push(Value::Null);
+                let values = frames[frame_index].stack.split_off(stack_length - count);
+                let located = if let [search, container] = values.as_slice() {
+                    locate_in_container(search, container, state)
+                        .map_err(|message| execution_error(module, &frames, message))?
+                } else {
+                    Value::Null
+                };
+                frames[frame_index].stack.push(located);
             }
             Instruction::Negate => {
                 let value = match pop_number(&mut frames[frame_index].stack) {
@@ -11180,6 +12845,14 @@ fn run_frames(
                 } else if let Value::List(list) = left {
                     execute_list_binary_operator(operator, list, &right, state)
                         .map_err(|message| execution_error(module, &frames, message))?
+                } else if matches!(instruction, Instruction::BitAnd)
+                    && (matches!(left, Value::Null) || matches!(right, Value::Null))
+                {
+                    // BYOND treats a null scalar bitwise intersection as 0,
+                    // even when the other operand is a list. This makes
+                    // optional-list filters such as `(data & vars)` safely
+                    // iterable when `data` is absent.
+                    Value::number(0.0)
                 } else {
                     let left = scalar_number_string(left)
                         .map_err(|message| execution_error(module, &frames, message))?;
@@ -11365,7 +13038,12 @@ fn run_frames(
                 continue;
             }
             Instruction::JumpIfArgumentSupplied { parameter, target } => {
-                if frames[frame_index].arguments.len() > usize::from(parameter) {
+                if frames[frame_index]
+                    .supplied_parameters
+                    .get(usize::from(parameter))
+                    .copied()
+                    .unwrap_or(false)
+                {
                     if let Err(message) = validate_jump(target, program.instructions.len()) {
                         return Err(execution_error(module, &frames, message));
                     }
@@ -11376,6 +13054,7 @@ fn run_frames(
             Instruction::Call {
                 procedure: mut target,
                 argument_count,
+                argument_names,
             } => {
                 if frames.len() >= limits.max_call_depth {
                     return Err(execution_error(
@@ -11413,7 +13092,15 @@ fn run_frames(
                 let target_program = module
                     .resolve_procedure(target)
                     .map_err(|message| execution_error(module, &frames, message))?;
-                frames.push(make_frame(target, target_program, &arguments, &context));
+                let mut target_frame = make_frame_named(
+                    target,
+                    target_program,
+                    &arguments,
+                    &argument_names,
+                    &context,
+                );
+                mark_boot_trace_frame(&mut target_frame, module, state, executed_steps);
+                frames.push(target_frame);
                 continue;
             }
             Instruction::CallCurrent { argument_count } => {
@@ -11434,7 +13121,7 @@ fn run_frames(
                     }
                     frames[frame_index].stack.split_off(stack_length - count)
                 } else {
-                    frames[frame_index].arguments.clone()
+                    forwarded_frame_arguments(&frames[frame_index], program)
                 };
                 let context = frame_context(&frames[frame_index]);
                 frames.push(make_frame(procedure, program, &arguments, &context));
@@ -11468,7 +13155,7 @@ fn run_frames(
                     }
                     frames[frame_index].stack.split_off(stack_length - count)
                 } else {
-                    frames[frame_index].arguments.clone()
+                    forwarded_frame_arguments(&frames[frame_index], program)
                 };
                 let target_program = module
                     .resolve_procedure(target)
@@ -11515,6 +13202,30 @@ fn run_frames(
                     let result =
                         result.map_err(|message| execution_error(module, &frames, message))?;
                     frames[frame_index].stack.push(result);
+                } else if matches!((&receiver, &selector), (Value::Datum(_), Value::Text(_)))
+                    && let Ok((target, context)) = dynamic_call_target(
+                        module,
+                        state,
+                        &receiver,
+                        &selector,
+                        &frame_context(&frames[frame_index]),
+                        false,
+                    )
+                {
+                    if frames.len() >= limits.max_call_depth {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("maximum call depth {} exceeded", limits.max_call_depth),
+                        ));
+                    }
+                    let target_program = module
+                        .resolve_procedure(target)
+                        .map_err(|message| execution_error(module, &frames, message))?;
+                    let mut target_frame = make_frame(target, target_program, &arguments, &context);
+                    mark_boot_trace_frame(&mut target_frame, module, state, executed_steps);
+                    frames.push(target_frame);
+                    continue;
                 } else if let (Value::Datum(savefile), Value::Text(method)) = (&receiver, &selector)
                     && state.heap.datum(*savefile).is_ok_and(|datum| {
                         let path = datum.type_path().as_str();
@@ -11555,8 +13266,35 @@ fn run_frames(
                 } else if let (Value::Datum(datum), Value::Text(method)) = (&receiver, &selector)
                     && is_regex_datum(*datum, state)
                 {
-                    let result = execute_regex_method(*datum, method, &arguments, state)
-                        .map_err(|message| execution_error(module, &frames, message))?;
+                    let result = if method.as_ref() == "Replace" {
+                        if !(2..=4).contains(&arguments.len()) {
+                            return Err(execution_error(
+                                module,
+                                &frames,
+                                "unknown or invalid /regex procedure \"Replace\"",
+                            ));
+                        }
+                        let mut replacement_arguments = Vec::with_capacity(arguments.len() + 1);
+                        replacement_arguments.push(arguments[0].clone());
+                        replacement_arguments.push(Value::Datum(*datum));
+                        replacement_arguments
+                            .push(arguments.get(1).cloned().unwrap_or(Value::Null));
+                        replacement_arguments.extend(arguments.iter().skip(2).cloned());
+                        Value::text(
+                            replace_text_regex(
+                                module,
+                                state,
+                                *datum,
+                                &replacement_arguments,
+                                false,
+                                &frame_context(&frames[frame_index]),
+                            )
+                            .map_err(|message| execution_error(module, &frames, message))?,
+                        )
+                    } else {
+                        execute_regex_method(*datum, method, &arguments, state)
+                            .map_err(|message| execution_error(module, &frames, message))?
+                    };
                     frames[frame_index].stack.push(result);
                 } else if let (Value::Datum(datum), Value::Text(method)) = (&receiver, &selector)
                     && is_icon_datum(*datum, &state.heap)
@@ -11609,7 +13347,9 @@ fn run_frames(
                     let target_program = module
                         .resolve_procedure(target)
                         .map_err(|message| execution_error(module, &frames, message))?;
-                    frames.push(make_frame(target, target_program, &arguments, &context));
+                    let mut target_frame = make_frame(target, target_program, &arguments, &context);
+                    mark_boot_trace_frame(&mut target_frame, module, state, executed_steps);
+                    frames.push(target_frame);
                     continue;
                 }
             }
@@ -11627,7 +13367,14 @@ fn run_frames(
                 spawned.instruction = entry;
                 spawned.stack.clear();
                 if delay.is_sign_negative() {
-                    match run_frames(module, vec![spawned], limits, state)? {
+                    // `spawn(-1)` runs the detached body synchronously until
+                    // its first block, but the caller has still consumed the
+                    // Spawn instruction.  The recursive frame runner returns
+                    // directly to this match arm, so advance the retained
+                    // caller here; otherwise it executes Spawn a second time
+                    // with the delay already popped and underflows its stack.
+                    frames[frame_index].instruction += 1;
+                    match run_frames(module, vec![spawned], limits, step_budget_behavior, state)? {
                         FrameRunOutcome::Complete(_) => {}
                         FrameRunOutcome::Yielded { frames, delay } => {
                             schedule_frames(state, frames, delay);
@@ -11647,7 +13394,41 @@ fn run_frames(
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                frames.pop();
+                let finished = frames.pop().expect("returning frame exists");
+                let result = finished.caller_result_override.clone().unwrap_or(result);
+                if boot_trace_enabled()
+                    && module
+                        .procedure_path(finished.procedure)
+                        .is_some_and(|path| {
+                            path.contains("/subsystem/processing/dcs/proc/GetElement@")
+                        })
+                {
+                    eprintln!("boot-vm: dcs-get-element-result value={result}");
+                }
+                if let Some(started) = finished.boot_trace_started {
+                    let (datum_delta, list_delta, deferred_delta) = finished
+                        .boot_trace_heap
+                        .map_or((0, 0, 0), |(datums, lists, deferred)| {
+                            (
+                                state.heap.live_datum_count() as i128 - datums as i128,
+                                state.heap.live_list_count() as i128 - lists as i128,
+                                module.materialized_deferred_procedure_count() as i128
+                                    - deferred as i128,
+                            )
+                        });
+                    eprintln!(
+                        "boot-vm: initializer-end path={} elapsed_ms={} steps={} datum_delta={} list_delta={} deferred_delta={}",
+                        module
+                            .paths
+                            .get(finished.procedure.index())
+                            .map_or("<missing>", String::as_str),
+                        started.elapsed().as_millis(),
+                        executed_steps.saturating_sub(finished.boot_trace_step),
+                        datum_delta,
+                        list_delta,
+                        deferred_delta,
+                    );
+                }
                 let Some(caller) = frames.last_mut() else {
                     return Ok(FrameRunOutcome::Complete(result));
                 };
@@ -11672,6 +13453,16 @@ fn make_frame(
         .min(program.parameter_count)
         .min(locals.len());
     locals[..bound_count].clone_from_slice(&arguments[..bound_count]);
+    // BYOND's implicit `args` list has one entry for every declared
+    // parameter even when the caller omitted it, padded with null, and then
+    // retains any extra supplied arguments. This is observable in atom/New:
+    // `new /obj` supplies no explicit location, but `/atom/New(loc, ...)`
+    // can still assign `args[1]` before forwarding it to Initialize().
+    let mut positioned_arguments = arguments.to_vec();
+    positioned_arguments.resize(
+        positioned_arguments.len().max(program.parameter_count),
+        Value::Null,
+    );
     CallFrame {
         procedure,
         instruction: 0,
@@ -11680,15 +13471,123 @@ fn make_frame(
         result: Value::Null,
         src: context.src.clone(),
         usr: context.usr.clone(),
-        arguments: arguments.to_vec(),
+        arguments: positioned_arguments,
+        supplied_parameters: (0..program.parameter_count)
+            .map(|index| index < arguments.len())
+            .collect(),
         exception_handlers: Vec::new(),
         detached_waitfor: false,
+        caller_result_override: None,
         static_locals: HashSet::new(),
+        boot_trace_started: None,
+        boot_trace_heap: None,
+        boot_trace_step: 0,
     }
+}
+
+fn boot_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DREAM64_BOOT_TRACE").is_some())
+}
+
+fn mark_boot_trace_frame(
+    frame: &mut CallFrame,
+    module: &Module,
+    state: &ExecutionState,
+    executed_steps: u64,
+) {
+    if !boot_trace_enabled() {
+        return;
+    }
+    let path = module
+        .paths
+        .get(frame.procedure.index())
+        .map_or("<missing>", String::as_str);
+    let traced = path.contains("/datum/controller/global_vars/proc/InitGlobal")
+        || [
+            "/proc/make_datum_reference_lists",
+            "/proc/init_sprite_accessories",
+            "/proc/init_species_list",
+            "/proc/init_hair_gradients",
+            "/proc/init_keybindings",
+            "/proc/init_emote_list",
+            "/proc/init_crafting_recipes",
+            "/proc/init_crafting_recipes_atoms",
+            "/proc/init_religion_sects",
+        ]
+        .iter()
+        .any(|suffix| path.ends_with(suffix));
+    if !traced {
+        return;
+    }
+    eprintln!("boot-vm: initializer-begin path={path}");
+    frame.boot_trace_started = Some(Instant::now());
+    frame.boot_trace_heap = Some((
+        state.heap.live_datum_count(),
+        state.heap.live_list_count(),
+        module.materialized_deferred_procedure_count(),
+    ));
+    frame.boot_trace_step = executed_steps;
+}
+
+fn make_frame_named(
+    procedure: ProcedureId,
+    program: &Program,
+    arguments: &[Value],
+    argument_names: &[Option<String>],
+    context: &ExecutionContext,
+) -> CallFrame {
+    if argument_names.iter().all(Option::is_none) {
+        return make_frame(procedure, program, arguments, context);
+    }
+    let mut positioned = vec![Value::Null; program.parameter_count];
+    let mut supplied = vec![false; program.parameter_count];
+    let mut next_positional = 0usize;
+    for (index, value) in arguments.iter().enumerate() {
+        let slot = argument_names
+            .get(index)
+            .and_then(Option::as_deref)
+            .and_then(|name| {
+                program
+                    .parameter_names
+                    .iter()
+                    .position(|parameter| parameter == name)
+            })
+            .unwrap_or_else(|| {
+                let slot = next_positional;
+                next_positional += 1;
+                slot
+            });
+        if slot < positioned.len() {
+            positioned[slot] = value.clone();
+            supplied[slot] = true;
+        }
+    }
+    let mut frame = make_frame(procedure, program, &positioned, context);
+    frame.arguments = positioned;
+    frame.supplied_parameters = supplied;
+    frame
 }
 
 fn frame_context(frame: &CallFrame) -> ExecutionContext {
     ExecutionContext::new(frame.src.clone(), frame.usr.clone())
+}
+
+fn forwarded_frame_arguments(frame: &CallFrame, program: &Program) -> Vec<Value> {
+    // An argumentless self/parent call forwards the live parameter variables,
+    // not the original pre-default call vector. Defaults and assignments have
+    // already updated the parameter locals by this point. Preserve any extra
+    // variadic values after the declared parameter slots.
+    let mut arguments = frame.arguments.clone();
+    for (index, value) in frame
+        .locals
+        .iter()
+        .take(program.parameter_count)
+        .enumerate()
+    {
+        arguments[index] = value.clone();
+    }
+    arguments
 }
 
 fn execution_error(
@@ -11775,6 +13674,26 @@ fn execute_compound_list_index_operation(
         CompoundListIndexOperator::ShiftRight => {
             bitwise_shift(left, right, |left, right| left >> right)
         }
+    }
+}
+
+fn compound_assignment_from_list_index(
+    operator: CompoundListIndexOperator,
+) -> CompoundAssignmentOperator {
+    match operator {
+        CompoundListIndexOperator::Add => CompoundAssignmentOperator::Add,
+        CompoundListIndexOperator::Subtract => CompoundAssignmentOperator::Subtract,
+        CompoundListIndexOperator::Multiply => CompoundAssignmentOperator::Multiply,
+        CompoundListIndexOperator::Divide => CompoundAssignmentOperator::Divide,
+        CompoundListIndexOperator::Remainder => CompoundAssignmentOperator::Remainder,
+        CompoundListIndexOperator::FractionalRemainder => {
+            CompoundAssignmentOperator::FractionalRemainder
+        }
+        CompoundListIndexOperator::BitAnd => CompoundAssignmentOperator::BitAnd,
+        CompoundListIndexOperator::BitOr => CompoundAssignmentOperator::BitOr,
+        CompoundListIndexOperator::BitXor => CompoundAssignmentOperator::BitXor,
+        CompoundListIndexOperator::ShiftLeft => CompoundAssignmentOperator::ShiftLeft,
+        CompoundListIndexOperator::ShiftRight => CompoundAssignmentOperator::ShiftRight,
     }
 }
 
@@ -11891,6 +13810,29 @@ fn is_icon_datum(datum: DatumId, heap: &ValueHeap) -> bool {
         .is_ok_and(|datum| datum.type_path().as_str() == "/icon")
 }
 
+fn clone_icon_datum(icon: DatumId, heap: &mut ValueHeap) -> Result<DatumId, String> {
+    if !is_icon_datum(icon, heap) {
+        return Err("icon clone requires an /icon datum".to_owned());
+    }
+    let fields = heap
+        .datum_fields(icon)
+        .map_err(|error| error.to_string())?
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    let clone = heap.allocate_datum(TypePath::parse("/icon").expect("icon path is valid"));
+    for (name, value) in fields {
+        let value = match value {
+            Value::List(list) => {
+                Value::List(heap.copy_list(list).map_err(|error| error.to_string())?)
+            }
+            value => value,
+        };
+        heap.set_datum_field(clone, name, value)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(clone)
+}
+
 fn icon_dimension(icon: DatumId, name: &str, heap: &ValueHeap) -> f32 {
     heap.datum_field(
         icon,
@@ -11977,11 +13919,17 @@ fn execute_icon_method(
             record_icon_operation(icon, method, arguments, heap)?;
             Ok(Value::Null)
         }
-        "Shift" | "DrawBox" | "Insert"
+        "Shift" | "DrawBox" | "Insert" | "Flip" | "SwapColor"
             if (method == "Shift" && (2..=3).contains(&arguments.len()))
                 || (method == "DrawBox" && (1..=5).contains(&arguments.len()))
-                || (method == "Insert" && (1..=6).contains(&arguments.len())) =>
+                || (method == "Insert" && (1..=6).contains(&arguments.len()))
+                || (method == "Flip" && arguments.len() == 1)
+                || (method == "SwapColor" && arguments.len() == 2) =>
         {
+            record_icon_operation(icon, method, arguments, heap)?;
+            Ok(Value::Null)
+        }
+        "Turn" if arguments.len() == 1 => {
             record_icon_operation(icon, method, arguments, heap)?;
             Ok(Value::Null)
         }
@@ -12348,7 +14296,7 @@ fn allocate_or_replace_engine_datum(
             path == "/turf" || path.starts_with("/turf/")
         })
     {
-        initialize_existing_datum(state, *existing, type_path.clone(), true)?;
+        initialize_existing_datum(state, *existing, type_path.clone(), true, true)?;
         initialize_engine_resource(state, *existing, &type_path, arguments)?;
         return Ok(*existing);
     }
@@ -12361,8 +14309,9 @@ fn allocate_initialized_datum(
     state: &mut ExecutionState,
     type_path: TypePath,
 ) -> Result<DatumId, String> {
+    let compact_defaults = is_turf_type_path(&type_path);
     let datum = state.heap.allocate_datum(type_path.clone());
-    initialize_existing_datum(state, datum, type_path, false)?;
+    initialize_existing_datum(state, datum, type_path, false, compact_defaults)?;
     Ok(datum)
 }
 
@@ -12371,21 +14320,46 @@ fn initialize_existing_datum(
     datum: DatumId,
     type_path: TypePath,
     preserve_cell: bool,
+    compact_defaults: bool,
 ) -> Result<(), String> {
-    let initial_values = state
-        .initial_values
-        .get(&type_path)
-        .cloned()
-        .unwrap_or_default();
+    if compact_defaults {
+        state.compact_default_datums.insert(datum);
+    } else {
+        state.compact_default_datums.remove(&datum);
+    }
+    // `/regex`, `/icon`, and the other engine-owned datum roots do not need
+    // to appear in the project's object tree. They still inherit BYOND's
+    // built-in `/datum` storage. Seed that storage at the allocation boundary
+    // so both project types and engine roots expose it before declaration
+    // defaults and `New` run.
+    if !compact_defaults {
+        for (name, value) in [("datum_flags", Value::number(0.0)), ("tag", Value::Null)] {
+            let field = FieldName::parse(name).expect("built-in datum field is valid");
+            if state.heap.datum_field(datum, &field).is_err() {
+                state
+                    .heap
+                    .set_datum_field(datum, field, value)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    let initial_values = if compact_defaults {
+        BTreeMap::new()
+    } else {
+        state
+            .initial_values
+            .get(&type_path)
+            .cloned()
+            .unwrap_or_default()
+    };
     let is_atom = is_atom_type_path(&type_path);
     if preserve_cell {
-        let preserved = ["x", "y", "z", "loc", "contents"];
         let fields = state
             .heap
             .datum_fields(datum)
             .map_err(|error| error.to_string())?
             .map(|(name, _)| name.clone())
-            .filter(|name| !preserved.contains(&name.as_str()))
+            .filter(|name| !is_map_cell_structural_field(name))
             .collect::<Vec<_>>();
         for field in fields {
             state
@@ -12399,7 +14373,7 @@ fn initialize_existing_datum(
             .map_err(|error| error.to_string())?;
     }
     for (name, value) in initial_values {
-        if preserve_cell && ["x", "y", "z", "loc", "contents"].contains(&name.as_str()) {
+        if preserve_cell && is_map_cell_structural_field(&name) {
             continue;
         }
         state
@@ -12426,20 +14400,42 @@ fn initialize_existing_datum(
         .collect::<Vec<_>>();
     let initializer_module = state.instance_initializer_module.clone();
     for initializer in plans {
-        let module = initializer_module
-            .as_ref()
-            .ok_or_else(|| "runtime instance initializer module is absent".to_owned())?;
-        let value = execute_module_in_context(
-            module,
-            initializer.entry,
-            &[],
-            state,
-            &ExecutionContext::new(Value::Datum(datum), Value::Null),
-        )
-        .map_err(|error| error.to_string())?;
+        let (field, value) = match initializer {
+            InstanceInitializer::Constant { field, value } => {
+                // Retyping a live map cell must retain its engine-owned spatial
+                // identity. These slots predate initializer execution, so their
+                // mere presence cannot be used as evidence that an earlier
+                // initializer wrote them.
+                if preserve_cell && is_map_cell_structural_field(&field) {
+                    continue;
+                }
+                // Compact engine turfs read untouched scalar defaults from the
+                // shared type catalog. A later constant action only needs an
+                // owned slot when an earlier runtime initializer actually
+                // wrote that field (including through a side effect).
+                if compact_defaults && state.heap.datum_field(datum, &field).is_err() {
+                    continue;
+                }
+                (field, value)
+            }
+            InstanceInitializer::Program { field, entry } => {
+                let module = initializer_module
+                    .as_ref()
+                    .ok_or_else(|| "runtime instance initializer module is absent".to_owned())?;
+                let value = execute_module_in_context(
+                    module,
+                    entry,
+                    &[],
+                    state,
+                    &ExecutionContext::new(Value::Datum(datum), Value::Null),
+                )
+                .map_err(|error| error.to_string())?;
+                (field, value)
+            }
+        };
         state
             .heap
-            .set_datum_field(datum, initializer.field, value)
+            .set_datum_field(datum, field, value)
             .map_err(|error| error.to_string())?;
     }
     if is_atom {
@@ -12483,9 +14479,109 @@ fn is_atom_type_path(path: &TypePath) -> bool {
         })
 }
 
+fn is_turf_type_path(path: &TypePath) -> bool {
+    path.as_str() == "/turf" || path.as_str().starts_with("/turf/")
+}
+
+fn is_map_cell_structural_field(field: &FieldName) -> bool {
+    matches!(field.as_str(), "x" | "y" | "z" | "loc" | "contents")
+}
+
+fn lazy_atom_list_field(
+    state: &mut ExecutionState,
+    datum: DatumId,
+    field: &FieldName,
+) -> Result<Option<Value>, String> {
+    enum ListKind {
+        Ordinary,
+        VisContents,
+        VisLocs,
+    }
+    let kind = match field.as_str() {
+        "filters" | "overlays" | "underlays" | "verbs" => ListKind::Ordinary,
+        "vis_contents" => ListKind::VisContents,
+        "vis_locs" => ListKind::VisLocs,
+        _ => return Ok(None),
+    };
+    let runtime_type = state
+        .heap
+        .datum(datum)
+        .map_err(|error| error.to_string())?
+        .type_path();
+    if !is_atom_type_path(runtime_type) {
+        return Ok(None);
+    }
+    let list = match kind {
+        ListKind::VisContents => state.ensure_visibility_list(datum, true)?,
+        ListKind::VisLocs => state.ensure_visibility_list(datum, false)?,
+        ListKind::Ordinary => {
+            if let Ok(Value::List(list)) = state.heap.datum_field(datum, field) {
+                *list
+            } else {
+                let list = state.heap.allocate_list();
+                state
+                    .heap
+                    .set_datum_field(datum, field.clone(), Value::List(list))
+                    .map_err(|error| error.to_string())?;
+                list
+            }
+        }
+    };
+    Ok(Some(Value::List(list)))
+}
+
+fn world_contents_iteration_snapshot(
+    state: &mut ExecutionState,
+    contents: ListId,
+) -> Result<ListId, String> {
+    let mut values = state
+        .heap
+        .list(contents)
+        .map_err(|error| error.to_string())?
+        .positions()
+        .map(|(_, value)| value.clone())
+        .collect::<Vec<_>>();
+    let mob = TypePath::parse("/mob").expect("built-in mob path is valid");
+    let movable = TypePath::parse("/atom/movable").expect("built-in movable path is valid");
+    let area = TypePath::parse("/area").expect("built-in area path is valid");
+    let turf = TypePath::parse("/turf").expect("built-in turf path is valid");
+    values.sort_by_key(|value| {
+        let Value::Datum(datum) = value else {
+            return 4_u8;
+        };
+        let Ok(datum) = state.heap.datum(*datum) else {
+            return 4;
+        };
+        let path = datum.type_path();
+        if is_subtype(state, path, &mob) {
+            0
+        } else if is_subtype(state, path, &movable) {
+            1
+        } else if is_subtype(state, path, &area) {
+            2
+        } else if is_subtype(state, path, &turf) {
+            3
+        } else {
+            4
+        }
+    });
+
+    let snapshot = state.heap.allocate_list();
+    for value in values {
+        state
+            .heap
+            .list_mut(snapshot)
+            .expect("newly allocated world iteration snapshot is live")
+            .add(value);
+    }
+    Ok(snapshot)
+}
+
 fn construct_matrix(arguments: &[Value], heap: &mut ValueHeap) -> Result<DatumId, String> {
     match arguments {
-        [] => return allocate_matrix([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], heap),
+        [] | [Value::Null] => {
+            return allocate_matrix([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], heap);
+        }
         [Value::Datum(source)] if is_matrix_datum(*source, heap) => {
             return allocate_matrix(matrix_components(*source, heap)?, heap);
         }
@@ -12600,8 +14696,16 @@ fn execute_matrix_method(
             value => current.map(|component| component * matrix_numeric(value)),
         },
         "scale" => {
-            let factor = arguments.first().map_or(0.0, matrix_numeric);
-            current.map(|component| component * factor)
+            let x = arguments.first().map_or(0.0, matrix_numeric);
+            let y = arguments.get(1).map_or(x, matrix_numeric);
+            [
+                current[0] * x,
+                current[1] * x,
+                current[2] * x,
+                current[3] * y,
+                current[4] * y,
+                current[5] * y,
+            ]
         }
         "translate" => {
             let Some(x) = arguments.first().and_then(Value::as_number) else {
@@ -12713,12 +14817,26 @@ fn replace_text_builtin(
     exact: bool,
     character_indices: bool,
     heap: &ValueHeap,
-) -> Result<String, String> {
-    let source = builtin_text(&arguments[0], heap, "replacetext text")?;
-    let needle = builtin_text(&arguments[1], heap, "replacetext needle")?;
-    let replacement = builtin_text(&arguments[2], heap, "replacetext replacement")?;
+) -> Result<Value, String> {
+    // BYOND's haystack and needle parameters are text-typed: a non-text
+    // haystack returns null, while a non-text needle is the empty string.
+    // Replacement is deliberately different and uses normal DM stringification
+    // (for example the numeric constant 90 becomes "90").
+    let Value::Text(source) = &arguments[0] else {
+        return Ok(Value::Null);
+    };
+    let source = source.to_string();
+    let needle = match &arguments[1] {
+        Value::Text(text) => text.to_string(),
+        _ => String::new(),
+    };
+    let replacement = stringify_dm_value(&arguments[2], heap)?;
     if needle.is_empty() {
-        return Ok(source);
+        if replacement.is_empty() {
+            return Ok(Value::text(source));
+        }
+        return replace_empty_needle(&source, &replacement, arguments, character_indices)
+            .map(Value::text);
     }
 
     let (start, end) = replacement_bounds(&source, arguments, character_indices)?;
@@ -12730,7 +14848,160 @@ fn replace_text_builtin(
     } else {
         replace_text_ascii_insensitive(target, &needle, &replacement)
     };
-    Ok(format!("{prefix}{replaced}{suffix}"))
+    Ok(Value::text(format!("{prefix}{replaced}{suffix}")))
+}
+
+fn stringify_dm_value(value: &Value, heap: &ValueHeap) -> Result<String, String> {
+    match value {
+        Value::Null => Ok(String::new()),
+        Value::Text(text) | Value::File(text) => Ok(text.to_string()),
+        Value::Number(number) => Ok(number.to_f32().to_string()),
+        Value::TypePath(path) => Ok(path.to_string()),
+        Value::ModifiedTypePath(path) => Ok(path.base().to_string()),
+        Value::Datum(datum) => {
+            let datum = heap.datum(*datum).map_err(|error| error.to_string())?;
+            let name = FieldName::parse("name").expect("built-in datum name is valid");
+            if let Ok(Value::Text(name)) = datum.field(&name) {
+                Ok(name.to_string())
+            } else {
+                Ok(datum.type_path().to_string())
+            }
+        }
+        Value::List(_) => Ok("/list".to_owned()),
+    }
+}
+
+fn replace_empty_needle(
+    source: &str,
+    replacement: &str,
+    arguments: &[Value],
+    character_indices: bool,
+) -> Result<String, String> {
+    let logical_length = if character_indices {
+        source.chars().count()
+    } else {
+        source.len()
+    };
+    let limit = i64::try_from(logical_length)
+        .unwrap_or(i64::MAX - 1)
+        .saturating_add(1);
+    let mut start = signed_text_index(arguments.get(3), 1)?;
+    if start == 0 {
+        return Ok(source.to_owned());
+    }
+    if start < 0 {
+        start = limit.saturating_add(start).max(1);
+    }
+    let mut end = signed_text_index(arguments.get(4), 0)?;
+    if end <= 0 {
+        end = limit.saturating_add(end).max(start);
+    }
+    let mut start = usize::try_from(start.clamp(1, limit)).unwrap_or(usize::MAX);
+    let mut end = usize::try_from(end.clamp(1, limit)).unwrap_or(usize::MAX);
+    if start == 1 {
+        start = 2;
+    }
+    end = end.min(logical_length);
+
+    let mut output = String::with_capacity(source.len().saturating_add(replacement.len()));
+    for (zero_based, character) in source.chars().enumerate() {
+        output.push(character);
+        let position = zero_based.saturating_add(1);
+        if position >= start.saturating_sub(1) && position < end {
+            output.push_str(replacement);
+        }
+    }
+    Ok(output)
+}
+
+fn replace_text_regex(
+    module: &Module,
+    state: &mut ExecutionState,
+    regex: DatumId,
+    arguments: &[Value],
+    character_indices: bool,
+    caller_context: &ExecutionContext,
+) -> Result<String, String> {
+    let source = builtin_text(&arguments[0], &state.heap, "replacetext text")?;
+    let field = |name| FieldName::parse(name).expect("regex field is valid");
+    let pattern = state
+        .heap()
+        .datum_field(regex, &field("_dream64_pattern"))
+        .map_err(|error| error.to_string())?
+        .clone();
+    let pattern = builtin_text(&pattern, &state.heap, "regex pattern")?;
+    let flags = state
+        .heap()
+        .datum_field(regex, &field("flags"))
+        .ok()
+        .and_then(|value| match value {
+            Value::Text(text) => Some(text.as_ref()),
+            _ => None,
+        })
+        .unwrap_or("")
+        .to_owned();
+    let global = flags.contains('g');
+    let (start, end) = replacement_bounds(&source, arguments, character_indices)?;
+    let prefix = source[..start].to_owned();
+    let suffix = source[end..].to_owned();
+    let mut target = source[start..end].to_owned();
+    let replacement_proc = matches!(arguments[2], Value::TypePath(_)).then(|| {
+        dynamic_call_target(
+            module,
+            state,
+            &Value::Null,
+            &arguments[2],
+            caller_context,
+            true,
+        )
+        .map(|(procedure, context)| (procedure, context))
+    });
+    let replacement_text = if replacement_proc.is_none() {
+        Some(builtin_text(
+            &arguments[2],
+            &state.heap,
+            "replacetext replacement",
+        )?)
+    } else {
+        None
+    };
+    let replacement_proc = replacement_proc.transpose()?;
+
+    let mut cursor = 0;
+    loop {
+        let Some((begin, finish, captures)) =
+            builtins::regex_search(&pattern, &flags, &target, cursor, target.len())?
+        else {
+            break;
+        };
+        let replacement = if let Some((procedure, context)) = &replacement_proc {
+            let mut callback_arguments = Vec::with_capacity(captures.len() + 1);
+            callback_arguments.push(Value::text(&target[begin..finish]));
+            callback_arguments.extend(
+                captures
+                    .into_iter()
+                    .map(|capture| capture.map_or(Value::Null, Value::text)),
+            );
+            let value =
+                execute_module_in_context(module, *procedure, &callback_arguments, state, context)
+                    .map_err(|error| error.to_string())?;
+            match value {
+                Value::Null => String::new(),
+                Value::Text(text) => text.to_string(),
+                Value::Number(number) => number.to_f32().to_string(),
+                Value::TypePath(path) => path.to_string(),
+                value => format!("{value}"),
+            }
+        } else {
+            replacement_text.clone().unwrap_or_default()
+        };
+        target.replace_range(begin..finish, &replacement);
+        cursor = begin.saturating_add(replacement.len().max(1));
+        if !global {
+            break;
+        }
+    }
+    Ok(format!("{prefix}{target}{suffix}"))
 }
 
 fn copy_text_builtin(
@@ -12880,10 +15151,13 @@ fn random_integer(arguments: &[Value], state: &mut u64) -> Result<f32, String> {
         [low, high] => (*low, *high),
         _ => return Err("rand accepts zero, one, or two bounds".to_owned()),
     };
-    let low = low.ceil();
-    let high = high.floor();
-    if !low.is_finite() || !high.is_finite() || high < low {
+    let mut low = low.ceil();
+    let mut high = high.floor();
+    if !low.is_finite() || !high.is_finite() {
         return Err(format!("invalid rand range {low} through {high}"));
+    }
+    if high < low {
+        std::mem::swap(&mut low, &mut high);
     }
     Ok(low + (deterministic_unit(state) * (high - low + 1.0)).floor())
 }
@@ -13012,7 +15286,10 @@ fn builtin_length(value: &Value, heap: &ValueHeap) -> Result<f32, String> {
         Value::Null => 0,
         Value::Text(text) => text.len(),
         Value::List(list) => heap.list(*list).map_err(|error| error.to_string())?.len(),
-        _ => return Err(format!("length requires text or a list, received {value}")),
+        // BYOND's legacy length() is also used as a cheap list/text probe.
+        // Values outside those two families (including type paths) report 0
+        // rather than raising a runtime error.
+        _ => 0,
     };
     length
         .to_string()
@@ -13035,6 +15312,7 @@ fn ref_builtin(value: &Value) -> Value {
         Value::Null
         | Value::Number(_)
         | Value::Text(_)
+        | Value::File(_)
         | Value::TypePath(_)
         | Value::ModifiedTypePath(_) => return Value::Null,
     };
@@ -13043,11 +15321,15 @@ fn ref_builtin(value: &Value) -> Value {
 
 /// Resolves BYOND's `get_step(atom_or_turf, direction)` against live turfs.
 ///
-/// BYOND directions are bit flags: north/south affect Y and east/west affect
-/// X, so diagonal values naturally combine their cardinal components.  A
-/// source atom's materialized coordinates are sufficient even when its `loc`
-/// has not been explicitly connected in the headless world model.
-fn get_step_builtin(source: &Value, direction: &Value, heap: &ValueHeap) -> Result<Value, String> {
+/// BYOND directions are bit flags: north/south affect Y, east/west affect X,
+/// and up/down affect Z, so combined values naturally move on multiple axes.
+/// A source atom's materialized coordinates are sufficient even when its
+/// `loc` has not been explicitly connected in the headless world model.
+pub(crate) fn get_step_builtin(
+    source: &Value,
+    direction: &Value,
+    state: &ExecutionState,
+) -> Result<Value, String> {
     let Value::Datum(source) = source else {
         return Ok(Value::Null);
     };
@@ -13060,7 +15342,7 @@ fn get_step_builtin(source: &Value, direction: &Value, heap: &ValueHeap) -> Resu
     let Ok(direction) = direction.to_string().parse::<i16>() else {
         return Ok(Value::Null);
     };
-    if !(0..=15).contains(&direction) {
+    if !(0..=63).contains(&direction) {
         return Ok(Value::Null);
     }
     // Unknown bits do not name a world direction.  `get_step(source, 0)` is
@@ -13068,7 +15350,10 @@ fn get_step_builtin(source: &Value, direction: &Value, heap: &ValueHeap) -> Resu
     let x = FieldName::parse("x").expect("built-in coordinate field is valid");
     let y = FieldName::parse("y").expect("built-in coordinate field is valid");
     let z = FieldName::parse("z").expect("built-in coordinate field is valid");
-    let source = heap.datum(*source).map_err(|error| error.to_string())?;
+    let source = state
+        .heap()
+        .datum(*source)
+        .map_err(|error| error.to_string())?;
     let coordinate = |field: &FieldName| -> Result<f32, String> {
         source
             .field(field)
@@ -13083,19 +15368,43 @@ fn get_step_builtin(source: &Value, direction: &Value, heap: &ValueHeap) -> Resu
         - f32::from(u8::from(direction & 8 != 0));
     let target_y = source_y + f32::from(u8::from(direction & 1 != 0))
         - f32::from(u8::from(direction & 2 != 0));
-    for (datum, candidate) in heap.datums() {
+    let target_z = source_z + f32::from(u8::from(direction & 16 != 0))
+        - f32::from(u8::from(direction & 32 != 0));
+    let coordinate = |value: f32| {
+        (value.is_finite() && value.fract() == 0.0)
+            .then(|| value.to_string().parse::<i32>().ok())
+            .flatten()
+    };
+    let Some((target_x, target_y, target_z)) = coordinate(target_x)
+        .zip(coordinate(target_y))
+        .zip(coordinate(target_z))
+        .map(|((x, y), z)| (x, y, z))
+    else {
+        return Ok(Value::Null);
+    };
+    if !state.world_turfs.is_empty() {
+        return Ok(state
+            .turf_at(target_x, target_y, target_z)
+            .map_or(Value::Null, Value::Datum));
+    }
+    // Standalone VM callers can provide a heap without a canonical world
+    // geometry index. Preserve that lightweight embedding contract without
+    // making production world lookups fall back to an O(all datums) scan.
+    for (datum, candidate) in state.heap().datums() {
         let path = candidate.type_path().as_str();
         if path != "/turf" && !path.starts_with("/turf/") {
             continue;
         }
-        let matches = [(&x, target_x), (&y, target_y), (&z, source_z)]
-            .into_iter()
-            .all(|(field, expected)| {
-                candidate
-                    .field(field)
-                    .is_ok_and(|value| value.as_number() == Some(expected))
-            });
-        if matches {
+        if candidate
+            .field(&x)
+            .is_ok_and(|value| value.as_number() == Some(target_x as f32))
+            && candidate
+                .field(&y)
+                .is_ok_and(|value| value.as_number() == Some(target_y as f32))
+            && candidate
+                .field(&z)
+                .is_ok_and(|value| value.as_number() == Some(target_z as f32))
+        {
             return Ok(Value::Datum(datum));
         }
     }
@@ -13139,8 +15448,8 @@ fn direction_towards_builtin(
 }
 
 /// Resolves BYOND's `block()` over materialized headless turfs.
-fn block_builtin(arguments: &[Value], heap: &mut ValueHeap) -> Result<Value, String> {
-    let list = heap.allocate_list();
+fn block_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    let list = state.heap.allocate_list();
     let x = FieldName::parse("x").expect("built-in coordinate field is valid");
     let y = FieldName::parse("y").expect("built-in coordinate field is valid");
     let z = FieldName::parse("z").expect("built-in coordinate field is valid");
@@ -13164,10 +15473,10 @@ fn block_builtin(arguments: &[Value], heap: &mut ValueHeap) -> Result<Value, Str
 
     let (start, end) = match arguments {
         [start, end] => {
-            let Some(start) = datum_coordinates(start, heap) else {
+            let Some(start) = datum_coordinates(start, &state.heap) else {
                 return Ok(Value::List(list));
             };
-            let Some(end) = datum_coordinates(end, heap) else {
+            let Some(end) = datum_coordinates(end, &state.heap) else {
                 return Ok(Value::List(list));
             };
             (start, end)
@@ -13203,26 +15512,92 @@ fn block_builtin(arguments: &[Value], heap: &mut ValueHeap) -> Result<Value, Str
     // code whose source/destination order naturally changes with direction.
     let low = (start.0.min(end.0), start.1.min(end.1), start.2.min(end.2));
     let high = (start.0.max(end.0), start.1.max(end.1), start.2.max(end.2));
-    let matching = heap
-        .datums()
-        .filter_map(|(datum, candidate)| {
-            let path = candidate.type_path().as_str();
-            if path != "/turf" && !path.starts_with("/turf/") {
+    let matching = if state.world_turfs.is_empty() {
+        // Standalone VM callers can construct a synthetic heap without ever
+        // materializing world geometry. Preserve that useful fallback while
+        // keeping real worlds on their authoritative coordinate index.
+        state
+            .heap
+            .datums()
+            .filter_map(|(datum, candidate)| {
+                let path = candidate.type_path().as_str();
+                if path != "/turf" && !path.starts_with("/turf/") {
+                    return None;
+                }
+                let candidate_x = candidate.field(&x).ok()?.as_number()?;
+                let candidate_y = candidate.field(&y).ok()?.as_number()?;
+                let candidate_z = candidate.field(&z).ok()?.as_number()?;
+                (candidate_x >= low.0
+                    && candidate_x <= high.0
+                    && candidate_y >= low.1
+                    && candidate_y <= high.1
+                    && candidate_z >= low.2
+                    && candidate_z <= high.2)
+                    .then_some(datum)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let integer_bounds = |low: f32, high: f32| -> Option<(i32, i32)> {
+            let low = low.ceil();
+            let high = high.floor();
+            if low > high || high < i32::MIN as f32 || low > i32::MAX as f32 {
                 return None;
             }
-            let candidate_x = candidate.field(&x).ok()?.as_number()?;
-            let candidate_y = candidate.field(&y).ok()?.as_number()?;
-            let candidate_z = candidate.field(&z).ok()?.as_number()?;
-            (candidate_x >= low.0
-                && candidate_x <= high.0
-                && candidate_y >= low.1
-                && candidate_y <= high.1
-                && candidate_z >= low.2
-                && candidate_z <= high.2)
-                .then_some(datum)
-        })
-        .collect::<Vec<_>>();
-    let result = heap
+            #[allow(clippy::cast_possible_truncation)]
+            Some((low as i32, high as i32))
+        };
+        let (Some((low_x, high_x)), Some((low_y, high_y)), Some((low_z, high_z))) = (
+            integer_bounds(low.0, high.0),
+            integer_bounds(low.1, high.1),
+            integer_bounds(low.2, high.2),
+        ) else {
+            return Ok(Value::List(list));
+        };
+        let axis_len = |low: i32, high: i32| {
+            u128::try_from(i64::from(high) - i64::from(low) + 1)
+                .expect("ordered i32 bounds have a positive span")
+        };
+        let volume = axis_len(low_x, high_x)
+            .saturating_mul(axis_len(low_y, high_y))
+            .saturating_mul(axis_len(low_z, high_z));
+        let direct_limit = (state.world_turfs.len() as u128)
+            .saturating_mul(2)
+            .max(4_096);
+        if volume <= direct_limit {
+            let mut matching = Vec::new();
+            for z in low_z..=high_z {
+                for y in low_y..=high_y {
+                    for x in low_x..=high_x {
+                        if let Some(turf) = state.turf_at(x, y, z) {
+                            matching.push(turf);
+                        }
+                    }
+                }
+            }
+            matching
+        } else {
+            // Avoid walking an attacker-sized coordinate cuboid. Filtering
+            // the compact index is still linear only in materialized turfs,
+            // then restore block()'s z/y/x coordinate order.
+            let mut matching = state
+                .world_turfs
+                .iter()
+                .filter(|((x, y, z), _)| {
+                    *x >= low_x
+                        && *x <= high_x
+                        && *y >= low_y
+                        && *y <= high_y
+                        && *z >= low_z
+                        && *z <= high_z
+                })
+                .map(|(coordinate, datum)| (*coordinate, *datum))
+                .collect::<Vec<_>>();
+            matching.sort_unstable_by_key(|((x, y, z), _)| (*z, *y, *x));
+            matching.into_iter().map(|(_, datum)| datum).collect()
+        }
+    };
+    let result = state
+        .heap
         .list_mut(list)
         .expect("a newly allocated list handle must be live");
     for datum in matching {
@@ -13236,11 +15611,14 @@ fn block_builtin(arguments: &[Value], heap: &mut ValueHeap) -> Result<Value, Str
 /// The regular `range(distance, center)` spelling and BYOND's accepted
 /// reversed `range(center, distance)` spelling are both supported.  With one
 /// argument, the current procedure's `src` is the center.  BYOND range is a
-/// square tile radius (Chebyshev distance), not Euclidean distance; every
-/// atom on matching same-z tiles is returned in deterministic heap allocation
-/// order.  Areas are deliberately excluded because they describe tiles rather
-/// than being located contents of one.
-fn range_builtin(arguments: &[Value], src: &Value, heap: &mut ValueHeap) -> Result<Value, String> {
+/// square tile radius (Chebyshev distance), not Euclidean distance. BYOND emits
+/// the center tile first, followed by the remaining tiles in x/y order; each
+/// turf is followed by its unique area (on first encounter) and live contents.
+fn range_builtin(
+    arguments: &[Value],
+    src: &Value,
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
     let null_center = Value::Null;
     let (distance, center) = match arguments {
         [distance] => (distance.as_number(), src),
@@ -13254,7 +15632,7 @@ fn range_builtin(arguments: &[Value], src: &Value, heap: &mut ValueHeap) -> Resu
         },
         _ => return Err("range accepts one or two arguments".to_owned()),
     };
-    let list = heap.allocate_list();
+    let list = state.heap.allocate_list();
     let Some(distance) = distance else {
         return Ok(Value::List(list));
     };
@@ -13267,7 +15645,10 @@ fn range_builtin(arguments: &[Value], src: &Value, heap: &mut ValueHeap) -> Resu
     let x = FieldName::parse("x").expect("built-in coordinate field is valid");
     let y = FieldName::parse("y").expect("built-in coordinate field is valid");
     let z = FieldName::parse("z").expect("built-in coordinate field is valid");
-    let center = heap.datum(*center).map_err(|error| error.to_string())?;
+    let center = state
+        .heap
+        .datum(*center)
+        .map_err(|error| error.to_string())?;
     let coordinate = |field: &FieldName| center.field(field).ok().and_then(Value::as_number);
     let (Some(center_x), Some(center_y), Some(center_z)) =
         (coordinate(&x), coordinate(&y), coordinate(&z))
@@ -13275,23 +15656,118 @@ fn range_builtin(arguments: &[Value], src: &Value, heap: &mut ValueHeap) -> Resu
         return Ok(Value::List(list));
     };
     let distance = distance.floor();
-    let matching = heap
-        .datums()
-        .filter_map(|(datum, candidate)| {
-            let path = candidate.type_path().as_str();
-            if path == "/area" || path.starts_with("/area/") {
-                return None;
+    let matching = if state.world_turfs.is_empty() {
+        // Standalone VM fixtures can supply coordinate-bearing atoms without
+        // constructing canonical world geometry. Retain the historical scan
+        // for those synthetic states only.
+        state
+            .heap
+            .datums()
+            .filter_map(|(datum, candidate)| {
+                let path = candidate.type_path().as_str();
+                if path == "/area" || path.starts_with("/area/") {
+                    return None;
+                }
+                let candidate_x = candidate.field(&x).ok()?.as_number()?;
+                let candidate_y = candidate.field(&y).ok()?.as_number()?;
+                let candidate_z = candidate.field(&z).ok()?.as_number()?;
+                (candidate_z.total_cmp(&center_z).is_eq()
+                    && (candidate_x - center_x).abs() <= distance
+                    && (candidate_y - center_y).abs() <= distance)
+                    .then_some(datum)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let coordinate = |value: f32| -> Option<i32> {
+            (value.is_finite()
+                && value.fract() == 0.0
+                && value >= i32::MIN as f32
+                && value <= i32::MAX as f32)
+                .then(|| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        value as i32
+                    }
+                })
+        };
+        let (Some(center_x), Some(center_y), Some(center_z)) = (
+            coordinate(center_x),
+            coordinate(center_y),
+            coordinate(center_z),
+        ) else {
+            return Ok(Value::List(list));
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let distance = distance.min(i32::MAX as f32) as i32;
+        let low_x = center_x.saturating_sub(distance);
+        let high_x = center_x.saturating_add(distance);
+        let low_y = center_y.saturating_sub(distance);
+        let high_y = center_y.saturating_add(distance);
+        let axis_len = |low: i32, high: i32| {
+            u128::try_from(i64::from(high) - i64::from(low) + 1)
+                .expect("ordered i32 bounds have a positive span")
+        };
+        let area = axis_len(low_x, high_x).saturating_mul(axis_len(low_y, high_y));
+        let direct_limit = (state.world_turfs.len() as u128)
+            .saturating_mul(2)
+            .max(4_096);
+        let mut tiles = if area <= direct_limit {
+            let mut tiles = Vec::new();
+            for x in low_x..=high_x {
+                for y in low_y..=high_y {
+                    if let Some(turf) = state.turf_at(x, y, center_z) {
+                        tiles.push(((x, y, center_z), turf));
+                    }
+                }
             }
-            let candidate_x = candidate.field(&x).ok()?.as_number()?;
-            let candidate_y = candidate.field(&y).ok()?.as_number()?;
-            let candidate_z = candidate.field(&z).ok()?.as_number()?;
-            (candidate_z.total_cmp(&center_z).is_eq()
-                && (candidate_x - center_x).abs() <= distance
-                && (candidate_y - center_y).abs() <= distance)
-                .then_some(datum)
-        })
-        .collect::<Vec<_>>();
-    let result = heap
+            tiles
+        } else {
+            state
+                .world_turfs
+                .iter()
+                .filter(|((x, y, z), _)| {
+                    *z == center_z && *x >= low_x && *x <= high_x && *y >= low_y && *y <= high_y
+                })
+                .map(|(coordinate, turf)| (*coordinate, *turf))
+                .collect::<Vec<_>>()
+        };
+        let center_coordinate = (center_x, center_y, center_z);
+        if let Some(index) = tiles
+            .iter()
+            .position(|(coordinate, _)| *coordinate == center_coordinate)
+        {
+            let center = tiles.remove(index);
+            tiles.insert(0, center);
+        }
+
+        let contents = FieldName::parse("contents").expect("built-in contents field");
+        let mut seen_areas = HashSet::new();
+        let mut matching = Vec::new();
+        for (coordinate, turf) in tiles {
+            matching.push(turf);
+            if let Some(area) = state.world_areas.get(&coordinate).copied()
+                && seen_areas.insert(area)
+            {
+                matching.push(area);
+            }
+            if let Ok(Value::List(contents)) = state.heap.datum_field(turf, &contents) {
+                matching.extend(
+                    state
+                        .heap
+                        .list(*contents)
+                        .map_err(|error| error.to_string())?
+                        .positions()
+                        .filter_map(|(_, value)| match value {
+                            Value::Datum(datum) => Some(*datum),
+                            _ => None,
+                        }),
+                );
+            }
+        }
+        matching
+    };
+    let result = state
+        .heap
         .list_mut(list)
         .expect("a newly allocated list handle must be live");
     for datum in matching {
@@ -13313,6 +15789,15 @@ fn typesof_builtin(
         // routines that expand a caller-provided list of roots one at a time.
         Value::Null => return Ok(Vec::new()),
         Value::TypePath(path) => path.clone(),
+        Value::Text(text) => {
+            let Ok(path) = TypePath::parse(text) else {
+                return Ok(Vec::new());
+            };
+            if !catalog.contains(&path) {
+                return Ok(Vec::new());
+            }
+            path
+        }
         Value::Datum(datum) => heap
             .datum(*datum)
             .map_err(|error| error.to_string())?
@@ -13392,7 +15877,14 @@ fn type_predicate_builtin(
             }))
         }
         TypePredicateKind::IsIcon => match value {
-            Value::Text(text) => Ok(text.to_ascii_lowercase().ends_with(".dmi")),
+            Value::File(path) => Ok(matches!(
+                std::path::Path::new(path.as_ref())
+                    .extension()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
+                Some("dmi" | "bmp" | "png" | "jpg" | "gif")
+            )),
             Value::Datum(datum) => {
                 let path = heap
                     .datum(*datum)
@@ -13415,7 +15907,12 @@ fn type_predicate_builtin(
         }
         TypePredicateKind::IsType => {
             let Some(target) = arguments.get(1) else {
-                return Ok(matches!(value, Value::Datum(_)));
+                // BYOND lists are first-class datum-like runtime values for
+                // the unqualified `istype(value)` predicate. Project code
+                // commonly uses this shape to validate a typed list argument
+                // before constructing an owner datum (for example admin rank
+                // lists during world startup).
+                return Ok(matches!(value, Value::Datum(_) | Value::List(_)));
             };
             let Value::TypePath(target) = target else {
                 return Ok(false);
@@ -13535,6 +16032,133 @@ fn runtime_truthy(heap: &ValueHeap, value: &Value) -> Result<bool, String> {
     heap.truthy(value).map_err(|error| error.to_string())
 }
 
+fn locate_in_container(
+    search: &Value,
+    container: &Value,
+    state: &ExecutionState,
+) -> Result<Value, String> {
+    let list = match container {
+        Value::List(list) => Some(*list),
+        Value::Datum(datum) => state
+            .heap()
+            .datum_field(
+                *datum,
+                &FieldName::parse("contents").expect("built-in contents field is valid"),
+            )
+            .ok()
+            .and_then(|value| match value {
+                Value::List(list) => Some(*list),
+                _ => None,
+            }),
+        _ => None,
+    };
+    let Some(list) = list else {
+        return Ok(Value::Null);
+    };
+    let values = state.heap().list(list).map_err(|error| error.to_string())?;
+    for (_, candidate) in values.positions() {
+        let matches = match search {
+            Value::TypePath(target) => match candidate {
+                Value::Datum(datum) => state
+                    .heap()
+                    .datum(*datum)
+                    .is_ok_and(|datum| builtins::is_subtype(state, datum.type_path(), target)),
+                Value::TypePath(candidate) => builtins::is_subtype(state, candidate, target),
+                Value::ModifiedTypePath(candidate) => {
+                    builtins::is_subtype(state, candidate.base(), target)
+                }
+                _ => false,
+            },
+            Value::Text(reference) if reference.starts_with("[0x") => {
+                ref_builtin(candidate).semantic_eq(search)
+            }
+            _ => candidate.semantic_eq(search),
+        };
+        if matches {
+            return Ok(candidate.clone());
+        }
+    }
+    Ok(Value::Null)
+}
+
+fn locate_single(search: &Value, state: &ExecutionState) -> Value {
+    match search {
+        Value::Null => Value::Null,
+        Value::Datum(datum) => state
+            .heap()
+            .datum(*datum)
+            .is_ok()
+            .then_some(Value::Datum(*datum))
+            .unwrap_or(Value::Null),
+        Value::List(list) => state
+            .heap()
+            .list(*list)
+            .is_ok()
+            .then_some(Value::List(*list))
+            .unwrap_or(Value::Null),
+        Value::TypePath(target) => state
+            .heap()
+            .datums()
+            .find(|(_, datum)| builtins::is_subtype(state, datum.type_path(), target))
+            .map_or(Value::Null, |(datum, _)| Value::Datum(datum)),
+        Value::ModifiedTypePath(target) => state
+            .heap()
+            .datums()
+            .find(|(_, datum)| builtins::is_subtype(state, datum.type_path(), target.base()))
+            .map_or(Value::Null, |(datum, _)| Value::Datum(datum)),
+        Value::Text(text) => {
+            if let Some(reference) = parse_heap_reference(text) {
+                return match reference {
+                    HeapReference::Datum(index) => state
+                        .heap()
+                        .datum_id_at_index(index)
+                        .map_or(Value::Null, Value::Datum),
+                    HeapReference::List(index) => state
+                        .heap()
+                        .list_id_at_index(index)
+                        .map_or(Value::Null, Value::List),
+                };
+            }
+            let tag = FieldName::parse("tag").expect("built-in datum tag field is valid");
+            state
+                .heap()
+                .datums()
+                .find(|(_, datum)| {
+                    datum
+                        .field(&tag)
+                        .is_ok_and(|candidate| candidate.semantic_eq(search))
+                })
+                .map_or(Value::Null, |(datum, _)| Value::Datum(datum))
+        }
+        Value::Number(_) | Value::File(_) => Value::Null,
+    }
+}
+
+enum HeapReference {
+    Datum(u32),
+    List(u32),
+}
+
+fn parse_heap_reference(text: &str) -> Option<HeapReference> {
+    let body = text.strip_prefix("[0x")?.strip_suffix(']')?;
+    if body.len() < 2 {
+        return None;
+    }
+    let (kind, digits) = body.split_at(1);
+    let encoded = u32::from_str_radix(digits, 16).ok()?;
+    let index = encoded.checked_sub(1)?;
+    match kind {
+        "d" => Some(HeapReference::Datum(index)),
+        "e" => Some(HeapReference::List(index)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static DYNAMIC_LOOKUP_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn dynamic_call_target(
     module: &Module,
     state: &ExecutionState,
@@ -13586,34 +16210,189 @@ fn dynamic_call_target(
         format!("{base_path}/proc/{selector_path}")
     };
 
-    let mut candidate = requested.clone();
-    loop {
-        let prefix = format!("{candidate}@");
-        if let Some((index, _)) = module
-            .paths
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, path)| *path == &candidate || path.starts_with(&prefix))
-        {
-            let procedure = ProcedureId::from_index(index).map_err(|error| error.message)?;
-            return Ok((procedure, context));
+    let find_candidate = |candidate: &str| {
+        #[cfg(test)]
+        DYNAMIC_LOOKUP_PROBES.set(DYNAMIC_LOOKUP_PROBES.get() + 1);
+        module.dynamic_names.get(candidate).copied()
+    };
+
+    // Absolute/global procedure references already identify their namespace.
+    // Preserve their historical exact/lexical lookup. Ordinary receiver calls,
+    // however, must follow the runtime object tree: DM parent_type can point
+    // outside the receiver's lexical path (notably /obj -> /atom).
+    if selector.starts_with('/') || base_path == "/proc" {
+        let mut candidate = requested.clone();
+        loop {
+            if let Some(procedure) = find_candidate(&candidate) {
+                return Ok((procedure, context));
+            }
+            let Some(segment) = candidate.rfind("/proc/") else {
+                break;
+            };
+            let owner = &candidate[..segment];
+            if owner == "/proc" || owner.is_empty() {
+                break;
+            }
+            let Some(parent_end) = owner.rfind('/') else {
+                break;
+            };
+            candidate = format!("{}/proc/{selector_path}", &owner[..parent_end]);
         }
-        let Some(segment) = candidate.rfind("/proc/") else {
-            break;
-        };
-        let owner = &candidate[..segment];
-        if owner == "/proc" || owner.is_empty() {
-            break;
+    } else {
+        let mut current = TypePath::parse(&base_path).ok();
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(owner) = current {
+            if !visited.insert(owner.clone()) {
+                break;
+            }
+            let candidate = format!("{}/proc/{selector_path}", owner.as_str());
+            if let Some(procedure) = find_candidate(&candidate) {
+                return Ok((procedure, context));
+            }
+            current = state
+                .type_parents
+                .get(&owner)
+                .cloned()
+                .flatten()
+                .or_else(|| {
+                    let parent = owner.as_str().rsplit_once('/')?.0;
+                    (!parent.is_empty())
+                        .then(|| TypePath::parse(parent).ok())
+                        .flatten()
+                });
         }
-        let Some(parent_end) = owner.rfind('/') else {
-            break;
-        };
-        candidate = format!("{}/proc/{selector_path}", &owner[..parent_end]);
     }
     Err(format!(
         "dynamic call could not resolve procedure {requested:?}"
     ))
+}
+
+fn hascall_builtin(
+    module: &Module,
+    state: &ExecutionState,
+    receiver: &Value,
+    selector: &Value,
+) -> bool {
+    let selector = match selector {
+        Value::Text(selector) => selector.as_ref(),
+        Value::TypePath(selector) => selector.as_str(),
+        _ => return false,
+    };
+    let selector = selector
+        .trim_end_matches('/')
+        .rsplit("/proc/")
+        .next()
+        .unwrap_or(selector)
+        .trim_start_matches("proc/")
+        .trim_start_matches('/');
+    if selector.is_empty() || selector.contains('/') {
+        return false;
+    }
+
+    if matches!(receiver, Value::List(_)) {
+        return matches!(
+            selector.to_ascii_lowercase().as_str(),
+            "add"
+                | "copy"
+                | "cut"
+                | "find"
+                | "insert"
+                | "join"
+                | "remove"
+                | "removeall"
+                | "splice"
+                | "swap"
+        );
+    }
+
+    let path = match receiver {
+        Value::Datum(datum) => match state.heap.datum(*datum) {
+            Ok(datum) => datum.type_path().clone(),
+            Err(_) => return false,
+        },
+        Value::TypePath(path) => path.clone(),
+        _ => return false,
+    };
+    let native = match path.as_str() {
+        "/list" => matches!(
+            selector.to_ascii_lowercase().as_str(),
+            "add"
+                | "copy"
+                | "cut"
+                | "find"
+                | "insert"
+                | "join"
+                | "remove"
+                | "removeall"
+                | "splice"
+                | "swap"
+        ),
+        "/regex" => selector.eq_ignore_ascii_case("Find"),
+        "/matrix" => matches!(
+            selector.to_ascii_lowercase().as_str(),
+            "add"
+                | "subtract"
+                | "multiply"
+                | "scale"
+                | "translate"
+                | "turn"
+                | "invert"
+                | "interpolate"
+        ),
+        "/vector" => matches!(
+            selector.to_ascii_lowercase().as_str(),
+            "dot" | "interpolate" | "cross" | "magnitude" | "normalize" | "copy"
+        ),
+        "/icon" => matches!(
+            selector.to_ascii_lowercase().as_str(),
+            "mapcolors"
+                | "blend"
+                | "setintensity"
+                | "scale"
+                | "crop"
+                | "shift"
+                | "width"
+                | "height"
+                | "drawbox"
+                | "insert"
+                | "getpixel"
+                | "turn"
+                | "flip"
+                | "swapcolor"
+        ),
+        path if path == "/savefile" || path.starts_with("/savefile/") => {
+            selector.eq_ignore_ascii_case("ExportText")
+        }
+        _ => false,
+    };
+    if native {
+        return true;
+    }
+
+    let mut current = Some(path);
+    while let Some(owner) = current {
+        let requested = format!("{}/proc/{selector}", owner.as_str());
+        if module.paths.iter().any(|candidate| {
+            candidate
+                .split_once('@')
+                .map_or(candidate.as_str(), |(path, _)| path)
+                .eq_ignore_ascii_case(&requested)
+        }) {
+            return true;
+        }
+        current = state
+            .type_parents
+            .get(&owner)
+            .cloned()
+            .flatten()
+            .or_else(|| {
+                let parent = owner.as_str().rsplit_once('/')?.0;
+                (!parent.is_empty())
+                    .then(|| TypePath::parse(parent).ok())
+                    .flatten()
+            });
+    }
+    false
 }
 
 fn execute_del(
@@ -13665,21 +16444,45 @@ fn execute_del(
     hook_result.map(|()| Value::Null)
 }
 
-fn invoke_constructor_if_present(
+fn constructor_target_if_present(
     module: &Module,
     state: &mut ExecutionState,
     datum: DatumId,
-    arguments: &[Value],
     caller_context: &ExecutionContext,
-) -> Result<(), RuntimeError> {
+) -> Option<(ProcedureId, ExecutionContext)> {
     let receiver = Value::Datum(datum);
     let selector = Value::text("New");
-    let Ok((constructor, context)) =
-        dynamic_call_target(module, state, &receiver, &selector, caller_context, false)
-    else {
-        return Ok(());
-    };
-    execute_module_in_context(module, constructor, arguments, state, &context).map(|_| ())
+    let traced_type = boot_trace_enabled()
+        .then(|| {
+            state
+                .heap
+                .datum(datum)
+                .ok()
+                .map(|datum| datum.type_path().clone())
+        })
+        .flatten()
+        .filter(|path| path.as_str().starts_with("/datum/controller/subsystem/"));
+    let (constructor, context) =
+        match dynamic_call_target(module, state, &receiver, &selector, caller_context, false) {
+            Ok(target) => target,
+            Err(error) => {
+                if let Some(path) = traced_type {
+                    eprintln!(
+                        "boot-vm: subsystem-constructor-missing type={} reason={}",
+                        path, error
+                    );
+                }
+                return None;
+            }
+        };
+    if let Some(path) = traced_type {
+        eprintln!(
+            "boot-vm: subsystem-constructor type={} procedure={}",
+            path,
+            module.procedure_path(constructor).unwrap_or("<unknown>")
+        );
+    }
+    Some((constructor, context))
 }
 
 fn construct_sized_list(arguments: &[Value], heap: &mut ValueHeap) -> Result<ListId, String> {
@@ -13725,9 +16528,10 @@ fn read_list_value<'heap>(
     heap: &'heap ValueHeap,
     list: ListId,
     key: &Value,
+    associative: bool,
 ) -> Result<&'heap Value, ValueError> {
     let values = heap.list(list)?;
-    if matches!(key, Value::Number(_)) {
+    if matches!(key, Value::Number(_)) && !associative {
         let index = value_to_list_index(key).map_err(ValueError::InvalidListIndex)?;
         values.get(index)
     } else {
@@ -13807,12 +16611,94 @@ fn datum_shared_storage(
     state.shared_fields.get(path)?.get(field).cloned()
 }
 
+/// Reads one instance field, falling back to the immutable effective type
+/// default when an engine-created datum deliberately leaves that default
+/// unmaterialized. Stale handles and genuinely unknown fields remain errors.
+fn datum_field_or_initial(
+    state: &ExecutionState,
+    datum: DatumId,
+    field: &FieldName,
+) -> Result<Value, ValueError> {
+    let runtime_type = state.heap.datum(datum)?.type_path().clone();
+    match state.heap.datum_field(datum, field) {
+        Ok(value) => Ok(value.clone()),
+        Err(error @ ValueError::MissingField(_))
+            if state.compact_default_datums.contains(&datum) =>
+        {
+            state
+                .initial_value(&runtime_type, field)
+                .cloned()
+                .ok_or(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn assign_datum_field(
     state: &mut ExecutionState,
     datum: DatumId,
     field: FieldName,
     value: Value,
 ) -> Result<(), String> {
+    if matches!(field.as_str(), "vis_contents" | "vis_locs") {
+        let is_vis_contents = field.as_str() == "vis_contents";
+        let replacement = match &value {
+            Value::Null => Vec::new(),
+            Value::Datum(member) => vec![*member],
+            Value::List(source) => state
+                .heap
+                .list(*source)
+                .map_err(|error| error.to_string())?
+                .positions()
+                .filter_map(|(_, value)| match value {
+                    Value::Datum(member) => Some(*member),
+                    Value::Null => None,
+                    _ => None,
+                })
+                .collect(),
+            value => {
+                return Err(format!(
+                    "{} assignment requires an atom, list, or null, received {value}",
+                    field.as_str()
+                ));
+            }
+        };
+        for member in &replacement {
+            let is_atom = state.heap.datum(*member).is_ok_and(|datum| {
+                let path = datum.type_path().as_str();
+                path == "/atom"
+                    || path.starts_with("/atom/")
+                    || path == "/obj"
+                    || path.starts_with("/obj/")
+                    || path == "/mob"
+                    || path.starts_with("/mob/")
+                    || path == "/turf"
+                    || path.starts_with("/turf/")
+                    || path == "/area"
+                    || path.starts_with("/area/")
+            });
+            if !is_atom {
+                return Err(format!("{} can only contain atoms", field.as_str()));
+            }
+        }
+        let list = state.ensure_visibility_list(datum, is_vis_contents)?;
+        let before = state.visibility_members(list)?;
+        {
+            let target = state
+                .heap
+                .list_mut(list)
+                .map_err(|error| error.to_string())?;
+            target.resize(0).map_err(|error| error.to_string())?;
+            for member in replacement {
+                let value = Value::Datum(member);
+                if !target.contains(&value) {
+                    target.add(value);
+                }
+            }
+        }
+        state.synchronize_visibility_list(list, &before)?;
+        return Ok(());
+    }
     let is_savefile = state.heap.datum(datum).is_ok_and(|datum| {
         let path = datum.type_path().as_str();
         path == "/savefile" || path.starts_with("/savefile/")
@@ -13935,7 +16821,7 @@ fn write_datum_vars(
     } else {
         assign_datum_field(state, datum, field, value.clone())?;
     }
-    write_list_value(&mut state.heap, list, key, value).map_err(|error| error.to_string())
+    write_list_value(&mut state.heap, list, key, value, false).map_err(|error| error.to_string())
 }
 
 fn write_list_value(
@@ -13943,9 +16829,10 @@ fn write_list_value(
     list: ListId,
     key: Value,
     value: Value,
+    associative: bool,
 ) -> Result<(), ValueError> {
     let values = heap.list_mut(list)?;
-    if matches!(key, Value::Number(_)) {
+    if matches!(key, Value::Number(_)) && !associative {
         let index = value_to_list_index(&key).map_err(ValueError::InvalidListIndex)?;
         values.set(index, value)?;
     } else {
@@ -13958,15 +16845,16 @@ fn value_to_list_index(value: &Value) -> Result<usize, String> {
     let Some(number) = value.as_number() else {
         return Err(format!("list index must be numeric, received {value}"));
     };
-    if !number.is_finite() || number < 1.0 || number.fract() != 0.0 {
+    let index = number.trunc();
+    if !index.is_finite() || index < 1.0 {
         return Err(format!(
-            "list index must be a positive whole number, received {number}"
+            "list index must truncate to a positive number, received {number}"
         ));
     }
-    number
-        .to_string()
-        .parse()
-        .map_err(|_| format!("list index {number} exceeds the host index range"))
+    if index >= i32::MAX as f32 {
+        return Err(format!("list index {number} exceeds the BYOND index range"));
+    }
+    Ok(index as usize)
 }
 
 fn pop(stack: &mut Vec<Value>) -> Result<Value, String> {
@@ -14097,7 +16985,11 @@ fn execute_scalar_add(left: Value, right: Value) -> Result<Value, String> {
         // `field += list(value)` idiom initializes it to that list. Logging
         // queues and many SS13 lazy collections depend on this coercion.
         (Value::Null, right @ Value::List(_)) => Ok(right),
+        (Value::Null, Value::Text(right)) => Ok(Value::Text(right)),
+        (Value::Text(left), Value::Null) => Ok(Value::Text(left)),
         (Value::Text(left), Value::Text(right)) => Ok(Value::text(format!("{left}{right}"))),
+        (Value::Null, right) => Ok(right),
+        (left, Value::Null) => Ok(left),
         (left, right) => Err(format!(
             "addition requires compatible DM values, received {left} and {right}"
         )),
@@ -14115,7 +17007,17 @@ fn execute_scalar_compound_assignment(
         return Ok(right);
     }
     if matches!(operator, CompoundAssignmentOperator::Add)
-        && matches!((&left, &right), (Value::Text(_), Value::Text(_)))
+        && matches!(
+            (&left, &right),
+            (Value::Text(_), Value::Text(_))
+                | (Value::Null, Value::Text(_))
+                | (Value::Text(_), Value::Null)
+        )
+    {
+        return execute_scalar_add(left, right);
+    }
+    if matches!(operator, CompoundAssignmentOperator::Add)
+        && (matches!(&left, Value::Null) || matches!(&right, Value::Null))
     {
         return execute_scalar_add(left, right);
     }
@@ -14177,20 +17079,21 @@ mod tests {
 
     use dm_core::{DmNumberBits, SourceSpan};
     use dm_lexer::{SpannedToken, TokenKind, lex};
-    use dm_syntax::parse;
+    use dm_syntax::{DefinitionKind, parse};
     use dm_value::{FieldName, TypePath};
 
     use super::{
         CompoundListIndexOperator, ExecutionContext, ExecutionLimits, ExecutionState,
-        InitializerBinding, Instruction, ProcedureSpec, Program, Value, advance_scheduler,
-        allocate_initialized_datum, allocate_matrix, compile_initializer,
+        InitializerBinding, InstanceInitializer, Instruction, ProcedureSpec, Program, Value,
+        advance_scheduler, allocate_initialized_datum, allocate_matrix, compile_initializer,
         compile_initializer_into_module, compile_module, compile_module_specs,
         compile_module_specs_selective, compile_module_specs_selective_with_errors,
         compile_module_with_global_fields, compile_procedure,
         compile_procedure_with_resolver_and_fields, condition_tokens, dm_builtin_numeric_constant,
         execute, execute_in_context, execute_in_state, execute_module, execute_module_in_context,
-        execute_module_in_state, execute_module_with_limits, execute_with_limits,
-        execute_with_limits_in_state, interpolated_expression_close, matrix_components,
+        execute_module_in_state, execute_module_with_limits, execute_module_with_limits_in_state,
+        execute_with_limits, execute_with_limits_in_state, interpolated_expression_close,
+        matrix_components,
     };
 
     #[test]
@@ -14271,6 +17174,185 @@ mod tests {
         assert_eq!(
             execute_module(&module, entry, &[]),
             Ok(Value::text("before one 2 [literal] after"))
+        );
+    }
+
+    #[test]
+    fn interpolated_string_unescapes_literal_brackets_around_expression() {
+        let syntax = parse("/proc/run()\n\tvar/value = \"-1,\"\n\treturn \"\\[[value]0\\]\"\n")
+            .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("interpolation should compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+
+        assert_eq!(
+            execute_module(&module, entry, &[]),
+            Ok(Value::text("[-1,0]")),
+        );
+    }
+
+    #[test]
+    fn ordinary_quoted_strings_decode_escapes_without_changing_raw_strings() {
+        let syntax = parse(concat!(
+            "/proc/run()\n",
+            "\tvar/value = 7\n",
+            "\treturn list(\"line\\nnext\\ttab\\\\slash\\\"quote\", ",
+            "\"\\[value]\", \"\\\\[value]\", @'\\n\\t\\\\')\n",
+        ))
+        .expect("escaped string source should parse");
+        let module = compile_module(&syntax.definitions).expect("escaped strings should compile");
+        let mut state = ExecutionState::new();
+        let result = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/run").expect("entry"),
+            &[],
+            &mut state,
+        )
+        .expect("escaped strings should execute");
+        let Value::List(result) = result else {
+            panic!("escaped string fixture should return a list");
+        };
+        let values = state
+            .heap()
+            .list(result)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                Value::text("line\nnext\ttab\\slash\"quote"),
+                Value::text("[value]"),
+                Value::text("\\7"),
+                Value::text(r"\n\t\\"),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_text_macros_runtime_improper_prefix_terminates_and_removes_marker() {
+        let syntax = parse(
+            r#"/proc/apply_text_macros(string)
+	var/next_backslash = findtext(string, "\\")
+	if(!next_backslash)
+		return string
+	var/leng = length(string)
+	var/next_space = findtext(string, " ", next_backslash + length(string[next_backslash]))
+	if(!next_space)
+		next_space = leng - next_backslash
+	if(!next_space)
+		return string
+	var/base = next_backslash == 1 ? "" : copytext(string, 1, next_backslash)
+	var/macro = lowertext(copytext(string, next_backslash + length(string[next_backslash]), next_space))
+	var/rest = next_backslash > leng ? "" : copytext(string, next_space + length(string[next_space]))
+	switch(macro)
+		if("proper")
+			rest = text("\proper []", rest)
+		if("improper")
+			rest = text("\improper []", rest)
+		else
+			return base
+	. = base
+	if(rest)
+		. += .(rest)
+"#,
+        )
+        .expect("apply_text_macros fixture should parse");
+        let module =
+            compile_module(&syntax.definitions).expect("text macro fixture should compile");
+        let entry = module
+            .procedure_id("/proc/apply_text_macros")
+            .expect("apply_text_macros entry exists");
+        assert_eq!(
+            execute_module(
+                &module,
+                entry,
+                &[Value::text(r"\improper Operative Remembrance Plaque")],
+            ),
+            Ok(Value::text("Operative Remembrance Plaque")),
+        );
+    }
+
+    #[test]
+    fn text_macro_prefix_suffix_roman_and_pronoun_family_uses_original_value() {
+        let syntax = parse(
+            r#"/proc/run(item)
+	return list(
+		text("\the []", item),
+		text("\A []", item),
+		text("\roman []", 7),
+		text("[]\th", 2),
+		text("[]\s", 2),
+		text("[]\he", item),
+		text("[]\she", item),
+		text("[]\his", item),
+		text("[]\himself", item),
+		text("[]\herself", item),
+		text("[]\hers", item),
+		"\the [item]",
+		"[item]\hers",
+		"\Roman[7]",
+	)
+"#,
+        )
+        .expect("text macro family fixture should parse");
+        let module = compile_module(&syntax.definitions).expect("text macros should compile");
+        let mut state = ExecutionState::new();
+        let item = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(
+                item,
+                FieldName::parse("name").unwrap(),
+                Value::text("apple"),
+            )
+            .unwrap();
+        state
+            .heap_mut()
+            .set_datum_field(
+                item,
+                FieldName::parse("gender").unwrap(),
+                Value::text("female"),
+            )
+            .unwrap();
+        let result = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/run").expect("run entry exists"),
+            &[Value::Datum(item)],
+            &mut state,
+        )
+        .expect("text macro family should execute");
+        let Value::List(result) = result else {
+            panic!("text macro fixture should return a list");
+        };
+        let values = state
+            .heap()
+            .list(result)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            [
+                "the apple",
+                "An apple",
+                "vii",
+                "2nd",
+                "2s",
+                "appleshe",
+                "appleshe",
+                "appleher",
+                "appleherself",
+                "appleherself",
+                "applehers",
+                "the apple",
+                "applehers",
+                "VII",
+            ]
+            .map(Value::text)
         );
     }
 
@@ -14400,6 +17482,16 @@ mod tests {
     }
 
     #[test]
+    fn runtime_new_accepts_current_src_type_field_in_destroy_recovery_shape() {
+        let syntax = parse(
+            "/datum/wound_pregen_data/Destroy(force)\n\tvar/error_message = \"[src] destroyed\"\n\tif(!force)\n\t\treturn 1\n\tvar/replacement = new src.type\n\treturn replacement.type\n",
+        )
+        .expect("wound recovery source should parse");
+        compile_module(&syntax.definitions)
+            .expect("src.type is a runtime new operand, not an ordinary local");
+    }
+
+    #[test]
     fn infinity_constants_interpolate_and_complex_raw_strings_use_custom_delimiters() {
         let syntax = parse(
             "/proc/run()\n\tvar/a = 1#INF\n\tvar/b = -1#INF\n\tvar/c = -1#IND\n\tvar/raw = @(END)\nhello worldEND\n\treturn (\"[a]\" == \"inf\") + (\"[b]\" == \"-inf\") + (\"[c]\" == \"nan\") + (raw == \"hello world\")\n",
@@ -14441,6 +17533,25 @@ mod tests {
         let module = compile_module(&syntax.definitions).expect("alist family should compile");
         let entry = module.procedure_id("/proc/run").expect("entry");
         assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(2.0)));
+    }
+
+    #[test]
+    fn alist_numeric_keys_remain_associative_across_nested_writes_and_mutation() {
+        let syntax = parse(concat!(
+            "/proc/run()\n",
+            "\tvar/alist/groups = alist(1 = list(), 2 = list(), 3 = list())\n",
+            "\tgroups[2][\"trait\"] = 7\n",
+            "\tgroups[2][\"trait\"]++\n",
+            "\tgroups[3] += list(\"x\")\n",
+            "\tvar/list/ordinary = list(10, 20)\n",
+            "\treturn groups[2][\"trait\"] + length(groups[3]) + ordinary[2]\n",
+        ))
+        .expect("numeric alist source should parse");
+        let module = compile_module(&syntax.definitions).expect("numeric alist should compile");
+        assert_eq!(
+            execute_module(&module, module.procedure_id("/proc/run").unwrap(), &[]),
+            Ok(Value::number(29.0)),
+        );
     }
 
     #[test]
@@ -14532,15 +17643,28 @@ mod tests {
     }
 
     #[test]
-    fn resource_literal_expressions_lower_to_their_path_text() {
-        let syntax = parse("/proc/resource_path()\n\treturn 'sound/effects/piano_hit.ogg'\n")
+    fn resource_literals_and_file_constructor_are_distinct_from_plain_text() {
+        let syntax = parse(
+            "/proc/resource_path()\n\treturn 'sound/effects/piano_hit.ogg'\n/proc/file_kinds()\n\treturn isfile(\"maps/test.dmm\") * 100 + isfile(file(\"maps/test.dmm\")) * 10 + isfile('maps/test.dmm')\n",
+        )
             .expect("source should parse");
-        let program =
-            compile_procedure(&syntax.definitions[0]).expect("resource literal should compile");
+        let module = compile_module(&syntax.definitions).expect("resource values should compile");
 
         assert_eq!(
-            execute(&program, &[]),
-            Ok(Value::text("sound/effects/piano_hit.ogg"))
+            execute_module(
+                &module,
+                module.procedure_id("/proc/resource_path").unwrap(),
+                &[],
+            ),
+            Ok(Value::file("sound/effects/piano_hit.ogg"))
+        );
+        assert_eq!(
+            execute_module(
+                &module,
+                module.procedure_id("/proc/file_kinds").unwrap(),
+                &[],
+            ),
+            Ok(Value::number(11.0))
         );
     }
 
@@ -14696,8 +17820,6 @@ mod tests {
         assert!(matches!(
             program.instructions.as_slice(),
             [
-                Instruction::MakeArgs,
-                Instruction::StoreLocal(_),
                 Instruction::PushTypePath(_),
                 Instruction::PushNumber(_),
                 Instruction::PushText(_),
@@ -14719,6 +17841,127 @@ mod tests {
                 .expect("datum must be live")
                 .type_path(),
             &TypePath::parse("/datum/example").unwrap()
+        );
+    }
+
+    #[test]
+    fn sleeping_constructor_suspends_the_caller_until_new_finishes() {
+        let syntax = parse(concat!(
+            "/datum/parsed_map/New()\n",
+            "\tvar/list/grid_sets = list()\n",
+            "\tgrid_sets += \"first\"\n",
+            "\tsleep(1)\n",
+            "\tgrid_sets += \"second\"\n",
+            "\tsrc.gridSets = grid_sets\n",
+            "\treturn 999\n",
+            "/proc/load_map()\n",
+            "\tvar/datum/parsed_map/parsed = new\n",
+            "\treturn length(parsed.gridSets)\n",
+        ))
+        .expect("sleeping constructor source should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("sleeping constructor and caller should compile");
+        let entry = module
+            .procedure_id("/proc/load_map")
+            .expect("map loader entry should exist");
+        let mut state = ExecutionState::new();
+
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::Null),
+            "the outer loader must yield with its synchronous New() call"
+        );
+        assert_eq!(state.scheduled_task_count(), 1);
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::number(2.0)]),
+            "New() must finish before the caller observes the constructed datum"
+        );
+    }
+
+    #[test]
+    fn scheduler_yield_collects_temporary_lists_without_breaking_frame_aliases() {
+        let syntax = parse(concat!(
+            "/proc/work()\n",
+            "\tvar/list/kept = list(list(7))\n",
+            "\tvar/list/discard = list()\n",
+            "\tdiscard = list()\n",
+            "\tdiscard = list()\n",
+            "\tdiscard = list()\n",
+            "\tdiscard = list()\n",
+            "\tsleep(1)\n",
+            "\treturn kept[1][1]\n",
+        ))
+        .expect("list collection fixture should parse");
+        let module = compile_module(&syntax.definitions).expect("fixture should compile");
+        let entry = module.procedure_id("/proc/work").unwrap();
+        let mut state = ExecutionState::new();
+        state.next_list_collection = 4;
+
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::Null)
+        );
+        assert_eq!(state.scheduled_task_count(), 1);
+        assert_eq!(
+            state.heap().live_list_count(),
+            3,
+            "only the nested kept lists and the current local should survive"
+        );
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::number(7.0)])
+        );
+    }
+
+    #[test]
+    fn list_gc_roots_later_same_tick_scheduler_continuations() {
+        let syntax = parse(concat!(
+            "/proc/collector()\n",
+            "\tsleep(1)\n",
+            "\tsleep(1)\n",
+            "/proc/victim(target)\n",
+            "\tvar/list/held = list(7)\n",
+            "\tsleep(1)\n",
+            "\ttarget.observed = held[1]\n",
+            "\treturn held[1]\n",
+            "/proc/start(target)\n",
+            "\tspawn(0) collector()\n",
+            "\tspawn(0) victim(target)\n",
+        ))
+        .expect("same-tick scheduler GC fixture should parse");
+        let module = compile_module(&syntax.definitions).expect("fixture should compile");
+        let mut state = ExecutionState::new();
+        let holder = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/holder").unwrap());
+
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/start").unwrap(),
+                &[Value::Datum(holder)],
+                &mut state,
+            ),
+            Ok(Value::Null)
+        );
+        assert_eq!(state.scheduled_task_count(), 2);
+        assert_eq!(
+            advance_scheduler(&module, 0, ExecutionLimits::default(), &mut state),
+            Ok(Vec::new()),
+            "both tasks should first suspend for the same next tick"
+        );
+        assert_eq!(state.scheduled_task_count(), 2);
+
+        state.next_list_collection = 1;
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::Null]),
+            "GC in the first due task must retain the later task's hidden frame roots"
+        );
+        assert_eq!(
+            state.heap().datum_field(holder, &field("observed")),
+            Ok(&Value::number(7.0))
         );
     }
 
@@ -14842,6 +18085,75 @@ mod tests {
     }
 
     #[test]
+    fn movable_constructor_receives_mob_location_and_contents_before_new() {
+        let syntax = parse(concat!(
+            "/obj/item/constructor_probe/New(where)\n",
+            "\tsrc.saw_location = (src.loc == where)\n",
+            "\tsrc.saw_contents = (src in where.contents)\n",
+            "/proc/build_constructor_probe()\n",
+            "\tvar/mob/preview_holder/holder = new /mob/preview_holder\n",
+            "\tvar/obj/item/constructor_probe/item = new /obj/item/constructor_probe(holder)\n",
+            "\treturn list(holder, item)\n",
+        ))
+        .expect("item-in-mob constructor fixture should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("item-in-mob constructor fixture should compile");
+        let entry = module
+            .procedure_id("/proc/build_constructor_probe")
+            .expect("constructor fixture entry should exist");
+        let mut state = ExecutionState::new();
+
+        let Value::List(result) = execute_module_in_state(&module, entry, &[], &mut state)
+            .expect("item-in-mob construction should execute")
+        else {
+            panic!("constructor fixture should return a list");
+        };
+        let values = state
+            .heap()
+            .list(result)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        let (Value::Datum(holder), Value::Datum(item)) = (&values[0], &values[1]) else {
+            panic!("constructor fixture should return the holder and item");
+        };
+        let item = *item;
+        let holder = *holder;
+
+        assert_eq!(
+            state.heap().datum_field(item, &field("loc")),
+            Ok(&Value::Datum(holder)),
+            "a mob is a valid movable constructor location"
+        );
+        assert_eq!(
+            state.heap().datum_field(item, &field("saw_location")),
+            Ok(&Value::number(1.0)),
+            "loc must be installed before New runs"
+        );
+        assert_eq!(
+            state.heap().datum_field(item, &field("saw_contents")),
+            Ok(&Value::number(1.0)),
+            "the containing mob's contents must be synchronized before New runs"
+        );
+        let Value::List(contents) = state
+            .heap()
+            .datum_field(holder, &field("contents"))
+            .unwrap()
+        else {
+            panic!("mob should have a contents list");
+        };
+        assert!(
+            state
+                .heap()
+                .list(*contents)
+                .unwrap()
+                .contains(&Value::Datum(item)),
+            "the constructed item remains in its mob's contents after New"
+        );
+    }
+
+    #[test]
     fn direct_loc_assignment_synchronizes_container_contents() {
         let syntax =
             parse("/proc/move(atom, target)\n\tatom.loc = target\n\treturn atom.loc\n").unwrap();
@@ -14917,6 +18229,7 @@ mod tests {
         Program {
             wait_for: true,
             parameter_count,
+            parameter_names: vec![String::new(); parameter_count],
             local_count: parameter_count,
             instructions,
             source_spans: (0..instruction_count)
@@ -15670,6 +18983,22 @@ mod tests {
     }
 
     #[test]
+    fn keyword_arguments_bind_declared_slots_and_leave_omitted_defaults_unsupplied() {
+        // Exact shape produced by Monkestation's addtimer macro: metadata is
+        // named past two omitted optional slots and must not slide into flags.
+        let source = parse(
+            "/proc/entry()\n\treturn helper(1, 0, file = \"globals.dm\", line = 47)\n/proc/helper(callback, wait = 0, flags = 0, timer_subsystem, file, line)\n\treturn flags + line + (file == \"globals.dm\") * 100 + isnull(timer_subsystem) * 1000\n",
+        )
+        .expect("timer-shaped named call should parse");
+        let module =
+            compile_module(&source.definitions).expect("timer-shaped named call should compile");
+        assert_eq!(
+            execute_module(&module, module.procedure_id("/proc/entry").unwrap(), &[]),
+            Ok(Value::number(1147.0))
+        );
+    }
+
+    #[test]
     fn keyword_style_arguments_in_discarded_calls_do_not_become_assignments() {
         let source = parse(
             "/proc/entry()\n\thelper(is_directional = TRUE, is_beam = TRUE)\n\treturn 7\n/proc/helper(first, second)\n\treturn first && second\n",
@@ -15813,7 +19142,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_advances_world_clock_with_tick_lag_and_resets_tick_usage() {
+    fn scheduler_advances_world_clock_and_short_work_observes_fresh_tick_usage() {
         let source = parse(
             "/proc/entry()\n\tspawn(3)\n\t\treturn_usage()\n/proc/return_usage()\n\tworld.observed = world.tick_usage\n",
         )
@@ -15854,11 +19183,130 @@ mod tests {
         );
         assert_eq!(
             state.heap().datum_field(world, &field("observed")),
-            Ok(&Value::number(100.0))
+            Ok(&Value::number(0.0))
         );
         assert_eq!(crate::world_numeric_field(&state, "time"), Some(4.0));
         assert_eq!(crate::world_numeric_field(&state, "timeofday"), Some(3.0));
         assert_eq!(crate::world_numeric_field(&state, "tick_usage"), Some(0.0));
+    }
+
+    #[test]
+    fn scheduled_overtime_work_yields_past_the_standalone_ten_million_step_guard() {
+        let source = parse(concat!(
+            "/proc/start()\n",
+            "\tspawn(0)\n",
+            "\t\tworker()\n",
+            "/proc/worker()\n",
+            "\twhile(global.progress < 1000000)\n",
+            "\t\tglobal.progress += 1\n",
+            "\t\tif(world.tick_usage > 196)\n",
+            "\t\t\tsleep(world.tick_lag)\n",
+            "\treturn global.progress\n",
+        ))
+        .expect("overtime scheduler source should parse");
+        let module = compile_module(&source.definitions).expect("overtime worker should compile");
+        let worker = module.procedure_id("/proc/worker").unwrap();
+        let start = module.procedure_id("/proc/start").unwrap();
+
+        let make_state = || {
+            let mut state = ExecutionState::new();
+            let world = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/world").unwrap());
+            for (name, value) in [("tick_lag", 1.0), ("tick_usage", 0.0)] {
+                state
+                    .heap_mut()
+                    .set_datum_field(world, field(name), Value::number(value))
+                    .unwrap();
+            }
+            state.set_global(field("world"), Value::Datum(world));
+            state.set_global(field("progress"), Value::number(0.0));
+            state
+        };
+
+        let mut standalone = make_state();
+        let error = execute_module_with_limits_in_state(
+            &module,
+            worker,
+            &[],
+            ExecutionLimits::default(),
+            &mut standalone,
+        )
+        .expect_err("the same unscheduled worker must retain the standalone guard");
+        assert_eq!(error.message, "instruction budget of 10000000 exhausted");
+
+        let mut scheduled = make_state();
+        execute_module_in_state(&module, start, &[], &mut scheduled).unwrap();
+        let mut rounds = 0;
+        let mut completed = Vec::new();
+        while scheduled.scheduled_task_count() != 0 && rounds < 100 {
+            let advance = u64::from(rounds != 0);
+            completed.extend(
+                advance_scheduler(&module, advance, ExecutionLimits::default(), &mut scheduled)
+                    .expect("explicit tick checks should keep each slice below the hard guard"),
+            );
+            rounds += 1;
+        }
+
+        assert!(rounds > 1, "the long worker should cooperatively yield");
+        assert_eq!(scheduled.scheduled_task_count(), 0);
+        assert_eq!(completed, vec![Value::Null]);
+        assert_eq!(
+            scheduled.global(&field("progress")),
+            Some(&Value::number(1_000_000.0))
+        );
+    }
+
+    #[test]
+    fn scheduled_step_budget_preserves_the_continuation_between_dispatch_slices() {
+        let source = parse(concat!(
+            "/proc/start()\n",
+            "\tspawn(0)\n",
+            "\t\tworker()\n",
+            "/proc/worker()\n",
+            "\tvar/local_progress = 0\n",
+            "\twhile(local_progress < 6)\n",
+            "\t\tlocal_progress += 1\n",
+            "\tglobal.progress = local_progress\n",
+            "\treturn local_progress\n",
+        ))
+        .expect("scheduled continuation source should parse");
+        let module = compile_module(&source.definitions)
+            .expect("scheduled continuation source should compile");
+        let worker = module.procedure_id("/proc/worker").unwrap();
+        let start = module.procedure_id("/proc/start").unwrap();
+        let limits = ExecutionLimits {
+            max_steps: 5,
+            ..ExecutionLimits::default()
+        };
+
+        let mut standalone = ExecutionState::new();
+        let error =
+            execute_module_with_limits_in_state(&module, worker, &[], limits, &mut standalone)
+                .expect_err("unscheduled work must retain the hard step guard");
+        assert_eq!(error.message, "instruction budget of 5 exhausted");
+
+        let mut scheduled = ExecutionState::new();
+        scheduled.set_global(field("progress"), Value::number(0.0));
+        execute_module_in_state(&module, start, &[], &mut scheduled).unwrap();
+        let mut rounds = 0;
+        let mut completed = Vec::new();
+        while scheduled.scheduled_task_count() != 0 && rounds < 100 {
+            completed.extend(
+                advance_scheduler(&module, 0, limits, &mut scheduled)
+                    .expect("a finite scheduled body should slice instead of failing"),
+            );
+            rounds += 1;
+        }
+
+        assert!(rounds > 1, "the fixture must cross at least one step slice");
+        assert_eq!(scheduled.scheduled_task_count(), 0);
+        assert_eq!(completed, vec![Value::Null]);
+        assert_eq!(
+            scheduled.global(&field("progress")),
+            Some(&Value::number(6.0)),
+            "the resumed frame must retain its local values and exact instruction",
+        );
     }
 
     #[test]
@@ -15914,6 +19362,77 @@ mod tests {
                 Ok(vec![Value::Null])
             );
         }
+    }
+
+    #[test]
+    fn negative_spawn_advances_caller_after_immediate_dynamic_call() {
+        // Exact shape emitted by Monkestation's INVOKE_ASYNC macro after an
+        // initializer saves its parent result: spawn(-1) must run load_map
+        // immediately, then resume after Spawn without disturbing `.`.
+        let syntax = parse(concat!(
+            "/obj/proc/Initialize()\n",
+            "\treturn 41\n",
+            "/obj/modular_map_root/proc/Initialize()\n",
+            "\t. = ..()\n",
+            "\tspawn(-1)\n",
+            "\t\tcall(0 || src, \"load_map\")()\n",
+            "/obj/modular_map_root/proc/load_map()\n",
+            "\tglobal.loads += 1\n",
+        ))
+        .expect("INVOKE_ASYNC-shaped source should parse");
+        let module = compile_module_specs(&[
+            ProcedureSpec {
+                path: "/obj/proc/Initialize@0".to_owned(),
+                definition: &syntax.definitions[0],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/obj/modular_map_root/proc/Initialize@1".to_owned(),
+                definition: &syntax.definitions[1],
+                parent: Some(0),
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/obj/modular_map_root/proc/load_map@2".to_owned(),
+                definition: &syntax.definitions[2],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+        ])
+        .expect("INVOKE_ASYNC-shaped procedure chain should compile");
+        let mut state = ExecutionState::new();
+        state.set_global(field("loads"), Value::number(0.0));
+        state.set_type_parents(BTreeMap::from([
+            (
+                TypePath::parse("/obj/modular_map_root").unwrap(),
+                Some(TypePath::parse("/obj").unwrap()),
+            ),
+            (TypePath::parse("/obj").unwrap(), None),
+        ]));
+        let root = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/modular_map_root").unwrap());
+        let initialize = module.procedure_id_at(1).unwrap();
+
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                initialize,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(root), Value::Null),
+            ),
+            Ok(Value::number(41.0))
+        );
+        assert_eq!(state.global(&field("loads")), Some(&Value::number(1.0)));
+        assert_eq!(state.scheduled_task_count(), 0);
     }
 
     #[test]
@@ -15988,6 +19507,43 @@ mod tests {
     }
 
     #[test]
+    fn file_line_text_indexing_is_one_based_character_text() {
+        let syntax = parse(concat!(
+            "/proc/classify_lines()\n",
+            "\tvar/list/lines = splittext(\"- comment\\n	key:value\\nÅngström\", \"\\n\")\n",
+            "\tvar/result = \"\"\n",
+            "\tfor(var/line in lines)\n",
+            "\t\tresult += line[1]\n",
+            "\treturn list(result, lines[3][1], lines[1][99])\n",
+        ))
+        .expect("advertisement/config line indexing shape should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("text indexing should lower for file2list consumers");
+        let mut state = ExecutionState::new();
+        let Value::List(result) = execute_in_state(&program, &[], &mut state).unwrap() else {
+            panic!("line classifier should return a list");
+        };
+        assert_eq!(
+            state
+                .heap()
+                .list(result)
+                .unwrap()
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>(),
+            vec![Value::text("-\tÅ"), Value::text("Å"), Value::Null]
+        );
+
+        let assignment =
+            parse("/proc/write_text()\n\tvar/value = \"abc\"\n\tvalue[1] = \"z\"\n").unwrap();
+        let assignment = compile_procedure(&assignment.definitions[0]).unwrap();
+        assert!(
+            execute(&assignment, &[]).is_err(),
+            "BYOND text values are immutable through index assignment"
+        );
+    }
+
+    #[test]
     fn block_enumerates_inclusive_turf_rectangles() {
         let source = parse("/proc/box(start, finish)\n\treturn block(start, finish)\n")
             .expect("block source should parse");
@@ -16026,9 +19582,83 @@ mod tests {
     }
 
     #[test]
+    fn block_uses_world_coordinate_index_in_zyx_order() {
+        let source = parse("/proc/box(start, finish)\n\treturn block(start, finish)\n")
+            .expect("block source should parse");
+        let module = compile_module(&source.definitions).expect("block should compile");
+        let entry = module.procedure_id("/proc/box").expect("box");
+        let mut state = ExecutionState::new();
+        let turf_path = TypePath::parse("/turf/indexed").expect("turf path");
+        let coordinates = [
+            (2, 2, 2),
+            (1, 2, 1),
+            (2, 1, 2),
+            (1, 1, 1),
+            (2, 2, 1),
+            (1, 1, 2),
+            (2, 1, 1),
+            (1, 2, 2),
+        ];
+        let mut by_coordinate = BTreeMap::new();
+        for (x_value, y_value, z_value) in coordinates {
+            let turf = state.heap_mut().allocate_datum(turf_path.clone());
+            for (name, value) in [("x", x_value), ("y", y_value), ("z", z_value)] {
+                state
+                    .heap_mut()
+                    .set_datum_field(turf, field(name), Value::number(value as f32))
+                    .expect("coordinate field should be writable");
+            }
+            state.world_turfs.insert((x_value, y_value, z_value), turf);
+            by_coordinate.insert((x_value, y_value, z_value), turf);
+        }
+        // A duplicate coordinate that is only present in the heap proves the
+        // indexed path does not regress to scanning every allocated datum.
+        let unindexed = state.heap_mut().allocate_datum(turf_path);
+        for (name, value) in [("x", 1), ("y", 1), ("z", 1)] {
+            state
+                .heap_mut()
+                .set_datum_field(unindexed, field(name), Value::number(value as f32))
+                .expect("unindexed coordinate field should be writable");
+        }
+
+        let result = execute_module_in_state(
+            &module,
+            entry,
+            &[
+                Value::Datum(by_coordinate[&(2, 2, 2)]),
+                Value::Datum(by_coordinate[&(1, 1, 1)]),
+            ],
+            &mut state,
+        )
+        .expect("indexed block should execute");
+        let Value::List(list) = result else {
+            panic!("block should return a list");
+        };
+        let values = state
+            .heap()
+            .list(list)
+            .expect("block list should be live")
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        let expected = [
+            (1, 1, 1),
+            (2, 1, 1),
+            (1, 2, 1),
+            (2, 2, 1),
+            (1, 1, 2),
+            (2, 1, 2),
+            (1, 2, 2),
+            (2, 2, 2),
+        ]
+        .map(|coordinate| Value::Datum(by_coordinate[&coordinate]));
+        assert_eq!(values, expected);
+    }
+
+    #[test]
     fn random_builtins_are_deterministic_and_respect_their_bounds() {
         let source = parse(
-            "/proc/unit()\n\treturn rand()\n/proc/range()\n\treturn rand(4, 6)\n/proc/chance()\n\treturn prob(100)\n",
+            "/proc/unit()\n\treturn rand()\n/proc/range()\n\treturn rand(4, 6)\n/proc/reversed()\n\treturn rand(10, 1)\n/proc/chance()\n\treturn prob(100)\n",
         )
                 .expect("source should parse");
         let module = compile_module(&source.definitions).expect("random builtins should compile");
@@ -16038,6 +19668,9 @@ mod tests {
         let unit = module
             .procedure_id("/proc/unit")
             .expect("unit should exist");
+        let reversed = module
+            .procedure_id("/proc/reversed")
+            .expect("reversed range should exist");
         let chance = module
             .procedure_id("/proc/chance")
             .expect("chance should exist");
@@ -16052,6 +19685,12 @@ mod tests {
             "rand() returned {unit_value}"
         );
         assert_eq!(execute_module(&module, chance, &[]), Ok(Value::number(1.0)));
+        let reversed_value =
+            execute_module(&module, reversed, &[]).expect("BYOND swaps reversed rand bounds");
+        assert!(
+            matches!(reversed_value.as_number(), Some(value) if (1.0..=10.0).contains(&value)),
+            "reversed rand returned {reversed_value}",
+        );
     }
 
     #[test]
@@ -16253,6 +19892,194 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_call_follows_runtime_parent_type_outside_lexical_path() {
+        let source = parse(concat!(
+            "/atom/proc/add_debris_element()\n\treturn 17\n",
+            "/obj/effect/statclick/ticket_list/proc/Initialize()\n",
+            "\treturn call(src, \"add_debris_element\")()\n",
+        ))
+        .unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+        let initialize = module
+            .procedure_id("/obj/effect/statclick/ticket_list/proc/Initialize")
+            .unwrap();
+        let ticket = TypePath::parse("/obj/effect/statclick/ticket_list").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_type_parents(BTreeMap::from([
+            (
+                ticket.clone(),
+                Some(TypePath::parse("/obj/effect/statclick").unwrap()),
+            ),
+            (
+                TypePath::parse("/obj/effect/statclick").unwrap(),
+                Some(TypePath::parse("/obj/effect").unwrap()),
+            ),
+            (
+                TypePath::parse("/obj/effect").unwrap(),
+                Some(TypePath::parse("/obj").unwrap()),
+            ),
+            (
+                TypePath::parse("/obj").unwrap(),
+                Some(TypePath::parse("/atom").unwrap()),
+            ),
+            (
+                TypePath::parse("/atom").unwrap(),
+                Some(TypePath::parse("/datum").unwrap()),
+            ),
+        ]));
+        let receiver = state.heap_mut().allocate_datum(ticket);
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                initialize,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(receiver), Value::Null),
+            ),
+            Ok(Value::number(17.0)),
+            "ticket-list Initialize must reach /atom through /obj's actual parent_type",
+        );
+    }
+
+    #[test]
+    fn dynamic_lookup_cost_depends_on_parent_depth_not_symbol_count() {
+        let mut text = String::new();
+        for index in 0..2_000 {
+            use std::fmt::Write as _;
+            writeln!(text, "/datum/noise{index}/proc/cold()\n\treturn {index}").unwrap();
+        }
+        text.push_str(concat!(
+            "/datum/base/proc/run()\n\treturn 1\n",
+            "/datum/base/proc/run()\n\treturn 2\n",
+            "/datum/child/proc/entry()\n",
+            "\t. = 0\n",
+            "\tfor(var/i in 1 to 100)\n",
+            "\t\t. += call(src, \"run\")()\n",
+            "\treturn .\n",
+        ));
+        let source = parse(&text).expect("large dynamic-dispatch fixture should parse");
+        let mut run_reopening = 0usize;
+        let specs = source
+            .definitions
+            .iter()
+            .map(|definition| {
+                let base = definition.path.to_string();
+                let path = if base == "/datum/base/proc/run" {
+                    let path = format!("{base}@{run_reopening}");
+                    run_reopening += 1;
+                    path
+                } else {
+                    format!("{base}@0")
+                };
+                ProcedureSpec {
+                    path,
+                    definition,
+                    parent: None,
+                    static_calls: BTreeMap::new(),
+                    src_fields: BTreeMap::new(),
+                    global_fields: BTreeMap::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let module = compile_module_specs(&specs).expect("large symbolic module should link");
+        let entry = module
+            .procedure_id("/datum/child/proc/entry@0")
+            .expect("entry should retain its stable id");
+        let child = TypePath::parse("/datum/child").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_type_parents(BTreeMap::from([(
+            child.clone(),
+            Some(TypePath::parse("/datum/base").unwrap()),
+        )]));
+        let receiver = state.heap_mut().allocate_datum(child);
+
+        crate::DYNAMIC_LOOKUP_PROBES.set(0);
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                entry,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(receiver), Value::Null),
+            ),
+            Ok(Value::number(200.0)),
+            "the latest reopening must win every dynamic dispatch",
+        );
+        assert_eq!(
+            crate::DYNAMIC_LOOKUP_PROBES.get(),
+            200,
+            "each call should probe only child then its runtime parent, independent of 2,000 cold symbols",
+        );
+    }
+
+    #[test]
+    fn hascall_reflects_lists_inherited_project_methods_and_native_types() {
+        let syntax = parse(concat!(
+            "/datum/base/proc/DebugValue()\n",
+            "\treturn 1\n",
+            "/proc/check(receiver, selector)\n",
+            "\treturn hascall(receiver, selector)\n",
+        ))
+        .unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let check = module.procedure_id("/proc/check").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_type_parents(BTreeMap::from([
+            (
+                TypePath::parse("/datum/base").unwrap(),
+                Some(TypePath::parse("/datum").unwrap()),
+            ),
+            (
+                TypePath::parse("/datum/child").unwrap(),
+                Some(TypePath::parse("/datum/base").unwrap()),
+            ),
+        ]));
+        let child = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/child").unwrap());
+        let list = state.heap_mut().allocate_list();
+        let run = |receiver, selector, state: &mut ExecutionState| {
+            execute_module_in_state(&module, check, &[receiver, selector], state)
+        };
+
+        assert_eq!(
+            run(Value::List(list), Value::text("Cut"), &mut state),
+            Ok(Value::number(1.0)),
+            "init_special_list_names detects native list-like Cut"
+        );
+        assert_eq!(
+            run(Value::Datum(child), Value::text("DebugValue"), &mut state),
+            Ok(Value::number(1.0)),
+            "_debug_variable_value sees inherited project procedures"
+        );
+        assert_eq!(
+            run(
+                Value::TypePath(TypePath::parse("/datum/child").unwrap()),
+                Value::TypePath(TypePath::parse("/datum/base/proc/DebugValue").unwrap()),
+                &mut state,
+            ),
+            Ok(Value::number(1.0)),
+            "procedure-path selectors are matched by their callable name"
+        );
+        assert_eq!(
+            run(
+                Value::TypePath(TypePath::parse("/icon").unwrap()),
+                Value::text("Width"),
+                &mut state,
+            ),
+            Ok(Value::number(1.0))
+        );
+        assert_eq!(
+            run(Value::Datum(child), Value::text("Missing"), &mut state),
+            Ok(Value::number(0.0))
+        );
+        assert_eq!(
+            run(Value::Null, Value::text("Cut"), &mut state),
+            Ok(Value::number(0.0))
+        );
+    }
+
+    #[test]
     fn dynamic_call_canonicalizes_global_proc_selectors_without_double_proc_segment() {
         let source = parse(
             "/proc/entry(selector)\n\treturn call(selector)(4)\n/proc/Log(value)\n\treturn value + 3\n",
@@ -16335,7 +20162,7 @@ mod tests {
     #[allow(clippy::vec_init_then_push)]
     fn null_conditional_field_index_and_call_short_circuit_without_rhs_evaluation() {
         let source = parse(
-            "/datum/example/proc/read(value, list/values)\n\tvar/a = value?.field\n\tvar/b = values?[bump()]\n\tvar/c = value?:take(bump())\n\tvalue?.field = bump()\n\tvalues?[bump()] = bump()\n\treturn isnull(a) + isnull(b) + isnull(c) + global.calls\n/datum/example/proc/take(value)\n\treturn value\n/proc/bump()\n\tglobal.calls += 1\n\treturn 1\n",
+            "/datum/example/proc/read(value, list/values)\n\tvar/a = value?.field\n\tvar/b = values?[bump()]\n\tvar/c = value?:take(bump())\n\tvar/d = value?.client.prefs.take(bump())\n\tvalue?.field = bump()\n\tvalues?[bump()] = bump()\n\treturn isnull(a) + isnull(b) + isnull(c) + isnull(d) + global.calls\n/datum/example/proc/take(value)\n\treturn value\n/proc/bump()\n\tglobal.calls += 1\n\treturn 1\n",
         )
         .expect("null-conditional source should parse");
         let mut specs = Vec::new();
@@ -16349,7 +20176,7 @@ mod tests {
         });
         specs.push(ProcedureSpec {
             path: "/datum/example/proc/take@0".to_owned(),
-            definition: &source.definitions[1],
+            definition: source.definitions.last().expect("procedure definition"),
             parent: None,
             static_calls: BTreeMap::new(),
             src_fields: BTreeMap::new(),
@@ -16373,7 +20200,7 @@ mod tests {
                 &[Value::Null, Value::Null],
                 &mut state,
             ),
-            Ok(Value::number(3.0))
+            Ok(Value::number(4.0))
         );
         assert_eq!(state.global(&field("calls")), Some(&Value::number(0.0)));
     }
@@ -16588,6 +20415,89 @@ mod tests {
     }
 
     #[test]
+    fn logical_assignment_to_parameter_member_preserves_receiver_and_result() {
+        let source = parse(
+            "/datum/listener/proc/register(datum/target)\n\tvar/list/lookup = (target._listen_lookup ||= list())\n\tlookup[\"signal\"] = src\n\treturn lookup[\"signal\"] == src\n",
+        )
+        .expect("member logical assignment source should parse");
+        let module =
+            compile_module(&source.definitions).expect("member logical assignment should compile");
+        let entry = module.procedure_id_at(0).expect("entry");
+        let mut state = ExecutionState::new();
+        let listener = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/listener").unwrap());
+        let target = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/target").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(target, field("_listen_lookup"), Value::Null)
+            .unwrap();
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                entry,
+                &[Value::Datum(target)],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(listener), Value::Null),
+            ),
+            Ok(Value::number(1.0))
+        );
+        assert!(matches!(
+            state.heap().datum_field(target, &field("_listen_lookup")),
+            Ok(Value::List(_))
+        ));
+    }
+
+    #[test]
+    fn logical_assignment_to_bare_src_field_preserves_receiver_and_result() {
+        let source = parse(
+            "/datum/listener/proc/register(datum/target)\n\tvar/list/procs = (_signal_procs ||= list())\n\tvar/list/target_procs = (procs[target] ||= list())\n\tvar/list/lookup = (target._listen_lookup ||= list())\n\tlookup[\"signal\"] = src\n\treturn target_procs.len + (lookup[\"signal\"] == src)\n",
+        )
+        .expect("RegisterSignal-shaped source should parse");
+        let module = compile_module_specs(&[ProcedureSpec {
+            path: "/datum/listener/proc/register@0".to_owned(),
+            definition: &source.definitions[0],
+            parent: None,
+            static_calls: BTreeMap::new(),
+            src_fields: BTreeMap::from([("_signal_procs".to_owned(), field("_signal_procs"))]),
+            global_fields: BTreeMap::new(),
+        }])
+        .expect("RegisterSignal-shaped assignment should compile");
+        let entry = module.procedure_id_at(0).expect("entry");
+        let mut state = ExecutionState::new();
+        let listener = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/listener").unwrap());
+        let target = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/target").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(listener, field("_signal_procs"), Value::Null)
+            .unwrap();
+        state
+            .heap_mut()
+            .set_datum_field(target, field("_listen_lookup"), Value::Null)
+            .unwrap();
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                entry,
+                &[Value::Datum(target)],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(listener), Value::Null),
+            ),
+            Ok(Value::number(1.0))
+        );
+        assert!(matches!(
+            state.heap().datum_field(listener, &field("_signal_procs")),
+            Ok(Value::List(_))
+        ));
+    }
+
+    #[test]
     fn plane_macro_nested_scope_keeps_cached_locals_visible() {
         let source = parse(
             "/proc/plane_macro(flag, other)\n\tvar/output = 0\n\tdo { if(flag) { var/_cached_plane = 7; var/_our_turf = other; if(_our_turf) { var/key = \"[_cached_plane]\"; output = _cached_plane; } else if(other) { output = _cached_plane; } else { output = _cached_plane; } } else { output = 2; } } while(0)\n\treturn output\n",
@@ -16626,6 +20536,25 @@ mod tests {
         assert_eq!(
             execute_module(&module, module.procedure_id("/proc/run").unwrap(), &[]),
             Ok(Value::number(24.0))
+        );
+    }
+
+    #[test]
+    fn null_bitand_list_is_zero_and_optional_intersection_iterates_nothing() {
+        let source = parse(concat!(
+            "/proc/run(list/data)\n",
+            "\tvar/list/known = list(\"id\", \"name\")\n",
+            "\tvar/count = 0\n",
+            "\tfor(var/name in (data & known))\n",
+            "\t\tcount++\n",
+            "\treturn count + (data & known)\n",
+        ))
+        .expect("optional list intersection should parse");
+        let module =
+            compile_module(&source.definitions).expect("optional list intersection should compile");
+        assert_eq!(
+            execute_module(&module, module.procedure_id("/proc/run").unwrap(), &[]),
+            Ok(Value::number(0.0))
         );
     }
 
@@ -16669,6 +20598,30 @@ mod tests {
     }
 
     #[test]
+    fn compound_list_assignment_expression_returns_assigned_value() {
+        let source = "/proc/run()\n\tvar/list/values = list(\"count\" = 3)\n\tvar/result = (values[\"count\"] += 2)\n\treturn result + values[\"count\"]\n";
+        assert_eq!(execute_source(source, 0.0), Value::number(10.0));
+    }
+
+    #[test]
+    fn physical_line_continuation_is_expression_whitespace() {
+        let source = "/proc/run()\n\treturn 1 + \\\n\t\t2\n";
+        assert_eq!(execute_source(source, 0.0), Value::number(3.0));
+    }
+
+    #[test]
+    fn multiline_parenthesized_lists_are_one_logical_statement() {
+        let source = "/proc/run()\n\tvar/list/values = list(\n\t\tlist(1, 2),\n\t\tlist(3)\n\t\t,list(4, 5, 6),\n\t)\n\treturn values.len\n";
+        assert_eq!(execute_source(source, 0.0), Value::number(3.0));
+    }
+
+    #[test]
+    fn input_as_constraint_stops_at_enclosing_call_boundary() {
+        let source = "/proc/wrap(value)\n\treturn value\n/proc/run()\n\treturn wrap(input(src, \"Prompt\") as null|message)\n";
+        assert_eq!(execute_source(source, 0.0), Value::number(0.0));
+    }
+
+    #[test]
     fn documented_list_methods_and_len_execute_natively() {
         let source = parse(
             "/proc/run()\n\tvar/list/values = list(\"a\", \"b\", \"c\")\n\tvalues.Add(list(\"d\", \"e\"))\n\tvar/list/copied = values.Copy(2, 5)\n\tvalues.Cut(2, 3)\n\tvar/found = values.Find(\"d\")\n\tvar/next_index = values.Insert(2, list(\"x\", \"y\"))\n\tvalues.Splice(-1, 0, \"z\")\n\tvalues.Swap(1, 6)\n\tvalues.len = 7\n\tvar/removed = values.Remove(\"d\")\n\tvar/removed_all = values.RemoveAll(\"x\")\n\treturn copied.len + (copied[1] == \"b\") + (copied[3] == \"d\") + found + next_index + removed + removed_all + values.len + (values[1] == \"z\") + (values[2] == \"y\")\n",
@@ -16678,6 +20631,108 @@ mod tests {
         assert_eq!(
             execute_module(&module, module.procedure_id("/proc/run").unwrap(), &[]),
             Ok(Value::number(21.0))
+        );
+    }
+
+    #[test]
+    fn vis_contents_and_vis_locs_stay_reciprocal_across_mutation_and_destroy_cleanup() {
+        let syntax = parse(
+            "/proc/link(atom/owner, atom/child)\n\towner.vis_contents = null\n\tchild.vis_locs = null\n\towner.vis_contents.Add(child)\n\tvar/added = (owner.vis_contents.len == 1 && child.vis_locs[1] == owner)\n\towner.vis_contents.Remove(child)\n\tvar/removed = (owner.vis_contents.len == 0 && child.vis_locs.len == 0)\n\towner.vis_contents = list(child, child, null)\n\tvar/assigned = (owner.vis_contents.len == 1 && child.vis_locs.len == 1)\n\towner.vis_contents.Cut()\n\tvar/cut = (owner.vis_contents.len == 0 && child.vis_locs.len == 0)\n\towner.vis_contents += child\n\tchild.vis_locs = null\n\tvar/destroy_cleanup = (owner.vis_contents.len == 0 && child.vis_locs.len == 0)\n\treturn added + removed + assigned + cut + destroy_cleanup\n",
+        )
+        .expect("visibility relationship fixture should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("visibility relationship fixture should compile");
+        let mut state = ExecutionState::new();
+        let owner = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/atom/movable/owner").unwrap());
+        let child = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/atom/movable/child").unwrap());
+
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id_at(0).unwrap(),
+                &[Value::Datum(owner), Value::Datum(child)],
+                &mut state,
+            ),
+            Ok(Value::number(5.0))
+        );
+    }
+
+    #[test]
+    fn atom_native_lists_materialize_lazily_and_keep_stable_identity() {
+        let syntax = parse(
+            "/proc/read_vis_contents(atom/target)\n\tvar/list/first = target.vis_contents\n\tvar/list/second = target.vis_contents\n\treturn first == second\n/proc/read_vis_locs_through_vars(atom/target)\n\treturn target.vars[\"vis_locs\"] == target.vis_locs\n/proc/read_appearance_and_verb_lists(atom/target)\n\tvar/list/overlays = target.overlays\n\toverlays.Add(\"state\")\n\tvar/list/underlays = target.underlays\n\tvar/list/filters = target.vars[\"filters\"]\n\tvar/list/verbs = target.verbs\n\treturn (overlays == target.overlays) + (target.overlays.len == 1) + (underlays == target.underlays) + (filters == target.filters) + (verbs == target.verbs)\n",
+        )
+        .expect("lazy visibility field fixture should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("lazy visibility field fixture should compile");
+        let mut state = ExecutionState::new();
+        let atom =
+            allocate_initialized_datum(&mut state, TypePath::parse("/obj/item").unwrap()).unwrap();
+
+        assert_eq!(
+            state.heap().live_list_count(),
+            1,
+            "a new atom needs contents, but untouched visibility lists stay unallocated"
+        );
+        assert!(
+            state
+                .heap()
+                .datum_field(atom, &field("vis_contents"))
+                .is_err()
+        );
+        assert!(state.heap().datum_field(atom, &field("vis_locs")).is_err());
+
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/read_vis_contents").unwrap(),
+                &[Value::Datum(atom)],
+                &mut state,
+            ),
+            Ok(Value::number(1.0))
+        );
+        assert_eq!(
+            state.heap().live_list_count(),
+            2,
+            "the first vis_contents read materializes exactly one stable list"
+        );
+
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module
+                    .procedure_id("/proc/read_vis_locs_through_vars")
+                    .unwrap(),
+                &[Value::Datum(atom)],
+                &mut state,
+            ),
+            Ok(Value::number(1.0))
+        );
+        assert_eq!(
+            state.heap().live_list_count(),
+            4,
+            "datum.vars and the first vis_locs access each materialize one list"
+        );
+
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module
+                    .procedure_id("/proc/read_appearance_and_verb_lists")
+                    .unwrap(),
+                &[Value::Datum(atom)],
+                &mut state,
+            ),
+            Ok(Value::number(5.0))
+        );
+        assert_eq!(
+            state.heap().live_list_count(),
+            8,
+            "four first accesses materialize overlays, underlays, filters, and verbs once"
         );
     }
 
@@ -16745,6 +20800,54 @@ mod tests {
                 &mut state,
             ),
             Ok(Value::number(3.0))
+        );
+    }
+
+    #[test]
+    fn typed_typepath_field_read_uses_the_declared_initial_value() {
+        let source = parse("/proc/read(datum/sound_effect/sfx)\n\treturn sfx.key\n")
+            .expect("sound-key-shaped source should parse");
+        let module = compile_module(&source.definitions)
+            .expect("typed type-path field access should compile");
+        let child = TypePath::parse("/datum/sound_effect/child").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_initial_values(BTreeMap::from([(
+            child.clone(),
+            BTreeMap::from([(field("key"), Value::text("child-key"))]),
+        )]));
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/read").unwrap(),
+                &[Value::TypePath(child)],
+                &mut state,
+            ),
+            Ok(Value::text("child-key"))
+        );
+    }
+
+    #[test]
+    fn initial_supports_runtime_vars_index_field_names() {
+        let source =
+            parse("/proc/read(target, variable)\n\treturn initial(target.vars[variable])\n")
+                .expect("dynamic initial source should parse");
+        let module =
+            compile_module(&source.definitions).expect("initial(object.vars[name]) should compile");
+        let path = TypePath::parse("/datum/example").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_initial_values(BTreeMap::from([(
+            path.clone(),
+            BTreeMap::from([(field("flag"), Value::number(7.0))]),
+        )]));
+        let datum = state.heap_mut().allocate_datum(path);
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/read").unwrap(),
+                &[Value::Datum(datum), Value::text("flag")],
+                &mut state,
+            ),
+            Ok(Value::number(7.0))
         );
     }
 
@@ -17010,9 +21113,9 @@ mod tests {
 
         assert_eq!(result, Value::number(11.0));
         assert_eq!(program.instructions.len(), program.source_spans.len());
-        // Every procedure now begins by materializing its implicit `args` list.
-        assert_eq!(program.source_spans[0], syntax.definitions[0].span);
-        assert_eq!(program.source_spans[2], syntax.definitions[0].body[0].span);
+        // This procedure never observes `args`, so execution begins directly
+        // with its first source statement.
+        assert_eq!(program.source_spans[0], syntax.definitions[0].body[0].span);
     }
 
     #[test]
@@ -17122,7 +21225,7 @@ mod tests {
     #[test]
     fn documented_pure_standard_procs_cover_sort_params_and_number_text() {
         let source = parse(
-            "/proc/probe()\n\tvar/list/p = params2list(\"a=one+two&b=%26\")\n\tif(p[\"a\"] != \"one two\" || p[\"b\"] != \"&\")\n\t\treturn 0\n\tif(list2params(p) != \"a=one+two&b=%26\")\n\t\treturn 0\n\tif(lentext(\"abc\") != 3)\n\t\treturn 0\n\tif(sorttext(\"A\", \"b\") != 1 || sorttextEx(\"a\", \"B\") != -1)\n\t\treturn 0\n\tif(num2text(11, 2, 16) != \"0b\")\n\t\treturn 0\n\treturn 1\n",
+            "/proc/probe()\n\tvar/list/p = params2list(\"a=one+two&b=%26\")\n\tif(p[\"a\"] != \"one two\" || p[\"b\"] != \"&\")\n\t\treturn 0\n\tif(list2params(p) != \"a=one+two&b=%26\")\n\t\treturn 0\n\tif(lentext(\"abc\") != 3)\n\t\treturn 0\n\tif(sorttext(\"A\", \"b\") != 1 || sorttextEx(\"a\", \"B\") != -1 || sorttext(null, /obj) != 1)\n\t\treturn 0\n\tif(num2text(11, 2, 16) != \"0b\")\n\t\treturn 0\n\treturn 1\n",
         )
         .expect("pure standard-proc source should parse");
         let module =
@@ -17677,6 +21780,12 @@ mod tests {
     }
 
     #[test]
+    fn labeled_loop_continue_advances_the_selected_loop() {
+        let source = "/proc/run()\n\tvar/result = 0\n\touter:\n\t\tfor(var/x in 1 to 3)\n\t\t\tfor(var/y in 1 to 3)\n\t\t\t\tresult += 1\n\t\t\t\tcontinue outer\n\treturn result\n";
+        assert_eq!(execute_source(source, 0.0), Value::number(3.0));
+    }
+
+    #[test]
     fn rejects_break_and_continue_outside_loops() {
         for (statement, expected) in [
             ("break", "break outside a loop"),
@@ -17705,13 +21814,13 @@ mod tests {
             entry,
             &[],
             ExecutionLimits {
-                max_steps: 8,
+                max_steps: 6,
                 ..ExecutionLimits::default()
             },
         )
         .expect_err("infinite loop should exhaust its instruction budget");
 
-        assert_eq!(error.message, "instruction budget of 8 exhausted");
+        assert_eq!(error.message, "instruction budget of 6 exhausted");
         assert_eq!(error.source_span, Some(while_span));
         assert_eq!(error.call_stack.len(), 1);
         assert_eq!(error.call_stack[0].procedure, "/proc/spin");
@@ -17767,7 +21876,7 @@ mod tests {
                 entry,
                 &[],
                 ExecutionLimits {
-                    max_steps: 8,
+                    max_steps: 4,
                     ..ExecutionLimits::default()
                 },
             ),
@@ -17778,7 +21887,7 @@ mod tests {
             entry,
             &[],
             ExecutionLimits {
-                max_steps: 5,
+                max_steps: 2,
                 ..ExecutionLimits::default()
             },
         )
@@ -17925,6 +22034,17 @@ mod tests {
             Ok(Value::Null),
             "BYOND treats for-in over null as an empty iteration"
         );
+        for non_iterable in [
+            Value::number(0.0),
+            Value::text("not a container"),
+            Value::TypePath(TypePath::parse("/datum/example").unwrap()),
+        ] {
+            assert_eq!(
+                execute(&program, &[non_iterable]),
+                Ok(Value::Null),
+                "BYOND treats every scalar for-in operand as an empty iteration"
+            );
+        }
     }
 
     #[test]
@@ -17953,6 +22073,19 @@ mod tests {
         let program = compile_procedure(&syntax.definitions[0])
             .expect("empty existing-variable range should compile");
         assert_eq!(execute(&program, &[]), Ok(Value::number(-1.0)));
+    }
+
+    #[test]
+    fn for_in_snapshots_values_when_the_source_removes_the_current_entry() {
+        let source = "/proc/alcohol_shape()\n\tvar/list/containers = list(1, 2, 3, 4)\n\tvar/list/seen = list()\n\tfor(var/typepath in containers)\n\t\tcontainers -= typepath\n\t\tseen += typepath\n\treturn seen.len * 10 + containers.len\n";
+        let syntax = parse(source).expect("alcohol initializer shape should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("mutating list iteration should compile");
+        assert_eq!(
+            execute(&program, &[]),
+            Ok(Value::number(40.0)),
+            "all four snapshotted entries must be visited and removed",
+        );
     }
 
     #[test]
@@ -18060,6 +22193,55 @@ mod tests {
     }
 
     #[test]
+    fn typed_for_in_as_anything_keeps_typepath_values() {
+        let syntax = parse(
+            "/proc/count(list/types)\n\tvar/visited = 0\n\tfor(var/datum/language/language_type as anything in types)\n\t\tvisited++\n\treturn visited\n",
+        )
+        .expect("language prototype loop should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("language prototype loop should compile");
+        let mut state = ExecutionState::new();
+        let types = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(types)
+            .unwrap()
+            .add(Value::TypePath(
+                TypePath::parse("/datum/language/common").unwrap(),
+            ));
+        assert_eq!(
+            execute_in_state(&program, &[Value::List(types)], &mut state),
+            Ok(Value::number(1.0))
+        );
+    }
+
+    #[test]
+    fn typed_for_in_skips_typepaths_and_scalars_in_mixed_seed_gene_lists() {
+        let syntax = parse(
+            "/proc/cleanup(list/genes)\n\tvar/visited = 0\n\tfor(var/datum/plant_gene/gene in genes)\n\t\tvisited++\n\treturn visited\n",
+        )
+        .expect("seed cleanup loop should parse");
+        let module = compile_module(&syntax.definitions).expect("seed cleanup loop should compile");
+        let entry = module.procedure_id("/proc/cleanup").unwrap();
+        let mut state = ExecutionState::new();
+        let gene = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/plant_gene").unwrap());
+        let genes = state.heap_mut().allocate_list();
+        for value in [
+            Value::TypePath(TypePath::parse("/datum/plant_gene/trait").unwrap()),
+            Value::Datum(gene),
+            Value::number(7.0),
+        ] {
+            state.heap_mut().list_mut(genes).unwrap().add(value);
+        }
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::List(genes)], &mut state),
+            Ok(Value::number(1.0))
+        );
+    }
+
+    #[test]
     fn list_literals_support_bracket_reads_and_writes() {
         let source =
             "/proc/list_access()\n\tvar/items = list(1, 2, 3)\n\titems[2] = 9\n\treturn items[2]\n";
@@ -18137,6 +22319,133 @@ mod tests {
     }
 
     #[test]
+    fn fractional_sequence_indexes_truncate_toward_zero_for_read_write_and_text() {
+        let syntax = parse(concat!(
+            "/proc/server_maint_shape()\n",
+            "\tvar/list/values = list(10, 20, 30)\n",
+            "\tvar/position_in_loop = (1 / 5) + 1\n",
+            "\tvar/read\n",
+            "\tif(!(position_in_loop % 1))\n",
+            "\t\tread = values[position_in_loop]\n",
+            "\tvalues[2.8] = 25\n",
+            "\tvalues[3.9] += 5\n",
+            "\treturn list(read, values[2], values[3], \"abc\"[2.9])\n",
+            "/proc/sub_one_index_is_invalid()\n",
+            "\treturn list(1)[0.9]\n",
+        ))
+        .expect("fractional index source should parse");
+        let module =
+            compile_module(&syntax.definitions).expect("fractional indexes should compile");
+        let mut state = ExecutionState::new();
+        let Value::List(result) = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/server_maint_shape").unwrap(),
+            &[],
+            &mut state,
+        )
+        .expect("BYOND truncates positive fractional sequence indexes toward zero") else {
+            panic!("server-maint shape should return a list")
+        };
+        assert_eq!(
+            state
+                .heap()
+                .list(result)
+                .unwrap()
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Value::number(10.0),
+                Value::number(25.0),
+                Value::number(35.0),
+                Value::text("b"),
+            ]
+        );
+
+        let error = execute_module_in_state(
+            &module,
+            module
+                .procedure_id("/proc/sub_one_index_is_invalid")
+                .unwrap(),
+            &[],
+            &mut state,
+        )
+        .expect_err("fractional indexes that truncate to zero remain invalid");
+        assert_eq!(
+            error.message,
+            "list index must truncate to a positive number, received 0.9"
+        );
+    }
+
+    #[test]
+    fn compound_associative_add_uses_null_identity_for_datums() {
+        let syntax = parse(
+            "/proc/add_route(list/paths, route, datum/value)\n\tpaths[route] += value\n\treturn paths[route]\n",
+        )
+        .expect("heretic route source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("heretic route source should compile");
+        let mut state = ExecutionState::new();
+        let paths = state.heap_mut().allocate_list();
+        let value = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/heretic_route").unwrap());
+        assert_eq!(
+            execute_in_state(
+                &program,
+                &[Value::List(paths), Value::text("ash"), Value::Datum(value)],
+                &mut state,
+            ),
+            Ok(Value::Datum(value))
+        );
+    }
+
+    #[test]
+    fn compound_associative_bit_or_uses_zero_for_missing_key() {
+        let syntax = parse(
+            "/proc/add_smoothing_group(list/cache, key, bit)\n\tcache[key] |= bit\n\treturn cache[key]\n",
+        )
+        .expect("smoothing cache source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("compound associative bit-or should compile");
+        let mut state = ExecutionState::new();
+        let cache = state.heap_mut().allocate_list();
+
+        assert_eq!(
+            execute_in_state(
+                &program,
+                &[Value::List(cache), Value::text("0"), Value::number(8.0)],
+                &mut state,
+            ),
+            Ok(Value::number(8.0)),
+        );
+    }
+
+    #[test]
+    fn compound_associative_union_mutates_nested_list() {
+        let syntax = parse(
+            "/proc/grant(list/languages, language, source)\n\tlanguages[language] = list()\n\tlanguages[language] |= source\n\treturn languages[language].len\n",
+        )
+        .expect("lazy language source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("lazy language source should compile");
+        let mut state = ExecutionState::new();
+        let languages = state.heap_mut().allocate_list();
+        assert_eq!(
+            execute_in_state(
+                &program,
+                &[
+                    Value::List(languages),
+                    Value::text("common"),
+                    Value::number(1.0)
+                ],
+                &mut state,
+            ),
+            Ok(Value::number(1.0))
+        );
+    }
+
+    #[test]
     fn associative_literals_lookup_update_and_iterate_in_source_order() {
         let lookup = "/proc/lookup()\n\tvar/items = list(1, \"first\" = 10, 2, \"second\" = 20)\n\titems[\"first\"] = 11\n\treturn items[\"first\"]\n";
         let syntax = parse(lookup).expect("source should parse");
@@ -18158,6 +22467,149 @@ mod tests {
             compile_procedure(&syntax.definitions[0]).expect("nested lists should compile");
 
         assert_eq!(execute(&program, &[]), Ok(Value::number(12.0)));
+    }
+
+    #[test]
+    fn world_and_atom_iterables_enumerate_live_contents() {
+        let syntax = parse(
+            "/proc/count_world()\n\tvar/count = 0\n\tfor(var/atom/item as anything in world)\n\t\tcount++\n\treturn count\n",
+        )
+        .unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let mut state = ExecutionState::new();
+        let world = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/world").unwrap());
+        let contents = state.heap_mut().allocate_list();
+        for path in ["/turf/open", "/obj/item"] {
+            let datum = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse(path).unwrap());
+            state
+                .heap_mut()
+                .list_mut(contents)
+                .unwrap()
+                .add(Value::Datum(datum));
+        }
+        state
+            .heap_mut()
+            .set_datum_field(world, field("contents"), Value::List(contents))
+            .unwrap();
+        state.set_global(field("world"), Value::Datum(world));
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/count_world").unwrap(),
+                &[],
+                &mut state,
+            ),
+            Ok(Value::number(2.0))
+        );
+    }
+
+    #[test]
+    fn world_geometry_registers_atoms_once_and_iteration_uses_byond_category_order() {
+        let syntax = parse(
+            "/proc/world_order()\n\tvar/list/result = list()\n\tfor(var/atom/item as anything in world)\n\t\tresult += item\n\treturn result\n",
+        )
+        .expect("world iteration source should parse");
+        let module = compile_module(&syntax.definitions).expect("world iteration should compile");
+        let mut state = ExecutionState::new();
+        let world = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/world").unwrap());
+        for (name, value) in [
+            ("maxx", Value::number(2.0)),
+            ("maxy", Value::number(1.0)),
+            ("maxz", Value::number(1.0)),
+            (
+                "area",
+                Value::TypePath(TypePath::parse("/area/default").unwrap()),
+            ),
+            (
+                "turf",
+                Value::TypePath(TypePath::parse("/turf/default").unwrap()),
+            ),
+        ] {
+            state
+                .heap_mut()
+                .set_datum_field(world, field(name), value)
+                .unwrap();
+        }
+        state.set_global(field("world"), Value::Datum(world));
+        state.resize_world_geometry(world, (2, 1, 1)).unwrap();
+        let object =
+            allocate_initialized_datum(&mut state, TypePath::parse("/obj/item").unwrap()).unwrap();
+        let mob =
+            allocate_initialized_datum(&mut state, TypePath::parse("/mob/living/player").unwrap())
+                .unwrap();
+
+        let Value::List(contents) = state.heap().datum_field(world, &field("contents")).unwrap()
+        else {
+            panic!("world.contents should be a list")
+        };
+        let registered = state
+            .heap()
+            .list(*contents)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            registered.len(),
+            5,
+            "two turfs must not be registered twice"
+        );
+        assert_eq!(
+            registered
+                .iter()
+                .filter_map(|value| match value {
+                    Value::Datum(datum) => Some(*datum),
+                    _ => None,
+                })
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            registered.len(),
+            "world.contents must contain one entry per atom",
+        );
+
+        let Value::List(order) = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/world_order").unwrap(),
+            &[],
+            &mut state,
+        )
+        .expect("world iteration should execute") else {
+            panic!("world iteration should return a list")
+        };
+        let paths = state
+            .heap()
+            .list(order)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| match value {
+                Value::Datum(datum) => state
+                    .heap()
+                    .datum(*datum)
+                    .unwrap()
+                    .type_path()
+                    .as_str()
+                    .to_owned(),
+                value => panic!("world iteration yielded non-atom {value:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            [
+                "/mob/living/player",
+                "/obj/item",
+                "/area/default",
+                "/turf/default",
+                "/turf/default",
+            ]
+        );
+        assert!(registered.contains(&Value::Datum(object)));
+        assert!(registered.contains(&Value::Datum(mob)));
     }
 
     #[test]
@@ -18217,6 +22669,31 @@ mod tests {
     }
 
     #[test]
+    fn dm_filter_and_mask_constant_families_have_byond_values() {
+        let syntax = parse(concat!(
+            "/proc/filter_constants()\n",
+            "\treturn list(MASK_INVERSE, MASK_SWAP, FILTER_OVERLAY, FILTER_UNDERLAY, OUTLINE_SHARP, OUTLINE_SQUARE, WAVE_BOUNDED, WAVE_SIDEWAYS, FILTER_COLOR_RGB, FILTER_COLOR_HSV, FILTER_COLOR_HSL, FILTER_COLOR_HCY)\n",
+        ))
+        .expect("filter constants should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("the complete BYOND filter flag family should compile");
+        let mut state = ExecutionState::new();
+        let Value::List(values) = execute_in_state(&program, &[], &mut state).unwrap() else {
+            panic!("constant inventory should return a list");
+        };
+        assert_eq!(
+            state
+                .heap()
+                .list(values)
+                .unwrap()
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>(),
+            [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 2.0, 1.0, 0.0, 1.0, 2.0, 3.0].map(Value::number)
+        );
+    }
+
+    #[test]
     fn dm_reset_appearance_constants_are_appearance_flag_bits() {
         let source =
             "/proc/appearance_flags()\n\treturn RESET_TRANSFORM | RESET_COLOR | RESET_ALPHA | 1\n";
@@ -18258,6 +22735,47 @@ mod tests {
     }
 
     #[test]
+    fn replacetext_uses_byond_scalar_replacement_and_typed_text_inputs() {
+        let source = concat!(
+            "/proc/uplink_description()\n",
+            "\tvar/desc = \"minimum %MIN seconds\"\n",
+            "\tdesc = replacetext(desc, \"%MIN\", 90)\n",
+            "\tvar/empty_needle = replacetext(\"abc\", 2, \"x\")\n",
+            "\tvar/removed = replacetext(\"abc\", \"b\", null)\n",
+            "\tvar/nontext_source = replacetext(123, \"2\", 9)\n",
+            "\treturn list(desc, empty_needle, removed, nontext_source)\n",
+        );
+        let syntax = parse(source).expect("replacetext coercion fixture should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("replacetext coercion fixture should compile");
+        let entry = module
+            .procedure_id("/proc/uplink_description")
+            .expect("fixture entry should link");
+        let mut state = ExecutionState::new();
+        let result = execute_module_in_state(&module, entry, &[], &mut state)
+            .expect("BYOND replacetext coercion should execute");
+        let Value::List(result) = result else {
+            panic!("fixture should return a list");
+        };
+        let values = state
+            .heap()
+            .list(result)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                Value::text("minimum 90 seconds"),
+                Value::text("axbxc"),
+                Value::text("ac"),
+                Value::Null,
+            ]
+        );
+    }
+
+    #[test]
     fn typed_and_uninitialized_locals_start_as_null() {
         let source = "/proc/locals()\n\tvar/datum/example/typed\n\tvar/plain\n\tif(typed || plain)\n\t\treturn 0\n\treturn 7\n";
         let syntax = parse(source).expect("source should parse");
@@ -18265,6 +22783,36 @@ mod tests {
             .expect("typed locals without initializers should compile");
 
         assert_eq!(execute(&program, &[]), Ok(Value::number(7.0)));
+    }
+
+    #[test]
+    fn later_bare_new_assignment_uses_the_local_declared_type() {
+        let syntax = parse(concat!(
+            "/datum/feedback_variable\n",
+            "\tvar/key\n",
+            "\tvar/key_type\n",
+            "/datum/feedback_variable/New(new_key, new_key_type)\n",
+            "\tkey = new_key\n",
+            "\tkey_type = new_key_type\n",
+            "/proc/find_feedback_datum()\n",
+            "\tvar/datum/feedback_variable/FV\n",
+            "\tFV = new(\"sect_chosen\", \"text\")\n",
+            "\treturn istype(FV, /datum/feedback_variable)\n",
+        ))
+        .expect("feedback-variable constructor shape should parse");
+        let procedures = syntax
+            .definitions
+            .iter()
+            .filter(|definition| definition.kind == DefinitionKind::Procedure)
+            .cloned()
+            .collect::<Vec<_>>();
+        let module = compile_module(&procedures)
+            .expect("later assignment should infer the typed local constructor path");
+        let entry = module
+            .procedure_id("/proc/find_feedback_datum")
+            .expect("feedback helper should be linked");
+
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(1.0)));
     }
 
     #[test]
@@ -18309,6 +22857,32 @@ mod tests {
     }
 
     #[test]
+    fn unused_implicit_args_does_not_allocate_a_heap_list() {
+        let source = "/proc/hot_path(value)\n\treturn value + 1\n";
+        let syntax = parse(source).expect("ordinary procedure should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("ordinary procedure should compile");
+        assert!(
+            !program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::MakeArgs)),
+            "unused special args must remain lazy"
+        );
+
+        let mut state = ExecutionState::new();
+        assert_eq!(
+            execute_in_state(&program, &[Value::number(4.0)], &mut state),
+            Ok(Value::number(5.0))
+        );
+        assert_eq!(
+            state.heap().live_list_count(),
+            0,
+            "a procedure that cannot observe args must not allocate its list"
+        );
+    }
+
+    #[test]
     fn implicit_args_is_a_per_call_list_of_all_supplied_values() {
         let source = "/proc/collect(first)\n\tif(length(args) != 3)\n\t\treturn 0\n\treturn args[3] + first\n";
         let syntax = parse(source).expect("source should parse");
@@ -18321,14 +22895,75 @@ mod tests {
                 .iter()
                 .any(|instruction| matches!(instruction, Instruction::MakeArgs))
         );
+        let mut state = ExecutionState::new();
         assert_eq!(
-            execute(
+            execute_in_state(
                 &program,
-                &[Value::number(2.0), Value::number(5.0), Value::number(11.0)]
+                &[Value::number(2.0), Value::number(5.0), Value::number(11.0)],
+                &mut state,
             ),
             Ok(Value::number(13.0))
         );
-        assert_eq!(execute(&program, &[]), Ok(Value::number(0.0)));
+        assert_eq!(
+            state.heap().live_list_count(),
+            1,
+            "referencing args must materialize one BYOND argument list"
+        );
+        assert_eq!(
+            execute_in_state(&program, &[], &mut state),
+            Ok(Value::number(0.0))
+        );
+    }
+
+    #[test]
+    fn implicit_args_pads_omitted_declared_parameters_like_byond_atom_new() {
+        let source = concat!(
+            "/proc/rewrite_first(loc, ...)\n",
+            "\targs[1] = 7\n",
+            "\treturn length(args) * 10 + args[1]\n",
+        );
+        let syntax = parse(source).expect("atom/New-shaped args fixture should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("atom/New-shaped args fixture should compile");
+
+        assert_eq!(program.parameter_count, 2);
+        assert_eq!(
+            execute(&program, &[]),
+            Ok(Value::number(27.0)),
+            "omitted loc and varargs slots remain writable null entries in args"
+        );
+        assert_eq!(
+            execute(
+                &program,
+                &[Value::number(1.0), Value::number(2.0), Value::number(3.0),],
+            ),
+            Ok(Value::number(37.0)),
+            "extra supplied arguments remain visible after declared slots"
+        );
+    }
+
+    #[test]
+    fn constructor_args_pad_an_omitted_atom_location_slot() {
+        let syntax = parse(concat!(
+            "/obj/args_fixture/New(loc, other)\n",
+            "\targs[1] = 7\n",
+            "\tglobal.args_observed = length(args) * 10 + args[1]\n",
+            "/proc/run_args_fixture()\n",
+            "\tnew /obj/args_fixture\n",
+            "\treturn global.args_observed\n",
+        ))
+        .expect("atom constructor args fixture should parse");
+        let module =
+            compile_module(&syntax.definitions).expect("atom constructor args fixture should link");
+        let entry = module
+            .procedure_id("/proc/run_args_fixture")
+            .expect("fixture entry should exist");
+
+        assert_eq!(
+            execute_module(&module, entry, &[]),
+            Ok(Value::number(27.0)),
+            "new /obj without an explicit loc still gives New both declared args slots"
+        );
     }
 
     #[test]
@@ -18432,6 +23067,20 @@ mod tests {
     }
 
     #[test]
+    fn compound_add_concatenates_text_onto_null() {
+        let syntax = parse(
+            "/proc/build_trigger(trigger)\n\tvar/all_triggers\n\tall_triggers += trigger\n\tall_triggers += null\n\treturn all_triggers\n",
+        )
+        .expect("voice trigger source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("voice trigger source should compile");
+        assert_eq!(
+            execute(&program, &[Value::text("come\\s*here")]),
+            Ok(Value::text("come\\s*here"))
+        );
+    }
+
+    #[test]
     fn special_result_survives_branches_and_loops() {
         let source = "/proc/accumulate(input)\n\t. = 0\n\twhile(input > 0)\n\t\tif(input == 2)\n\t\t\t. += 10\n\t\telse\n\t\t\t. += input\n\t\tinput = input - 1\n";
 
@@ -18485,6 +23134,10 @@ mod tests {
                 "/proc/test()\n\treturn istype(new /datum/example, /datum)\n",
                 1.0,
             ),
+            (
+                "/proc/test()\n\tvar/list/ranks = list(\"Admin\")\n\treturn istype(ranks)\n",
+                1.0,
+            ),
             ("/proc/test()\n\treturn istype(3, /datum)\n", 0.0),
         ] {
             let syntax = parse(source).expect("source should parse");
@@ -18498,6 +23151,75 @@ mod tests {
                     .any(|instruction| matches!(instruction, Instruction::TypePredicate { .. }))
             );
         }
+    }
+
+    #[test]
+    fn unqualified_istype_uses_typed_parameter_and_local_declarations() {
+        let syntax = parse(concat!(
+            "/proc/remove_from_active(turf/open/T)\n",
+            "\tif(istype(T))\n",
+            "\t\treturn 9\n",
+            "\treturn 7\n",
+            "/proc/typed_parameter_is_list(list/datum/example/value)\n",
+            "\treturn istype(value)\n",
+            "/proc/typed_local_is_list(input)\n",
+            "\tvar/list/datum/example/value = input\n",
+            "\treturn istype(value)\n",
+            "/proc/run()\n",
+            "\tvar/turf/closed/wall = new\n",
+            "\tvar/turf/open/floor = new\n",
+            "\tvar/datum/example/not_a_list = new\n",
+            "\tvar/list/items = list()\n",
+            "\treturn remove_from_active(wall) * 1000 + remove_from_active(floor) * 100 + typed_parameter_is_list(not_a_list) * 10 + typed_parameter_is_list(items) + typed_local_is_list(not_a_list) * 10000 + typed_local_is_list(items) * 100000\n",
+        ))
+        .expect("typed istype fixture should parse");
+        let module =
+            compile_module(&syntax.definitions).expect("typed istype fixture should compile");
+        let entry = module.procedure_id("/proc/run").expect("run entry");
+
+        // The closed turf must fail the declared /turf/open guard without
+        // touching the open-only field. Both parameter and local /list
+        // declarations must reject an arbitrary datum and accept a list.
+        assert_eq!(
+            execute_module(&module, entry, &[]),
+            Ok(Value::number(107_901.0))
+        );
+    }
+
+    #[test]
+    fn typed_parameter_inference_ignores_repeated_name_in_default_expression() {
+        let syntax = parse(concat!(
+            "/proc/typed(datum/value = value)\n",
+            "\treturn istype(value)\n",
+            "/proc/run()\n",
+            "\tvar/datum/example/item = new\n",
+            "\treturn typed(item)\n",
+        ))
+        .expect("repeated parameter-name fixture should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("repeated parameter-name fixture should compile");
+        let entry = module.procedure_id("/proc/run").expect("run entry");
+
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(1.0)));
+    }
+
+    #[test]
+    fn typed_local_inference_ignores_repeated_name_in_initializer() {
+        let syntax = parse(concat!(
+            "/proc/typed_local(input)\n",
+            "\tvar/datum/value = value\n",
+            "\tvalue = input\n",
+            "\treturn istype(value)\n",
+            "/proc/run()\n",
+            "\tvar/datum/example/item = new\n",
+            "\treturn typed_local(item)\n",
+        ))
+        .expect("repeated local-name fixture should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("repeated local-name fixture should compile");
+        let entry = module.procedure_id("/proc/run").expect("run entry");
+
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(1.0)));
     }
 
     #[test]
@@ -18696,6 +23418,206 @@ mod tests {
             Ok(Value::number(1.0)),
         );
         assert_eq!(state.world_turfs.len(), 4);
+    }
+
+    #[test]
+    fn engine_created_turfs_share_effective_defaults_at_world_scale() {
+        let syntax = parse(
+            "/proc/observe(turf/cell)\n\tvar/list/reflection = cell.vars\n\tvar/before = cell.density + reflection[\"density\"]\n\tvar/declared = initial(cell.density)\n\tvar/native_bounds = bounds_dist(cell, cell)\n\t++cell.density\n\treturn list(before, declared, native_bounds, cell.density, reflection[\"density\"], cell.name)\n/proc/retype(turf/cell)\n\tvar/turf/replaced = new /turf/compact/changed(cell)\n\treturn list(replaced, replaced.density, replaced.name, replaced.x, replaced.vars[\"density\"])\n",
+        )
+        .expect("compact turf fixture should parse");
+        let module = compile_module(&syntax.definitions).expect("compact turf fixture compiles");
+        let mut state = ExecutionState::new();
+        let world = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/world").unwrap());
+        let world_contents = state.heap_mut().allocate_list();
+        for (name, value) in [
+            (
+                "area",
+                Value::TypePath(TypePath::parse("/area/default").unwrap()),
+            ),
+            (
+                "turf",
+                Value::TypePath(TypePath::parse("/turf/compact").unwrap()),
+            ),
+            ("contents", Value::List(world_contents)),
+        ] {
+            state
+                .heap_mut()
+                .set_datum_field(world, field(name), value)
+                .unwrap();
+        }
+        state.set_global(field("world"), Value::Datum(world));
+        state.set_type_parents(BTreeMap::from([
+            (
+                TypePath::parse("/area/default").unwrap(),
+                Some(TypePath::parse("/area").unwrap()),
+            ),
+            (
+                TypePath::parse("/turf/compact").unwrap(),
+                Some(TypePath::parse("/turf").unwrap()),
+            ),
+            (
+                TypePath::parse("/turf/compact/changed").unwrap(),
+                Some(TypePath::parse("/turf/compact").unwrap()),
+            ),
+        ]));
+        let effective = |path: &str, density: f32, name: &str| {
+            let mut fields = BTreeMap::from([
+                (field("contents"), Value::Null),
+                (field("density"), Value::number(density)),
+                (field("bound_height"), Value::number(64.0)),
+                (field("bound_width"), Value::number(64.0)),
+                (field("loc"), Value::Null),
+                (field("name"), Value::text(name)),
+                (field("x"), Value::number(0.0)),
+                (field("y"), Value::number(0.0)),
+                (field("z"), Value::number(0.0)),
+            ]);
+            for index in 0..96 {
+                fields.insert(
+                    field(&format!("inherited_scalar_{index}")),
+                    Value::number(index as f32),
+                );
+            }
+            (TypePath::parse(path).unwrap(), fields)
+        };
+        state.set_initial_values(BTreeMap::from([
+            effective("/turf/compact", 1.0, "compact"),
+            effective("/turf/compact/changed", 7.0, "changed"),
+        ]));
+        let changed_path = TypePath::parse("/turf/compact/changed").unwrap();
+        state.set_instance_initializers(
+            Arc::new(BTreeMap::from([(
+                changed_path,
+                vec![
+                    InstanceInitializer::Constant {
+                        field: field("x"),
+                        value: Value::number(0.0),
+                    },
+                    InstanceInitializer::Constant {
+                        field: field("y"),
+                        value: Value::number(0.0),
+                    },
+                    InstanceInitializer::Constant {
+                        field: field("z"),
+                        value: Value::number(0.0),
+                    },
+                    InstanceInitializer::Constant {
+                        field: field("loc"),
+                        value: Value::Null,
+                    },
+                    InstanceInitializer::Constant {
+                        field: field("contents"),
+                        value: Value::Null,
+                    },
+                ],
+            )])),
+            None,
+        );
+
+        state
+            .resize_world_geometry(world, (255, 255, 2))
+            .expect("two full-size z levels should materialize compactly");
+        let turf_count = 255 * 255 * 2;
+        assert_eq!(state.world_turfs.len(), turf_count);
+        let materialized_fields = state
+            .world_turfs
+            .values()
+            .map(|turf| state.heap().datum(*turf).unwrap().field_len())
+            .sum::<usize>();
+        assert_eq!(materialized_fields, turf_count * 5);
+        let effective_fields_per_turf = 9 + 96;
+        let field_slot_bytes = std::mem::size_of::<(FieldName, Value)>();
+        let compact_field_bytes = materialized_fields * field_slot_bytes;
+        let eager_field_bytes = turf_count * effective_fields_per_turf * field_slot_bytes;
+        eprintln!(
+            "compact-turf-scale turfs={turf_count} fields={materialized_fields} field_slot_bytes={field_slot_bytes} compact_field_bytes={compact_field_bytes} eager_field_bytes={eager_field_bytes} datum_inline_bytes={} contents_list_inline_bytes={}",
+            std::mem::size_of::<dm_value::Datum>(),
+            std::mem::size_of::<dm_value::DmList>(),
+        );
+        assert!(eager_field_bytes >= compact_field_bytes * 20);
+        assert!(state.world_turfs.values().all(|turf| {
+            state
+                .heap()
+                .datum(*turf)
+                .is_ok_and(|datum| datum.field_len() == 5)
+        }));
+
+        let cell = state.turf_at(255, 255, 2).expect("corner turf exists");
+        let observed = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/observe").unwrap(),
+            &[Value::Datum(cell)],
+            &mut state,
+        )
+        .expect("shared defaults should read and mutate through fields and vars");
+        let Value::List(observed) = observed else {
+            panic!("observe should return a list")
+        };
+        assert_eq!(
+            state
+                .heap()
+                .list(observed)
+                .unwrap()
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>(),
+            [
+                Value::number(2.0),
+                Value::number(1.0),
+                Value::number(-64.0),
+                Value::number(2.0),
+                Value::number(2.0),
+                Value::text("compact"),
+            ]
+        );
+        assert_eq!(state.heap().datum(cell).unwrap().field_len(), 6);
+
+        let structural_fields = ["x", "y", "z", "loc", "contents"];
+        let structural_before = structural_fields.map(|name| {
+            state
+                .heap()
+                .datum_field(cell, &field(name))
+                .unwrap_or_else(|error| panic!("missing structural field {name}: {error}"))
+                .clone()
+        });
+
+        let retyped = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/retype").unwrap(),
+            &[Value::Datum(cell)],
+            &mut state,
+        )
+        .expect("turf replacement should preserve the compact map cell");
+        let Value::List(retyped) = retyped else {
+            panic!("retype should return a list")
+        };
+        assert_eq!(
+            state
+                .heap()
+                .list(retyped)
+                .unwrap()
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>(),
+            [
+                Value::Datum(cell),
+                Value::number(7.0),
+                Value::text("changed"),
+                Value::number(255.0),
+                Value::number(7.0),
+            ]
+        );
+        for (name, expected) in structural_fields.into_iter().zip(structural_before) {
+            assert_eq!(
+                state.heap().datum_field(cell, &field(name)),
+                Ok(&expected),
+                "retype constant replay must preserve map-cell field {name}",
+            );
+        }
+        assert_eq!(state.heap().datum(cell).unwrap().field_len(), 5);
     }
 
     #[test]
@@ -18900,8 +23822,18 @@ mod tests {
         };
         let datum = state.heap().datum(regex).expect("regex datum should exist");
         assert_eq!(datum.type_path().to_string(), "/regex");
-        assert_eq!(datum.field(&field("text")), Ok(&Value::text("[a-z]+")));
+        assert_eq!(datum.field(&field("datum_flags")), Ok(&Value::number(0.0)));
+        assert_eq!(datum.field(&field("tag")), Ok(&Value::Null));
+        assert_eq!(
+            datum.field(&field("_dream64_pattern")),
+            Ok(&Value::text("[a-z]+"))
+        );
+        assert_eq!(datum.field(&field("text")), Ok(&Value::Null));
         assert_eq!(datum.field(&field("flags")), Ok(&Value::text("ig")));
+        assert_eq!(datum.field(&field("match")), Ok(&Value::Null));
+        assert_eq!(datum.field(&field("index")), Ok(&Value::number(0.0)));
+        assert_eq!(datum.field(&field("group")), Ok(&Value::Null));
+        assert_eq!(datum.field(&field("next")), Ok(&Value::Null));
     }
 
     #[test]
@@ -18923,6 +23855,24 @@ mod tests {
     }
 
     #[test]
+    fn parsed_map_searches_treat_null_file_text_as_an_empty_haystack() {
+        let syntax = parse(concat!(
+            "/proc/run()\n",
+            "\tvar/tfile = null\n",
+            "\tvar/regex/matches_tgm = regex(@\"^//MAP CONVERTED BY dmm2tgm.py\")\n",
+            "\tvar/regex/dmm_regex = regex(@\"[A-Za-z]+\", \"g\")\n",
+            "\treturn findtext(tfile, matches_tgm) + dmm_regex.Find(tfile, 1)\n",
+        ))
+        .expect("parsed-map null-file search source should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("parsed-map null-file searches should compile");
+        assert_eq!(
+            execute_module(&module, module.procedure_id("/proc/run").unwrap(), &[]),
+            Ok(Value::number(0.0)),
+        );
+    }
+
+    #[test]
     fn multiline_global_regex_find_advances_and_populates_capture_groups() {
         let syntax = parse(
             "/proc/run(text)\n\tvar/regex/entries = new(@\"^(?!#)(.+?)\\s+=\\s+(.+)\", \"gm\")\n\tvar/result = \"\"\n\twhile(entries.Find(text))\n\t\tresult += \"[entries.group[1]]:[entries.group[2]]|\"\n\treturn result\n",
@@ -18939,6 +23889,174 @@ mod tests {
                 )],
             ),
             Ok(Value::text("Alice:Admin|Bob:Moderator|"))
+        );
+    }
+
+    #[test]
+    fn global_regex_exposes_byond_next_and_text_for_dmm_style_explicit_sweeps() {
+        let syntax = parse(concat!(
+            "/proc/run(text)\n",
+            "\tvar/regex/entries = new(@\"([A-Za-z]+)\", \"g\")\n",
+            "\tvar/stored_index = 1\n",
+            "\tvar/count = 0\n",
+            "\twhile(entries.Find(text, stored_index))\n",
+            "\t\tstored_index = entries.next\n",
+            "\t\tcount++\n",
+            "\treturn list(count, stored_index, entries.index, entries.match, entries.text)\n",
+        ))
+        .expect("DMM-style regex source should parse");
+        let module = compile_module(&syntax.definitions).expect("DMM-style regex should compile");
+        let mut state = ExecutionState::new();
+        let result = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/run").unwrap(),
+            &[Value::text("aa bb")],
+            &mut state,
+        )
+        .expect("DMM-style regex sweep should execute");
+        let Value::List(result) = result else {
+            panic!("regex state should be returned in a list")
+        };
+        let values = state
+            .heap()
+            .list(result)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                Value::number(2.0),
+                Value::number(6.0),
+                Value::number(4.0),
+                Value::text("bb"),
+                Value::text("aa bb"),
+            ]
+        );
+    }
+
+    #[test]
+    fn station_dmm_regex_parses_model_and_coordinate_records_in_one_global_sweep() {
+        let syntax = parse(
+            r#"/proc/run(tfile)
+	var/regex/dmm_regex = new(@'"([a-zA-Z]+)" = (?:\(\n|\()((?:.|\n)*?)\)\n(?!\t)|\((\d+),(\d+),(\d+)\) = \{"([a-zA-Z\n]*)"\}', "g")
+	var/stored_index = 1
+	var/list/grid_models = list()
+	var/coordinate_records = 0
+	var/grid_line_count = 0
+	while(dmm_regex.Find(tfile, stored_index))
+		stored_index = dmm_regex.next
+		var/list/regex_output = dmm_regex.group
+		if(regex_output[1])
+			grid_models[regex_output[1]] = regex_output[2]
+		else if(regex_output[3])
+			coordinate_records++
+			var/list/grid_lines = splittext(regex_output[6], "\n")
+			grid_line_count = length(grid_lines)
+	return length(grid_models) * 100 + coordinate_records * 10 + grid_line_count
+"#,
+        )
+        .expect("station DMM regex source should parse");
+        let module = compile_module(&syntax.definitions).expect("station DMM regex should compile");
+        assert_eq!(
+            execute_module(
+                &module,
+                module.procedure_id("/proc/run").unwrap(),
+                &[Value::text(
+                    "\"a\" = (/area,/turf)\n(1,1,1) = {\"\naaa\nbbb\n\"}\n"
+                )],
+            ),
+            Ok(Value::number(114.0))
+        );
+    }
+
+    #[test]
+    fn splittext_regex_delimiters_preserve_bounds_and_optional_matches() {
+        let source = parse(concat!(
+            "/proc/run()\n",
+            "\tvar/regex/delimiter = regex(@\"[,:]\", \"g\")\n",
+            "\tvar/list/plain = splittext(\"a,b:c\", delimiter)\n",
+            "\tvar/list/included = splittext(\"a,b:c\", delimiter, 1, 0, TRUE)\n",
+            "\treturn list(plain, included)\n",
+        ))
+        .expect("regex split source should parse");
+        let module = compile_module(&source.definitions).expect("regex split should compile");
+        let mut state = ExecutionState::new();
+        let result = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/run").expect("run exists"),
+            &[],
+            &mut state,
+        )
+        .expect("regex split should execute");
+        let Value::List(result) = result else {
+            panic!("regex split should return both lists");
+        };
+        let lists = state
+            .heap()
+            .list(result)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        let values = |value: &Value| {
+            let Value::List(list) = value else {
+                panic!("split result should be a list");
+            };
+            state
+                .heap()
+                .list(*list)
+                .unwrap()
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            values(&lists[0]),
+            vec![Value::text("a"), Value::text("b"), Value::text("c")]
+        );
+        assert_eq!(
+            values(&lists[1]),
+            vec![
+                Value::text("a"),
+                Value::text(","),
+                Value::text("b"),
+                Value::text(":"),
+                Value::text("c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn replacetext_regex_invokes_proc_replacement_with_match_and_capture_groups() {
+        let syntax = parse(
+            "/proc/capitalize(t)\n\tif(t)\n\t\tvar/first = t[1]\n\t\treturn uppertext(first) + copytext(t, 1 + length(first))\n\treturn t\n/proc/run(input)\n\tvar/regex/word = new(@\"([A-z]+)\", \"g\")\n\treturn replacetext(input, word, /proc/capitalize)\n",
+        )
+        .expect("regex proc-replacement source should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("regex proc-replacement source should compile");
+        let entry = module.procedure_id("/proc/run").unwrap();
+        assert_eq!(
+            execute_module(&module, entry, &[Value::text("hello world")]),
+            Ok(Value::text("Hello World"))
+        );
+    }
+
+    #[test]
+    fn regex_replace_method_sanitizes_all_global_matches() {
+        let syntax = parse(
+            "/proc/sanitize(value)\n\tvar/regex/forbidden = new(@\"[^A-Za-z0-9._-]\", \"g\")\n\treturn forbidden.Replace(value, \"\")\n",
+        )
+        .expect("regex.Replace source should parse");
+        let module = compile_module(&syntax.definitions).expect("regex.Replace should compile");
+        let entry = module.procedure_id("/proc/sanitize").unwrap();
+        assert_eq!(
+            execute_module(&module, entry, &[Value::text("pirates: heavy?/gang")]),
+            // OpenDream/BYOND advance at least one position after an empty
+            // replacement, so directly adjacent matches are considered on
+            // the next replacement call rather than the same sweep.
+            Ok(Value::text("pirates heavy/gang"))
         );
     }
 
@@ -18972,6 +24090,50 @@ mod tests {
     }
 
     #[test]
+    fn project_mutable_appearance_helper_receives_human_preview_named_arguments() {
+        let syntax = parse(
+            "/proc/mutable_appearance(icon, icon_state = \"\", layer = 2, offset_spokesman, plane = -32767, alpha = 255, appearance_flags = 0, offset_const)\n\tvar/mutable_appearance/appearance = new()\n\tappearance.icon = icon\n\tappearance.icon_state = icon_state\n\tappearance.layer = layer\n\tappearance.plane = plane\n\tappearance.alpha = alpha\n\tappearance.appearance_flags = appearance_flags\n\treturn appearance\n/proc/build_preview_overlay()\n\treturn mutable_appearance('icons/mob/species/human/bodyparts.dmi', layer = -7, appearance_flags = 64)\n",
+        )
+        .expect("human-preview mutable appearance fixture should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("project mutable appearance helper should override the engine fallback");
+        let entry = module
+            .procedure_id("/proc/build_preview_overlay")
+            .expect("preview fixture entry should exist");
+        let mut state = ExecutionState::new();
+        let result = execute_module_in_state(&module, entry, &[], &mut state)
+            .expect("human-preview mutable appearance fixture should execute");
+        let Value::Datum(appearance) = result else {
+            panic!("project mutable appearance helper should return its datum");
+        };
+        let appearance = state
+            .heap()
+            .datum(appearance)
+            .expect("returned mutable appearance should remain live");
+
+        assert_eq!(
+            appearance.field(&field("icon")),
+            Ok(&Value::file("icons/mob/species/human/bodyparts.dmi"))
+        );
+        assert_eq!(
+            appearance.field(&field("icon_state")),
+            Ok(&Value::text("")),
+            "the omitted icon_state must use the project helper's default"
+        );
+        assert_eq!(appearance.field(&field("layer")), Ok(&Value::number(-7.0)));
+        assert_eq!(
+            appearance.field(&field("plane")),
+            Ok(&Value::number(-32767.0)),
+            "later omitted defaults must still execute around named arguments"
+        );
+        assert_eq!(appearance.field(&field("alpha")), Ok(&Value::number(255.0)));
+        assert_eq!(
+            appearance.field(&field("appearance_flags")),
+            Ok(&Value::number(64.0))
+        );
+    }
+
+    #[test]
     fn matrix_constructor_methods_and_equivalence_use_affine_components() {
         let syntax = parse(
             "/proc/run()\n\tvar/matrix/value = matrix(1, 2, 3, 4, 5, 6)\n\tvalue.Add(matrix(7, 8, 9, 10, 11, 12))\n\tvalue.Subtract(matrix(7, 8, 9, 10, 11, 12))\n\tvalue.Multiply(matrix(7, 8, 9, 10, 11, 12))\n\treturn value ~= matrix(39, 54, 78, 54, 75, 108)\n",
@@ -18983,12 +24145,74 @@ mod tests {
     }
 
     #[test]
+    fn project_matrix_members_dispatch_before_native_fallback() {
+        let syntax = parse(
+            "/matrix/proc/get_x_shift()\n\treturn 23\n/proc/run()\n\tvar/matrix/value = matrix()\n\treturn value.get_x_shift()\n",
+        )
+        .expect("project matrix member source should parse");
+        let module =
+            compile_module(&syntax.definitions).expect("project matrix member should compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(23.0)));
+    }
+
+    #[test]
+    fn matrix_null_constructs_identity_for_absent_atom_transform() {
+        let syntax = parse(
+            "/proc/run(value)\n\tvar/matrix/copied = matrix(value)\n\treturn copied ~= matrix(1, 0, 0, 0, 1, 0)\n",
+        )
+        .expect("matrix null source should parse");
+        let module =
+            compile_module(&syntax.definitions).expect("matrix null source should compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(
+            execute_module(&module, entry, &[Value::Null]),
+            Ok(Value::number(1.0))
+        );
+    }
+
+    #[test]
     fn matrix_transform_methods_mutate_the_six_public_fields() {
         let syntax = parse(
             "/proc/run()\n\tvar/matrix/value = matrix(1, 2, 3, 4, 5, 6)\n\tvalue.Translate(2)\n\tvalue.Turn(90)\n\treturn value ~= matrix(4, 5, 8, -1, -2, -5)\n",
         )
         .expect("matrix source should parse");
         let module = compile_module(&syntax.definitions).expect("matrix source should compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(1.0)));
+    }
+
+    #[test]
+    fn matrix_scale_applies_independent_horizontal_and_vertical_factors() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/matrix/value = matrix(1, 2, 3, 4, 5, 6)\n\tvalue.Scale(2, 3)\n\treturn value ~= matrix(2, 4, 6, 12, 15, 18)\n",
+        )
+        .expect("matrix scale source should parse");
+        let module =
+            compile_module(&syntax.definitions).expect("matrix scale source should compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(1.0)));
+    }
+
+    #[test]
+    fn turn_builtin_rotates_a_matrix_copy_without_mutating_the_source() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/matrix/original = matrix(1, 2, 3, 4, 5, 6)\n\tvar/matrix/rotated = turn(original, 90)\n\treturn original != rotated && original ~= matrix(1, 2, 3, 4, 5, 6) && rotated ~= matrix(4, 5, 6, -1, -2, -3)\n",
+        )
+        .expect("turn matrix source should parse");
+        let module =
+            compile_module(&syntax.definitions).expect("turn matrix source should compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(1.0)));
+    }
+
+    #[test]
+    fn turn_builtin_clones_and_rotates_an_icon() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/icon/original = icon('icons/test.dmi')\n\tvar/icon/rotated = turn(original, 90)\n\treturn isicon(rotated) && original != rotated && original.icon == rotated.icon\n",
+        )
+        .expect("turn icon source should parse");
+        let module = compile_module(&syntax.definitions).expect("turn icon source should compile");
         let entry = module.procedure_id("/proc/run").expect("entry");
         assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(1.0)));
     }
@@ -19024,6 +24248,33 @@ mod tests {
     }
 
     #[test]
+    fn locate_type_in_list_returns_first_matching_runtime_datum() {
+        let syntax = parse("/proc/find(target, items)\n\treturn locate(target) in items\n")
+            .expect("locate-in source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("locate-in source should compile");
+        let mut state = ExecutionState::new();
+        let processor_type =
+            TypePath::parse("/datum/controller/subsystem/processing").expect("processor type path");
+        let processor = state.heap_mut().allocate_datum(processor_type.clone());
+        let items = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(items)
+            .unwrap()
+            .add(Value::Datum(processor));
+
+        assert_eq!(
+            execute_in_state(
+                &program,
+                &[Value::TypePath(processor_type), Value::List(items)],
+                &mut state,
+            ),
+            Ok(Value::Datum(processor))
+        );
+    }
+
+    #[test]
     fn length_builtin_counts_text_bytes_and_list_entries() {
         let source = "/proc/measure()\n\tvar/text_length = length(\"aé\")\n\tvar/list_length = length(list(10, 20, \"key\" = 30))\n\treturn text_length * 10 + list_length\n";
         let syntax = parse(source).expect("source should parse");
@@ -19040,6 +24291,17 @@ mod tests {
         // contributes two UTF-8 bytes. Associative list entries contribute
         // one entry, like positional list values.
         assert_eq!(execute(&program, &[]), Ok(Value::number(33.0)));
+    }
+
+    #[test]
+    fn length_builtin_returns_zero_for_non_sequence_values() {
+        let source =
+            "/proc/measure()\n\treturn length(/turf/baseturf_bottom) + length(42) + length(null)\n";
+        let syntax = parse(source).expect("source should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("length probes should compile");
+
+        assert_eq!(execute(&program, &[]), Ok(Value::number(0.0)));
     }
 
     #[test]
@@ -19064,9 +24326,8 @@ mod tests {
         let mut state = ExecutionState::new();
         assert_eq!(
             execute_in_state(&list_program, &[], &mut state),
-            // The procedure's implicit `args` list occupies the first list
-            // slot, so the explicit list receives the next BYOND list ref.
-            Ok(Value::text("[0xe000002]"))
+            // Unobserved implicit `args` stays lazy, so this is the first list.
+            Ok(Value::text("[0xe000001]"))
         );
         assert_eq!(
             execute_in_state(&datum_program, &[], &mut state),
@@ -19075,6 +24336,102 @@ mod tests {
         assert_eq!(
             execute_in_state(&scalar_program, &[], &mut state),
             Ok(Value::Null)
+        );
+    }
+
+    #[test]
+    fn locate_one_argument_resolves_weakrefs_lists_tags_and_types() {
+        let syntax = parse(
+            "/proc/run(D, L)\n\treturn locate(ref(D)) == D && locate(ref(L)) == L && locate(\"stack-canary\") == D && locate(/datum/target) == D\n",
+        )
+        .expect("locate reference source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("locate reference source should compile");
+        let mut state = ExecutionState::new();
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/target").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(datum, field("tag"), Value::text("stack-canary"))
+            .unwrap();
+        let list = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(list)
+            .unwrap()
+            .add(Value::Datum(datum));
+        assert_eq!(
+            execute_in_state(
+                &program,
+                &[Value::Datum(datum), Value::List(list)],
+                &mut state,
+            ),
+            Ok(Value::number(1.0))
+        );
+    }
+
+    #[test]
+    fn mapping_multiz_get_step_resolves_up_down_and_world_bounds() {
+        let syntax = parse(
+            "/proc/neighbors(turf/center, turf/above, turf/below)\n\treturn list(get_step(center, UP), get_step(center, DOWN), get_step(above, UP), get_step(below, DOWN), get_step(center, UP | NORTH))\n",
+        )
+        .expect("Mapping-shaped vertical get_step fixture should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("Mapping-shaped vertical get_step fixture should compile");
+        let mut state = ExecutionState::new();
+        let coordinates = [
+            ("/turf/center", 4, 9, 2),
+            ("/turf/above", 4, 9, 3),
+            ("/turf/below", 4, 9, 1),
+            ("/turf/above_north", 4, 10, 3),
+        ];
+        let mut turfs = Vec::new();
+        for (path, x, y, z) in coordinates {
+            let turf = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse(path).unwrap());
+            for (name, value) in [("x", x), ("y", y), ("z", z)] {
+                state
+                    .heap_mut()
+                    .set_datum_field(turf, field(name), Value::number(value as f32))
+                    .unwrap();
+            }
+            state.world_turfs.insert((x, y, z), turf);
+            turfs.push(turf);
+        }
+        let [center, above, below, above_north] = turfs.as_slice() else {
+            unreachable!("fixture has four turfs")
+        };
+
+        let result = execute_in_state(
+            &program,
+            &[
+                Value::Datum(*center),
+                Value::Datum(*above),
+                Value::Datum(*below),
+            ],
+            &mut state,
+        )
+        .expect("vertical get_step should execute");
+        let Value::List(result) = result else {
+            panic!("fixture should return a list")
+        };
+        assert_eq!(
+            state
+                .heap()
+                .list(result)
+                .unwrap()
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>(),
+            [
+                Value::Datum(*above),
+                Value::Datum(*below),
+                Value::Null,
+                Value::Null,
+                Value::Datum(*above_north),
+            ]
         );
     }
 
@@ -19189,7 +24546,7 @@ mod tests {
         };
         assert_eq!(
             run("/proc/resource", &[Value::text("icons/a.dmi")], &mut state),
-            Value::text("icons/a.dmi")
+            Value::file("icons/a.dmi")
         );
         assert_eq!(
             run("/proc/quote", &[Value::text("a+b.c?")], &mut state),
@@ -19278,6 +24635,40 @@ mod tests {
     }
 
     #[test]
+    fn icon_datums_materialize_as_resources_without_becoming_files_themselves() {
+        let syntax = parse(
+            "/proc/body_zone_asset()\n\tvar/icon/body_zone = icon('icons/hud/screen_gen.dmi', \"head\")\n\tvar/was_icon_file = isfile(body_zone)\n\tif(!isfile(body_zone))\n\t\tbody_zone = fcopy_rsc(body_zone)\n\treturn list(was_icon_file, isfile(body_zone), isfile(\"icons/hud/screen_gen.dmi\"), body_zone)\n/proc/cloned_body_zone_asset()\n\tvar/icon/original = icon('icons/hud/screen_gen.dmi', \"chest\")\n\treturn fcopy_rsc(icon(original))\n",
+        )
+        .unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let mut state = ExecutionState::new();
+        let result = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/body_zone_asset").unwrap(),
+            &[],
+            &mut state,
+        )
+        .unwrap();
+        let Value::List(result) = result else {
+            panic!("asset contract should return its observations");
+        };
+        let result = state.heap().list(result).unwrap();
+        assert_eq!(result.get(1), Ok(&Value::number(0.0)));
+        assert_eq!(result.get(2), Ok(&Value::number(1.0)));
+        assert_eq!(result.get(3), Ok(&Value::number(0.0)));
+        assert_eq!(result.get(4), Ok(&Value::file("icons/hud/screen_gen.dmi")));
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/cloned_body_zone_asset").unwrap(),
+                &[],
+                &mut state,
+            ),
+            Ok(Value::file("icons/hud/screen_gen.dmi"))
+        );
+    }
+
+    #[test]
     fn byond_control_freak_constants_are_available_to_dm_code() {
         let syntax =
             parse("/proc/control_flags()\n\treturn CONTROL_FREAK_SKIN | CONTROL_FREAK_MACROS\n")
@@ -19322,7 +24713,7 @@ mod tests {
         let title = run("/proc/title_shaped", &mut state);
         assert_eq!(
             state.heap().datum_field(title, &field("icon")),
-            Ok(&Value::text("icons/runtime/default_title.dmi")),
+            Ok(&Value::file("icons/runtime/default_title.dmi")),
         );
     }
 
@@ -19552,6 +24943,110 @@ mod tests {
     }
 
     #[test]
+    fn range_uses_indexed_center_area_and_turf_contents_in_byond_order() {
+        let syntax = parse("/proc/nearby(distance, center)\n\treturn range(distance, center)\n")
+            .expect("range source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("range should compile");
+        let mut state = ExecutionState::new();
+        let area_a = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/area/a").expect("area path"));
+        let area_b = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/area/b").expect("area path"));
+        let turf_path = TypePath::parse("/turf/indexed").expect("turf path");
+        let mut turfs = BTreeMap::new();
+        for coordinate in [(2, 2, 1), (1, 2, 1), (2, 1, 1), (1, 1, 1)] {
+            let turf = state.heap_mut().allocate_datum(turf_path.clone());
+            for (name, value) in [
+                ("x", coordinate.0),
+                ("y", coordinate.1),
+                ("z", coordinate.2),
+            ] {
+                state
+                    .heap_mut()
+                    .set_datum_field(turf, field(name), Value::number(value as f32))
+                    .expect("coordinate should be writable");
+            }
+            state.world_turfs.insert(coordinate, turf);
+            state.world_areas.insert(
+                coordinate,
+                if coordinate.0 == 1 && coordinate.1 == 2 {
+                    area_b
+                } else {
+                    area_a
+                },
+            );
+            state
+                .ensure_contents(turf)
+                .expect("indexed turf should expose contents");
+            turfs.insert(coordinate, turf);
+        }
+
+        let object_path = TypePath::parse("/obj/indexed").expect("object path");
+        let mut objects = BTreeMap::new();
+        for coordinate in [(1, 2, 1), (2, 2, 1), (1, 1, 1), (2, 1, 1)] {
+            let object = state.heap_mut().allocate_datum(object_path.clone());
+            let contents = state
+                .heap()
+                .datum_field(turfs[&coordinate], &field("contents"))
+                .ok()
+                .and_then(|value| match value {
+                    Value::List(list) => Some(*list),
+                    _ => None,
+                })
+                .expect("turf contents should be a list");
+            state
+                .heap_mut()
+                .list_mut(contents)
+                .expect("contents list should be live")
+                .add(Value::Datum(object));
+            objects.insert(coordinate, object);
+        }
+        let unindexed = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/unindexed").expect("object path"));
+        for (name, value) in [("x", 2), ("y", 1), ("z", 1)] {
+            state
+                .heap_mut()
+                .set_datum_field(unindexed, field(name), Value::number(value as f32))
+                .expect("unindexed coordinate should be writable");
+        }
+
+        let result = execute_in_state(
+            &program,
+            &[Value::number(1.0), Value::Datum(turfs[&(2, 1, 1)])],
+            &mut state,
+        )
+        .expect("indexed range should execute");
+        let Value::List(result) = result else {
+            panic!("range should return a list");
+        };
+        let values = state
+            .heap()
+            .list(result)
+            .expect("range list should be live")
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                Value::Datum(turfs[&(2, 1, 1)]),
+                Value::Datum(area_a),
+                Value::Datum(objects[&(2, 1, 1)]),
+                Value::Datum(turfs[&(1, 1, 1)]),
+                Value::Datum(objects[&(1, 1, 1)]),
+                Value::Datum(turfs[&(1, 2, 1)]),
+                Value::Datum(area_b),
+                Value::Datum(objects[&(1, 2, 1)]),
+                Value::Datum(turfs[&(2, 2, 1)]),
+                Value::Datum(objects[&(2, 2, 1)]),
+            ]
+        );
+    }
+
+    #[test]
     fn qdel_builtin_removes_a_datum_from_heap() {
         let syntax = parse("/proc/test(v)\n\tqdel(v)\n").expect("source should parse");
         let program = compile_procedure(&syntax.definitions[0]).expect("qdel call should compile");
@@ -19581,6 +25076,26 @@ mod tests {
         execute_in_state(&program, &[Value::List(list)], &mut state)
             .expect("del should destroy a list");
         assert!(state.heap().list(list).is_err());
+    }
+
+    #[test]
+    fn deleted_datum_references_are_false_in_conditions() {
+        let syntax = parse("/proc/run(target)\n\tdel(target)\n\treturn !target\n")
+            .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("deletion module should compile");
+        let entry = module
+            .procedure_id("/proc/run")
+            .expect("entry should exist");
+        let mut state = ExecutionState::new();
+        let target = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").expect("type path"));
+
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::Datum(target)], &mut state),
+            Ok(Value::number(1.0))
+        );
+        assert!(state.heap().datum(target).is_err());
     }
 
     #[test]
@@ -19660,33 +25175,116 @@ mod tests {
     }
 
     #[test]
-    fn sort_list_builtin_orders_positional_values_with_stable_text_order() {
-        let syntax = parse("/proc/test()\n\tvar/list/L = list(2, 10, 1)\n\treturn sort_list(L)\n")
-            .expect("source should parse");
-        let program =
-            compile_procedure(&syntax.definitions[0]).expect("sort_list call should compile");
+    fn project_file2list_wrapper_shadows_the_native_fallback() {
+        let syntax = parse(concat!(
+            "/proc/file2list(path, separator = \"|\", trim = TRUE)\n",
+            "\treturn list(path, separator, trim)\n",
+            "/proc/run()\n",
+            "\treturn file2list(\"virtual.txt\", \"::\", FALSE)\n",
+        ))
+        .unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let mut state = ExecutionState::new();
+        let Value::List(result) = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/run").unwrap(),
+            &[],
+            &mut state,
+        )
+        .unwrap() else {
+            panic!("project wrapper should run instead of native filesystem access");
+        };
+        assert_eq!(
+            state
+                .heap()
+                .list(result)
+                .unwrap()
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Value::text("virtual.txt"),
+                Value::text("::"),
+                Value::number(0.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn project_file2list_wrapper_returns_empty_for_missing_config_include() {
+        let syntax = parse(concat!(
+            "/proc/trim(value)\n",
+            "\treturn trimtext(value)\n",
+            "/proc/file2list(filename, separator = \"\\n\", trim_file = TRUE)\n",
+            "\tif(trim_file)\n",
+            "\t\treturn splittext(trim(file2text(filename)), separator)\n",
+            "\treturn splittext(file2text(filename), separator)\n",
+            "/proc/run()\n",
+            "\treturn file2list(\"config/auxtools.txt\")\n",
+        ))
+        .unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let mut state = ExecutionState::new();
+        let root =
+            std::env::temp_dir().join(format!("dream64-missing-config-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        state.set_project_root(root.clone());
+        let result = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/run").unwrap(),
+            &[],
+            &mut state,
+        )
+        .unwrap();
+        let Value::List(result) = result else {
+            panic!("missing include must produce an empty list");
+        };
+        assert!(state.heap().list(result).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_sort_list_wrapper_wins_and_dispatches_comparator_proc_reference() {
+        let syntax = parse(concat!(
+            "/proc/cmp_desc(left, right)\n\treturn right - left\n",
+            "/proc/sort_list(values, comparator)\n",
+            "\tvar/list/result = values.Copy()\n",
+            "\tvar/temporary\n",
+            "\tif(call(comparator)(result[1], result[2]) > 0)\n",
+            "\t\ttemporary = result[1]\n",
+            "\t\tresult[1] = result[2]\n",
+            "\t\tresult[2] = temporary\n",
+            "\treturn result\n",
+            "/proc/run()\n\treturn sort_list(list(1, 3), /proc/cmp_desc)\n",
+        ))
+        .expect("project sort wrapper should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("project sort wrapper and comparator should link");
+        let run = module.procedure_id("/proc/run").expect("run procedure");
         assert!(
-            program
+            module
+                .procedure(run)
+                .expect("run program")
                 .instructions
                 .iter()
-                .any(|instruction| matches!(instruction, Instruction::StandardBuiltin { name, .. } if name == "sort_list"))
+                .all(|instruction| !matches!(instruction, Instruction::StandardBuiltin { name, .. } if name == "sort_list")),
+            "a declared project sort_list must not be replaced by a native builtin",
         );
-
         let mut state = ExecutionState::new();
-        let result = execute_in_state(&program, &[], &mut state).expect("sort_list should execute");
-        let Value::List(sorted) = result else {
-            panic!("sort_list should return a list");
+        let Value::List(sorted) = execute_module_in_state(&module, run, &[], &mut state)
+            .expect("project comparator should execute")
+        else {
+            panic!("project sort wrapper should return a list")
         };
-        let items = state
-            .heap()
-            .list(sorted)
-            .expect("sorted list should exist")
-            .positions()
-            .map(|(_, value)| value.clone())
-            .collect::<Vec<_>>();
         assert_eq!(
-            items,
-            vec![Value::number(1.0), Value::number(2.0), Value::number(10.0)]
+            state
+                .heap()
+                .list(sorted)
+                .expect("sorted list")
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>(),
+            vec![Value::number(3.0), Value::number(1.0)],
         );
     }
 
@@ -19970,7 +25568,7 @@ mod tests {
             program
                 .instructions
                 .iter()
-                .any(|instruction| matches!(instruction, Instruction::TypesOf))
+                .any(|instruction| matches!(instruction, Instruction::TypesOf { .. }))
         );
 
         let mut state = ExecutionState::new();
@@ -20000,6 +25598,155 @@ mod tests {
                 Value::TypePath(TypePath::parse("/datum/child/grandchild").expect("type path")),
             ]
         );
+    }
+
+    #[test]
+    fn typesof_invalid_text_is_empty_like_byond_516() {
+        let syntax = parse(
+            "/proc/types()\n\treturn typesof(\"Devoted Followers\").len + typesof(\"/datum\").len\n",
+        )
+        .expect("textual typesof source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("textual typesof source should compile");
+        let mut state = ExecutionState::new();
+        state.set_type_paths([
+            TypePath::parse("/datum").unwrap(),
+            TypePath::parse("/datum/child").unwrap(),
+        ]);
+        assert_eq!(
+            execute_in_state(&program, &[], &mut state),
+            Ok(Value::number(2.0))
+        );
+    }
+
+    #[test]
+    fn procedure_typesof_preserves_source_order_for_generated_global_initializers() {
+        let syntax = parse(
+            "/datum/controller/global_vars/proc/InitGlobalhuds_by_category()\n\treturn\n/datum/controller/global_vars/proc/InitGlobalhuds()\n\treturn\n/proc/catalog()\n\treturn typesof(/datum/controller/global_vars/proc)\n",
+        )
+        .expect("managed global initializer catalog should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("managed global initializer catalog should compile");
+        let mut state = ExecutionState::new();
+        let result = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/catalog").unwrap(),
+            &[],
+            &mut state,
+        )
+        .expect("procedure typesof should execute");
+        let Value::List(list) = result else {
+            panic!("procedure typesof should return a list")
+        };
+        let values = state
+            .heap()
+            .list(list)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                Value::TypePath(
+                    TypePath::parse(
+                        "/datum/controller/global_vars/proc/InitGlobalhuds_by_category"
+                    )
+                    .unwrap()
+                ),
+                Value::TypePath(
+                    TypePath::parse("/datum/controller/global_vars/proc/InitGlobalhuds").unwrap()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn reopened_generated_initglobal_remains_a_procedure_type_but_initialize_does_not() {
+        let syntax = parse(
+            "/datum/controller/global_vars/InitGlobalhuds_by_category()\n\treturn\n/datum/controller/global_vars/Initialize()\n\treturn\n",
+        )
+        .expect("shorthand controller overrides should parse");
+        let initglobal = ProcedureSpec {
+            path: "/datum/controller/global_vars/proc/InitGlobalhuds_by_category@2".to_owned(),
+            definition: &syntax.definitions[0],
+            parent: None,
+            static_calls: BTreeMap::new(),
+            src_fields: BTreeMap::new(),
+            global_fields: BTreeMap::new(),
+        };
+        let initialize = ProcedureSpec {
+            path: "/datum/controller/global_vars/proc/Initialize@3".to_owned(),
+            definition: &syntax.definitions[1],
+            parent: None,
+            static_calls: BTreeMap::new(),
+            src_fields: BTreeMap::new(),
+            global_fields: BTreeMap::new(),
+        };
+        assert!(super::procedure_spec_is_type_path(&initglobal));
+        assert!(!super::procedure_spec_is_type_path(&initialize));
+    }
+
+    #[test]
+    fn typesof_accepts_multiple_families_in_argument_order_and_deduplicates() {
+        let syntax = parse(concat!(
+            "/proc/clock_turfs()\n",
+            "\treturn typesof(/turf/open/floor/bronze, /turf/open/indestructible/reebe_flooring, /turf/closed/wall/clockwork, /turf/open/floor/engine/clockwork)\n",
+            "/proc/overlap()\n",
+            "\treturn typesof(/datum, /datum/child, null)\n",
+        ))
+        .expect("multi-selector typesof source should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("generated managed-global typesof initializer should compile");
+        let mut state = ExecutionState::new();
+        state.set_type_paths([
+            TypePath::parse("/datum").unwrap(),
+            TypePath::parse("/datum/child").unwrap(),
+            TypePath::parse("/datum/child/grandchild").unwrap(),
+            TypePath::parse("/turf/open/floor/bronze").unwrap(),
+            TypePath::parse("/turf/open/floor/bronze/gear").unwrap(),
+        ]);
+
+        let clock = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/clock_turfs").unwrap(),
+            &[],
+            &mut state,
+        )
+        .expect("clock turf families should execute");
+        let Value::List(clock) = clock else {
+            panic!("typesof should return a list");
+        };
+        let clock = state
+            .heap()
+            .list(clock)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            clock,
+            [
+                "/turf/open/floor/bronze",
+                "/turf/open/floor/bronze/gear",
+                "/turf/open/indestructible/reebe_flooring",
+                "/turf/closed/wall/clockwork",
+                "/turf/open/floor/engine/clockwork",
+            ]
+            .map(|path| Value::TypePath(TypePath::parse(path).unwrap()))
+        );
+
+        let overlap = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/overlap").unwrap(),
+            &[],
+            &mut state,
+        )
+        .expect("overlapping families and null should execute");
+        let Value::List(overlap) = overlap else {
+            panic!("typesof should return a list");
+        };
+        assert_eq!(state.heap().list(overlap).unwrap().len(), 3);
     }
 
     #[test]
@@ -20134,6 +25881,15 @@ mod tests {
     }
 
     #[test]
+    fn filter_datum_inherits_engine_datum_storage() {
+        let syntax =
+            parse("/proc/run()\n\tvar/f = filter(type = \"blur\")\n\treturn f.datum_flags\n")
+                .expect("filter source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("filter should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::number(0.0)));
+    }
+
+    #[test]
     fn filter_arglist_spreads_associative_entries_as_named_properties() {
         let syntax = parse(
             "/proc/run()\n\tvar/list/arguments = list(\"type\" = \"blur\", \"size\" = 7)\n\tvar/f = filter(arglist(arguments))\n\treturn f.size\n",
@@ -20250,6 +26006,36 @@ mod tests {
             compile_module(&syntax.definitions)
                 .unwrap_or_else(|error| panic!("{name}: {}", error.message));
         }
+    }
+
+    #[test]
+    fn deferred_gate_parser_families_compile_byond_shapes() {
+        let source = concat!(
+            "/proc/UnregisterSignal(target, signals)\n\treturn\n",
+            "/datum/proc/Topic(href, href_list[])\n\treturn 0\n",
+            "/client/Topic(href, href_list, hsrc, hsrc_command)\n\treturn ..()\n",
+            "/client/mentor/Topic(href, href_list, hsrc)\n\treturn ..()\n",
+            "/datum/example/Destroy(force)\n",
+            "\tvar/list/limbs = list()\n",
+            "\tUnregisterSignal(src, list(1, 2, 3,))\n",
+            "\tif(limbs) { for(var/_K, V in limbs) qdel(V); limbs.Cut(); }\n",
+            "\treturn ..()\n",
+            "/proc/world_loop()\n",
+            "\tvar/count = 0\n",
+            "\tfor(var/Obj in world)\n",
+            "\t\tcount++\n",
+            "\treturn count\n",
+            "/proc/empty_case(value)\n",
+            "\tswitch(value)\n",
+            "\t\tif(1)\n",
+            "\t\tif(2) return 2\n",
+            "/proc/trailing_case(value)\n",
+            "\tswitch(value)\n",
+            "\t\tif(1, 2, 3,) return 1\n",
+        );
+        let syntax = parse(source).expect("deferred gate syntax families should parse");
+        compile_module(&syntax.definitions)
+            .expect("Topic, nested trailing comma, untyped world loop, and empty case lower");
     }
 
     #[test]

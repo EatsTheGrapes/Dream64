@@ -1,0 +1,11 @@
+// Tiny production TGM fixture. The quoted grid's leading newline is
+// intentional and matches Monkestation's generated maps.
+"a" = (
+/obj/structure/sign/plaques/kiddie/badger{
+	name = "\improper Operative Remembrance Plaque"
+	},
+/turf/open/space/basic,
+/area/space)
+(1,1,1) = {"
+a
+"}

@@ -51,6 +51,28 @@ impl CompilerDatabase {
         let project = Project::load(root_file).map_err(CompilerError::Project)?;
         Ok(compile_project(project))
     }
+
+    /// Compiles a project through an exact persistent preprocessing cache.
+    ///
+    /// The returned boolean is `true` only when the cached project snapshot
+    /// was accepted after byte-for-byte validation of every discovered file.
+    /// Syntax and semantic products are still rebuilt from that immutable
+    /// snapshot, so compiler changes cannot reuse stale AST or object-tree
+    /// data.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same project discovery and source errors as [`Self::compile`]
+    /// when the cache is absent or stale.
+    pub fn compile_cached(
+        &self,
+        root_file: impl AsRef<Path>,
+        cache_file: impl AsRef<Path>,
+    ) -> Result<(Compilation, bool), CompilerError> {
+        let (project, cache_hit) =
+            Project::load_cached(root_file, cache_file).map_err(CompilerError::Project)?;
+        Ok((compile_project(project), cache_hit))
+    }
 }
 
 /// A complete frontend snapshot for one project.

@@ -99,6 +99,11 @@ const STANDARD_BUILTINS: &str = concat!(
 // bare-call resolution. Headless profiling control has no observable profile
 // payload yet, but BYOND's start/stop/restart calls legitimately return null.
 const NATIVE_PARENT_BUILTINS: &str = concat!(
+    // Every allocatable DM object has engine-owned terminal constructor and
+    // destructor hooks. User code may call `..()` even when no source-level
+    // `/datum/New` or `/datum/Del` declaration exists.
+    "/datum/New(...)\n\treturn null\n",
+    "/datum/Del()\n\treturn null\n",
     "/world/Profile(command, type, format)\n\treturn _dream64_world_profile(command, type, format)\n",
     "/world/GetConfig(config_set, param)\n\treturn _dream64_world_get_config(config_set, param)\n",
     "/world/SetConfig(config_set, param, value)\n\treturn _dream64_world_set_config(config_set, param, value)\n",
@@ -106,6 +111,23 @@ const NATIVE_PARENT_BUILTINS: &str = concat!(
     "/world/IsBanned(key, address, computer_id, type)\n\treturn 0\n",
     "/world/Error(exception)\n\treturn null\n",
 );
+
+fn native_parent_index(
+    path: &CodePath,
+    native_parent_indices: &BTreeMap<String, usize>,
+) -> Option<usize> {
+    let path = path.to_string();
+    native_parent_indices.get(&path).copied().or_else(|| {
+        let terminal = if path.ends_with("/proc/New") {
+            "/datum/proc/New"
+        } else if path.ends_with("/proc/Del") {
+            "/datum/proc/Del"
+        } else {
+            return None;
+        };
+        native_parent_indices.get(terminal).copied()
+    })
+}
 /// Tree-local identity of a canonical procedure.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProcedureId(u32);
@@ -254,6 +276,15 @@ impl ExecutableProcedures {
     #[must_use]
     pub const fn module(&self) -> &dm_vm::Module {
         &self.module
+    }
+
+    /// Returns the linked VM module for append-only runtime initializer entries.
+    ///
+    /// Appending preserves all existing procedure identities and deferred
+    /// project bodies while allowing map expressions to be linked after world
+    /// allocation.
+    pub const fn module_mut(&mut self) -> &mut dm_vm::Module {
+        &mut self.module
     }
 
     /// Resolves a semantic implementation to its VM-local identity.
@@ -409,7 +440,8 @@ impl ProcedureRegistry {
                             &dynamic_targets,
                             &procedures,
                         );
-                    for referenced_path in static_proc_reference_paths(definition) {
+                    for referenced_path in static_proc_reference_paths(definition, &procedure.path)
+                    {
                         build_stats.static_proc_reference_index_lookups += 1;
                         if let Some(target) = by_text_path
                             .get(&referenced_path)
@@ -417,6 +449,23 @@ impl ProcedureRegistry {
                         {
                             member_targets.insert(target);
                         }
+                    }
+                    // `typesof(/owner/proc)` materializes procedure paths which
+                    // are commonly fed straight into `call(src, path)()`.  The
+                    // selector is intentionally runtime data, but the family is
+                    // statically bounded: every effective procedure below that
+                    // procedure-type path must be present in the symbolic
+                    // module.  In particular, tgstation's generated
+                    // `InitGlobal*` procedures are discovered this way.
+                    for family in static_procedure_type_families(definition) {
+                        member_targets.extend(procedures.iter().filter_map(|candidate| {
+                            candidate
+                                .path
+                                .segments()
+                                .starts_with(&family)
+                                .then_some(candidate.effective_target)
+                                .flatten()
+                        }));
                     }
                     let mut dynamic = dynamic_call_literal_selectors(definition);
                     let construction = construction_dependencies(
@@ -573,6 +622,35 @@ impl ProcedureRegistry {
                 .map(|implementation| implementation.id)
         });
         self.compile_vm_selected_deferred(compilation, selected, &BTreeSet::new())
+    }
+
+    /// Links the complete project procedure table while eagerly lowering only
+    /// the statically proven closure of the supplied startup roots.
+    ///
+    /// A BYOND/OpenDream runtime can dynamically invoke any project method
+    /// whose selector and receiver are produced at runtime. Keeping every
+    /// identity deferred preserves that contract without paying to lower
+    /// unrelated UI/admin/gameplay bodies during headless startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when symbol metadata or an eagerly required body
+    /// cannot be represented. Deferred body errors remain attached until the
+    /// corresponding procedure is actually reached.
+    pub fn compile_vm_all_symbolic_with_eager_roots(
+        &self,
+        compilation: &Compilation,
+        roots: impl IntoIterator<Item = ProcedureImplementationId>,
+    ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
+        let roots = roots.into_iter().collect::<BTreeSet<_>>();
+        let eager = self.eager_implementation_closure(compilation, roots);
+        let selected = self.procedures.iter().flat_map(|procedure| {
+            procedure
+                .implementations
+                .iter()
+                .map(|implementation| implementation.id)
+        });
+        self.compile_vm_selected_deferred(compilation, selected, &eager)
     }
 
     /// Links the conservative procedure frontier named by bootstrap
@@ -810,10 +888,37 @@ impl ProcedureRegistry {
                 .flatten()
             {
                 stats.static_selectors_resolved += 1;
-                if let Some(target) = self.static_call_target(implementation, selector, compilation)
-                    && selected.insert(target)
+                let resolved = self.static_call_target(implementation, selector, compilation);
+                if let Some(target) = resolved {
+                    if selected.insert(target) {
+                        pending.push(target);
+                    }
+                }
+                // A bare member call is statically name-resolved but remains
+                // virtual on src at runtime. Retain compatible descendant
+                // overrides as deferred symbols so an inherited body running
+                // on a concrete subtype can dispatch to that subtype's method.
+                let owner = self
+                    .procedure(implementation.procedure())
+                    .and_then(|procedure| procedure.owner_type);
+                let resolved_owner = resolved
+                    .and_then(|target| self.procedure(target.procedure()))
+                    .and_then(|procedure| procedure.owner_type);
+                if let (Some(owner), Some(resolved_owner)) = (owner, resolved_owner)
+                    && type_is_descendant_or_same(compilation, owner, resolved_owner)
+                    && let Some(candidates) = self.dynamic_targets.get(selector)
                 {
-                    pending.push(target);
+                    for &candidate in candidates {
+                        let candidate_owner = self
+                            .procedure(candidate.procedure())
+                            .and_then(|procedure| procedure.owner_type);
+                        if candidate_owner.is_some_and(|candidate_owner| {
+                            type_is_descendant_or_same(compilation, candidate_owner, owner)
+                        }) && selected.insert(candidate)
+                        {
+                            pending.push(candidate);
+                        }
+                    }
                 }
             }
         }
@@ -1064,7 +1169,7 @@ impl ProcedureRegistry {
                                 })
                         })
                         .transpose()?
-                        .or_else(|| native_parent_indices.get(&procedure.path.to_string()).copied())
+                        .or_else(|| native_parent_index(&procedure.path, &native_parent_indices))
                 } else {
                     None
                 };
@@ -1316,25 +1421,10 @@ fn normalize_upward_paths(
     let mut normalized = definition.clone();
     let mut local_types = BTreeMap::<String, dm_syntax::DefinitionPath>::new();
     for parameter in &normalized.parameters {
-        let identifiers = parameter
-            .tokens
-            .iter()
-            .take_while(
-                |token| !matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
-            )
-            .filter_map(|token| match &token.kind {
-                TokenKind::Identifier(name) => Some(name.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let end = identifiers
-            .iter()
-            .position(|name| *name == "as")
-            .unwrap_or(identifiers.len());
-        if let Some(name) = identifiers[..end].last()
+        if let Some(name) = parameter_declaration_name(&parameter.tokens)
             && let Some(path) = declared_type_path(&parameter.tokens, name)
         {
-            local_types.insert((*name).to_owned(), path);
+            local_types.insert(name.to_owned(), path);
         }
     }
     let contextual_anchor = owner
@@ -1449,20 +1539,7 @@ fn normalize_upward_paths(
         }
     }
     for parameter in &mut normalized.parameters {
-        let declaration_end = parameter
-            .tokens
-            .iter()
-            .position(
-                |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
-            )
-            .unwrap_or(parameter.tokens.len());
-        let declared_name = parameter.tokens[..declaration_end]
-            .iter()
-            .rev()
-            .find_map(|token| match &token.kind {
-                TokenKind::Identifier(name) if name != "var" => Some(name.clone()),
-                _ => None,
-            });
+        let declared_name = parameter_declaration_name(&parameter.tokens).map(str::to_owned);
         if let Some(name) = declared_name
             && let Some(path) = declared_type_path(&parameter.tokens, &name)
         {
@@ -1896,23 +1973,8 @@ fn validate_const_assignments(
     if let Some(node) = procedure_node {
         validate_override_return_signature(compilation, node)?;
     }
-    let return_type = procedure_node.and_then(|node| effective_datum_return(compilation, node));
-    let scalar_return = procedure_node.and_then(|node| effective_scalar_return(compilation, node));
-
     for parameter in &definition.parameters {
-        let identifiers: Vec<_> = parameter
-            .tokens
-            .iter()
-            .filter_map(|token| match &token.kind {
-                TokenKind::Identifier(name) => Some(name.as_str()),
-                _ => None,
-            })
-            .collect();
-        let name_end = identifiers
-            .iter()
-            .position(|name| *name == "as")
-            .unwrap_or(identifiers.len());
-        let Some(name) = identifiers[..name_end].last().copied() else {
+        let Some(name) = parameter_declaration_name(&parameter.tokens) else {
             continue;
         };
         locals.insert(name.to_owned());
@@ -2032,41 +2094,10 @@ fn validate_const_assignments(
         }
 
         let Some(assignment_index) = assignment else {
-            if matches!(tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(keyword)) if keyword == "return")
-                && let (Some(expected), Some(actual)) = (
-                    return_type,
-                    proven_datum_expression_type(
-                        compilation,
-                        &tokens[1..],
-                        &local_types,
-                        owner,
-                        bindings,
-                        &known_truthy,
-                        registry,
-                        implementation,
-                    ),
-                )
-            {
-                validate_type_assignment(compilation, "return", expected, actual)?;
-            }
-            if matches!(tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(keyword)) if keyword == "return")
-                && let (Some(expected), Some(actual)) = (
-                    scalar_return,
-                    proven_scalar_type(
-                        compilation,
-                        registry,
-                        implementation,
-                        &tokens[1..],
-                        &scalar_types,
-                        &local_types,
-                        owner,
-                        bindings,
-                        &known_truthy,
-                    ),
-                )
-            {
-                validate_scalar_assignment("return", expected, actual)?;
-            }
+            // BYOND return annotations constrain the declared proc signature
+            // (and therefore callers), but do not reject body values. BYOND
+            // 516 accepts path-, scalar-, local-, and call-result mismatches
+            // here; runtime filtering/coercion remains the proc contract.
             continue;
         };
         let assigned = &tokens[..assignment_index];
@@ -2948,6 +2979,23 @@ fn declared_type_node(
         .find(&declared_type_path(tokens, variable_name)?)
 }
 
+fn parameter_declaration_name(tokens: &[dm_lexer::SpannedToken]) -> Option<&str> {
+    let end = tokens
+        .iter()
+        .position(|token| {
+            matches!(&token.kind, TokenKind::Operator(operator) if operator == "=")
+                || matches!(&token.kind, TokenKind::Identifier(name) if matches!(name.as_str(), "as" | "in"))
+        })
+        .unwrap_or(tokens.len());
+    tokens[..end]
+        .iter()
+        .rev()
+        .find_map(|token| match &token.kind {
+            TokenKind::Identifier(name) if name != "var" => Some(name.as_str()),
+            _ => None,
+        })
+}
+
 fn validate_declared_type_exists(
     compilation: &Compilation,
     tokens: &[dm_lexer::SpannedToken],
@@ -3043,27 +3091,27 @@ fn declared_type_path(
             _ => None,
         })
         .collect();
-    let segments: Vec<String> =
-        if let Some(as_index) = identifiers.iter().position(|name| *name == "as") {
-            identifiers[as_index + 1..]
-                .iter()
-                .take_while(|name| !matches!(**name, "null" | "num" | "text"))
-                .map(|name| (**name).to_owned())
-                .collect()
-        } else {
-            let name_index = identifiers
-                .iter()
-                .rposition(|name| *name == variable_name)?;
-            let type_start = identifiers
-                .iter()
-                .position(|name| *name == "var")
-                .map_or(0, |index| index + 1);
-            identifiers[type_start..name_index]
-                .iter()
-                .filter(|name| !matches!(**name, "global" | "static" | "tmp" | "const" | "final"))
-                .map(|name| (**name).to_owned())
-                .collect()
-        };
+    // `as ...` and a following `in ...` are input/verb constraints, never a
+    // declared datum path.  Preserve an explicit type before the variable
+    // (`mob/M as mob in players`) and otherwise leave the parameter untyped
+    // (`message as message`, `target as turf in world`).
+    let constraint = identifiers
+        .iter()
+        .position(|name| *name == "as")
+        .unwrap_or(identifiers.len());
+    let declaration = &identifiers[..constraint];
+    let name_index = declaration
+        .iter()
+        .rposition(|name| *name == variable_name)?;
+    let type_start = declaration
+        .iter()
+        .position(|name| *name == "var")
+        .map_or(0, |index| index + 1);
+    let segments: Vec<String> = declaration[type_start..name_index]
+        .iter()
+        .filter(|name| !matches!(**name, "global" | "static" | "tmp" | "const" | "final"))
+        .map(|name| (**name).to_owned())
+        .collect();
     if segments.is_empty() {
         return None;
     }
@@ -3286,15 +3334,7 @@ fn declared_receiver_types(
 ) -> BTreeMap<String, dm_syntax::DefinitionPath> {
     let mut types = BTreeMap::new();
     for parameter in &definition.parameters {
-        let Some(name) = parameter
-            .tokens
-            .iter()
-            .rev()
-            .find_map(|token| match &token.kind {
-                TokenKind::Identifier(name) if name != "as" => Some(name.as_str()),
-                _ => None,
-            })
-        else {
+        let Some(name) = parameter_declaration_name(&parameter.tokens) else {
             continue;
         };
         if let Some(path) = declared_type_path(&parameter.tokens, name) {
@@ -3332,7 +3372,7 @@ fn declared_receiver_types(
 }
 
 fn declared_global_types(compilation: &Compilation) -> BTreeMap<String, TypePath> {
-    compilation
+    let mut types = compilation
         .code_tree()
         .nodes()
         .iter()
@@ -3352,7 +3392,19 @@ fn declared_global_types(compilation: &Compilation) -> BTreeMap<String, TypePath
                 .ok()
                 .map(|path| (name.clone(), path))
         })
-        .collect()
+        .collect::<BTreeMap<_, _>>();
+    if compilation
+        .code_tree()
+        .nodes()
+        .iter()
+        .any(|node| node.kind == NodeKind::Type && node.path.to_string() == "/world")
+    {
+        types.insert(
+            "world".to_owned(),
+            TypePath::parse("/world").expect("built-in world type path is valid"),
+        );
+    }
+    types
 }
 
 fn declared_field_types(compilation: &Compilation) -> BTreeMap<NodeId, BTreeMap<String, NodeId>> {
@@ -3666,8 +3718,19 @@ fn type_node_from_tokens(
         .flatten()
 }
 
-fn static_proc_reference_paths(definition: &dm_syntax::Definition) -> BTreeSet<String> {
-    fn collect(tokens: &[dm_lexer::SpannedToken], paths: &mut BTreeSet<String>) {
+fn static_proc_reference_paths(
+    definition: &dm_syntax::Definition,
+    procedure_path: &CodePath,
+) -> BTreeSet<String> {
+    let procedure_path = procedure_path.to_string();
+    let owner_path = procedure_path
+        .split_once("/proc/")
+        .map(|(owner, _)| owner.to_owned());
+    fn collect(
+        tokens: &[dm_lexer::SpannedToken],
+        owner_path: Option<&str>,
+        paths: &mut BTreeSet<String>,
+    ) {
         let mut index = 0usize;
         while index < tokens.len() {
             if let TokenKind::String(value) | TokenKind::RawString(value) = &tokens[index].kind {
@@ -3683,6 +3746,21 @@ fn static_proc_reference_paths(definition: &dm_syntax::Definition) -> BTreeSet<S
                 {
                     paths.insert(value.clone());
                 }
+            }
+            // tgstation's PROC_REF(name) expands to nameof(.proc/name).
+            // Although the resulting selector is text at runtime, the
+            // receiver is the current datum and the target family is exactly
+            // bounded by the owning type at compile time.
+            if matches!(&tokens[index].kind, TokenKind::Operator(operator) if operator == ".")
+                && matches!(tokens.get(index + 1).map(|token| &token.kind), Some(TokenKind::Identifier(segment)) if segment == "proc")
+                && matches!(tokens.get(index + 2).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "/")
+                && let Some(TokenKind::Identifier(name)) =
+                    tokens.get(index + 3).map(|token| &token.kind)
+                && let Some(owner_path) = owner_path
+            {
+                paths.insert(format!("{owner_path}/proc/{name}"));
+                index += 4;
+                continue;
             }
             if !matches!(&tokens[index].kind, TokenKind::Operator(operator) if operator == "/") {
                 index += 1;
@@ -3717,12 +3795,51 @@ fn static_proc_reference_paths(definition: &dm_syntax::Definition) -> BTreeSet<S
     // registry scan per procedure. Parameter token lists retain the only
     // header expressions that can genuinely reference another procedure.
     for parameter in &definition.parameters {
-        collect(&parameter.tokens, &mut paths);
+        collect(&parameter.tokens, owner_path.as_deref(), &mut paths);
     }
     for line in &definition.body {
-        collect(&line.tokens, &mut paths);
+        collect(&line.tokens, owner_path.as_deref(), &mut paths);
     }
     paths
+}
+
+fn static_procedure_type_families(definition: &dm_syntax::Definition) -> BTreeSet<Vec<String>> {
+    fn collect(tokens: &[dm_lexer::SpannedToken], families: &mut BTreeSet<Vec<String>>) {
+        for (index, token) in tokens.iter().enumerate() {
+            if !matches!(&token.kind, TokenKind::Identifier(name) if name == "typesof")
+                || !matches!(
+                    tokens.get(index + 1).map(|token| &token.kind),
+                    Some(TokenKind::Punctuation('('))
+                )
+            {
+                continue;
+            }
+            let mut cursor = index + 2;
+            let mut segments = Vec::new();
+            while matches!(tokens.get(cursor).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "/")
+            {
+                let Some(TokenKind::Identifier(segment)) =
+                    tokens.get(cursor + 1).map(|token| &token.kind)
+                else {
+                    break;
+                };
+                segments.push(segment.clone());
+                cursor += 2;
+            }
+            if segments.last().is_some_and(|segment| segment == "proc") {
+                families.insert(segments);
+            }
+        }
+    }
+
+    let mut families = BTreeSet::new();
+    for parameter in &definition.parameters {
+        collect(&parameter.tokens, &mut families);
+    }
+    for line in &definition.body {
+        collect(&line.tokens, &mut families);
+    }
+    families
 }
 
 fn is_identifier_text(value: &str) -> bool {
@@ -3762,6 +3879,18 @@ fn member_call_dependencies(
     let mut typed_virtual = BTreeSet::new();
     let mut unresolved = BTreeSet::new();
     for line in &definition.body {
+        // Interpolated DM text stores its embedded expressions inside a single
+        // String token. The VM reparses those expressions when lowering the
+        // body, so their member calls must participate in symbolic linking as
+        // well. Receiver typing cannot be recovered reliably from decoded
+        // string text (nested quoted arguments are legal), therefore retain
+        // matching member symbols conservatively and leave exact virtual
+        // selection to runtime dispatch.
+        for token in &line.tokens {
+            if let TokenKind::String(text) | TokenKind::RawString(text) = &token.kind {
+                collect_text_member_call_selectors(text, &mut unresolved);
+            }
+        }
         for selector_index in 2..line.tokens.len().saturating_sub(1) {
             let dot = &line.tokens[selector_index - 1];
             let selector = &line.tokens[selector_index];
@@ -3775,17 +3904,37 @@ fn member_call_dependencies(
                 continue;
             };
             let receiver_end = selector_index - 1;
-            let receiver_node = (0..receiver_end).find_map(|start| {
-                proven_receiver_expression_type(
-                    compilation,
-                    owner,
-                    &line.tokens[start..receiver_end],
-                    &flowing_types,
-                    global_types,
-                    field_types,
-                    by_owner_name,
-                    procedures,
-                )
+            // `world` is an engine-owned, typed global receiver. Prefer that
+            // exact binding before examining a larger enclosing expression:
+            // macro-expanded arguments such as
+            // `list.Add("key", world.some_proc())` otherwise let the broad
+            // prefix scan incorrectly prove `list` as the receiver and retain
+            // the wrong same-named member family.
+            let receiver_node = matches!(
+                line.tokens
+                    .get(receiver_end.saturating_sub(1))
+                    .map(|token| &token.kind),
+                Some(TokenKind::Identifier(identifier)) if identifier == "world"
+            )
+            .then(|| {
+                compilation
+                    .code_tree()
+                    .find(&dm_syntax::DefinitionPath::new(vec!["world".to_owned()]))
+            })
+            .flatten()
+            .or_else(|| {
+                (0..receiver_end).find_map(|start| {
+                    proven_receiver_expression_type(
+                        compilation,
+                        owner,
+                        &line.tokens[start..receiver_end],
+                        &flowing_types,
+                        global_types,
+                        field_types,
+                        by_owner_name,
+                        procedures,
+                    )
+                })
             });
             let Some(mut receiver_node) = receiver_node else {
                 unresolved.insert(selector.clone());
@@ -4153,6 +4302,40 @@ fn collect_text_call_selectors(text: &str, selectors: &mut BTreeSet<String>) {
     }
 }
 
+fn collect_text_member_call_selectors(text: &str, selectors: &mut BTreeSet<String>) {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'.' {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let start = index;
+        if bytes
+            .get(index)
+            .is_none_or(|byte| !byte.is_ascii_alphabetic() && *byte != b'_')
+        {
+            continue;
+        }
+        index += 1;
+        while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+        {
+            index += 1;
+        }
+        let mut next = index;
+        while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+            next += 1;
+        }
+        if bytes.get(next) == Some(&b'(') {
+            selectors.insert(text[start..index].to_owned());
+        }
+    }
+}
+
 fn collect_call_selectors(tokens: &[dm_lexer::SpannedToken], selectors: &mut BTreeSet<String>) {
     for index in 0..tokens.len().saturating_sub(1) {
         if index > 0 {
@@ -4230,11 +4413,32 @@ fn standard_instance_fields(path: Option<&CodePath>, fields: &mut BTreeMap<Strin
     let Some(path) = path else {
         return;
     };
-    let names: &[&str] = match path.to_string().as_str() {
+    let path = path.to_string();
+    let names = standard_instance_field_names(&path);
+    if names.is_empty() {
+        return;
+    }
+    for name in names {
+        // All catalog entries are fixed, valid DM identifiers.
+        fields.insert(
+            (*name).to_owned(),
+            FieldName::parse(name).expect("standard field name is valid"),
+        );
+    }
+}
+
+/// Returns the engine-owned fields declared directly by a built-in DM type.
+///
+/// This is public so runtime materialization tests can enforce that the
+/// semantic catalog and concrete datum defaults never drift apart.
+#[doc(hidden)]
+#[must_use]
+pub fn standard_instance_field_names(path: &str) -> &'static [&'static str] {
+    match path {
         // Every datum exposes its canonical runtime type through this
         // read-only built-in field. The VM materializes its value from the
         // datum record rather than from a user-declared default.
-        "/datum" => &["tag", "type", "parent_type"],
+        "/datum" => &["datum_flags", "tag", "type", "parent_type", "vars"],
         "/world" => &[
             "system_type",
             "icon_size",
@@ -4303,6 +4507,7 @@ fn standard_instance_fields(path: Option<&CodePath>, fields: &mut BTreeMap<Strin
             "maptext_x",
             "maptext_y",
             "mouse_opacity",
+            "mouse_over_pointer",
             "name",
             "opacity",
             "overlays",
@@ -4314,10 +4519,13 @@ fn standard_instance_fields(path: Option<&CodePath>, fields: &mut BTreeMap<Strin
             "pixel_z",
             "render_source",
             "render_target",
+            "suffix",
             "transform",
             "underlays",
             "vis_contents",
+            "vis_locs",
             "vis_flags",
+            "verbs",
             "x",
             "y",
             "z",
@@ -4334,26 +4542,78 @@ fn standard_instance_fields(path: Option<&CodePath>, fields: &mut BTreeMap<Strin
             "step_y",
             "step_size",
         ],
-        "/mob" => &["ckey", "client", "key", "see_invisible", "sight"],
+        "/mob" => &[
+            "ckey",
+            "client",
+            "eye",
+            "key",
+            "perspective",
+            "see_in_dark",
+            "see_infrared",
+            "see_invisible",
+            "sight",
+        ],
         "/client" => &[
             "address",
             "ckey",
             "computer_id",
             "connection",
+            "control_freak",
+            "dir",
+            "gender",
             "byond_build",
             "byond_version",
             "key",
+            "eye",
+            "images",
+            "inactivity",
             "mob",
+            "perspective",
+            "pixel_w",
+            "pixel_x",
+            "pixel_y",
+            "pixel_z",
             "screen",
+            "statobj",
             "verbs",
             "view",
         ],
         "/matrix" => &["a", "b", "c", "d", "e", "f"],
+        // BYOND exposes the state of the most recent regex operation as
+        // ordinary fields. Map readers in tg-derived projects use `next`
+        // directly to advance a global regex sweep.
+        "/regex" => &["text", "flags", "match", "index", "group", "next"],
+        "/particles" => &[
+            "color",
+            "width",
+            "height",
+            "count",
+            "spawning",
+            "bound1",
+            "bound2",
+            "gravity",
+            "gradient",
+            "transform",
+            "icon",
+            "icon_state",
+            "lifespan",
+            "fadein",
+            "fade",
+            "position",
+            "velocity",
+            "scale",
+            "grow",
+            "rotation",
+            "spin",
+            "friction",
+            "drift",
+        ],
         // `/image` is an engine-owned appearance datum rather than an atom,
         // but BYOND exposes the same mutable appearance surface used by
         // overlays. These fields exist without user declarations.
         "/image" => &[
             "alpha",
+            "appearance",
             "appearance_flags",
             "blend_mode",
             "color",
@@ -4369,14 +4629,7 @@ fn standard_instance_fields(path: Option<&CodePath>, fields: &mut BTreeMap<Strin
             "underlays",
             "vis_contents",
         ],
-        _ => return,
-    };
-    for name in names {
-        // All catalog entries are fixed, valid DM identifiers.
-        fields.insert(
-            (*name).to_owned(),
-            FieldName::parse(name).expect("standard field name is valid"),
-        );
+        _ => &[],
     }
 }
 
@@ -4630,10 +4883,9 @@ mod tests {
         let incompatible_return = TestProject::compile(
             "/datum/base\n/obj/item\n/proc/build() as /datum/base\n\treturn /obj/item\n",
         );
-        let error = ProcedureRegistry::build(&incompatible_return)
+        ProcedureRegistry::build(&incompatible_return)
             .compile_vm(&incompatible_return)
-            .expect_err("an obj path cannot satisfy a datum/base return type");
-        assert!(error.message.contains("typed variable `return`"));
+            .expect("BYOND return annotations do not reject body values");
 
         let compatible = TestProject::compile(
             "/datum/base\n/datum/base/child\n/proc/copy() as /datum/base\n\tvar/datum/base/target\n\tvar/datum/base/child/source\n\ttarget = source\n\treturn /datum/base/child\n",
@@ -4648,24 +4900,16 @@ mod tests {
         let bad_local = TestProject::compile(
             "/proc/value() as num\n\tvar/const/result = \"wrong\"\n\treturn result\n",
         );
-        assert!(
-            ProcedureRegistry::build(&bad_local)
-                .compile_vm(&bad_local)
-                .expect_err("text cannot satisfy a numeric return")
-                .message
-                .contains("typed variable `return`")
-        );
+        ProcedureRegistry::build(&bad_local)
+            .compile_vm(&bad_local)
+            .expect("BYOND scalar return annotations do not reject body values");
 
         let bad_parameter = TestProject::compile(
             "/proc/value(var/input = \"text\" as text) as num\n\treturn input\n",
         );
-        assert!(
-            ProcedureRegistry::build(&bad_parameter)
-                .compile_vm(&bad_parameter)
-                .expect_err("a text parameter cannot satisfy a numeric return")
-                .message
-                .contains("typed variable `return`")
-        );
+        ProcedureRegistry::build(&bad_parameter)
+            .compile_vm(&bad_parameter)
+            .expect("BYOND permits dynamic scalar return values");
 
         let compatible = TestProject::compile(
             "/proc/number() as num\n\tvar/value = 5 as num|null\n\tvalue = null\n\tvalue = 7\n\treturn value\n/proc/text_value(var/input = \"ok\" as text) as text\n\treturn input\n",
@@ -4680,13 +4924,9 @@ mod tests {
         let inherited_mismatch = TestProject::compile(
             "/datum/proc/value() as num\n\treturn 5\n/datum/child/value()\n\treturn \"wrong\"\n",
         );
-        assert!(
-            ProcedureRegistry::build(&inherited_mismatch)
-                .compile_vm(&inherited_mismatch)
-                .expect_err("unannotated override should inherit numeric return")
-                .message
-                .contains("typed variable `return`")
-        );
+        ProcedureRegistry::build(&inherited_mismatch)
+            .compile_vm(&inherited_mismatch)
+            .expect("an inherited annotation constrains signatures, not body values");
 
         let changed_signature = TestProject::compile(
             "/datum/proc/value() as num\n\treturn 5\n/datum/child/value() as text\n\treturn \"wrong\"\n",
@@ -4702,13 +4942,9 @@ mod tests {
         let call_mismatch = TestProject::compile(
             "/proc/text_value() as text\n\treturn \"text\"\n/proc/number_value() as num\n\treturn text_value()\n",
         );
-        assert!(
-            ProcedureRegistry::build(&call_mismatch)
-                .compile_vm(&call_mismatch)
-                .expect_err("static text call cannot satisfy numeric return")
-                .message
-                .contains("typed variable `return`")
-        );
+        ProcedureRegistry::build(&call_mismatch)
+            .compile_vm(&call_mismatch)
+            .expect("BYOND permits a differently annotated call result to be returned");
 
         let compatible = TestProject::compile(
             "/datum/base\n/datum/base/child\n/proc/build_child() as /datum/base/child\n\treturn /datum/base/child\n/proc/build() as /datum/base\n\treturn build_child()\n",
@@ -4744,24 +4980,16 @@ mod tests {
         let field_mismatch = TestProject::compile(
             "/datum/value_holder\n\tvar/bar = 5 as num\n\tproc/read() as text\n\t\tvar/datum/value_holder/D = new\n\t\treturn D.bar\n",
         );
-        assert!(
-            ProcedureRegistry::build(&field_mismatch)
-                .compile_vm(&field_mismatch)
-                .expect_err("numeric typed member cannot satisfy text return")
-                .message
-                .contains("typed variable `return`")
-        );
+        ProcedureRegistry::build(&field_mismatch)
+            .compile_vm(&field_mismatch)
+            .expect("typed fields remain runtime values at a return site");
 
         let method_mismatch = TestProject::compile(
             "/datum/producer/proc/value() as text\n\treturn \"text\"\n/proc/read() as num\n\tvar/datum/producer/P = new\n\treturn P.value()\n",
         );
-        assert!(
-            ProcedureRegistry::build(&method_mismatch)
-                .compile_vm(&method_mismatch)
-                .expect_err("typed receiver method return should propagate")
-                .message
-                .contains("typed variable `return`")
-        );
+        ProcedureRegistry::build(&method_mismatch)
+            .compile_vm(&method_mismatch)
+            .expect("typed method results remain runtime values at a return site");
 
         let compatible = TestProject::compile(
             "/datum/base\n/datum/base/child\n/datum/producer/proc/value() as /datum/base/child\n\treturn /datum/base/child\n/proc/read() as /datum/base\n\tvar/datum/producer/P = new\n\treturn P.value()\n",
@@ -4776,36 +5004,24 @@ mod tests {
         let compilation = TestProject::compile(
             "/datum/do/re/mi/fa/so/f()\n\treturn 5\n/datum/do/re/f()\n\treturn ..() + \" re\"\n/datum/do/re/mi/fa/f()\n\treturn ..() + \" fa\"\n/datum/do/re/mi/f()\n\treturn ..() + \" mi\"\n/datum/do/proc/f() as text\n\treturn \"do\"\n",
         );
-        assert!(
-            ProcedureRegistry::build(&compilation)
-                .compile_vm(&compilation)
-                .expect_err("early numeric override must inherit late text signature")
-                .message
-                .contains("typed variable `return`")
-        );
+        ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("late inherited signatures do not constrain override body values");
     }
 
     #[test]
     fn infers_only_proven_scalar_composite_results() {
         let incompatible =
             TestProject::compile("/proc/ternary_value() as text\n\treturn 1 ? 2 : 3\n");
-        assert!(
-            ProcedureRegistry::build(&incompatible)
-                .compile_vm(&incompatible)
-                .expect_err("numeric ternary cannot satisfy text return")
-                .message
-                .contains("typed variable `return`")
-        );
+        ProcedureRegistry::build(&incompatible)
+            .compile_vm(&incompatible)
+            .expect("return annotations do not reject numeric ternaries");
 
         let list_mismatch =
             TestProject::compile("/proc/list_value() as text\n\treturn list(1, 2, 3)[1]\n");
-        assert!(
-            ProcedureRegistry::build(&list_mismatch)
-                .compile_vm(&list_mismatch)
-                .expect_err("homogeneous numeric list index cannot satisfy text return")
-                .message
-                .contains("typed variable `return`")
-        );
+        ProcedureRegistry::build(&list_mismatch)
+            .compile_vm(&list_mismatch)
+            .expect("return annotations do not reject list-index results");
 
         let compatible = TestProject::compile(
             "/datum/proc/value() as text\n\treturn \"base\"\n/datum/child/value()\n\treturn ..() + \" child\"\n/proc/number() as num\n\treturn (1 ? 2 : 3) + list(4, 5)[1]\n",
@@ -4819,13 +5035,9 @@ mod tests {
     fn mutable_unannotated_locals_do_not_acquire_static_scalar_types() {
         let compilation =
             TestProject::compile("/datum/proc/foo() as num\n\tvar/meep = 5\n\treturn meep\n");
-        assert!(
-            ProcedureRegistry::build(&compilation)
-                .compile_vm(&compilation)
-                .expect_err("a mutable unannotated local remains dynamically typed")
-                .message
-                .contains("typed variable `return`")
-        );
+        ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("dynamic locals may be returned from annotated procedures");
     }
 
     #[test]
@@ -4942,6 +5154,10 @@ mod tests {
                 "late derived field",
                 "/datum/later\n\tvar/datum/pointless_base/a\n/datum/pointless_base/derived/var/x = 7\n/proc/RunTest()\n\tvar/datum/later/L = new\n\tL.a = new /datum/pointless_base/derived()\n\treturn\n",
             ),
+            (
+                "BYOND input-qualified parameters",
+                "/area/target\n/datum/thing\n/mob/player\n/client/proc/jump_to_area(area/target in world)\n\treturn target\n/client/proc/debug_variables(datum/thing in world)\n\treturn thing\n/proc/togglebuildmode(mob/M in global.player_list)\n\treturn M\n",
+            ),
         ];
         for (label, source) in cases {
             let compilation = TestProject::compile(source);
@@ -4986,6 +5202,25 @@ mod tests {
                 .compile_vm(&compilation)
                 .unwrap_or_else(|error| panic!("{label} should compile: {error:?}"));
         }
+    }
+
+    #[test]
+    fn title_icon_field_assignment_infers_icon_and_preserves_the_resource() {
+        let compilation = TestProject::compile(concat!(
+            "/datum/controller/subsystem/title\n",
+            "\tvar/icon/icon\n",
+            "\tproc/Initialize()\n",
+            "\t\ticon = new(fcopy_rsc(\"icons/runtime/default_title.dmi\"))\n",
+            "\t\treturn icon.icon\n",
+            "/proc/run_title_initialize()\n",
+            "\tvar/datum/controller/subsystem/title/title = new\n",
+            "\treturn title.Initialize()\n",
+        ));
+
+        assert_eq!(
+            execute_effective(&compilation, "/proc/run_title_initialize", &[]),
+            Ok(Value::file("icons/runtime/default_title.dmi")),
+        );
     }
 
     #[test]
@@ -5119,6 +5354,36 @@ mod tests {
         assert!(!instructions.iter().any(|instruction| matches!(
             instruction,
             dm_vm::Instruction::LoadField(_) | dm_vm::Instruction::StoreField(_)
+        )));
+    }
+
+    #[test]
+    fn typed_global_receiver_static_increment_uses_qualified_shared_slot() {
+        let compilation = TestProject::compile(
+            "var/global/datum/controller/master/Master\n/datum/controller/master\n\tvar/static/restart_count = 0\n/proc/Recreate_MC()\n\treturn ++Master.restart_count\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let executable = registry
+            .compile_vm(&compilation)
+            .expect("master static mutation");
+        let procedure = procedure_by_path(&registry, "/proc/Recreate_MC")
+            .effective_target
+            .and_then(|id| executable.implementation(id))
+            .expect("Recreate_MC implementation");
+        let instructions = &executable
+            .module()
+            .procedure(procedure)
+            .unwrap()
+            .instructions;
+        let qualified =
+            dm_value::FieldName::static_storage("/datum/controller/master/var/restart_count");
+        assert!(instructions.iter().any(|instruction| matches!(
+            instruction,
+            dm_vm::Instruction::MutateGlobal { name, delta: 1, prefix: true } if name == &qualified
+        )), "{instructions:?}");
+        assert!(!instructions.iter().any(|instruction| matches!(
+            instruction,
+            dm_vm::Instruction::MutateField { name, .. } if name.as_str() == "restart_count"
         )));
     }
 
@@ -5404,9 +5669,24 @@ GLOBAL_REAL(Master, /datum/controller/master)
     }
 
     #[test]
+    fn lowers_existing_instance_field_as_undeclared_for_loop_target() {
+        let compilation = TestProject::compile(
+            "/obj/machine\n\tvar/cointype = /obj/coin\n\tInitialize()\n\t\tfor(cointype in typesof(/obj/coin))\n\t\t\tvar/obj/coin/value = new cointype\n/obj/coin\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let procedure = procedure_by_path(&registry, "/obj/machine/proc/Initialize");
+        registry
+            .compile_vm_implementations(
+                &compilation,
+                procedure.implementations.iter().map(|body| body.id),
+            )
+            .expect("an undeclared for target should bind an existing src field");
+    }
+
+    #[test]
     fn lowers_standard_atom_fields_only_for_their_builtin_hierarchy() {
         let compilation = TestProject::compile(
-            "/atom/proc/offsets()\n\tif(pixel_x == 0 && pixel_y == 0)\n\t\treturn list(pixel_w, pixel_z)\n/obj/example\n\tproc/read()\n\t\tloc = src\n\t\tpixel_x += 1\n\t\talpha -= 1\n\t\treturn list(dir, color, desc, blend_mode, alpha, appearance_flags, layer, plane, transform, overlays, underlays, vis_contents, x, y, z)\n/datum/example\n\tproc/read()\n\t\treturn alpha\n",
+            "/atom/proc/offsets()\n\tif(pixel_x == 0 && pixel_y == 0)\n\t\treturn list(pixel_w, pixel_z)\n/obj/example\n\tproc/read()\n\t\tloc = src\n\t\tpixel_x += 1\n\t\talpha -= 1\n\t\treturn list(dir, color, desc, blend_mode, alpha, appearance_flags, layer, plane, transform, overlays, underlays, vis_contents, vis_locs, x, y, z)\n\tDestroy()\n\t\tvis_locs = null\n\t\tif(length(vis_contents))\n\t\t\tvis_contents.Cut()\n/datum/example\n\tproc/read()\n\t\treturn alpha\n",
         );
         let registry = ProcedureRegistry::build(&compilation);
         let object = procedure_by_path(&registry, "/obj/example/proc/read");
@@ -5416,6 +5696,13 @@ GLOBAL_REAL(Master, /datum/controller/master)
                 object.implementations.iter().map(|body| body.id),
             )
             .expect("standard atom fields should compile as src fields");
+        let destroy = procedure_by_path(&registry, "/obj/example/proc/Destroy");
+        registry
+            .compile_vm_implementations(
+                &compilation,
+                destroy.implementations.iter().map(|body| body.id),
+            )
+            .expect("vis_locs and vis_contents should bind in Destroy");
         let atom = procedure_by_path(&registry, "/atom/proc/offsets");
         registry
             .compile_vm_implementations(
@@ -5436,6 +5723,40 @@ GLOBAL_REAL(Master, /datum/controller/master)
             "unexpected diagnostic: {}",
             error.message
         );
+    }
+
+    #[test]
+    fn mulebot_initialize_binds_deprecated_atom_suffix_field() {
+        let compilation = TestProject::compile(
+            "/atom\n/mob\n/mob/living\n/mob/living/simple_animal\n/mob/living/simple_animal/bot\n/mob/living/simple_animal/bot/mulebot\n\tvar/id\n\tproc/set_id(value)\n\t\tid = value\n\tInitialize(mapload)\n\t\tset_id(suffix || id || \"fallback\")\n\t\tsuffix = null\n\t\treturn suffix\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let initialize = procedure_by_path(
+            &registry,
+            "/mob/living/simple_animal/bot/mulebot/proc/Initialize",
+        );
+        let executable = registry
+            .compile_vm_implementations(
+                &compilation,
+                initialize.implementations.iter().map(|body| body.id),
+            )
+            .expect("BYOND's deprecated /atom/suffix field must bind through mob inheritance");
+        let entry = executable
+            .implementation(initialize.effective_target.expect("Initialize has a body"))
+            .expect("Initialize implementation should be compiled");
+        let program = executable
+            .module()
+            .procedure(entry)
+            .expect("Initialize program should exist");
+
+        assert!(program.instructions.iter().any(|instruction| matches!(
+            instruction,
+            Instruction::LoadField(field) if field.as_str() == "suffix"
+        )));
+        assert!(program.instructions.iter().any(|instruction| matches!(
+            instruction,
+            Instruction::StoreField(field) if field.as_str() == "suffix"
+        )));
     }
 
     #[test]
@@ -5579,6 +5900,143 @@ GLOBAL_REAL(Master, /datum/controller/master)
     }
 
     #[test]
+    fn typesof_procedure_family_links_generated_managed_global_initializers() {
+        let compilation = TestProject::compile(concat!(
+            "/datum/controller/global_vars/var/global/list/species_list\n",
+            "/datum/controller/global_vars/var/global/list/crafting_recipes\n",
+            "/datum/controller/global_vars/proc/InitGlobalspecies_list()\n",
+            "\tspecies_list = list()\n",
+            "/datum/controller/global_vars/proc/InitGlobalcrafting_recipes()\n",
+            "\tcrafting_recipes = list()\n",
+            "/datum/controller/global_vars/Initialize()\n",
+            "\tfor(var/glob_proc in typesof(/datum/controller/global_vars/proc))\n",
+            "\t\tcall(src, glob_proc)()\n",
+            "/datum/unrelated/proc/not_an_initializer()\n",
+        ));
+        let registry = ProcedureRegistry::build(&compilation);
+        let initialize =
+            procedure_by_path(&registry, "/datum/controller/global_vars/proc/Initialize")
+                .effective_target
+                .expect("Initialize implementation");
+        let closure = registry.implementation_closure(&compilation, [initialize]);
+
+        for path in [
+            "/datum/controller/global_vars/proc/InitGlobalspecies_list",
+            "/datum/controller/global_vars/proc/InitGlobalcrafting_recipes",
+        ] {
+            let target = procedure_by_path(&registry, path)
+                .effective_target
+                .expect("generated managed-global initializer");
+            assert!(closure.contains(&target), "closure omitted {path}");
+        }
+        let unrelated = procedure_by_path(&registry, "/datum/unrelated/proc/not_an_initializer")
+            .effective_target
+            .expect("unrelated implementation");
+        assert!(!closure.contains(&unrelated));
+
+        registry
+            .compile_vm_implementations_symbolic_dynamic(&compilation, [initialize])
+            .expect("bounded procedure family must be linked into the symbolic module");
+    }
+
+    #[test]
+    fn managed_global_macro_retains_underscore_named_initializer() {
+        let compilation = TestProject::compile(concat!(
+            "#define GLOBAL_MANAGED(X, InitValue) /datum/controller/global_vars/proc/InitGlobal##X(){ X = InitValue; }\n",
+            "#define GLOBAL_RAW(X) /datum/controller/global_vars/var/global##X\n",
+            "#define GLOBAL_LIST_INIT(X, InitValue) GLOBAL_RAW(/list/##X); GLOBAL_MANAGED(X, InitValue)\n",
+            "#define GLOBAL_LIST_EMPTY(X) GLOBAL_LIST_INIT(X, list())\n",
+            "GLOBAL_LIST_EMPTY(all_huds)\n",
+            "GLOBAL_LIST_EMPTY(huds_by_category)\n",
+            "GLOBAL_LIST_INIT(huds, list(1))\n",
+            "/datum/controller/global_vars/Initialize()\n",
+            "\tfor(var/glob_proc in typesof(/datum/controller/global_vars/proc))\n",
+            "\t\tcall(src, glob_proc)()\n",
+        ));
+        let registry = ProcedureRegistry::build(&compilation);
+        for path in [
+            "/datum/controller/global_vars/proc/InitGlobalall_huds",
+            "/datum/controller/global_vars/proc/InitGlobalhuds_by_category",
+            "/datum/controller/global_vars/proc/InitGlobalhuds",
+        ] {
+            assert!(
+                registry
+                    .procedures()
+                    .iter()
+                    .any(|procedure| procedure.path.to_string() == path),
+                "managed global macro omitted {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn reopened_initglobal_is_enumerated_and_invoked_by_procedure_typesof() {
+        let compilation = TestProject::compile(concat!(
+            "/datum/controller/global_vars\n\tvar/trace = 0\n",
+            "/datum/controller/global_vars/proc/InitGlobalhuds_by_category()\n\ttrace += 1\n",
+            "/datum/controller/global_vars/InitGlobalhuds_by_category()\n\t..()\n\ttrace += 10\n",
+            "/datum/controller/global_vars/proc/InitGlobalhuds()\n\ttrace *= 2\n",
+            "/datum/controller/global_vars/Initialize()\n",
+            "\tfor(var/glob_proc in typesof(/datum/controller/global_vars/proc))\n",
+            "\t\tcall(src, glob_proc)()\n",
+            "\treturn trace\n",
+        ));
+        let registry = ProcedureRegistry::build(&compilation);
+        let initialize =
+            procedure_by_path(&registry, "/datum/controller/global_vars/proc/Initialize")
+                .effective_target
+                .unwrap();
+        let closure = registry.implementation_closure(&compilation, [initialize]);
+        for path in [
+            "/datum/controller/global_vars/proc/InitGlobalhuds_by_category",
+            "/datum/controller/global_vars/proc/InitGlobalhuds",
+        ] {
+            let target = procedure_by_path(&registry, path).effective_target.unwrap();
+            assert!(closure.contains(&target), "closure omitted {path}");
+        }
+        let executable = registry
+            .compile_vm_implementations_symbolic_dynamic(&compilation, [initialize])
+            .expect("reopened managed global family should compile");
+        let catalog = executable
+            .module()
+            .procedure_type_paths()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        for path in [
+            "/datum/controller/global_vars/proc/InitGlobalhuds_by_category",
+            "/datum/controller/global_vars/proc/InitGlobalhuds",
+        ] {
+            assert!(
+                catalog.iter().any(|entry| entry == path),
+                "catalog omitted {path}: {catalog:?}"
+            );
+        }
+        let entry = executable.implementation(initialize).unwrap();
+        let mut state = ExecutionState::new();
+        let receiver = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/controller/global_vars").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(
+                receiver,
+                FieldName::parse("trace").unwrap(),
+                Value::number(0.0),
+            )
+            .unwrap();
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                entry,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(receiver), Value::Null),
+            ),
+            Ok(Value::number(22.0))
+        );
+    }
+
+    #[test]
     fn typed_global_member_call_links_exact_runtime_receiver_target() {
         let compilation = TestProject::compile(
             "var/global/datum/log_holder/logger\n/proc/entry()\n\treturn logger.Log(4)\n/datum/log_holder/proc/Log(value)\n\treturn value + 3\n/datum/unrelated/proc/Log(value)\n\treturn value + 100\n",
@@ -5616,6 +6074,55 @@ GLOBAL_REAL(Master, /datum/controller/master)
                 &ExecutionContext::default(),
             ),
             Ok(Value::number(7.0))
+        );
+    }
+
+    #[test]
+    fn interpolated_world_member_call_links_runtime_candidates() {
+        let compilation = TestProject::compile(
+            "/world/proc/get_world_state_for_logging()\n\treturn 7\n/datum/log_entry/proc/render()\n\tvar/list/entries = list()\n\tentries.Add(\"[world.get_world_state_for_logging()]\")\n\treturn entries[1]\n/datum/unrelated/proc/get_world_state_for_logging()\n\treturn 99\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/datum/log_entry/proc/render")
+            .effective_target
+            .unwrap();
+        let closure = registry.implementation_closure(&compilation, [entry]);
+        let world = procedure_by_path(&registry, "/world/proc/get_world_state_for_logging")
+            .effective_target
+            .unwrap();
+        let unrelated = procedure_by_path(
+            &registry,
+            "/datum/unrelated/proc/get_world_state_for_logging",
+        )
+        .effective_target
+        .unwrap();
+        assert!(closure.contains(&world));
+        assert!(closure.contains(&unrelated));
+
+        let executable = registry
+            .compile_vm_implementations_symbolic_dynamic(&compilation, [entry])
+            .expect("macro-shaped nested world member target should link");
+        assert!(executable.implementation(world).is_some());
+        let mut state = ExecutionState::new();
+        let world_datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/world").unwrap());
+        state.set_global(
+            dm_value::FieldName::parse("world").unwrap(),
+            Value::Datum(world_datum),
+        );
+        let log_entry = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/log_entry").unwrap());
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(entry).unwrap(),
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(log_entry), Value::Null),
+            ),
+            Ok(Value::text("7"))
         );
     }
 
@@ -5955,6 +6462,68 @@ GLOBAL_REAL(Master, /datum/controller/master)
     }
 
     #[test]
+    fn typed_local_member_call_after_dynamic_new_retains_admin_verb_method_family() {
+        let compilation = TestProject::compile(concat!(
+            "/datum/admin_verb/proc/__avd_check_should_exist()\n\treturn 1\n",
+            "/datum/admin_verb/AdminVOX/__avd_check_should_exist()\n\treturn 0\n",
+            "/datum/controller/subsystem/admin_verbs/proc/setup_verb_list()\n",
+            "\tvar/datum/admin_verb/verb_type = /datum/admin_verb/AdminVOX\n",
+            "\tvar/datum/admin_verb/verb_singleton = new verb_type\n",
+            "\treturn verb_singleton.__avd_check_should_exist()\n",
+        ));
+        let registry = ProcedureRegistry::build(&compilation);
+        let setup = procedure_by_path(
+            &registry,
+            "/datum/controller/subsystem/admin_verbs/proc/setup_verb_list",
+        )
+        .effective_target
+        .unwrap();
+        let base = procedure_by_path(&registry, "/datum/admin_verb/proc/__avd_check_should_exist")
+            .effective_target
+            .unwrap();
+        let override_target = procedure_by_path(
+            &registry,
+            "/datum/admin_verb/AdminVOX/proc/__avd_check_should_exist",
+        )
+        .effective_target
+        .unwrap();
+        let closure = registry.implementation_closure(&compilation, [setup]);
+        assert!(closure.contains(&base), "base method must be retained");
+        assert!(
+            closure.contains(&override_target),
+            "compatible generated overrides must be retained"
+        );
+    }
+
+    #[test]
+    fn complete_symbolic_lifecycle_table_keeps_unproven_runtime_methods_deferred() {
+        let compilation = TestProject::compile(concat!(
+            "/proc/startup()\n\treturn 1\n",
+            "/datum/runtime_only/proc/invoke_from_data()\n\treturn 9\n",
+        ));
+        let registry = ProcedureRegistry::build(&compilation);
+        let startup = procedure_by_path(&registry, "/proc/startup")
+            .effective_target
+            .unwrap();
+        let runtime_only =
+            procedure_by_path(&registry, "/datum/runtime_only/proc/invoke_from_data")
+                .effective_target
+                .unwrap();
+        assert!(
+            !registry
+                .implementation_closure(&compilation, [startup])
+                .contains(&runtime_only),
+            "fixture must be outside the statically proven closure"
+        );
+        let executable = registry
+            .compile_vm_all_symbolic_with_eager_roots(&compilation, [startup])
+            .expect("complete deferred table should link");
+        assert!(executable.implementation(startup).is_some());
+        assert!(executable.implementation(runtime_only).is_some());
+        assert!(executable.module().deferred_procedure_count() >= 1);
+    }
+
+    #[test]
     fn proc_pseudo_macro_is_the_current_canonical_procedure_reference() {
         let compilation = TestProject::compile(
             "/datum/example/proc/reenter(again)\n\tif(again)\n\t\treturn call(src, __PROC__)(0)\n\treturn 7\n",
@@ -6068,6 +6637,27 @@ GLOBAL_REAL(Master, /datum/controller/master)
     }
 
     #[test]
+    fn relative_proc_ref_retains_signal_callback() {
+        let compilation = TestProject::compile(
+            "/datum/handler/proc/register()\n\tvar/callback = nameof(.proc/new_item_created)\n\treturn call(src, callback)()\n/datum/handler/proc/new_item_created()\n\treturn 42\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let register = procedure_by_path(&registry, "/datum/handler/proc/register")
+            .effective_target
+            .unwrap();
+        let callback = procedure_by_path(&registry, "/datum/handler/proc/new_item_created")
+            .effective_target
+            .unwrap();
+
+        assert!(
+            registry
+                .implementation_closure(&compilation, [register])
+                .contains(&callback),
+            "PROC_REF-style nameof(.proc/name) callbacks must remain linked",
+        );
+    }
+
+    #[test]
     fn literal_text2path_proc_reference_retains_inferable_symbol() {
         let compilation = TestProject::compile(
             "/proc/cmp_value(a, b)\n\treturn a - b\n/proc/entry()\n\tvar/cmp = text2path(\"/proc/cmp_value\")\n\treturn call(cmp)(9, 4)\n",
@@ -6103,6 +6693,121 @@ GLOBAL_REAL(Master, /datum/controller/master)
                 &ExecutionContext::default(),
             ),
             Ok(Value::number(5.0))
+        );
+    }
+
+    #[test]
+    fn project_sort_wrapper_and_comparator_reference_are_retained_transitively() {
+        let compilation = TestProject::compile(concat!(
+            "/proc/cmp_desc(left, right)\n\treturn right - left\n",
+            "/proc/sort_list(values, comparator)\n",
+            "\treturn call(comparator)(values[1], values[2])\n",
+            "/proc/entry()\n\treturn sort_list(list(1, 3), /proc/cmp_desc)\n",
+            "/proc/unrelated()\n\treturn 99\n",
+        ));
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/proc/entry")
+            .effective_target
+            .unwrap();
+        let wrapper = procedure_by_path(&registry, "/proc/sort_list")
+            .effective_target
+            .unwrap();
+        let comparator = procedure_by_path(&registry, "/proc/cmp_desc")
+            .effective_target
+            .unwrap();
+        let unrelated = procedure_by_path(&registry, "/proc/unrelated")
+            .effective_target
+            .unwrap();
+        let closure = registry.implementation_closure(&compilation, [entry]);
+        assert!(closure.contains(&wrapper));
+        assert!(closure.contains(&comparator));
+        assert!(!closure.contains(&unrelated));
+
+        let executable = registry
+            .compile_vm_implementations(&compilation, [entry])
+            .expect("project sort wrapper and comparator should link transitively");
+        let mut state = ExecutionState::new();
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(entry).unwrap(),
+                &[],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::number(2.0)),
+        );
+    }
+
+    #[test]
+    fn inherited_bare_call_retains_and_dispatches_runtime_subtype_override() {
+        let compilation = TestProject::compile(concat!(
+            "/atom/proc/add_debris_element()\n\treturn 1\n",
+            "/obj/Initialize()\n\treturn add_debris_element()\n",
+            "/obj/effect/statclick/ticket_list\n",
+            "/obj/structure/barricade/wooden/add_debris_element()\n\treturn 9\n",
+            "/datum/unrelated/add_debris_element()\n\treturn 100\n",
+        ));
+        let registry = ProcedureRegistry::build(&compilation);
+        let initialize = procedure_by_path(&registry, "/obj/proc/Initialize")
+            .effective_target
+            .unwrap();
+        let base = procedure_by_path(&registry, "/atom/proc/add_debris_element")
+            .effective_target
+            .unwrap();
+        let override_target = procedure_by_path(
+            &registry,
+            "/obj/structure/barricade/wooden/proc/add_debris_element",
+        )
+        .effective_target
+        .unwrap();
+        let unrelated = procedure_by_path(&registry, "/datum/unrelated/proc/add_debris_element")
+            .effective_target
+            .unwrap();
+        let closure = registry.implementation_closure(&compilation, [initialize]);
+        assert!(closure.contains(&base));
+        assert!(closure.contains(&override_target));
+        assert!(!closure.contains(&unrelated));
+        assert!(
+            !registry
+                .eager_implementation_closure(&compilation, [initialize])
+                .contains(&override_target),
+            "compatible virtual overrides should stay deferred until dispatched",
+        );
+
+        let executable = registry
+            .compile_vm_implementations_symbolic_dynamic(&compilation, [initialize])
+            .unwrap();
+        let mut state = ExecutionState::new();
+        let wooden = TypePath::parse("/obj/structure/barricade/wooden").unwrap();
+        state.set_type_parents(BTreeMap::from([
+            (
+                wooden.clone(),
+                Some(TypePath::parse("/obj/structure/barricade").unwrap()),
+            ),
+            (
+                TypePath::parse("/obj/structure/barricade").unwrap(),
+                Some(TypePath::parse("/obj/structure").unwrap()),
+            ),
+            (
+                TypePath::parse("/obj/structure").unwrap(),
+                Some(TypePath::parse("/obj").unwrap()),
+            ),
+            (
+                TypePath::parse("/obj").unwrap(),
+                Some(TypePath::parse("/atom").unwrap()),
+            ),
+        ]));
+        let receiver = state.heap_mut().allocate_datum(wooden);
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(initialize).unwrap(),
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(receiver), Value::Null),
+            ),
+            Ok(Value::number(9.0)),
         );
     }
 
@@ -6173,6 +6878,87 @@ GLOBAL_REAL(Master, /datum/controller/master)
     }
 
     #[test]
+    fn dynamic_subsystem_catalog_construction_runs_each_generated_new_and_sets_global() {
+        let compilation = TestProject::compile(
+            "/var/global/datum/controller/subsystem/processing/dcs/SSdcs\n/datum/controller/subsystem\n/datum/controller/subsystem/processing\n/datum/controller/subsystem/processing/dcs/New()\n\tSSdcs = src\n/proc/entry()\n\tvar/list/subsystem_types = typesof(/datum/controller/subsystem) - /datum/controller/subsystem\n\tfor(var/I in subsystem_types)\n\t\tnew I\n\treturn istype(SSdcs, /datum/controller/subsystem/processing/dcs)\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/proc/entry")
+            .effective_target
+            .unwrap();
+        let constructor = procedure_by_path(
+            &registry,
+            "/datum/controller/subsystem/processing/dcs/proc/New",
+        )
+        .effective_target
+        .unwrap();
+        let closure = registry.implementation_closure(&compilation, [entry]);
+        assert!(closure.contains(&constructor));
+        let executable = registry
+            .compile_vm_implementations(&compilation, [entry])
+            .expect("dynamic subsystem constructor family should link");
+        let mut state = ExecutionState::new();
+        let subsystem = TypePath::parse("/datum/controller/subsystem").unwrap();
+        let processing = TypePath::parse("/datum/controller/subsystem/processing").unwrap();
+        let dcs = TypePath::parse("/datum/controller/subsystem/processing/dcs").unwrap();
+        state.set_type_paths([subsystem.clone(), processing.clone(), dcs.clone()]);
+        state.set_type_parents(BTreeMap::from([
+            (
+                subsystem.clone(),
+                Some(TypePath::parse("/datum/controller").unwrap()),
+            ),
+            (processing.clone(), Some(subsystem)),
+            (dcs, Some(processing)),
+        ]));
+        state.set_global(FieldName::parse("SSdcs").unwrap(), Value::Null);
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(entry).unwrap(),
+                &[],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::number(1.0))
+        );
+    }
+
+    #[test]
+    fn nested_list_assignment_preserves_get_element_result_value() {
+        let compilation = TestProject::compile(
+            "/datum/element\n/datum/element/child\n/datum/manager\n\tvar/list/elements_by_type\n/datum/manager/New()\n\telements_by_type = list()\n/datum/manager/proc/GetElement(list/arguments)\n\tvar/datum/element/eletype = arguments[1]\n\tvar/element_id = eletype\n\t. = elements_by_type[element_id]\n\tif(.)\n\t\treturn\n\t. = elements_by_type[element_id] = new eletype\n/proc/entry()\n\tvar/datum/manager/manager = new\n\tmanager.GetElement(list(/datum/element/child))\n\treturn istype(manager.GetElement(list(/datum/element/child)), /datum/element/child)\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/proc/entry")
+            .effective_target
+            .unwrap();
+        let executable = registry
+            .compile_vm_implementations(&compilation, [entry])
+            .expect("GetElement-shaped procedure should compile");
+        let mut state = ExecutionState::new();
+        state.set_type_parents(BTreeMap::from([
+            (
+                TypePath::parse("/datum/element/child").unwrap(),
+                Some(TypePath::parse("/datum/element").unwrap()),
+            ),
+            (
+                TypePath::parse("/datum/manager").unwrap(),
+                Some(TypePath::parse("/datum").unwrap()),
+            ),
+        ]));
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(entry).unwrap(),
+                &[],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::number(1.0))
+        );
+    }
+
+    #[test]
     fn typed_global_member_call_links_exact_method_not_bare_global_proc() {
         let compilation = TestProject::compile(
             "/datum/log_holder/proc/Log()\n\treturn 1\n/proc/Log()\n\treturn 2\n/var/global/datum/log_holder/logger = new /datum/log_holder\n/proc/log_world()\n\treturn logger.Log()\n",
@@ -6225,6 +7011,16 @@ GLOBAL_REAL(Master, /datum/controller/master)
         ProcedureRegistry::build(&compilation)
             .compile_vm(&compilation)
             .expect("DM union annotation must remain valid");
+    }
+
+    #[test]
+    fn input_constraints_do_not_form_fake_declared_types() {
+        let compilation = TestProject::compile(
+            "/proc/plain(message as message)\n\treturn message\n/proc/typed(mob/M as mob in world)\n\treturn M\n/proc/untyped(target as turf in world)\n\treturn target\n",
+        );
+        ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("input constraints must not be interpreted as datum paths");
     }
 
     #[test]
@@ -6716,6 +7512,23 @@ GLOBAL_REAL(Master, /datum/controller/master)
         assert_eq!(
             execute_effective(&compilation, "/custom/proc/run", &[]),
             Ok(Value::number(8.0))
+        );
+    }
+
+    #[test]
+    fn terminal_new_and_del_parent_calls_resolve_to_engine_hooks() {
+        let compilation = TestProject::compile(
+            "/datum/species\n\tNew()\n\t\treturn ..()\n\tDel()\n\t\treturn ..()\n",
+        );
+        assert_eq!(
+            execute_effective(&compilation, "/datum/species/proc/New", &[]),
+            Ok(Value::Null),
+            "a subtype constructor may terminate at BYOND's engine /datum/New",
+        );
+        assert_eq!(
+            execute_effective(&compilation, "/datum/species/proc/Del", &[]),
+            Ok(Value::Null),
+            "a subtype destructor may terminate at BYOND's engine /datum/Del",
         );
     }
 

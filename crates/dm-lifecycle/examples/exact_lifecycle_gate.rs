@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use dm_compiler::CompilerDatabase;
-use dm_lifecycle::{LifecycleIndex, LifecycleKind, LifecycleResolution};
+use dm_lifecycle::{
+    LifecycleIndex, LifecycleKind, LifecycleResolution, precompile_lifecycle_for_world,
+};
 use dm_semantics::{ProcedureImplementationId, ProcedureRegistry};
 use dm_world::InitializerResolution;
 
@@ -129,14 +131,134 @@ fn run() -> Result<(), String> {
             println!("gate_issue_body procedure={path} implementation={implementation:?}");
         }
     }
-    procedures
-        .compile_vm_implementations_symbolic_dynamic(&compilation, roots)
-        .map_err(|error| format!("gate_symbolic_module=blocked message={:?}", error.message))?;
-    println!("gate_symbolic_module=compatible");
-    if issues.is_empty() {
+    let mut deferred_issues = BTreeMap::<String, Vec<ProcedureImplementationId>>::new();
+    if env::var_os("DREAM64_GATE_VALIDATE_DEFERRED").is_some() {
+        let mut deferred = reachable.difference(&eager).copied().collect::<Vec<_>>();
+        if env::var_os("DREAM64_GATE_DEFERRED_STARTUP_ONLY").is_some() {
+            deferred.retain(|implementation| {
+                procedures
+                    .procedure(implementation.procedure())
+                    .is_some_and(|procedure| startup_family(&procedure.path.to_string()) != "other")
+            });
+            println!("gate_deferred_validation_filter=startup");
+        }
+        println!("gate_deferred_validation_bodies={}", deferred.len());
+        // Compile each retained deferred body independently and immediately
+        // discard its Program. This validates runtime-reachable lazy bodies
+        // without materializing all of them into the production Module or
+        // increasing its steady-state memory footprint.
+        for (implementation, result) in
+            procedures.compile_vm_bodies_independently(&compilation, deferred)
+        {
+            if let Err(error) = result {
+                deferred_issues
+                    .entry(error.message)
+                    .or_default()
+                    .push(implementation);
+            }
+        }
+        println!("gate_deferred_issue_groups={}", deferred_issues.len());
+        for (message, implementations) in &deferred_issues {
+            println!(
+                "gate_deferred_issue bodies={} message={message:?}",
+                implementations.len()
+            );
+            for implementation in implementations.iter().take(8) {
+                let path = procedures
+                    .procedure(implementation.procedure())
+                    .map_or_else(
+                        || "<missing>".to_owned(),
+                        |procedure| procedure.path.to_string(),
+                    );
+                println!(
+                    "gate_deferred_issue_body procedure={path} implementation={implementation:?}"
+                );
+            }
+        }
+        if let Some(output) = env::var_os("DREAM64_GATE_DEFERRED_REPORT") {
+            let mut report = String::from("category\tstartup_family\tbodies\tprocedure\tmessage\n");
+            for (message, implementations) in &deferred_issues {
+                let category = deferred_issue_category(message);
+                for implementation in implementations {
+                    let path = procedures
+                        .procedure(implementation.procedure())
+                        .map_or_else(
+                            || "<missing>".to_owned(),
+                            |procedure| procedure.path.to_string(),
+                        );
+                    let startup = startup_family(&path);
+                    report.push_str(&format!(
+                        "{category}\t{startup}\t1\t{}\t{}\n",
+                        path.replace('\t', " "),
+                        message.replace(['\t', '\n', '\r'], " "),
+                    ));
+                }
+            }
+            fs::write(&output, report).map_err(|error| {
+                format!(
+                    "failed to write deferred report {}: {error}",
+                    PathBuf::from(output).display()
+                )
+            })?;
+        }
+    }
+    // Keep the final compatibility decision on the exact production path.
+    // The issue inventory above deliberately compiles eager bodies separately
+    // so it can report more than the first failure, but boot uses this API to
+    // select roots and build its symbolic module before RuntimeImage exists.
+    let precompiled = precompile_lifecycle_for_world(&compilation, &procedures, &index, &world)
+        .map_err(|error| format!("gate_precompile=blocked message={:?}", error.message))?;
+    println!(
+        "gate_precompile=compatible targets={} bodies={} procedures={} deferred={}",
+        precompiled.targets(),
+        precompiled.reachable_bodies(),
+        precompiled.module_procedures(),
+        precompiled.deferred_procedures(),
+    );
+    if issues.is_empty() && deferred_issues.is_empty() {
         Ok(())
     } else {
-        Err(format!("{} eager lifecycle issue groups", issues.len()))
+        Err(format!(
+            "{} eager and {} deferred lifecycle issue groups",
+            issues.len(),
+            deferred_issues.len(),
+        ))
+    }
+}
+
+fn deferred_issue_category(message: &str) -> &'static str {
+    if message.contains(": unknown local") {
+        "engine-field"
+    } else if message.contains(": unknown procedure") {
+        "builtin-or-link"
+    } else if message.starts_with("unknown declared type") {
+        "declaration-parse"
+    } else if message.contains("received") || message.contains("expected") {
+        "arity-or-syntax"
+    } else if message.contains("unexpected token") || message.contains("unsupported statement") {
+        "syntax"
+    } else if message.starts_with("cannot assign") {
+        "type-check"
+    } else {
+        "other"
+    }
+}
+
+fn startup_family(path: &str) -> &'static str {
+    if path.starts_with("/world/proc/Genesis") || path.starts_with("/world/proc/New") {
+        "world"
+    } else if path.contains("/datum/controller/global_vars/proc/") {
+        "glob"
+    } else if path.contains("/datum/controller/master/proc/") {
+        "master"
+    } else if path.ends_with("/proc/PreInit") {
+        "preinit"
+    } else if path.ends_with("/proc/Initialize") {
+        "initialize"
+    } else if path.ends_with("/proc/Destroy") {
+        "destroy"
+    } else {
+        "other"
     }
 }
 

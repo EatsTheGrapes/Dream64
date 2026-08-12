@@ -16,5 +16,8 @@ dm-semantics = { path = "../dm-semantics" }
 dm-value = { path = "../dm-value" }
 dm-vm = { path = "../dm-vm" }
 
+[dev-dependencies]
+dm-syntax = { path = "../dm-syntax" }
+
 [lints]
 workspace = true

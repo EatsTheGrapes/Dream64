@@ -116,14 +116,28 @@ fn headless_boot_executes_deterministic_map_lifecycle_and_preserves_state() {
             LifecycleKind::LateInitialize,
         ]
     );
-    assert!(matches!(
-        execution.events[0].event,
+    let world_new = execution
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.event,
+                InitializationEvent::Lifecycle {
+                    subject: EventSubject::World,
+                    kind: LifecycleKind::New,
+                    ..
+                }
+            )
+        })
+        .expect("world New should execute");
+    assert!(execution.events[..world_new].iter().all(|event| matches!(
+        event.event,
         InitializationEvent::Lifecycle {
-            subject: EventSubject::World,
+            subject: EventSubject::MapAtom(_),
             kind: LifecycleKind::New,
             ..
         }
-    ));
+    )));
 
     let world_id = execution.world.expect("world datum should be allocated");
     assert_eq!(

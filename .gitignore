@@ -1,2 +1,13 @@
 target/
 /conformance-results/
+
+# Local headless-boot traces and compiler audit reports.
+/monkestation-headless-boot-*.log
+/boot*-trace*.log
+/deferred-lifecycle-*.log
+/deferred-lifecycle-*.tsv
+
+# Local BYOND/OpenDream oracle workspaces and generated artifacts.
+/tmp/
+/_oracle_*/
+/_oracle_*.dmb

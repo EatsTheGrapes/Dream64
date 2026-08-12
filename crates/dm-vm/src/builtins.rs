@@ -13,10 +13,11 @@
     reason = "DM uses binary32 numbers for integer/index boundaries and native builtin dispatch shares a Result ABI"
 )]
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::Component;
 use std::path::PathBuf;
 use std::process::Command;
@@ -32,7 +33,10 @@ pub(super) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
         | "arcsin" | "arccos" | "length_char" | "lowertext" | "uppertext" | "trimtext"
         | "ascii2text" | "text2path" | "isinf" | "isnan" | "ckey" | "fexists" | "file2text"
         | "lentext" | "list2params" | "params2list" | "file" | "html_encode" | "html_decode"
-        | "isfile" | "fdel" | "del" | "rand_seed" | "link" => (1, 1),
+        | "isfile" | "fdel" | "del" | "rand_seed" | "link" | "ckeyEx" | "refcount" | "issaved" => {
+            (1, 1)
+        }
+        "run" => (1, 3),
         "flist" => (0, 1),
         "fcopy_rsc" | "REGEX_QUOTE" | "REGEX_QUOTE_REPLACEMENT" => (1, 1),
         "browse" => (1, 2),
@@ -48,9 +52,19 @@ pub(super) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
         "json_decode" | "md5" => (0, 1),
         "json_encode" => (0, 2),
         "log" | "arctan" | "text2ascii" | "text2ascii_char" | "text2num" => (1, 2),
-        "image" | "sort_list" | "qdel" | "typecacheof" | "icon" => (0, 5),
-        "view" | "oview" | "viewers" | "oviewers" | "hearers" => (1, 2),
+        "image" => (0, 6),
+        "qdel" | "typecacheof" | "icon" => (0, 5),
+        "view" => (0, 2),
+        "oview" | "viewers" | "oviewers" | "hearers" | "ohearers" => (0, 2),
         "step" => (2, 3),
+        "step_towards" => (2, 2),
+        "step_to" | "get_step_to" | "get_step_away" => (2, 3),
+        "step_away" => (2, 3),
+        "step_rand" | "get_step_rand" => (1, 2),
+        "bounds_dist" => (2, 2),
+        "winshow" => (2, 3),
+        "winclone" => (3, 3),
+        "shell" => (1, 2),
         "sound" => (0, 7),
         "icon_states" => (1, 2),
         "newlist" => (0, usize::MAX),
@@ -65,6 +79,7 @@ pub(super) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
         "rgb2num" => (1, 2),
         "rgb" => (3, 5),
         "gradient" => (2, usize::MAX),
+        "generator" => (1, 4),
         "findtext"
         | "findtextEx"
         | "findtext_char"
@@ -77,7 +92,8 @@ pub(super) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
         "splittext" | "splittext_char" => (2, 5),
         "spantext" | "spantext_char" | "nonspantext" | "nonspantext_char" => (2, 3),
         "splicetext" | "splicetext_char" => (4, 4),
-        "get_dist" | "turn" | "astype" | "flick" | "output" => (2, 2),
+        "astype" => (1, 2),
+        "get_dist" | "turn" | "flick" | "output" => (2, 2),
         "values_cut_over" | "values_cut_under" => (2, 3),
         "values_dot" => (2, 2),
         "values_product" | "values_sum" => (1, 1),
@@ -138,23 +154,27 @@ pub(super) fn execute_standard_builtin(
         "length_char" => length_char(arguments, state),
         "lowertext" => text_map(arguments, state, str::to_lowercase),
         "uppertext" => text_map(arguments, state, str::to_uppercase),
+        "trimtext" if matches!(arguments[0], Value::Null) => Ok(Value::Null),
         "trimtext" => text_map(arguments, state, |value| value.trim().to_owned()),
-        "fcopy_rsc" => Ok(arguments.first().cloned().unwrap_or(Value::Null)),
+        "fcopy_rsc" => fcopy_rsc(arguments, state),
         // `link()` wraps a URL for BYOND's output operator. Headless output
         // retains the URL value itself, which is sufficient to preserve the
         // observable redirect payload without a client browser.
         "link" => Ok(arguments.first().cloned().unwrap_or(Value::Null)),
+        "run" => Ok(Value::Null),
+        "issaved" => Ok(Value::number(1.0)),
         "REGEX_QUOTE" => regex_quote(arguments, state, false),
         "REGEX_QUOTE_REPLACEMENT" => regex_quote(arguments, state, true),
         "browse" => headless_browse(arguments, state),
         "browse_rsc" => headless_transfer("browse_rsc", arguments, state),
         "ftp" => headless_transfer("ftp", arguments, state),
         "winset" => headless_winset(arguments, state),
+        "winshow" => headless_winshow(arguments, state),
+        "winclone" => headless_winclone(arguments, state),
         "winget" => headless_winget(arguments, state),
         "winexists" => headless_winexists(arguments, state),
         "alert" => headless_alert(arguments),
         "FLOOR" => floor_multiple(arguments),
-        "sort_list" => sort_list_builtin(arguments, state),
         "typecacheof" => typecacheof_builtin(arguments, state),
         "ascii2text" => ascii2text(arguments),
         "text2ascii" => text2ascii(arguments, state, false),
@@ -200,11 +220,16 @@ pub(super) fn execute_standard_builtin(
         "_dream64_world_set_config" => world_set_config(arguments, state),
         "_dream64_world_open_port" => world_open_port(arguments, state),
         "ckey" => ckey(arguments, state),
+        "ckeyEx" => ckey_ex(arguments, state),
+        "refcount" => Ok(Value::number(match arguments.first() {
+            Some(Value::Datum(_)) | Some(Value::List(_)) => 1.0,
+            _ => 0.0,
+        })),
         "fexists" => fexists(arguments, state),
         "file2text" => file2text(arguments, state),
         "isfile" => Ok(Value::number(f32::from(matches!(
             arguments[0],
-            Value::Text(_)
+            Value::File(_)
         )))),
         "fdel" => fdel(arguments, state),
         "flist" => flist(arguments, state),
@@ -215,14 +240,27 @@ pub(super) fn execute_standard_builtin(
         "rgb" => rgb_builtin(arguments),
         "rgb2num" => rgb2num_builtin(arguments, state),
         "gradient" => gradient_builtin(arguments, state),
+        "generator" => {
+            resource_datum_builtin("/generator", &["type", "a", "b", "rand"], arguments, state)
+        }
         "time2text" => time2text_builtin(arguments, state),
         "view" => spatial_query(arguments, state, false, false),
         "oview" => spatial_query(arguments, state, false, true),
         "viewers" | "hearers" => spatial_query(arguments, state, true, false),
+        "ohearers" => spatial_query(arguments, state, true, true),
         "oviewers" => spatial_query(arguments, state, true, true),
         "step" => step_builtin(arguments, state),
+        "step_towards" => step_towards_builtin(arguments, state),
+        "step_to" => step_to_builtin(arguments, state),
+        "get_step_to" => get_step_to_builtin(arguments, state),
+        "step_away" => step_away_builtin(arguments, state),
+        "get_step_away" => get_step_away_builtin(arguments, state),
+        "step_rand" => step_rand_builtin(arguments, state),
+        "get_step_rand" => get_step_rand_builtin(arguments, state),
+        "bounds_dist" => bounds_dist_builtin(arguments, state),
+        "shell" => Ok(Value::Null),
         "file" => match &arguments[0] {
-            Value::Text(path) => Ok(Value::text(path.to_string())),
+            Value::Text(path) | Value::File(path) => Ok(Value::file(path.clone())),
             value => Err(format!("file() requires a resource path, received {value}")),
         },
         "lentext" => lentext(arguments, state),
@@ -255,11 +293,7 @@ pub(super) fn execute_standard_builtin(
             arguments,
             state,
         ),
-        "icon_states" => {
-            // DMI state discovery requires decoding the resource; retain a
-            // deterministic empty list when no renderer/resource decoder is attached.
-            Ok(Value::List(state.heap_mut().allocate_list()))
-        }
+        "icon_states" => icon_states_builtin(arguments, state),
         _ => Err(format!("unknown native DM builtin {name:?}")),
     }
 }
@@ -277,6 +311,58 @@ pub(super) fn execute_external_call(
         .and_then(|name| name.to_str())
         .unwrap_or(&library)
         .to_ascii_lowercase();
+    if matches!(filename.as_str(), "memorystats.dll" | "libmemorystats.so") {
+        return match (function.as_str(), arguments) {
+            // byond-memorystats exposes DreamDaemon's allocator report through
+            // this single zero-argument export. Dream64 cannot truthfully
+            // manufacture BYOND's internal prototype/object counters, so keep
+            // their established text schema at zero and append the real host
+            // process resident set when the platform can provide it safely.
+            ("memory_stats", []) => Ok(Value::text(headless_memory_stats_report())),
+            _ => Err(format!(
+                "external call {library}::{function} requires an installed host bridge"
+            )),
+        };
+    }
+    if matches!(
+        filename.as_str(),
+        "dreamluau" | "dreamluau.dll" | "libdreamluau.so"
+    ) {
+        let export = function.strip_prefix("byond:").unwrap_or(&function);
+        return match export {
+            // DreamLuaU's process-wide configuration and cleanup calls have no
+            // observable DM return value. Headless Dream64 does not embed a
+            // Luau VM, but these hooks must remain safe and idempotent so
+            // ordinary datum destruction and SS13 startup can proceed.
+            "set_usr" | "set_execution_limit_millis" | "set_execution_limit_secs"
+                if arguments.len() == 1 =>
+            {
+                Ok(Value::Null)
+            }
+            "clear_execution_limit" if arguments.is_empty() => Ok(Value::Null),
+            "set_new_wrapper"
+            | "set_var_get_wrapper"
+            | "set_var_set_wrapper"
+            | "set_object_call_wrapper"
+            | "set_global_call_wrapper"
+            | "set_print_wrapper"
+                if arguments.len() == 1 =>
+            {
+                Ok(Value::Null)
+            }
+            "collect_garbage" | "kill_state" | "clear_ref_userdata" if arguments.len() == 1 => {
+                Ok(Value::Null)
+            }
+            "kill_sleeping_thread" | "kill_yielded_thread" if arguments.len() == 2 => {
+                Ok(Value::Null)
+            }
+            // No Luau frames exist in headless mode.
+            "get_traceback" if arguments.len() == 1 => Ok(Value::Null),
+            _ => Err(format!(
+                "external call {library}::{function} requires an installed host bridge"
+            )),
+        };
+    }
     if !matches!(
         filename.as_str(),
         "rust_g" | "rust_g.dll" | "librust_g.so" | "librust_g64.so"
@@ -295,6 +381,29 @@ pub(super) fn execute_external_call(
                 .map_err(|error| format!("unix_timestamp failed: {error}"))?
                 .as_secs();
             Ok(Value::text(seconds.to_string()))
+        }
+        "formatted_timestamp" if matches!(arguments.len(), 1 | 2) => {
+            let format = strict_text(&arguments[0], state, "formatted_timestamp format")?;
+            let offset_hours = arguments
+                .get(1)
+                .map(|value| {
+                    value
+                        .as_number()
+                        .or_else(|| value.to_string().parse::<f32>().ok())
+                        .ok_or_else(|| "formatted_timestamp offset must be numeric".to_owned())
+                })
+                .transpose()?
+                .unwrap_or(0.0);
+            let unix_millis = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| format!("formatted_timestamp failed: {error}"))?
+                .as_millis();
+            let unix_millis = i64::try_from(unix_millis).unwrap_or(i64::MAX);
+            Ok(Value::text(format_unix_timestamp(
+                unix_millis,
+                &format,
+                offset_hours,
+            )))
         }
         "rg_git_revparse" if arguments.len() == 1 => {
             let revision = strict_text(&arguments[0], state, "rg_git_revparse revision")?;
@@ -326,9 +435,104 @@ pub(super) fn execute_external_call(
                 ],
             )
         }
+        "rg_git_commit_date_head" if matches!(arguments.len(), 0 | 1) => {
+            let format = arguments
+                .first()
+                .map(|value| strict_text(value, state, "rg_git_commit_date_head format"))
+                .transpose()?
+                .unwrap_or_else(|| "%F".to_owned());
+            validate_git_date_format(&format)?;
+            let date = format!("--date=format:{format}");
+            run_git_bridge(
+                state,
+                &[
+                    "log",
+                    "-1",
+                    "--format=%ad",
+                    &date,
+                    "--end-of-options",
+                    "HEAD",
+                ],
+            )
+        }
+        "hash_string" if arguments.len() == 2 => rust_g_hash_string(arguments, state),
+        "hash_file" if arguments.len() == 2 => rust_g_hash_file(arguments, state),
+        "json_is_valid" if arguments.len() == 1 => {
+            let input = strict_text(&arguments[0], state, "json_is_valid input")?;
+            Ok(Value::text(
+                if serde_json::from_str::<serde_json::Value>(&input).is_ok() {
+                    "true"
+                } else {
+                    "false"
+                },
+            ))
+        }
+        "cnoise_generate" if arguments.len() == 6 => rust_g_cellular_noise(arguments, state),
+        "noise_poisson_map" if arguments.len() == 4 => rust_g_poisson_noise(arguments, state),
+        "log_write" if arguments.len() == 3 => {
+            let path = relaxed_resolved_file_path(&arguments[..1], state, "log_write")?;
+            let text = strict_text(&arguments[1], state, "log_write text")?;
+            let format_internally =
+                strict_text(&arguments[2], state, "log_write format")?.eq_ignore_ascii_case("true");
+            let parent = path
+                .parent()
+                .ok_or_else(|| "log_write path has no parent".to_owned())?;
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("log_write failed to create parent: {error}"))?;
+            let root = state
+                .project_root()
+                .ok_or_else(|| "log_write requires a configured project root".to_owned())?
+                .canonicalize()
+                .map_err(|error| format!("log_write project root is unavailable: {error}"))?;
+            let parent = parent
+                .canonicalize()
+                .map_err(|error| format!("log_write parent directory is unavailable: {error}"))?;
+            if !parent.starts_with(root) {
+                return Err("log_write path escapes the project root".to_owned());
+            }
+            let path = parent.join(
+                path.file_name()
+                    .ok_or_else(|| "log_write path is invalid".to_owned())?,
+            );
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|error| format!("log_write failed: {error}"))?;
+            file.write_all(text.as_bytes())
+                .map_err(|error| format!("log_write failed: {error}"))?;
+            if format_internally && !text.ends_with('\n') {
+                file.write_all(b"\n")
+                    .map_err(|error| format!("log_write failed: {error}"))?;
+            }
+            Ok(Value::Null)
+        }
+        "log_close_all" if arguments.is_empty() => Ok(Value::Null),
         "file_write" | "file_append" if arguments.len() == 2 => {
             let text = strict_text(&arguments[0], state, function.as_str())?;
-            let path = resolved_file_path(&arguments[1..], state, function.as_str())?;
+            let path = relaxed_resolved_file_path(&arguments[1..], state, function.as_str())?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| format!("{function} path has no parent"))?;
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("{function} failed to create parent: {error}"))?;
+            // Re-resolve after creation so a raced or pre-existing symlink can
+            // never redirect the eventual write outside the project root.
+            let root = state
+                .project_root()
+                .ok_or_else(|| format!("{function} requires a configured project root"))?
+                .canonicalize()
+                .map_err(|error| format!("{function} project root is unavailable: {error}"))?;
+            let parent = parent
+                .canonicalize()
+                .map_err(|error| format!("{function} parent directory is unavailable: {error}"))?;
+            if !parent.starts_with(root) {
+                return Err(format!("{function} path escapes the project root"));
+            }
+            let path = parent.join(
+                path.file_name()
+                    .ok_or_else(|| format!("{function} path is invalid"))?,
+            );
             if function == "file_write" {
                 fs::write(path, text).map_err(|error| format!("file_write failed: {error}"))?;
             } else {
@@ -381,10 +585,764 @@ pub(super) fn execute_external_call(
                 state.external_timer_milliseconds(&name).to_string(),
             ))
         }
+        "time_microseconds" if arguments.len() == 1 => {
+            let name = strict_text(&arguments[0], state, "time_microseconds")?;
+            Ok(Value::text(
+                state.external_timer_microseconds(&name).to_string(),
+            ))
+        }
+        "iconforge_load_gags_config" if arguments.len() == 3 => {
+            iconforge_load_gags_config(arguments, state)
+        }
+        "iconforge_load_gags_config_async" if arguments.len() == 3 => {
+            let result = iconforge_load_gags_config(arguments, state)?;
+            Ok(Value::text(
+                state.enqueue_iconforge_job(owned_value_text(result)),
+            ))
+        }
+        "iconforge_gags" if arguments.len() == 3 => iconforge_gags(arguments, state),
+        "iconforge_gags_async" if arguments.len() == 3 => {
+            let result = iconforge_gags(arguments, state)?;
+            Ok(Value::text(
+                state.enqueue_iconforge_job(owned_value_text(result)),
+            ))
+        }
+        "iconforge_check" if arguments.len() == 1 => {
+            let id = strict_text(&arguments[0], state, "iconforge_check job id")?;
+            Ok(Value::text(state.poll_iconforge_job(&id).unwrap_or_else(
+                || format!("IconForge error: Unknown job ID '{id}'"),
+            )))
+        }
+        "iconforge_cleanup" if arguments.is_empty() => {
+            state.clear_iconforge();
+            Ok(Value::Null)
+        }
+        "iconforge_cache_valid" if arguments.len() == 3 => Ok(Value::text(
+            r#"{"result":"0","fail_reason":"Dream64 headless cache has no rendered spritesheet"}"#,
+        )),
+        "iconforge_cache_valid_async" if arguments.len() == 3 => {
+            let result = r#"{"result":"0","fail_reason":"Dream64 headless cache has no rendered spritesheet"}"#;
+            Ok(Value::text(state.enqueue_iconforge_job(result.to_owned())))
+        }
+        "iconforge_generate" if arguments.len() == 6 => Ok(Value::text(
+            r#"{"sizes":{},"sprites":{},"dmi_hashes":{},"sprites_hash":"","error":null,"headless":true}"#,
+        )),
+        "iconforge_generate_async" if arguments.len() == 6 => {
+            let result = r#"{"sizes":{},"sprites":{},"dmi_hashes":{},"sprites_hash":"","error":null,"headless":true}"#;
+            Ok(Value::text(state.enqueue_iconforge_job(result.to_owned())))
+        }
+        "iconforge_generate_headless" if arguments.len() == 3 => {
+            let file_path = strict_text(&arguments[0], state, "iconforge_generate_headless path")?;
+            Ok(Value::text(
+                serde_json::json!({
+                    "file_path": file_path,
+                    "width": serde_json::Value::Null,
+                    "height": serde_json::Value::Null,
+                    "error": "Dream64 headless mode skipped icon rendering",
+                })
+                .to_string(),
+            ))
+        }
+        "sql_connect_pool" if arguments.len() == 1 => Ok(Value::text(
+            serde_json::json!({
+                "status": "err",
+                "data": "Dream64 headless SQL host is unavailable",
+            })
+            .to_string(),
+        )),
+        "sql_connected" if arguments.len() == 1 => Ok(Value::text(r#"{"status":"offline"}"#)),
+        "sql_disconnect_pool" if arguments.len() == 1 => Ok(Value::Null),
+        "sql_query_blocking" if arguments.len() == 3 => Ok(Value::text(
+            r#"{"status":"offline","data":"Dream64 headless SQL host is unavailable"}"#,
+        )),
+        "sql_query_async" if arguments.len() == 3 => {
+            let result =
+                r#"{"status":"offline","data":"Dream64 headless SQL host is unavailable"}"#;
+            Ok(Value::text(state.enqueue_sql_job(result.to_owned())))
+        }
+        "sql_check_query" if arguments.len() == 1 => {
+            let id = strict_text(&arguments[0], state, "sql_check_query job id")?;
+            Ok(Value::text(
+                state
+                    .poll_sql_job(&id)
+                    .unwrap_or_else(|| "NO SUCH JOB".to_owned()),
+            ))
+        }
+        "dmi_read_metadata" if arguments.len() == 1 => {
+            let requested = strict_text(&arguments[0], state, "dmi_read_metadata path")?;
+            let resolved = relaxed_resolved_file_path(arguments, state, "dmi_read_metadata path")?;
+            let metadata = read_dmi_metadata(&resolved).unwrap_or_else(|error| DmiMetadata {
+                width: 32,
+                height: 32,
+                states: Vec::new(),
+                error: Some(format!(
+                    "Failed to read DMI '{requested}' (resolved to '{}') - {error}",
+                    resolved.display()
+                )),
+            });
+            Ok(Value::text(metadata.to_json().to_string()))
+        }
+        "dmi_icon_states" if arguments.len() == 1 => {
+            let resolved = relaxed_resolved_file_path(arguments, state, "dmi_icon_states path")?;
+            let states = read_dmi_metadata(&resolved)
+                .map(|metadata| {
+                    metadata
+                        .states
+                        .into_iter()
+                        .map(|state| state.name)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Ok(Value::text(serde_json::json!(states).to_string()))
+        }
+        "dmi_strip_metadata" if arguments.len() == 1 => Ok(Value::text("")),
+        "dmi_resize_png" if arguments.len() == 4 => Ok(Value::text("")),
+        "dmi_inject_metadata" if arguments.len() == 2 => Ok(Value::text("")),
         _ => Err(format!(
             "external call {library}::{function} requires an installed host bridge"
         )),
     }
+}
+
+fn headless_memory_stats_report() -> String {
+    let resident = current_process_resident_bytes()
+        .map(format_memory_size)
+        .unwrap_or_else(|| "unavailable".to_owned());
+    format!(
+        "Server mem usage:\n\
+prototypes:\n\
+\tobj: 0 B (0)\n\
+\tmob: 0 B (0)\n\
+\tproc: 0 B (0)\n\
+\tstr: 0 B (0)\n\
+\tappearance: 0 B (0)\n\
+\tfilter: 0 B (0)\n\
+\tid array: 0 B (0)\n\
+\tmap: 0 B (0,0,0)\n\
+objects:\n\
+\tmobs: 0 B (0)\n\
+\tobjs: 0 B (0)\n\
+\tdatums: 0 B (0)\n\
+\timages: 0 B (0)\n\
+\tlists: 0 B (0)\n\
+\tprocs: 0 B (0)\n\
+Dream64 host:\n\
+\tresident: {resident}"
+    )
+}
+
+fn format_memory_size(bytes: u64) -> String {
+    const KIB: u64 = 1_024;
+    const MIB: u64 = KIB * KIB;
+    const GIB: u64 = MIB * KIB;
+    if bytes >= GIB {
+        format!("{:.2} GB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.2} MB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.2} KB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+#[cfg(windows)]
+fn current_process_resident_bytes() -> Option<u64> {
+    let pid = std::process::id().to_string();
+    let query = format!("(Get-Process -Id {pid}).WorkingSet64");
+    if let Ok(output) = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &query])
+        .output()
+        && output.status.success()
+        && let Ok(bytes) = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u64>()
+    {
+        return Some(bytes);
+    }
+
+    // PowerShell can be removed on a deliberately minimal Windows host. Keep
+    // the inbox task-list tool as a best-effort fallback; failure simply makes
+    // the report say that the host aggregate is unavailable.
+    let output = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout);
+    let memory_kib = line
+        .trim()
+        .trim_end_matches('"')
+        .rsplit_once("\",\"")?
+        .1
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>()
+        .parse::<u64>()
+        .ok()?;
+    memory_kib.checked_mul(1_024)
+}
+
+#[cfg(unix)]
+fn current_process_resident_bytes() -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    let resident_kib = status.lines().find_map(|line| {
+        line.strip_prefix("VmRSS:")?
+            .split_ascii_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+    })?;
+    resident_kib.checked_mul(1_024)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn current_process_resident_bytes() -> Option<u64> {
+    None
+}
+
+fn rust_g_cellular_noise(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    fn parse_number(value: &Value, state: &ExecutionState, name: &str) -> Result<f64, String> {
+        let text = strict_text(value, state, name)?;
+        text.parse::<f64>()
+            .map_err(|error| format!("cnoise_generate {name} is invalid: {error}"))
+    }
+
+    fn parse_dimension(value: &Value, state: &ExecutionState, name: &str) -> Result<usize, String> {
+        let number = parse_number(value, state, name)?;
+        if !number.is_finite() || number.fract() != 0.0 || !(1.0..=4_096.0).contains(&number) {
+            return Err(format!(
+                "cnoise_generate {name} must be a whole number from 1 through 4096"
+            ));
+        }
+        Ok(number as usize)
+    }
+
+    fn parse_count(value: &Value, state: &ExecutionState, name: &str) -> Result<usize, String> {
+        let number = parse_number(value, state, name)?;
+        if !number.is_finite() || number.fract() != 0.0 || !(0.0..=4_096.0).contains(&number) {
+            return Err(format!(
+                "cnoise_generate {name} must be a whole number from 0 through 4096"
+            ));
+        }
+        Ok(number as usize)
+    }
+
+    fn parse_neighbour_limit(
+        value: &Value,
+        state: &ExecutionState,
+        name: &str,
+    ) -> Result<u8, String> {
+        let number = parse_number(value, state, name)?;
+        if !number.is_finite() || number.fract() != 0.0 || !(0.0..=8.0).contains(&number) {
+            return Err(format!(
+                "cnoise_generate {name} must be a whole number from 0 through 8"
+            ));
+        }
+        Ok(number as u8)
+    }
+
+    let percentage = parse_number(&arguments[0], state, "percentage")?;
+    if !percentage.is_finite() || !(0.0..=100.0).contains(&percentage) {
+        return Err("cnoise_generate percentage must be from 0 through 100".to_owned());
+    }
+    let smoothing = parse_count(&arguments[1], state, "smoothing_iterations")?;
+    let birth_limit = parse_neighbour_limit(&arguments[2], state, "birth_limit")?;
+    let death_limit = parse_neighbour_limit(&arguments[3], state, "death_limit")?;
+    let width = parse_dimension(&arguments[4], state, "width")?;
+    let height = parse_dimension(&arguments[5], state, "height")?;
+    let cells = width
+        .checked_mul(height)
+        .ok_or_else(|| "cnoise_generate dimensions overflow the host index range".to_owned())?;
+    if cells > 16_777_216 {
+        return Err("cnoise_generate dimensions exceed the 16,777,216-cell limit".to_owned());
+    }
+
+    let mut current = Vec::with_capacity(cells);
+    for _ in 0..cells {
+        current.push(
+            f64::from(super::deterministic_unit(&mut state.random_state)) * 100.0 < percentage,
+        );
+    }
+    let mut next = vec![false; cells];
+    for _ in 0..smoothing {
+        for y in 0..height {
+            for x in 0..width {
+                let mut neighbours = 0_u8;
+                for dy in -1_isize..=1 {
+                    for dx in -1_isize..=1 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let nx = x as isize + dx;
+                        let ny = y as isize + dy;
+                        if nx >= 0
+                            && ny >= 0
+                            && nx < width as isize
+                            && ny < height as isize
+                            && current[ny as usize * width + nx as usize]
+                        {
+                            neighbours = neighbours.saturating_add(1);
+                        }
+                    }
+                }
+                let index = y * width + x;
+                next[index] = if current[index] {
+                    neighbours >= death_limit
+                } else {
+                    neighbours > birth_limit
+                };
+            }
+        }
+        std::mem::swap(&mut current, &mut next);
+    }
+
+    let mut output = String::with_capacity(cells);
+    output.extend(
+        current
+            .into_iter()
+            .map(|closed| if closed { '1' } else { '0' }),
+    );
+    Ok(Value::text(output))
+}
+
+fn rust_g_poisson_noise(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
+    use fast_poisson::Poisson2D;
+
+    let parse = |index: usize, name: &str| {
+        strict_text(&arguments[index], state, name)
+            .map_err(|error| format!("noise_poisson_map {name} is invalid: {error}"))
+    };
+    let seed = parse(0, "seed")?
+        .parse::<u64>()
+        .map_err(|error| format!("noise_poisson_map seed is invalid: {error}"))?;
+    let width = parse(1, "width")?
+        .parse::<usize>()
+        .map_err(|error| format!("noise_poisson_map width is invalid: {error}"))?;
+    let height = parse(2, "height")?
+        .parse::<usize>()
+        .map_err(|error| format!("noise_poisson_map height is invalid: {error}"))?;
+    let radius = parse(3, "radius")?
+        .parse::<f32>()
+        .map_err(|error| format!("noise_poisson_map radius is invalid: {error}"))?;
+    let cells = width
+        .checked_mul(height)
+        .ok_or_else(|| "noise_poisson_map dimensions overflow the host index range".to_owned())?;
+    if cells > 16_777_216 {
+        return Err("noise_poisson_map dimensions exceed the 16,777,216-cell limit".to_owned());
+    }
+
+    // Keep this construction identical to rust-g's poissonnoise export. The
+    // iterator yields floating points; rust-g truncates both coordinates and
+    // then collapses the set into a row-major binary string.
+    let points: HashSet<(usize, usize)> = Poisson2D::new()
+        .with_dimensions([width as f32, height as f32], radius)
+        .with_seed(seed)
+        .iter()
+        .map(|[x, y]| (x as usize, y as usize))
+        .collect();
+    let mut output = String::with_capacity(cells);
+    for y in 0..height {
+        for x in 0..width {
+            output.push(if points.contains(&(x, y)) { '1' } else { '0' });
+        }
+    }
+    Ok(Value::text(output))
+}
+
+#[derive(Debug)]
+struct DmiMetadata {
+    width: u32,
+    height: u32,
+    states: Vec<DmiState>,
+    error: Option<String>,
+}
+
+impl DmiMetadata {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "width": self.width,
+            "height": self.height,
+            "states": self.states.iter().map(DmiState::to_json).collect::<Vec<_>>(),
+            "headless_error": self.error,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct DmiState {
+    name: String,
+    dirs: u32,
+    frames: u32,
+    delay: Vec<f64>,
+    loop_value: i64,
+    rewind: i64,
+    movement: i64,
+    hotspot: Option<Vec<i64>>,
+}
+
+impl DmiState {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            dirs: 1,
+            frames: 1,
+            delay: Vec::new(),
+            loop_value: 0,
+            rewind: 0,
+            movement: 0,
+            hotspot: None,
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "dirs": self.dirs,
+            "frames": self.frames,
+            "delay": self.delay,
+            "loop": self.loop_value,
+            "rewind": self.rewind,
+            "movement": self.movement,
+            "hotspot": self.hotspot,
+        })
+    }
+}
+
+fn read_dmi_metadata(path: &std::path::Path) -> Result<DmiMetadata, String> {
+    let png = fs::read(path).map_err(|error| error.to_string())?;
+    if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err("resource is not a PNG-backed DMI".to_owned());
+    }
+    let mut cursor = 8usize;
+    let mut image_width = None;
+    let mut image_height = None;
+    let mut description = None;
+    while cursor.checked_add(12).is_some_and(|end| end <= png.len()) {
+        let length = u32::from_be_bytes(
+            png[cursor..cursor + 4]
+                .try_into()
+                .map_err(|_| "invalid PNG chunk length")?,
+        ) as usize;
+        let chunk_type = &png[cursor + 4..cursor + 8];
+        let data_start = cursor + 8;
+        let data_end = data_start
+            .checked_add(length)
+            .ok_or("PNG chunk length overflow")?;
+        let chunk_end = data_end.checked_add(4).ok_or("PNG chunk CRC overflow")?;
+        if chunk_end > png.len() {
+            return Err("truncated PNG chunk".to_owned());
+        }
+        let data = &png[data_start..data_end];
+        match chunk_type {
+            b"IHDR" if data.len() >= 8 => {
+                image_width = Some(u32::from_be_bytes(data[0..4].try_into().unwrap()));
+                image_height = Some(u32::from_be_bytes(data[4..8].try_into().unwrap()));
+            }
+            b"tEXt" => {
+                if let Some(separator) = data.iter().position(|byte| *byte == 0)
+                    && &data[..separator] == b"Description"
+                {
+                    description = Some(
+                        String::from_utf8(data[separator + 1..].to_vec())
+                            .map_err(|error| error.to_string())?,
+                    );
+                }
+            }
+            b"zTXt" => {
+                if let Some(separator) = data.iter().position(|byte| *byte == 0)
+                    && &data[..separator] == b"Description"
+                {
+                    let method = *data
+                        .get(separator + 1)
+                        .ok_or("DMI zTXt chunk lacks compression method")?;
+                    if method != 0 {
+                        return Err(format!("unsupported DMI zTXt compression method {method}"));
+                    }
+                    let compressed = data
+                        .get(separator + 2..)
+                        .ok_or("DMI zTXt chunk lacks compressed data")?;
+                    let mut decoder = flate2::read::ZlibDecoder::new(compressed);
+                    let mut decoded = String::new();
+                    decoder
+                        .read_to_string(&mut decoded)
+                        .map_err(|error| error.to_string())?;
+                    description = Some(decoded);
+                }
+            }
+            _ => {}
+        }
+        cursor = chunk_end;
+        if description.is_some() && image_width.is_some() {
+            break;
+        }
+    }
+    let image_width = image_width.ok_or("PNG is missing IHDR width")?;
+    let image_height = image_height.ok_or("PNG is missing IHDR height")?;
+    match description {
+        Some(description) => parse_dmi_description(&description, image_width, image_height),
+        None => Ok(DmiMetadata {
+            width: image_width,
+            height: image_height,
+            states: vec![DmiState::new(String::new())],
+            error: None,
+        }),
+    }
+}
+
+fn icon_states_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    let resource = match arguments.first().cloned().unwrap_or(Value::Null) {
+        Value::Datum(datum) => super::datum_field_or_initial(
+            state,
+            datum,
+            &FieldName::parse("icon").expect("icon field name is valid"),
+        )
+        .map_err(|error| error.to_string())?,
+        value => value,
+    };
+    let requested = strict_text(&resource, state, "icon_states resource")?;
+    let resolved =
+        relaxed_resolved_file_path(&[Value::text(requested)], state, "icon_states resource")?;
+    let metadata = read_dmi_metadata(&resolved)?;
+    let list = state.heap_mut().allocate_list();
+    let values = state
+        .heap_mut()
+        .list_mut(list)
+        .map_err(|error| error.to_string())?;
+    for icon_state in metadata.states {
+        values.add(Value::text(icon_state.name));
+    }
+    Ok(Value::List(list))
+}
+
+fn parse_dmi_description(
+    description: &str,
+    image_width: u32,
+    image_height: u32,
+) -> Result<DmiMetadata, String> {
+    let mut metadata = DmiMetadata {
+        width: image_width,
+        height: image_height,
+        states: Vec::new(),
+        error: None,
+    };
+    let mut state = None;
+    for raw_line in description.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("invalid DMI metadata line {line:?}"));
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "version" => {}
+            "width" => {
+                metadata.width = value
+                    .parse()
+                    .map_err(|error| format!("invalid DMI width {value:?}: {error}"))?;
+            }
+            "height" => {
+                metadata.height = value
+                    .parse()
+                    .map_err(|error| format!("invalid DMI height {value:?}: {error}"))?;
+            }
+            "state" => {
+                if let Some(previous) = state.take() {
+                    metadata.states.push(previous);
+                }
+                let name = serde_json::from_str::<String>(value)
+                    .unwrap_or_else(|_| value.trim_matches('"').to_owned());
+                state = Some(DmiState::new(name));
+            }
+            "dirs" => {
+                if let Some(state) = state.as_mut() {
+                    state.dirs = value
+                        .parse()
+                        .map_err(|error| format!("invalid DMI dirs {value:?}: {error}"))?;
+                }
+            }
+            "frames" => {
+                if let Some(state) = state.as_mut() {
+                    state.frames = value
+                        .parse()
+                        .map_err(|error| format!("invalid DMI frames {value:?}: {error}"))?;
+                }
+            }
+            "delay" => {
+                if let Some(state) = state.as_mut() {
+                    state.delay = value
+                        .split(',')
+                        .map(str::trim)
+                        .map(str::parse)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| format!("invalid DMI delay {value:?}: {error}"))?;
+                }
+            }
+            "loop" | "rewind" | "movement" => {
+                if let Some(state) = state.as_mut() {
+                    let parsed = value
+                        .parse()
+                        .map_err(|error| format!("invalid DMI {key} {value:?}: {error}"))?;
+                    match key {
+                        "loop" => state.loop_value = parsed,
+                        "rewind" => state.rewind = parsed,
+                        _ => state.movement = parsed,
+                    }
+                }
+            }
+            "hotspot" => {
+                if let Some(state) = state.as_mut() {
+                    state.hotspot = Some(
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .map(str::parse)
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|error| format!("invalid DMI hotspot {value:?}: {error}"))?,
+                    );
+                }
+            }
+            _ => return Err(format!("unsupported DMI metadata key {key:?}")),
+        }
+    }
+    if let Some(state) = state {
+        metadata.states.push(state);
+    }
+    Ok(metadata)
+}
+
+fn format_unix_timestamp(unix_millis: i64, format: &str, offset_hours: f32) -> String {
+    let offset_seconds = (offset_hours * 3_600.0).round() as i64;
+    let local_millis = unix_millis.saturating_add(offset_seconds.saturating_mul(1_000));
+    let days = local_millis.div_euclid(86_400_000);
+    let day_millis = local_millis.rem_euclid(86_400_000);
+    let (year, month, day) = civil_date_from_unix_days(days);
+    let hour = day_millis / 3_600_000;
+    let minute = day_millis / 60_000 % 60;
+    let second = day_millis / 1_000 % 60;
+    let millis = day_millis % 1_000;
+    let offset_sign = if offset_seconds < 0 { '-' } else { '+' };
+    let offset_abs = offset_seconds.abs();
+    let offset = format!(
+        "{offset_sign}{:02}{:02}",
+        offset_abs / 3_600,
+        offset_abs / 60 % 60
+    );
+    let literal_percent = "\u{0}";
+    format
+        .replace("%%", literal_percent)
+        .replace("%.3f", &format!(".{millis:03}"))
+        .replace("%F", &format!("{year:04}-{month:02}-{day:02}"))
+        .replace("%T", &format!("{hour:02}:{minute:02}:{second:02}"))
+        .replace("%Y", &format!("{year:04}"))
+        .replace("%m", &format!("{month:02}"))
+        .replace("%d", &format!("{day:02}"))
+        .replace("%H", &format!("{hour:02}"))
+        .replace("%M", &format!("{minute:02}"))
+        .replace("%S", &format!("{second:02}"))
+        .replace("%z", &offset)
+        .replace(literal_percent, "%")
+}
+
+fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
+}
+
+fn owned_value_text(value: Value) -> String {
+    match value {
+        Value::Text(text) => text.to_string(),
+        Value::Null => String::new(),
+        value => value.to_string(),
+    }
+}
+
+fn iconforge_load_gags_config(
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    let config_path = strict_text(&arguments[0], state, "iconforge config path")?;
+    let config_json = strict_text(&arguments[1], state, "iconforge config JSON")?;
+    if let Err(error) = serde_json::from_str::<serde_json::Value>(&config_json) {
+        return Ok(Value::text(format!(
+            "IconForge error: Failed to parse config for '{config_path}': {error}"
+        )));
+    }
+    let icon_path_text = strict_text(&arguments[2], state, "iconforge icon path")?;
+    let icon_path = resolved_file_path(&arguments[2..3], state, "iconforge icon path")?;
+    if let Err(error) = fs::metadata(&icon_path) {
+        return Ok(Value::text(format!(
+            "IconForge error: Failed to open DMI '{icon_path_text}' (resolved to '{}') - {error}",
+            icon_path.display()
+        )));
+    }
+    state.load_iconforge_gags_config(config_path);
+    Ok(Value::text("OK"))
+}
+
+fn iconforge_gags(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    let config_path = strict_text(&arguments[0], state, "iconforge config path")?;
+    if !state.has_iconforge_gags_config(&config_path) {
+        return Ok(Value::text(format!(
+            "IconForge error: Provided config_path {config_path} has not been loaded by iconforge_load_gags_config!"
+        )));
+    }
+    let output_text = strict_text(&arguments[2], state, "iconforge output path")?;
+    let relative = std::path::Path::new(&output_text);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return Err("iconforge output path escapes the project root".to_owned());
+    }
+    let root = state
+        .project_root()
+        .ok_or_else(|| "iconforge output path requires a configured project root".to_owned())?
+        .canonicalize()
+        .map_err(|error| format!("iconforge project root is unavailable: {error}"))?;
+    let mut parent = root.clone();
+    for component in relative
+        .parent()
+        .into_iter()
+        .flat_map(std::path::Path::components)
+    {
+        let Component::Normal(component) = component else {
+            continue;
+        };
+        parent.push(component);
+        if !parent.exists() {
+            fs::create_dir(&parent).map_err(|error| {
+                format!("IconForge error: Failed to create output directory: {error}")
+            })?;
+        }
+        let resolved = parent.canonicalize().map_err(|error| {
+            format!("IconForge error: Failed to resolve output directory: {error}")
+        })?;
+        if !resolved.starts_with(&root) {
+            return Err("iconforge output path escapes the project root".to_owned());
+        }
+        parent = resolved;
+    }
+    let output = resolved_file_path(&arguments[2..3], state, "iconforge output path")?;
+    fs::write(&output, [])
+        .map_err(|error| format!("IconForge error: Failed to create headless output: {error}"))?;
+    Ok(Value::text("OK"))
 }
 
 fn validate_git_revision(revision: &str) -> Result<(), String> {
@@ -760,6 +1718,55 @@ fn resource_datum_builtin(
     Ok(Value::Datum(datum))
 }
 
+fn fcopy_rsc(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
+    let Some(value) = arguments.first() else {
+        return Ok(Value::Null);
+    };
+    match value {
+        Value::File(path) | Value::Text(path) => Ok(Value::file(path.clone())),
+        Value::Null => Ok(Value::Null),
+        Value::Datum(_) => icon_backing_resource(value, state, 0),
+        value => Err(format!(
+            "fcopy_rsc requires a file, path, or icon, received {value}"
+        )),
+    }
+}
+
+/// OpenDream, matching BYOND, keeps `/icon` objects distinct from resources:
+/// `isfile(icon)` is false, while `fcopy_rsc(icon)` materializes an icon
+/// resource. Dream64's headless renderer retains the constructor's backing
+/// resource instead of rasterizing pixels, so unwrap that backing resource
+/// (including icons cloned from other icons) into the first-class `File`
+/// value used by filesystem/resource builtins.
+fn icon_backing_resource(
+    value: &Value,
+    state: &ExecutionState,
+    depth: usize,
+) -> Result<Value, String> {
+    if depth >= 64 {
+        return Err("fcopy_rsc encountered a cyclic icon resource".to_owned());
+    }
+    let Value::Datum(icon) = value else {
+        return Err(format!("fcopy_rsc requires an icon, received {value}"));
+    };
+    let datum = state.heap.datum(*icon).map_err(|error| error.to_string())?;
+    let path = datum.type_path().as_str();
+    if path != "/icon" && !path.starts_with("/icon/") {
+        return Err(format!("fcopy_rsc requires an icon, received {value}"));
+    }
+    let field = FieldName::parse("icon").expect("built-in icon field is valid");
+    match datum.field(&field) {
+        Ok(Value::File(path)) | Ok(Value::Text(path)) => Ok(Value::file(path.clone())),
+        Ok(Value::Datum(backing)) => {
+            icon_backing_resource(&Value::Datum(*backing), state, depth + 1)
+        }
+        Ok(Value::Null) | Err(_) => Ok(Value::Null),
+        Ok(value) => Err(format!(
+            "fcopy_rsc icon has an unsupported backing resource {value}"
+        )),
+    }
+}
+
 fn newlist_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
     let result = state.heap.allocate_list();
     for argument in arguments {
@@ -866,9 +1873,44 @@ fn text_template(arguments: &[Value], state: &ExecutionState) -> Result<Value, S
     let mut output = String::with_capacity(template.len());
     let mut characters = template.chars().peekable();
     let mut holes = 0_usize;
+    let mut pending_prefix = None;
+    let mut previous_value = None;
+    let mut previous_output_start = 0_usize;
     while let Some(character) = characters.next() {
-        if character == '\\' && matches!(characters.peek(), Some('[' | ']')) {
-            output.push(characters.next().expect("peeked escaped bracket exists"));
+        if matches!(
+            character,
+            super::TEXT_MACRO_THE
+                | super::TEXT_MACRO_THE_UPPER
+                | super::TEXT_MACRO_A
+                | super::TEXT_MACRO_A_UPPER
+                | super::TEXT_MACRO_PROPER
+                | super::TEXT_MACRO_IMPROPER
+                | super::TEXT_MACRO_ROMAN
+                | super::TEXT_MACRO_ROMAN_UPPER
+        ) {
+            pending_prefix = Some(character);
+            continue;
+        }
+        if matches!(
+            character,
+            super::TEXT_MACRO_ORDINAL
+                | super::TEXT_MACRO_PLURAL
+                | super::TEXT_MACRO_SUBJECT
+                | super::TEXT_MACRO_SUBJECT_UPPER
+                | super::TEXT_MACRO_POSSESSIVE_ADJECTIVE
+                | super::TEXT_MACRO_POSSESSIVE_ADJECTIVE_UPPER
+                | super::TEXT_MACRO_OBJECT
+                | super::TEXT_MACRO_REFLEXIVE
+                | super::TEXT_MACRO_POSSESSIVE
+                | super::TEXT_MACRO_POSSESSIVE_UPPER
+        ) {
+            apply_text_suffix(
+                character,
+                previous_value,
+                previous_output_start,
+                &mut output,
+                state,
+            )?;
             continue;
         }
         if character != '[' {
@@ -891,7 +1933,13 @@ fn text_template(arguments: &[Value], state: &ExecutionState) -> Result<Value, S
         let value = values
             .next()
             .ok_or_else(|| "text() has fewer arguments than template holes".to_owned())?;
-        output.push_str(&runtime_text(value, state, "text() interpolation")?);
+        previous_output_start = output.len();
+        output.push_str(&format_text_interpolation(
+            value,
+            pending_prefix.take(),
+            state,
+        )?);
+        previous_value = Some(value);
         holes += 1;
     }
     if values.next().is_some() {
@@ -902,11 +1950,250 @@ fn text_template(arguments: &[Value], state: &ExecutionState) -> Result<Value, S
     Ok(Value::text(output))
 }
 
+fn is_text_format_marker(character: char) -> bool {
+    matches!(
+        character,
+        super::TEXT_MACRO_THE
+            | super::TEXT_MACRO_THE_UPPER
+            | super::TEXT_MACRO_A
+            | super::TEXT_MACRO_A_UPPER
+            | super::TEXT_MACRO_PROPER
+            | super::TEXT_MACRO_IMPROPER
+            | super::TEXT_MACRO_ROMAN
+            | super::TEXT_MACRO_ROMAN_UPPER
+            | super::TEXT_MACRO_ORDINAL
+            | super::TEXT_MACRO_PLURAL
+            | super::TEXT_MACRO_SUBJECT
+            | super::TEXT_MACRO_SUBJECT_UPPER
+            | super::TEXT_MACRO_POSSESSIVE_ADJECTIVE
+            | super::TEXT_MACRO_POSSESSIVE_ADJECTIVE_UPPER
+            | super::TEXT_MACRO_OBJECT
+            | super::TEXT_MACRO_REFLEXIVE
+            | super::TEXT_MACRO_POSSESSIVE
+            | super::TEXT_MACRO_POSSESSIVE_UPPER
+    )
+}
+
+fn text_macro_visible(value: &Value, state: &ExecutionState) -> Result<String, String> {
+    Ok(runtime_text(value, state, "text() interpolation")?
+        .chars()
+        .filter(|character| !is_text_format_marker(*character))
+        .collect())
+}
+
+fn text_macro_is_proper(value: &Value, state: &ExecutionState) -> Result<bool, String> {
+    let raw = runtime_text(value, state, "text() article")?;
+    if raw.starts_with(super::TEXT_MACRO_PROPER) {
+        return Ok(true);
+    }
+    if raw.starts_with(super::TEXT_MACRO_IMPROPER) {
+        return Ok(false);
+    }
+    let Some(first) = raw
+        .chars()
+        .find(|character| !is_text_format_marker(*character))
+    else {
+        return Ok(true);
+    };
+    Ok(first.is_whitespace() || first.is_uppercase())
+}
+
+fn format_text_interpolation(
+    value: &Value,
+    prefix: Option<char>,
+    state: &ExecutionState,
+) -> Result<String, String> {
+    let visible = text_macro_visible(value, state)?;
+    let Some(prefix) = prefix else {
+        return Ok(visible);
+    };
+    match prefix {
+        super::TEXT_MACRO_THE | super::TEXT_MACRO_THE_UPPER => {
+            if text_macro_is_proper(value, state)? {
+                Ok(visible)
+            } else {
+                let article = if prefix == super::TEXT_MACRO_THE_UPPER {
+                    "The "
+                } else {
+                    "the "
+                };
+                Ok(format!("{article}{visible}"))
+            }
+        }
+        super::TEXT_MACRO_A | super::TEXT_MACRO_A_UPPER => {
+            if text_macro_is_proper(value, state)? {
+                return Ok(visible);
+            }
+            let plural = value_gender(value, state).as_deref() == Some("plural");
+            let vowel = visible.chars().next().is_some_and(|character| {
+                matches!(character.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u')
+            });
+            let article = match (prefix == super::TEXT_MACRO_A_UPPER, plural, vowel) {
+                (true, true, _) => "Some ",
+                (false, true, _) => "some ",
+                (true, false, true) => "An ",
+                (false, false, true) => "an ",
+                (true, false, false) => "A ",
+                (false, false, false) => "a ",
+            };
+            Ok(format!("{article}{visible}"))
+        }
+        super::TEXT_MACRO_ROMAN | super::TEXT_MACRO_ROMAN_UPPER => {
+            Ok(value.as_number().map_or_else(String::new, |number| {
+                roman_text(number, prefix == super::TEXT_MACRO_ROMAN_UPPER)
+            }))
+        }
+        // `\\proper` and `\\improper` are metadata markers when stored in a
+        // literal name. During runtime text() formatting BYOND consumes them.
+        super::TEXT_MACRO_PROPER | super::TEXT_MACRO_IMPROPER => Ok(visible),
+        _ => Ok(visible),
+    }
+}
+
+fn roman_text(number: f32, upper: bool) -> String {
+    if number.is_nan() {
+        return "-".to_owned();
+    }
+    if number.is_infinite() {
+        return if number.is_sign_negative() {
+            "-inf"
+        } else {
+            "inf"
+        }
+        .to_owned();
+    }
+    let mut value = number.trunc() as i64;
+    let mut output = String::new();
+    if value < 0 {
+        output.push('-');
+        value = value.saturating_abs();
+    }
+    for (amount, lower, upper_character) in [
+        (1000, 'm', 'M'),
+        (500, 'd', 'D'),
+        (100, 'c', 'C'),
+        (50, 'l', 'L'),
+        (10, 'x', 'X'),
+        (5, 'v', 'V'),
+        (1, 'i', 'I'),
+    ] {
+        while value >= amount {
+            value -= amount;
+            output.push(if upper { upper_character } else { lower });
+        }
+    }
+    output
+}
+
+fn value_gender(value: &Value, state: &ExecutionState) -> Option<String> {
+    let Value::Datum(datum) = value else {
+        return None;
+    };
+    super::datum_field_or_initial(
+        state,
+        *datum,
+        &FieldName::parse("gender").expect("gender field name is valid"),
+    )
+    .ok()
+    .as_ref()
+    .and_then(value_text)
+    .map(str::to_owned)
+}
+
+fn apply_text_suffix(
+    suffix: char,
+    previous: Option<&Value>,
+    previous_output_start: usize,
+    output: &mut String,
+    state: &ExecutionState,
+) -> Result<(), String> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    match suffix {
+        super::TEXT_MACRO_ORDINAL => {
+            output.truncate(previous_output_start);
+            let integer = previous.as_number().map_or(0_i64, |number| number as i64);
+            output.push_str(&integer.to_string());
+            output.push_str(match integer {
+                1 => "st",
+                2 => "nd",
+                3 => "rd",
+                _ => "th",
+            });
+        }
+        super::TEXT_MACRO_PLURAL => {
+            if previous.as_number() != Some(1.0) {
+                output.push('s');
+            }
+        }
+        _ => {
+            let Some(gender) = value_gender(previous, state) else {
+                return Ok(());
+            };
+            let index = match gender.as_str() {
+                "male" => 0,
+                "female" => 1,
+                "plural" => 2,
+                "neuter" => 3,
+                _ => return Ok(()),
+            };
+            let words: [&[&str; 4]; 8] = [
+                &["he", "she", "they", "it"],
+                &["He", "She", "They", "It"],
+                &["his", "her", "their", "its"],
+                &["His", "Her", "Their", "Its"],
+                &["him", "her", "them", "it"],
+                &["himself", "herself", "themself", "itself"],
+                &["his", "hers", "theirs", "its"],
+                &["His", "Hers", "Theirs", "Its"],
+            ];
+            let family = match suffix {
+                super::TEXT_MACRO_SUBJECT => 0,
+                super::TEXT_MACRO_SUBJECT_UPPER => 1,
+                super::TEXT_MACRO_POSSESSIVE_ADJECTIVE => 2,
+                super::TEXT_MACRO_POSSESSIVE_ADJECTIVE_UPPER => 3,
+                super::TEXT_MACRO_OBJECT => 4,
+                super::TEXT_MACRO_REFLEXIVE => 5,
+                super::TEXT_MACRO_POSSESSIVE => 6,
+                super::TEXT_MACRO_POSSESSIVE_UPPER => 7,
+                _ => return Ok(()),
+            };
+            output.push_str(words[family][index]);
+        }
+    }
+    Ok(())
+}
+
 fn md5_builtin(arguments: &[Value]) -> Result<Value, String> {
     let Some(Value::Text(text)) = arguments.first() else {
         return Ok(Value::Null);
     };
     Ok(Value::text(format!("{:x}", md5::compute(text.as_bytes()))))
+}
+
+fn rust_g_hash_string(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
+    let algorithm = strict_text(&arguments[0], state, "hash_string algorithm")?;
+    let text = strict_text(&arguments[1], state, "hash_string text")?;
+    match algorithm.to_ascii_lowercase().as_str() {
+        "md5" => Ok(Value::text(format!("{:x}", md5::compute(text.as_bytes())))),
+        algorithm => Err(format!(
+            "hash_string algorithm {algorithm:?} is unavailable in the Dream64 host"
+        )),
+    }
+}
+
+fn rust_g_hash_file(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
+    let algorithm = strict_text(&arguments[0], state, "hash_file algorithm")?;
+    if !algorithm.eq_ignore_ascii_case("md5") {
+        return Err(format!(
+            "hash_file algorithm {algorithm:?} is unavailable in the Dream64 host"
+        ));
+    }
+    let path = relaxed_resolved_file_path(&arguments[1..], state, "hash_file path")?;
+    let bytes = fs::read(&path)
+        .map_err(|error| format!("hash_file failed to read '{}': {error}", path.display()))?;
+    Ok(Value::text(format!("{:x}", md5::compute(bytes))))
 }
 
 fn json_encode_builtin(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
@@ -962,7 +2249,7 @@ fn json_value_from_dm(
                 Ok(serde_json::Value::Object(object))
             }
         }
-        Value::Text(text) => Ok(serde_json::Value::String(text.to_string())),
+        Value::Text(text) | Value::File(text) => Ok(serde_json::Value::String(text.to_string())),
         Value::TypePath(path) => Ok(serde_json::Value::String(path.to_string())),
         Value::ModifiedTypePath(path) => Ok(serde_json::Value::String(path.base().to_string())),
         Value::Datum(_) => Ok(serde_json::Value::String(runtime_text(
@@ -1001,8 +2288,10 @@ fn json_decode_builtin(arguments: &[Value], state: &mut ExecutionState) -> Resul
     let Some(Value::Text(text)) = arguments.first() else {
         return Err("json_decode requires text".to_owned());
     };
-    let json: serde_json::Value =
-        serde_json::from_str(text).map_err(|error| format!("json_decode failed: {error}"))?;
+    let json: serde_json::Value = serde_json::from_str(text).map_err(|error| {
+        let preview = text.chars().take(256).collect::<String>();
+        format!("json_decode failed for {preview:?}: {error}")
+    })?;
     dm_value_from_json(&json, state)
 }
 
@@ -1077,7 +2366,11 @@ fn sorttext(arguments: &[Value], state: &ExecutionState, exact: bool) -> Result<
     }
     let values = arguments
         .iter()
-        .map(|value| strict_text(value, state, "sorttext"))
+        // BYOND sorttext is a comparator over each value's text
+        // representation. It accepts null (""), numbers, type paths, and
+        // datums; tg/Monk relies on this while sorting associative type
+        // catalogs whose optional display key can be null.
+        .map(|value| runtime_text(value, state, "sorttext"))
         .collect::<Result<Vec<_>, _>>()?;
     let compare = |left: &str, right: &str| {
         if exact {
@@ -1273,6 +2566,7 @@ fn fallback_number(value: &Value) -> f32 {
         Value::Number(number) => number.to_f32(),
         Value::Null
         | Value::Text(_)
+        | Value::File(_)
         | Value::TypePath(_)
         | Value::ModifiedTypePath(_)
         | Value::Datum(_)
@@ -1314,7 +2608,11 @@ fn truthy(value: &Value) -> bool {
         Value::Null => false,
         Value::Number(number) => number.to_f32() != 0.0,
         Value::Text(text) => !text.is_empty(),
-        Value::TypePath(_) | Value::ModifiedTypePath(_) | Value::Datum(_) | Value::List(_) => true,
+        Value::File(_)
+        | Value::TypePath(_)
+        | Value::ModifiedTypePath(_)
+        | Value::Datum(_)
+        | Value::List(_) => true,
     }
 }
 
@@ -1371,9 +2669,9 @@ fn clamp_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Valu
     }
 }
 
-fn runtime_text(value: &Value, state: &ExecutionState, context: &str) -> Result<String, String> {
+fn runtime_text(value: &Value, state: &ExecutionState, _context: &str) -> Result<String, String> {
     match value {
-        Value::Text(text) => Ok(text.to_string()),
+        Value::Text(text) | Value::File(text) => Ok(text.to_string()),
         Value::Null => Ok(String::new()),
         Value::Number(number) => {
             let number = number.to_f32();
@@ -1396,7 +2694,10 @@ fn runtime_text(value: &Value, state: &ExecutionState, context: &str) -> Result<
             }
             Ok(datum.type_path().to_string())
         }
-        Value::List(_) => Err(format!("{context} cannot convert a list to text")),
+        // BYOND exposes lists as the engine datum display name rather than
+        // joining their contents. Verified on 516.1680 for both positional
+        // and associative lists: `"[L]"` is exactly `/list`.
+        Value::List(_) => Ok("/list".to_owned()),
     }
 }
 
@@ -1435,9 +2736,11 @@ fn del_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value,
 fn qdel_value(value: &Value, state: &mut ExecutionState) -> Result<(), String> {
     match value {
         Value::Null => Ok(()),
-        Value::Number(_) | Value::Text(_) | Value::TypePath(_) | Value::ModifiedTypePath(_) => {
-            Ok(())
-        }
+        Value::Number(_)
+        | Value::Text(_)
+        | Value::File(_)
+        | Value::TypePath(_)
+        | Value::ModifiedTypePath(_) => Ok(()),
         Value::Datum(datum) => {
             unregister_runtime_datum(state, *datum)?;
             state
@@ -1620,56 +2923,11 @@ fn image_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Valu
     Ok(Value::Datum(image))
 }
 
-fn sort_list_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
-    let list = arguments
-        .first()
-        .ok_or_else(|| "sort_list requires a list argument".to_owned())?;
-    let list = match list {
-        Value::List(list) => *list,
-        value => return Err(format!("sort_list requires a list, received {value}")),
-    };
-
-    let entries = {
-        let snapshot = state.heap.list(list).map_err(|error| error.to_string())?;
-        if snapshot.associative_len() > 0 {
-            return Err("sort_list does not support associative entries yet".to_owned());
-        }
-        snapshot
-            .positions()
-            .map(|(_, value)| value.clone())
-            .collect::<Vec<_>>()
-    };
-
-    let mut entries = entries;
-    entries.sort_by(|left, right| match (left, right) {
-        (Value::Number(left), Value::Number(right)) => left
-            .to_f32()
-            .partial_cmp(&right.to_f32())
-            .unwrap_or(std::cmp::Ordering::Equal),
-        _ => {
-            let left =
-                runtime_text(left, state, "sort_list item").unwrap_or_else(|_| left.to_string());
-            let right =
-                runtime_text(right, state, "sort_list item").unwrap_or_else(|_| right.to_string());
-            left.cmp(&right)
-        }
-    });
-
-    let list_id = list;
-    let list = state
-        .heap
-        .list_mut(list_id)
-        .map_err(|error| error.to_string())?;
-    list.resize(0).map_err(|error| error.to_string())?;
-    for entry in entries {
-        list.add(entry);
-    }
-    Ok(Value::List(list_id))
-}
-
 fn strict_text(value: &Value, state: &ExecutionState, context: &str) -> Result<String, String> {
     match value {
-        Value::Text(text) => Ok(text.to_string()),
+        // File/resource values retain their own runtime type for `isfile`, but
+        // BYOND text-consuming and filesystem APIs observe their path text.
+        Value::Text(text) | Value::File(text) => Ok(text.to_string()),
         _ => Err(format!(
             "{context} requires text, received {}",
             runtime_text(value, state, context)?
@@ -1778,6 +3036,63 @@ fn headless_winset(arguments: &[Value], state: &mut ExecutionState) -> Result<Va
         .map_err(|error| error.to_string())?
         .set_key(control, params);
     Ok(Value::Null)
+}
+
+fn headless_winshow(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    let Some(Value::Datum(client)) = arguments.first() else {
+        return Ok(Value::Null);
+    };
+    let field = FieldName::parse("_dream64_winshow").expect("headless UI field");
+    let settings = match state.heap.datum_field(*client, &field) {
+        Ok(Value::List(list)) => *list,
+        _ => {
+            let list = state.heap.allocate_list();
+            state.mark_associative_list(list);
+            state
+                .heap
+                .set_datum_field(*client, field, Value::List(list))
+                .map_err(|e| e.to_string())?;
+            list
+        }
+    };
+    state
+        .heap
+        .list_mut(settings)
+        .map_err(|e| e.to_string())?
+        .set_key(
+            arguments.get(1).cloned().unwrap_or(Value::Null),
+            arguments
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| Value::number(1.0)),
+        );
+    Ok(Value::Null)
+}
+
+fn headless_winclone(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    let [Value::Datum(client), source, destination] = arguments else {
+        return Ok(Value::number(0.0));
+    };
+    let field = FieldName::parse("_dream64_winset").expect("headless UI field");
+    let Some(Value::List(settings)) = state.heap.datum_field(*client, &field).ok().cloned() else {
+        return Ok(Value::number(0.0));
+    };
+    let value = state
+        .heap
+        .list(settings)
+        .map_err(|e| e.to_string())?
+        .get_key(source)
+        .ok()
+        .cloned();
+    let Some(value) = value else {
+        return Ok(Value::number(0.0));
+    };
+    state
+        .heap
+        .list_mut(settings)
+        .map_err(|e| e.to_string())?
+        .set_key(destination.clone(), value);
+    Ok(Value::number(1.0))
 }
 
 fn headless_winget(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
@@ -1957,8 +3272,13 @@ fn text2ascii(
     }
 }
 
-fn text2num(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
-    let text = strict_text(&arguments[0], state, "text2num")?;
+fn text2num(arguments: &[Value], _state: &ExecutionState) -> Result<Value, String> {
+    let text = match &arguments[0] {
+        Value::Number(number) => return Ok(Value::Number(*number)),
+        Value::Null => return Ok(Value::Null),
+        Value::Text(text) => text.to_string(),
+        _ => return Ok(Value::Null),
+    };
     let radix = if let Some(radix) = arguments.get(1) {
         number(radix, "text2num radix")?.trunc() as i32
     } else {
@@ -2111,7 +3431,15 @@ fn findtext(
     character_indices: bool,
     reverse: bool,
 ) -> Result<Value, String> {
-    let haystack = strict_text(&arguments[0], state, "findtext haystack")?;
+    // BYOND text searches accept null as an empty text value. This is
+    // observable when `file2text()` returns null for a directory entry from
+    // `flist()`: map readers probe the result with `findtext()` before their
+    // regex loop and must receive a normal no-match rather than a runtime.
+    let haystack = if matches!(arguments[0], Value::Null) {
+        String::new()
+    } else {
+        strict_text(&arguments[0], state, "findtext haystack")?
+    };
     if let Value::Datum(regex) = arguments[1] {
         let start = signed_position(arguments.get(2), 1)?.max(1) as usize;
         let end = signed_position(arguments.get(3), 0)?;
@@ -2120,7 +3448,7 @@ fn findtext(
         } else {
             end as usize
         };
-        return regex_find(regex, &haystack, start, end, false, state);
+        return regex_find(regex, &haystack, start, end, false, false, state);
     }
     let needle = strict_text(&arguments[1], state, "findtext needle")?;
     if reverse {
@@ -2181,7 +3509,17 @@ pub(super) fn execute_regex_method(
     if method != "Find" || arguments.is_empty() || arguments.len() > 3 {
         return Err(format!("unknown or invalid /regex procedure {method:?}"));
     }
-    let haystack = strict_text(&arguments[0], state, "regex.Find haystack")?;
+    // `/regex.Find()` applies the same null-to-empty text coercion as the
+    // global text-search procedures. In particular, this lets a parsed-map
+    // reader finish cleanly after `file2text()` rejected a directory.
+    let haystack = if matches!(arguments[0], Value::Null) {
+        String::new()
+    } else {
+        strict_text(&arguments[0], state, "regex.Find haystack")?
+    };
+    let supplied_start = arguments
+        .get(1)
+        .is_some_and(|value| !matches!(value, Value::Null));
     let start = signed_position(arguments.get(1), 1)?.max(1) as usize;
     let end = signed_position(arguments.get(2), 0)?;
     let end = if end <= 0 {
@@ -2189,7 +3527,7 @@ pub(super) fn execute_regex_method(
     } else {
         end as usize
     };
-    regex_find(datum, &haystack, start, end, true, state)
+    regex_find(datum, &haystack, start, end, true, !supplied_start, state)
 }
 
 fn regex_find(
@@ -2197,13 +3535,14 @@ fn regex_find(
     haystack: &str,
     requested_start: usize,
     requested_end: usize,
-    honor_global_cursor: bool,
+    method_call: bool,
+    use_global_cursor: bool,
     state: &mut ExecutionState,
 ) -> Result<Value, String> {
     let field = |name| FieldName::parse(name).expect("regex field is valid");
     let pattern = state
         .heap()
-        .datum_field(datum, &field("text"))
+        .datum_field(datum, &field("_dream64_pattern"))
         .map_err(|error| error.to_string())?
         .clone();
     let pattern = strict_text(&pattern, state, "regex pattern")?;
@@ -2214,7 +3553,7 @@ fn regex_find(
         .and_then(value_text)
         .unwrap_or("")
         .to_owned();
-    let global = flags.contains('g') && honor_global_cursor;
+    let global = flags.contains('g');
     let previous = state
         .heap()
         .datum_field(datum, &field("_dream64_haystack"))
@@ -2226,7 +3565,7 @@ fn regex_find(
         .ok()
         .and_then(Value::as_number)
         .unwrap_or(0.0) as usize;
-    let start = if global && previous == Some(haystack) && cursor > 0 {
+    let start = if global && use_global_cursor && previous == Some(haystack) && cursor > 0 {
         cursor
     } else {
         requested_start.saturating_sub(1)
@@ -2234,16 +3573,21 @@ fn regex_find(
     let end = requested_end.saturating_sub(1).min(haystack.len());
     let found = regex_search(&pattern, &flags, haystack, start.min(end), end)?;
     let Some((begin, finish, captures)) = found else {
-        for (name, value) in [
-            ("match", Value::Null),
-            ("index", Value::number(0.0)),
-            ("group", Value::Null),
-            ("_dream64_cursor", Value::number(0.0)),
-            ("_dream64_haystack", Value::Null),
-        ] {
+        if global {
+            for (name, value) in [
+                ("next", Value::Null),
+                ("_dream64_cursor", Value::number(0.0)),
+            ] {
+                state
+                    .heap_mut()
+                    .set_datum_field(datum, field(name), value)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        if method_call {
             state
                 .heap_mut()
-                .set_datum_field(datum, field(name), value)
+                .set_datum_field(datum, field("text"), Value::text(haystack))
                 .map_err(|e| e.to_string())?;
         }
         return Ok(Value::number(0.0));
@@ -2261,13 +3605,20 @@ fn regex_find(
     } else {
         finish.saturating_add(1)
     };
-    for (name, value) in [
+    let mut fields = vec![
         ("match", Value::text(&haystack[begin..finish])),
         ("index", Value::number((begin + 1) as f32)),
         ("group", Value::List(groups)),
         ("_dream64_cursor", Value::number(next as f32)),
         ("_dream64_haystack", Value::text(haystack)),
-    ] {
+    ];
+    if global {
+        fields.push(("next", Value::number((next + 1) as f32)));
+    }
+    if method_call {
+        fields.push(("text", Value::text(haystack)));
+    }
+    for (name, value) in fields {
         state
             .heap_mut()
             .set_datum_field(datum, field(name), value)
@@ -2276,14 +3627,15 @@ fn regex_find(
     Ok(Value::number((begin + 1) as f32))
 }
 
-fn regex_search(
+pub(super) fn regex_search(
     pattern: &str,
     flags: &str,
     haystack: &str,
     start: usize,
     end: usize,
 ) -> Result<Option<(usize, usize, Vec<Option<String>>)>, String> {
-    let mut builder = fancy_regex::RegexBuilder::new(pattern);
+    let pattern = translate_byond_regex_pattern(pattern);
+    let mut builder = fancy_regex::RegexBuilder::new(&pattern);
     builder
         .case_insensitive(flags.contains('i'))
         .multi_line(flags.contains('m'));
@@ -2312,38 +3664,122 @@ fn regex_search(
     Ok(Some((whole.start(), whole.end(), groups)))
 }
 
+fn translate_byond_regex_pattern(pattern: &str) -> String {
+    let mut translated = String::with_capacity(pattern.len());
+    let mut characters = pattern.chars().peekable();
+    let mut in_character_class = false;
+    while let Some(character) = characters.next() {
+        match character {
+            '[' => {
+                in_character_class = true;
+                translated.push(character);
+            }
+            ']' => {
+                in_character_class = false;
+                translated.push(character);
+            }
+            '\\' if characters.peek() == Some(&'l') => {
+                characters.next();
+                if in_character_class {
+                    translated.push_str("A-Za-z");
+                } else {
+                    translated.push_str("[A-Za-z]");
+                }
+            }
+            _ => translated.push(character),
+        }
+    }
+    translated
+}
+
 fn splittext(
     arguments: &[Value],
     state: &mut ExecutionState,
     character_indices: bool,
 ) -> Result<Value, String> {
-    let text = strict_text(&arguments[0], state, "splittext text")?;
-    if matches!(arguments[1], Value::Datum(_)) {
-        return Err(
-            "regex delimiters in splittext are not yet supported by the headless VM".to_owned(),
-        );
+    if matches!(arguments[0], Value::Null) {
+        return Ok(Value::List(state.heap.allocate_list()));
     }
-    let delimiter = strict_text(&arguments[1], state, "splittext delimiter")?;
+    let text = strict_text(&arguments[0], state, "splittext text")?;
     let start = signed_position(arguments.get(2), 1)?;
     let end = signed_position(arguments.get(3), 0)?;
     let include_delimiters = arguments.get(4).is_some_and(truthy);
-    let (start, end, _) = text_region(&text, start, end, character_indices);
-    let target = &text[start..end];
+    let (region_start, region_end, _) = text_region(&text, start, end, character_indices);
+    let target = &text[region_start..region_end];
     let list = state.heap.allocate_list();
     let mut output = Vec::new();
-    if delimiter.is_empty() {
-        output.extend(target.chars().map(|character| character.to_string()));
-    } else {
-        let mut cursor = 0;
-        while let Some(found) = target[cursor..].find(&delimiter) {
-            let found = cursor + found;
-            output.push(target[cursor..found].to_owned());
-            if include_delimiters {
-                output.push(delimiter.clone());
-            }
-            cursor = found + delimiter.len();
+    if let Value::Datum(regex) = arguments[1] {
+        if !is_regex_datum(regex, state) {
+            return Ok(Value::List(list));
         }
-        output.push(target[cursor..].to_owned());
+        let field = |name| FieldName::parse(name).expect("regex field is valid");
+        let pattern = state
+            .heap()
+            .datum_field(regex, &field("_dream64_pattern"))
+            .map_err(|error| error.to_string())?
+            .clone();
+        let pattern = strict_text(&pattern, state, "splittext regex delimiter")?;
+        let flags = state
+            .heap()
+            .datum_field(regex, &field("flags"))
+            .ok()
+            .and_then(value_text)
+            .unwrap_or("")
+            .to_owned();
+        let mut segment_start = region_start;
+        let mut search_start = region_start;
+        while search_start <= region_end {
+            let Some((found, finish, captures)) =
+                regex_search(&pattern, &flags, &text, search_start, region_end)?
+            else {
+                break;
+            };
+            output.push(text[segment_start..found].to_owned());
+            if include_delimiters {
+                output.push(text[found..finish].to_owned());
+            } else {
+                output.extend(captures.into_iter().flatten());
+            }
+            segment_start = finish;
+            search_start = if finish > found {
+                finish
+            } else {
+                finish
+                    + text[finish..region_end]
+                        .chars()
+                        .next()
+                        .map(char::len_utf8)
+                        .unwrap_or(1)
+            };
+        }
+        output.push(text[segment_start..region_end].to_owned());
+    } else {
+        let delimiter = strict_text(&arguments[1], state, "splittext delimiter")?;
+        if delimiter.is_empty() {
+            output.extend(target.chars().map(|character| character.to_string()));
+        } else {
+            let mut cursor = 0;
+            while let Some(found) = target[cursor..].find(&delimiter) {
+                let found = cursor + found;
+                output.push(target[cursor..found].to_owned());
+                if include_delimiters {
+                    output.push(delimiter.clone());
+                }
+                cursor = found + delimiter.len();
+            }
+            output.push(target[cursor..].to_owned());
+        }
+    }
+    // BYOND applies Start/End only to the matching region. Text outside that
+    // region remains attached to the first and last split elements.
+    if output.is_empty() {
+        output.push(text.clone());
+    } else {
+        output[0].insert_str(0, &text[..region_start]);
+        output
+            .last_mut()
+            .expect("split output exists")
+            .push_str(&text[region_end..]);
     }
     let entries = state
         .heap
@@ -2557,6 +3993,149 @@ fn step_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value
     Ok(Value::number(1.0))
 }
 
+fn direction_between(source: &Value, target: &Value, state: &ExecutionState, away: bool) -> i16 {
+    let (Some((sx, sy, sz)), Some((tx, ty, tz))) = (
+        datum_coordinates(state, source),
+        datum_coordinates(state, target),
+    ) else {
+        return 0;
+    };
+    if sz != tz {
+        return 0;
+    }
+    let (dx, dy) = if away {
+        (sx - tx, sy - ty)
+    } else {
+        (tx - sx, ty - sy)
+    };
+    let mut direction = 0;
+    if dy > 0.0 {
+        direction |= 1;
+    } else if dy < 0.0 {
+        direction |= 2;
+    }
+    if dx > 0.0 {
+        direction |= 4;
+    } else if dx < 0.0 {
+        direction |= 8;
+    }
+    direction
+}
+
+fn step_towards_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    let direction = direction_between(&arguments[0], &arguments[1], state, false);
+    step_builtin(
+        &[arguments[0].clone(), Value::number(f32::from(direction))],
+        state,
+    )
+}
+
+fn within_minimum_distance(arguments: &[Value], state: &ExecutionState) -> bool {
+    let minimum = arguments.get(2).and_then(Value::as_number).unwrap_or(0.0);
+    minimum > 0.0
+        && matches!(
+            (datum_coordinates(state, &arguments[0]), datum_coordinates(state, &arguments[1])),
+            (Some(left), Some(right))
+                if left.2 == right.2
+                    && (left.0 - right.0).abs().max((left.1 - right.1).abs()) <= minimum
+        )
+}
+
+fn step_to_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    if within_minimum_distance(arguments, state) {
+        return Ok(Value::number(0.0));
+    }
+    step_towards_builtin(arguments, state)
+}
+
+fn get_step_to_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    if within_minimum_distance(arguments, state) {
+        return Ok(Value::Null);
+    }
+    let direction = direction_between(&arguments[0], &arguments[1], state, false);
+    super::get_step_builtin(&arguments[0], &Value::number(f32::from(direction)), state)
+}
+
+fn step_away_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    if let Some(maximum) = arguments.get(2).and_then(Value::as_number)
+        && maximum > 0.0
+        && let (Some(source), Some(target)) = (
+            datum_coordinates(state, &arguments[0]),
+            datum_coordinates(state, &arguments[1]),
+        )
+        && (source.0 - target.0)
+            .abs()
+            .max((source.1 - target.1).abs())
+            .max((source.2 - target.2).abs())
+            > maximum
+    {
+        return Ok(Value::number(0.0));
+    }
+    let direction = direction_between(&arguments[0], &arguments[1], state, true);
+    step_builtin(
+        &[arguments[0].clone(), Value::number(f32::from(direction))],
+        state,
+    )
+}
+
+fn get_step_away_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    let direction = direction_between(&arguments[0], &arguments[1], state, true);
+    super::get_step_builtin(&arguments[0], &Value::number(f32::from(direction)), state)
+}
+
+fn step_rand_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    let directions = [1_i16, 2, 4, 8];
+    let index = (super::deterministic_unit(&mut state.random_state) * 4.0) as usize;
+    step_builtin(
+        &[
+            arguments[0].clone(),
+            Value::number(f32::from(directions[index.min(3)])),
+        ],
+        state,
+    )
+}
+
+fn get_step_rand_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    let directions = [1_i16, 2, 4, 8];
+    let index = (super::deterministic_unit(&mut state.random_state) * 4.0) as usize;
+    super::get_step_builtin(
+        &arguments[0],
+        &Value::number(f32::from(directions[index.min(3)])),
+        state,
+    )
+}
+
+fn bounds_dist_builtin(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
+    let Some(left) = datum_coordinates(state, &arguments[0]) else {
+        return Ok(Value::number(f32::INFINITY));
+    };
+    let Some(right) = datum_coordinates(state, &arguments[1]) else {
+        return Ok(Value::number(f32::INFINITY));
+    };
+    if left.2 != right.2 {
+        return Ok(Value::number(f32::INFINITY));
+    }
+    let dimension = |value: &Value, name: &str| {
+        let Value::Datum(datum) = value else {
+            return 32.0;
+        };
+        let Ok(field) = FieldName::parse(name) else {
+            return 32.0;
+        };
+        super::datum_field_or_initial(state, *datum, &field)
+            .ok()
+            .as_ref()
+            .and_then(Value::as_number)
+            .unwrap_or(32.0)
+    };
+    let horizontal = (right.0 - left.0).abs() * 32.0
+        - (dimension(&arguments[0], "bound_width") + dimension(&arguments[1], "bound_width")) / 2.0;
+    let vertical = (right.1 - left.1).abs() * 32.0
+        - (dimension(&arguments[0], "bound_height") + dimension(&arguments[1], "bound_height"))
+            / 2.0;
+    Ok(Value::number(horizontal.max(vertical)))
+}
+
 pub(super) fn synchronize_moved_atom_contents(
     state: &mut ExecutionState,
     atom: DatumId,
@@ -2686,7 +4265,12 @@ fn fallback_parent(path: &TypePath) -> Option<TypePath> {
 }
 
 fn astype(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
-    let Value::TypePath(target) = &arguments[1] else {
+    let Some(target) = arguments.get(1) else {
+        // The one-argument form gets its constraint from contextual DM type
+        // information; lowering has already validated that context.
+        return Ok(arguments[0].clone());
+    };
+    let Value::TypePath(target) = target else {
         return Ok(Value::Null);
     };
     let candidate = match &arguments[0] {
@@ -2706,6 +4290,32 @@ fn astype(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> 
 }
 
 fn turn(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    if let Value::Datum(icon) = &arguments[0]
+        && super::is_icon_datum(*icon, &state.heap)
+    {
+        let angle = arguments[1].as_number().unwrap_or(0.0);
+        let cloned = super::clone_icon_datum(*icon, &mut state.heap)?;
+        super::execute_icon_method(cloned, "Turn", &[Value::number(angle)], &mut state.heap)?;
+        return Ok(Value::Datum(cloned));
+    }
+    if let Value::Datum(matrix) = &arguments[0]
+        && super::is_matrix_datum(*matrix, &state.heap)
+    {
+        let angle = number(&arguments[1], "turn angle")?.to_radians();
+        let mut cosine = angle.cos();
+        let mut sine = angle.sin();
+        if cosine.abs() < 1.0e-6 {
+            cosine = 0.0;
+        }
+        if sine.abs() < 1.0e-6 {
+            sine = 0.0;
+        }
+        let rotated = super::matrix_product(
+            super::matrix_components(*matrix, &state.heap)?,
+            [cosine, sine, 0.0, -sine, cosine, 0.0],
+        );
+        return super::allocate_matrix(rotated, &mut state.heap).map(Value::Datum);
+    }
     const DIRECTIONS: [i32; 8] = [1, 9, 8, 10, 2, 6, 4, 5];
     let direction = number(&arguments[0], "turn direction")?.trunc() as i32;
     let angle = number(&arguments[1], "turn angle")?;
@@ -2730,6 +4340,17 @@ fn ckey(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
         key.chars()
             .filter(|character| character.is_alphanumeric())
             .flat_map(char::to_lowercase)
+            .collect::<String>(),
+    ))
+}
+
+fn ckey_ex(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
+    let key = strict_text(&arguments[0], state, "ckeyEx")?;
+    Ok(Value::text(
+        key.chars()
+            .filter(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '@' | '_' | '-')
+            })
             .collect::<String>(),
     ))
 }
@@ -2916,6 +4537,10 @@ pub(super) fn execute_list_compound_operator(
     right: &Value,
     state: &mut ExecutionState,
 ) -> Result<Value, String> {
+    let visibility_before = state
+        .is_visibility_list(left)
+        .then(|| state.visibility_members(left))
+        .transpose()?;
     match operator {
         CompoundAssignmentOperator::Add => {
             for entry in operator_rhs_entries(right, state)? {
@@ -2972,6 +4597,9 @@ pub(super) fn execute_list_compound_operator(
                 "operator {operator:?} is not defined for a BYOND list"
             ));
         }
+    }
+    if let Some(before) = visibility_before {
+        state.normalize_and_synchronize_visibility_list(left, &before)?;
     }
     Ok(Value::List(left))
 }
@@ -3072,6 +4700,10 @@ fn list_add(
         return Err("list.Add requires at least one item".to_owned());
     }
     let values = flattened_list_arguments(arguments, state)?;
+    let visibility_before = state
+        .is_visibility_list(list)
+        .then(|| state.visibility_members(list))
+        .transpose()?;
     if let Some(owner) = state.contents_owner(list) {
         let owner_path = state
             .heap
@@ -3131,6 +4763,9 @@ fn list_add(
             target.add(value);
         }
     }
+    if let Some(before) = visibility_before {
+        state.normalize_and_synchronize_visibility_list(list, &before)?;
+    }
     Ok(Value::Null)
 }
 
@@ -3182,6 +4817,38 @@ pub(super) fn move_movable_to_turf(
             .set_datum_field(movable, field, value)
             .map_err(|error| error.to_string())?;
     }
+    Ok(())
+}
+
+pub(super) fn move_movable_to_atom(
+    state: &mut ExecutionState,
+    movable: DatumId,
+    location: DatumId,
+) -> Result<(), String> {
+    let location_is_turf = state.heap.datum(location).is_ok_and(|datum| {
+        let path = datum.type_path().as_str();
+        path == "/turf" || path.starts_with("/turf/")
+    });
+    if location_is_turf {
+        return move_movable_to_turf(state, movable, location);
+    }
+
+    let loc = FieldName::parse("loc").expect("built-in loc field");
+    let old_loc = state
+        .heap
+        .datum_field(movable, &loc)
+        .ok()
+        .and_then(|value| match value {
+            Value::Datum(datum) => Some(*datum),
+            _ => None,
+        });
+    if old_loc != Some(location) {
+        synchronize_moved_atom_contents(state, movable, old_loc, Some(location))?;
+    }
+    state
+        .heap
+        .set_datum_field(movable, loc, Value::Datum(location))
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -3316,12 +4983,19 @@ fn list_cut(
     } else {
         list_boundary(raw_end, len, true)?
     };
+    let visibility_before = state
+        .is_visibility_list(list)
+        .then(|| state.visibility_members(list))
+        .transpose()?;
     state
         .heap
         .list_mut(list)
         .map_err(|error| error.to_string())?
         .cut_range(start, end)
         .map_err(|error| error.to_string())?;
+    if let Some(before) = visibility_before {
+        state.normalize_and_synchronize_visibility_list(list, &before)?;
+    }
     Ok(Value::Null)
 }
 
@@ -3372,6 +5046,10 @@ fn list_insert(
         return Err(format!("list.Insert index {index} exceeds {}", len + 1));
     }
     let values = flattened_list_arguments(&arguments[1..], state)?;
+    let visibility_before = state
+        .is_visibility_list(list)
+        .then(|| state.visibility_members(list))
+        .transpose()?;
     let target = state
         .heap
         .list_mut(list)
@@ -3381,6 +5059,9 @@ fn list_insert(
             .insert(index, value)
             .map_err(|error| error.to_string())?;
         index += 1;
+    }
+    if let Some(before) = visibility_before {
+        state.normalize_and_synchronize_visibility_list(list, &before)?;
     }
     Ok(Value::number(index as f32))
 }
@@ -3473,7 +5154,11 @@ fn list_remove(
         }
         .to_owned());
     }
-    if all {
+    let visibility_before = state
+        .is_visibility_list(list)
+        .then(|| state.visibility_members(list))
+        .transpose()?;
+    let result = if all {
         let mut total = 0usize;
         loop {
             let removed = list_remove_once(list, arguments, state)?;
@@ -3482,12 +5167,14 @@ fn list_remove(
                 break;
             }
         }
-        Ok(Value::number(total as f32))
+        Value::number(total as f32)
     } else {
-        Ok(Value::number(f32::from(
-            list_remove_once(list, arguments, state)? > 0,
-        )))
+        Value::number(f32::from(list_remove_once(list, arguments, state)? > 0))
+    };
+    if let Some(before) = visibility_before {
+        state.normalize_and_synchronize_visibility_list(list, &before)?;
     }
+    Ok(result)
 }
 
 fn list_splice(
@@ -3516,6 +5203,10 @@ fn list_splice(
     if end < start {
         std::mem::swap(&mut start, &mut end);
     }
+    let visibility_before = state
+        .is_visibility_list(list)
+        .then(|| state.visibility_members(list))
+        .transpose()?;
     state
         .heap
         .list_mut(list)
@@ -3523,6 +5214,9 @@ fn list_splice(
         .cut_range(start, end)
         .map_err(|error| error.to_string())?;
     if arguments.len() <= 2 {
+        if let Some(before) = visibility_before {
+            state.normalize_and_synchronize_visibility_list(list, &before)?;
+        }
         return Ok(Value::Null);
     }
     let values = flattened_list_arguments(&arguments[2..], state)?;
@@ -3542,6 +5236,9 @@ fn list_splice(
         target
             .insert(index + offset, value)
             .map_err(|error| error.to_string())?;
+    }
+    if let Some(before) = visibility_before {
+        state.normalize_and_synchronize_visibility_list(list, &before)?;
     }
     Ok(Value::Null)
 }
@@ -3616,6 +5313,86 @@ fn resolved_file_path(
     Ok(existing)
 }
 
+fn relaxed_resolved_file_path(
+    arguments: &[Value],
+    state: &ExecutionState,
+    context: &str,
+) -> Result<PathBuf, String> {
+    let raw = strict_text(&arguments[0], state, context)?;
+    let relative = PathBuf::from(raw);
+    let root = state
+        .project_root()
+        .ok_or_else(|| format!("{context} requires a configured project root"))?
+        .canonicalize()
+        .map_err(|error| format!("{context} project root is unavailable: {error}"))?;
+    let candidate = if relative.is_absolute() {
+        relative
+    } else {
+        if relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return Err(format!("{context} path escapes the project root"));
+        }
+        root.join(relative)
+    };
+    let mut ancestor = candidate.as_path();
+    let resolved_ancestor = loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => break ancestor.canonicalize().map_err(|error| error.to_string())?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| format!("{context} path has no existing ancestor"))?;
+            }
+            Err(error) => return Err(format!("{context} path is unavailable: {error}")),
+        }
+    };
+    if !resolved_ancestor.starts_with(&root) {
+        return Err(format!("{context} path escapes the project root"));
+    }
+    Ok(candidate)
+}
+
+fn prepare_write_file_path(
+    arguments: &[Value],
+    state: &ExecutionState,
+    context: &str,
+) -> Result<Option<PathBuf>, String> {
+    let candidate = relaxed_resolved_file_path(arguments, state, context)?;
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| format!("{context} path has no parent"))?;
+    // BYOND creates every missing destination directory for its file-writing
+    // builtins. Keep I/O failures as an ordinary false result for callers
+    // such as fcopy()/text2file(), while retaining containment failures as
+    // runtime errors rather than allowing a symlink escape.
+    if fs::create_dir_all(parent).is_err() {
+        return Ok(None);
+    }
+    let root = state
+        .project_root()
+        .ok_or_else(|| format!("{context} requires a configured project root"))?
+        .canonicalize()
+        .map_err(|error| format!("{context} project root is unavailable: {error}"))?;
+    let parent = match parent.canonicalize() {
+        Ok(parent) => parent,
+        Err(_) => return Ok(None),
+    };
+    if !parent.starts_with(root) {
+        return Err(format!("{context} path escapes the project root"));
+    }
+    Ok(Some(
+        parent.join(
+            candidate
+                .file_name()
+                .ok_or_else(|| format!("{context} path is invalid"))?,
+        ),
+    ))
+}
+
 fn fexists(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
     let raw = strict_text(&arguments[0], state, "fexists")?;
     let relative = PathBuf::from(raw);
@@ -3624,20 +5401,32 @@ fn fexists(arguments: &[Value], state: &ExecutionState) -> Result<Value, String>
         .ok_or_else(|| "fexists requires a configured project root".to_owned())?
         .canonicalize()
         .map_err(|error| format!("fexists project root is unavailable: {error}"))?;
-    let has_parent_traversal = relative
-        .components()
-        .any(|component| component == Component::ParentDir);
     let invalid_relative_root = !relative.is_absolute()
         && relative
             .components()
             .any(|component| matches!(component, Component::RootDir | Component::Prefix(_)));
-    if has_parent_traversal || invalid_relative_root {
+    if invalid_relative_root {
         return Err("fexists path escapes the project root".to_owned());
     }
     let path = if relative.is_absolute() {
         relative
     } else {
-        root.join(relative)
+        let mut contained = PathBuf::new();
+        for component in relative.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(segment) => contained.push(segment),
+                Component::ParentDir => {
+                    if !contained.pop() {
+                        return Err("fexists path escapes the project root".to_owned());
+                    }
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err("fexists path escapes the project root".to_owned());
+                }
+            }
+        }
+        root.join(contained)
     };
 
     // A missing intermediate directory is an ordinary negative existence
@@ -3662,7 +5451,19 @@ fn fexists(arguments: &[Value], state: &ExecutionState) -> Result<Value, String>
 }
 
 fn file2text(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
-    let path = resolved_file_path(arguments, state, "file2text")?;
+    // A contained path may have multiple nonexistent parent components. BYOND
+    // reports a missing file as null; resolve its nearest existing ancestor
+    // only to enforce root/symlink containment, then let the read return
+    // NotFound normally.
+    let path = relaxed_resolved_file_path(arguments, state, "file2text")?;
+    // BYOND resources may name a directory (notably entries returned by
+    // `flist()`). A directory is not readable file content, so `file2text()`
+    // returns null instead of surfacing the host OS' access-denied/is-directory
+    // error. OpenDream follows the same contract by only loading resource data
+    // when `File.Exists(path)` is true.
+    if !path.is_file() {
+        return Ok(Value::Null);
+    }
     match fs::read_to_string(path) {
         Ok(text) => Ok(Value::text(text)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
@@ -3686,7 +5487,9 @@ fn fdel(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
 
 fn text2file(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
     let text = strict_text(&arguments[0], state, "text2file text")?;
-    let path = resolved_file_path(&arguments[1..], state, "text2file")?;
+    let Some(path) = prepare_write_file_path(&arguments[1..], state, "text2file")? else {
+        return Ok(Value::number(0.0));
+    };
     // BYOND appends by default. A false optional compatibility flag requests
     // replacement, matching the existing extended arity accepted here.
     let append = arguments.get(2).is_none_or(truthy);
@@ -3703,8 +5506,11 @@ fn text2file(arguments: &[Value], state: &ExecutionState) -> Result<Value, Strin
 }
 
 fn fcopy(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
-    let source = resolved_file_path(arguments, state, "fcopy source")?;
-    let destination = resolved_file_path(&arguments[1..], state, "fcopy destination")?;
+    let source = relaxed_resolved_file_path(arguments, state, "fcopy source")?;
+    let Some(destination) = prepare_write_file_path(&arguments[1..], state, "fcopy destination")?
+    else {
+        return Ok(Value::number(0.0));
+    };
     Ok(Value::number(f32::from(
         fs::copy(source, destination).is_ok(),
     )))
@@ -3773,7 +5579,8 @@ pub(super) fn execute_output(
     let Value::Text(_) = target else {
         return Ok(());
     };
-    let path = resolved_file_path(std::slice::from_ref(target), state, "output")?;
+    let path = prepare_write_file_path(std::slice::from_ref(target), state, "output")?
+        .ok_or_else(|| "output failed to create destination parent".to_owned())?;
     let text = runtime_text(value, state, "output value")?;
     let mut file = OpenOptions::new()
         .create(true)
@@ -4018,6 +5825,49 @@ fn civil_from_days_since_2000(days: i64) -> (i64, usize, i64) {
 mod json_md5_tests {
     use super::*;
 
+    #[test]
+    fn byond_letter_class_matches_multiline_admin_rank_blocks() {
+        let source = "Name = Host\nInclude = @ ADMIN BAN\nExclude = FUN\nEdit =\n";
+        let pattern = r"^Name\s*=\s*(.+?)\s*\n+Include\s*=\s*([\l @]*?)\s*\n+Exclude\s*=\s*([\l @]*?)\s*\n+Edit\s*=\s*([\l @]*?)\s*\n*$";
+        let found = regex_search(pattern, "gm", source, 0, source.len())
+            .expect("BYOND regex should compile")
+            .expect("rank block should match");
+        assert_eq!(found.2[0].as_deref(), Some("Host"));
+        assert_eq!(found.2[1].as_deref(), Some("@ ADMIN BAN"));
+        assert_eq!(found.2[2].as_deref(), Some("FUN"));
+        assert_eq!(found.2[3].as_deref(), Some(""));
+    }
+
+    #[test]
+    fn text_interpolation_uses_byond_list_display_name() {
+        let mut state = ExecutionState::new();
+        let positional = state.heap.allocate_list();
+        state
+            .heap
+            .list_mut(positional)
+            .unwrap()
+            .add(Value::number(1.0));
+        let associative = state.heap.allocate_list();
+        state
+            .heap
+            .list_mut(associative)
+            .unwrap()
+            .set_key(Value::text("a"), Value::number(3.0));
+
+        assert_eq!(
+            text_template(
+                &[
+                    Value::text("plain=|[]| assoc=|[]|"),
+                    Value::List(positional),
+                    Value::List(associative),
+                ],
+                &state,
+            )
+            .unwrap(),
+            Value::text("plain=|/list| assoc=|/list|")
+        );
+    }
+
     fn encoded(value: Value, state: &ExecutionState) -> String {
         let Value::Text(text) = json_encode_builtin(&[value], state).expect("JSON should encode")
         else {
@@ -4205,7 +6055,8 @@ mod color_text_file_tests {
     fn filesystem_builtins_and_output_stay_inside_project_root() {
         let root = std::env::temp_dir().join(format!("dream64-vm-files-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("data/logs")).unwrap();
+        fs::create_dir_all(root.join("data/logs/nested")).unwrap();
+        fs::create_dir_all(root.join("html/changelogs/archive")).unwrap();
         let mut state = ExecutionState::new();
         state.set_project_root(root.clone());
 
@@ -4241,7 +6092,19 @@ mod color_text_file_tests {
         let Value::List(files) = flist(&[Value::text("data/logs")], &mut state).unwrap() else {
             panic!("flist should return a list");
         };
-        assert_eq!(state.heap().list(files).unwrap().len(), 2);
+        let files = state
+            .heap()
+            .list(files)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 3);
+        assert!(files.contains(&Value::text("nested/")));
+        assert_eq!(
+            file2text(&[Value::file("data/logs/nested/")], &state),
+            Ok(Value::Null),
+        );
         assert_eq!(
             fexists(&[Value::text("data/logs/runtime.log")], &state),
             Ok(Value::number(1.0))
@@ -4250,7 +6113,80 @@ mod color_text_file_tests {
             fexists(&[Value::text("data/not-created/deeper/dummy.sav")], &state),
             Ok(Value::number(0.0))
         );
+        assert_eq!(
+            fexists(
+                &[Value::text("config/../html/changelogs/archive/2000-01.yml")],
+                &state
+            ),
+            Ok(Value::number(0.0))
+        );
+        assert_eq!(
+            file2text(
+                &[Value::text("data/not-created/deeper/missing.txt")],
+                &state
+            ),
+            Ok(Value::Null)
+        );
         assert!(fexists(&[Value::text("../outside")], &state).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_writes_create_missing_destination_directories_like_byond() {
+        let root = std::env::temp_dir().join(format!(
+            "dream64-vm-write-parents-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("source.txt"), "payload").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_project_root(root.clone());
+
+        assert_eq!(
+            fcopy(
+                &[
+                    Value::text("source.txt"),
+                    Value::text("tmp/md5asfile/deep/copied.txt"),
+                ],
+                &state,
+            )
+            .unwrap(),
+            Value::number(1.0),
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("tmp/md5asfile/deep/copied.txt")).unwrap(),
+            "payload",
+        );
+        assert_eq!(
+            fcopy(
+                &[
+                    Value::text("missing/source.txt"),
+                    Value::text("tmp/missing-copy.txt"),
+                ],
+                &state,
+            )
+            .unwrap(),
+            Value::number(0.0),
+            "a missing source is an ordinary failed copy, not a runtime error",
+        );
+        assert_eq!(
+            text2file(
+                &[
+                    Value::text("written"),
+                    Value::text("generated/nested/value.txt"),
+                ],
+                &state,
+            )
+            .unwrap(),
+            Value::number(1.0),
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("generated/nested/value.txt")).unwrap(),
+            "written",
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4302,6 +6238,57 @@ mod color_text_file_tests {
         assert_eq!(
             text2file(&[Value::text("bad"), Value::text("data")], &state).unwrap(),
             Value::number(0.0)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rust_g_formatted_timestamp_matches_logger_shape_and_offset() {
+        let unix_millis = 946_684_800_123;
+        assert_eq!(
+            format_unix_timestamp(unix_millis, "%Y-%m-%d %H:%M:%S%.3f %z", 0.0),
+            "2000-01-01 00:00:00.123 +0000"
+        );
+        assert_eq!(
+            format_unix_timestamp(unix_millis, "%F %T", -8.0),
+            "1999-12-31 16:00:00"
+        );
+    }
+
+    #[test]
+    fn rust_g_logging_family_appends_formats_and_closes() {
+        let root = std::env::temp_dir().join(format!(
+            "dream64-rustg-log-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut state = ExecutionState::new();
+        state.set_project_root(root.clone());
+        let library = Value::text("rust_g");
+        for (text, formatted) in [("raw\n", "false"), ("readable", "true")] {
+            assert_eq!(
+                execute_external_call(
+                    &library,
+                    &Value::text("log_write"),
+                    &[
+                        Value::text("data/logs/round/runtime.log"),
+                        Value::text(text),
+                        Value::text(formatted),
+                    ],
+                    &mut state,
+                ),
+                Ok(Value::Null)
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(root.join("data/logs/round/runtime.log")).unwrap(),
+            "raw\nreadable\n"
+        );
+        assert_eq!(
+            execute_external_call(&library, &Value::text("log_close_all"), &[], &mut state,),
+            Ok(Value::Null)
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -4397,6 +6384,22 @@ mod color_text_file_tests {
             fs::read_to_string(root.join("data/runtime.log")).unwrap(),
             "replacement"
         );
+        execute_external_call(
+            &library,
+            &Value::text("file_write"),
+            &[
+                Value::text("header\n"),
+                Value::text("data/logs/2026/08/10/round-start/secret/game.log.json"),
+            ],
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("data/logs/2026/08/10/round-start/secret/game.log.json"))
+                .unwrap(),
+            "header\n",
+            "SetupLogs creates its entire dated/category directory tree"
+        );
         assert!(
             execute_external_call(
                 &library,
@@ -4444,6 +6447,463 @@ mod color_text_file_tests {
         assert!(execute_external_call(&library, &Value::text("unknown"), &[], &mut state).is_err());
         fs::remove_dir_all(root).unwrap();
         fs::remove_file(outside).unwrap();
+    }
+
+    #[test]
+    fn dreamluau_headless_cleanup_and_configuration_are_safe_but_strict() {
+        let mut state = ExecutionState::new();
+        let library = Value::text("dreamluau.dll");
+        let object = Value::Null;
+
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("byond:clear_ref_userdata"),
+                std::slice::from_ref(&object),
+                &mut state,
+            ),
+            Ok(Value::Null),
+        );
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("byond:set_execution_limit_secs"),
+                &[Value::number(5.0)],
+                &mut state,
+            ),
+            Ok(Value::Null),
+        );
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("byond:get_traceback"),
+                &[Value::number(1.0)],
+                &mut state,
+            ),
+            Ok(Value::Null),
+        );
+        assert!(
+            execute_external_call(
+                &library,
+                &Value::text("byond:clear_ref_userdata"),
+                &[],
+                &mut state,
+            )
+            .is_err()
+        );
+        assert!(
+            execute_external_call(&library, &Value::text("byond:unknown"), &[], &mut state,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn memorystats_bridge_preserves_monk_report_shape_and_rejects_unknown_exports() {
+        let mut state = ExecutionState::new();
+        let library = Value::text("memorystats.dll");
+        let Value::Text(report) =
+            execute_external_call(&library, &Value::text("memory_stats"), &[], &mut state).unwrap()
+        else {
+            panic!("memory_stats must return text");
+        };
+        assert!(report.starts_with("Server mem usage:\nprototypes:\n"));
+        assert!(report.contains("\nobjects:\n"));
+        assert!(report.contains("\nDream64 host:\n\tresident: "));
+        assert!(
+            execute_external_call(
+                &library,
+                &Value::text("memory_stats"),
+                &[Value::Null],
+                &mut state,
+            )
+            .is_err()
+        );
+        assert!(
+            execute_external_call(&library, &Value::text("unknown"), &[], &mut state,).is_err()
+        );
+    }
+
+    #[test]
+    fn rust_g_iconforge_async_jobs_poll_and_preserve_gags_error_contracts() {
+        let root = std::env::temp_dir().join(format!(
+            "dream64-iconforge-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("icons")).unwrap();
+        fs::write(root.join("icons/base.dmi"), b"headless fixture").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_project_root(root.clone());
+        let library = Value::text("rust_g");
+        let job = execute_external_call(
+            &library,
+            &Value::text("iconforge_load_gags_config_async"),
+            &[
+                Value::text("/datum/greyscale_config/test"),
+                Value::text("{\"layers\":[]}"),
+                Value::text("icons/base.dmi"),
+            ],
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("iconforge_check"),
+                std::slice::from_ref(&job),
+                &mut state,
+            ),
+            Ok(Value::text("NO RESULTS YET"))
+        );
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("iconforge_check"),
+                &[job],
+                &mut state,
+            ),
+            Ok(Value::text("OK"))
+        );
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("iconforge_gags"),
+                &[
+                    Value::text("/datum/greyscale_config/test"),
+                    Value::text("#ffffff"),
+                    Value::text("tmp/gags/test.dmi"),
+                ],
+                &mut state,
+            ),
+            Ok(Value::text("OK"))
+        );
+        assert!(root.join("tmp/gags/test.dmi").is_file());
+        let generated = execute_external_call(
+            &library,
+            &Value::text("iconforge_generate"),
+            &[
+                Value::text("data/spritesheets/"),
+                Value::text("startup"),
+                Value::text("{}"),
+                Value::text("0"),
+                Value::text("0"),
+                Value::text("1"),
+            ],
+            &mut state,
+        )
+        .unwrap();
+        let generated: serde_json::Value =
+            serde_json::from_str(&owned_value_text(generated)).unwrap();
+        assert_eq!(generated["error"], serde_json::Value::Null);
+        assert_eq!(generated["headless"], true);
+        assert!(
+            generated["sizes"]
+                .as_object()
+                .is_some_and(|sizes| sizes.is_empty())
+        );
+        let missing = execute_external_call(
+            &library,
+            &Value::text("iconforge_load_gags_config"),
+            &[
+                Value::text("/datum/greyscale_config/missing"),
+                Value::text("{}"),
+                Value::text("icons/missing.dmi"),
+            ],
+            &mut state,
+        )
+        .unwrap();
+        assert!(
+            owned_value_text(missing)
+                .starts_with("IconForge error: Failed to open DMI 'icons/missing.dmi'")
+        );
+        assert!(
+            execute_external_call(&library, &Value::text("iconforge_unknown"), &[], &mut state,)
+                .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rust_g_sql_bridge_fails_offline_without_aborting_async_pollers() {
+        let library = Value::text("rust_g");
+        let mut state = ExecutionState::new();
+        let connection = execute_external_call(
+            &library,
+            &Value::text("sql_connect_pool"),
+            &[Value::text("{}")],
+            &mut state,
+        )
+        .unwrap();
+        let Value::Text(connection) = connection else {
+            panic!("SQL connection result should be JSON text");
+        };
+        let decoded: serde_json::Value = serde_json::from_str(&connection).unwrap();
+        assert_eq!(decoded["status"], "err");
+
+        let job = execute_external_call(
+            &library,
+            &Value::text("sql_query_async"),
+            &[
+                Value::text("missing"),
+                Value::text("SELECT 1"),
+                Value::text("[]"),
+            ],
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("sql_check_query"),
+                std::slice::from_ref(&job),
+                &mut state,
+            ),
+            Ok(Value::text("NO RESULTS YET"))
+        );
+        let result = execute_external_call(
+            &library,
+            &Value::text("sql_check_query"),
+            &[job],
+            &mut state,
+        )
+        .unwrap();
+        let Value::Text(result) = result else {
+            panic!("SQL query result should be JSON text");
+        };
+        let decoded: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(decoded["status"], "offline");
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("sql_check_query"),
+                &[Value::text("unknown")],
+                &mut state,
+            ),
+            Ok(Value::text("NO SUCH JOB"))
+        );
+    }
+
+    #[test]
+    fn rust_g_dmi_metadata_degrades_missing_render_resources_to_empty_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "dream64-dmi-metadata-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut state = ExecutionState::new();
+        state.set_project_root(root.clone());
+        let result = execute_external_call(
+            &Value::text("rust_g"),
+            &Value::text("dmi_read_metadata"),
+            &[Value::text("missing/nested/icon.dmi")],
+            &mut state,
+        )
+        .unwrap();
+        let Value::Text(result) = result else {
+            panic!("DMI metadata should be JSON text");
+        };
+        let decoded: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(decoded["width"], 32);
+        assert_eq!(decoded["height"], 32);
+        assert_eq!(decoded["states"], serde_json::json!([]));
+        assert!(
+            decoded["headless_error"]
+                .as_str()
+                .unwrap()
+                .contains("missing/nested/icon.dmi")
+        );
+    }
+
+    #[test]
+    fn rust_g_dmi_metadata_reads_png_description_states_and_dimensions() {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+
+        let root = std::env::temp_dir().join(format!(
+            "dream64-dmi-description-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("icons")).unwrap();
+        let description = concat!(
+            "# BEGIN DMI\n",
+            "version = 4.0\n",
+            "width = 32\n",
+            "height = 32\n",
+            "state = \"cloak\"\n",
+            "dirs = 1\n",
+            "frames = 1\n",
+            "state = \"admin\"\n",
+            "dirs = 4\n",
+            "frames = 2\n",
+            "delay = 1,2\n",
+            "# END DMI\n",
+        );
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(description.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut push_chunk = |kind: &[u8; 4], data: &[u8]| {
+            png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            png.extend_from_slice(kind);
+            png.extend_from_slice(data);
+            png.extend_from_slice(&[0; 4]);
+        };
+        let mut header = Vec::new();
+        header.extend_from_slice(&64u32.to_be_bytes());
+        header.extend_from_slice(&64u32.to_be_bytes());
+        header.extend_from_slice(&[8, 6, 0, 0, 0]);
+        push_chunk(b"IHDR", &header);
+        let mut text = b"Description\0\0".to_vec();
+        text.extend_from_slice(&compressed);
+        push_chunk(b"zTXt", &text);
+        push_chunk(b"IEND", &[]);
+        fs::write(root.join("icons/test.dmi"), png).unwrap();
+
+        let mut state = ExecutionState::new();
+        state.set_project_root(root);
+        let result = execute_external_call(
+            &Value::text("rust_g"),
+            &Value::text("dmi_read_metadata"),
+            &[Value::text("icons/test.dmi")],
+            &mut state,
+        )
+        .unwrap();
+        let Value::Text(result) = result else {
+            panic!("DMI metadata should be JSON text");
+        };
+        let decoded: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(decoded["width"], 32);
+        assert_eq!(decoded["height"], 32);
+        assert_eq!(decoded["states"][0]["name"], "cloak");
+        assert_eq!(decoded["states"][1]["name"], "admin");
+        assert_eq!(decoded["states"][1]["dirs"], 4);
+        assert_eq!(decoded["states"][1]["frames"], 2);
+        let icon_states =
+            execute_standard_builtin("icon_states", &[Value::text("icons/test.dmi")], &mut state)
+                .unwrap();
+        let Value::List(icon_states) = icon_states else {
+            panic!("icon_states should return a list");
+        };
+        assert_eq!(
+            state
+                .heap()
+                .list(icon_states)
+                .unwrap()
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>(),
+            vec![Value::text("cloak"), Value::text("admin")],
+        );
+    }
+
+    #[test]
+    fn text2num_passes_numbers_and_null_like_byond_516() {
+        let state = ExecutionState::new();
+        assert_eq!(
+            text2num(&[Value::number(-2.5)], &state),
+            Ok(Value::number(-2.5)),
+        );
+        assert_eq!(text2num(&[Value::Null], &state), Ok(Value::Null));
+        assert_eq!(
+            text2num(&[Value::text("12x")], &state),
+            Ok(Value::number(12.0)),
+        );
+        assert_eq!(text2num(&[Value::text("bad")], &state), Ok(Value::Null),);
+    }
+
+    #[test]
+    fn rust_g_cellular_noise_is_bounded_row_major_and_binary() {
+        let library = Value::text("rust_g");
+        let function = Value::text("cnoise_generate");
+        let arguments = [
+            Value::text("45"),
+            Value::text("3"),
+            Value::text("4"),
+            Value::text("3"),
+            Value::text("4"),
+            Value::text("3"),
+        ];
+        let mut first_state = ExecutionState::new();
+        let first = execute_external_call(&library, &function, &arguments, &mut first_state)
+            .expect("documented cellular-noise call should succeed");
+        let Value::Text(first) = first else {
+            panic!("cellular noise must return text")
+        };
+        assert_eq!(first.len(), 12);
+        assert!(first.bytes().all(|byte| matches!(byte, b'0' | b'1')));
+
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &function,
+                &[
+                    Value::text("0"),
+                    Value::text("1"),
+                    Value::text("4"),
+                    Value::text("3"),
+                    Value::text("5"),
+                    Value::text("4"),
+                ],
+                &mut ExecutionState::new(),
+            ),
+            Ok(Value::text("0".repeat(20))),
+            "rust-g ignores out-of-bounds neighbours instead of closing map edges"
+        );
+
+        let mut second_state = ExecutionState::new();
+        assert_eq!(
+            execute_external_call(&library, &function, &arguments, &mut second_state),
+            Ok(Value::text(first)),
+            "equal headless random streams must produce equal row-major maps"
+        );
+        assert!(
+            execute_external_call(
+                &library,
+                &function,
+                &[
+                    Value::text("45"),
+                    Value::text("3"),
+                    Value::text("4"),
+                    Value::text("3"),
+                    Value::text("0"),
+                    Value::text("3"),
+                ],
+                &mut ExecutionState::new(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rust_g_poisson_noise_matches_station_row_major_contract() {
+        let library = Value::text("rust_g");
+        let function = Value::text("noise_poisson_map");
+        let arguments = [
+            Value::text("1337"),
+            Value::text("32"),
+            Value::text("24"),
+            Value::text("6"),
+        ];
+        let first =
+            execute_external_call(&library, &function, &arguments, &mut ExecutionState::new())
+                .expect("documented Poisson-noise call should succeed");
+        let Value::Text(first) = first else {
+            panic!("Poisson noise must return text")
+        };
+        assert_eq!(first.len(), 32 * 24);
+        assert!(first.bytes().all(|byte| matches!(byte, b'0' | b'1')));
+        assert!(first.contains('1'));
+        assert!(first.contains('0'));
+        assert_eq!(
+            execute_external_call(&library, &function, &arguments, &mut ExecutionState::new(),),
+            Ok(Value::text(first)),
+            "the explicit rust-g seed must produce a stable station sample",
+        );
     }
 
     #[test]
@@ -4515,6 +6975,15 @@ mod color_text_file_tests {
                 &library,
                 &Value::text("rg_git_commit_date"),
                 &[Value::text("HEAD"), Value::text("%F")],
+                &mut state,
+            ),
+            Ok(Value::text("2020-01-02"))
+        );
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("rg_git_commit_date_head"),
+                &[Value::text("%F")],
                 &mut state,
             ),
             Ok(Value::text("2020-01-02"))
@@ -4615,6 +7084,78 @@ mod color_text_file_tests {
             panic!("timer should return numeric text")
         };
         assert!(milliseconds.parse::<f64>().is_ok());
+        let Value::Text(microseconds) = execute_external_call(
+            &library,
+            &Value::text("time_microseconds"),
+            &[Value::text("subsystem")],
+            &mut state,
+        )
+        .unwrap() else {
+            panic!("timer should return numeric text")
+        };
+        assert!(microseconds.parse::<f64>().is_ok());
+    }
+
+    #[test]
+    fn rust_g_startup_hash_and_json_utility_family_is_real_and_sandboxed() {
+        let root = std::env::temp_dir().join(format!(
+            "dream64-rust-g-utilities-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("asset.css"), b"startup").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_project_root(root.clone());
+        let library = Value::text("rust_g");
+        let expected = Value::text(format!("{:x}", md5::compute(b"startup")));
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("hash_string"),
+                &[Value::text("md5"), Value::text("startup")],
+                &mut state,
+            ),
+            Ok(expected.clone())
+        );
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("hash_file"),
+                &[Value::text("md5"), Value::text("asset.css")],
+                &mut state,
+            ),
+            Ok(expected)
+        );
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("json_is_valid"),
+                &[Value::text("{\"ready\":true}")],
+                &mut state,
+            ),
+            Ok(Value::text("true"))
+        );
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("json_is_valid"),
+                &[Value::text("{broken")],
+                &mut state,
+            ),
+            Ok(Value::text("false"))
+        );
+        assert!(
+            execute_external_call(
+                &library,
+                &Value::text("hash_file"),
+                &[Value::text("md5"), Value::text("../outside")],
+                &mut state,
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
 

@@ -4,13 +4,15 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
 
 use dm_compiler::{Compilation, CompilerDatabase};
 use dm_lifecycle::{
     HeadlessReadinessProbe, LifecycleIndex, LifecycleKind, LifecycleResolution,
-    SchedulerDrainLimits, build_initialization_plan,
-    execute_initialization_plan_with_scheduler_policy, sweep_lifecycle_compatibility,
-    sweep_lifecycle_compatibility_with_closures,
+    SchedulerDrainLimits, SchedulerDrainTermination, advance_persistent_scheduler,
+    audit_initialization_plan_with_precompiled, build_initialization_plan,
+    execute_initialization_plan_with_precompiled, precompile_lifecycle_for_world,
+    sweep_lifecycle_compatibility, sweep_lifecycle_compatibility_with_closures,
 };
 use dm_runtime::{RuntimeImage, RuntimeImageConstructionEvent, RuntimeInitializerDiagnostic};
 use dm_semantics::ProcedureRegistry;
@@ -27,6 +29,26 @@ enum Command {
 
 #[allow(clippy::too_many_lines)]
 fn main() -> ExitCode {
+    // Large production DM procedures (notably tg/Monk's macro-expanded
+    // /atom/Initialize) legitimately create a deeply nested compiler walk.
+    // Windows' default main-thread stack is too small for that workload.
+    // Keep the whole persistent headless host on one explicitly sized stack
+    // so deferred materialization and later runtime calls have the same
+    // predictable capacity.
+    std::thread::Builder::new()
+        .name("dream64-headless".to_owned())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(run_main)
+        .expect("failed to create Dream64 headless host thread")
+        .join()
+        .unwrap_or_else(|_| {
+            eprintln!("Dream64 headless host thread panicked");
+            ExitCode::FAILURE
+        })
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_main() -> ExitCode {
     let mut arguments = env::args_os().skip(1);
     let Some(first) = arguments.next() else {
         eprintln!("usage: dm-lifecycle [plan|boot|sweep|sweep-closure] <world.dme> [map.dmm]");
@@ -64,16 +86,83 @@ fn main() -> ExitCode {
         eprintln!("usage: dm-lifecycle [plan|boot|sweep|sweep-closure] <world.dme> [map.dmm]");
         return ExitCode::from(2);
     }
+    let compile_started = Instant::now();
     if command == Command::Boot {
         eprintln!("boot-progress: compiling project {}", environment.display());
     }
-    let compilation = match CompilerDatabase::new().compile(&environment) {
+    let cache_file = project_cache_file(&environment);
+    let compilation_result = if command == Command::Boot {
+        CompilerDatabase::new()
+            .compile_cached(&environment, &cache_file)
+            .map(|(compilation, cache_hit)| (compilation, Some(cache_hit)))
+    } else {
+        CompilerDatabase::new()
+            .compile(&environment)
+            .map(|compilation| (compilation, None))
+    };
+    let (compilation, project_cache_hit) = match compilation_result {
         Ok(compilation) => compilation,
         Err(error) => {
             eprintln!("{}: {error}", environment.display());
             return ExitCode::FAILURE;
         }
     };
+    if command == Command::Boot {
+        eprintln!(
+            "boot-progress: project-compile-complete elapsed_ms={} preprocessing_cache={} cache={}",
+            compile_started.elapsed().as_millis(),
+            if project_cache_hit == Some(true) {
+                "hit"
+            } else {
+                "miss"
+            },
+            cache_file.display(),
+        );
+    }
+    let procedures = ProcedureRegistry::build(&compilation);
+    let mut prepared_boot = None;
+    if command == Command::Boot {
+        eprintln!("boot-progress: loading map");
+        let (map_path, map_source) = match load_map(&compilation, requested_map.as_deref()) {
+            Ok(map) => map,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        eprintln!("boot-progress: parsing map {map_path}");
+        let map = match dm_map::parse(&map_source) {
+            Ok(map) => map,
+            Err(error) => {
+                eprintln!("{map_path}: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let world = dm_world::build_plan(&map, &compilation);
+        drop(map);
+        drop(map_source);
+        let compile_index = LifecycleIndex::build_compile_only(&compilation, &procedures);
+        eprintln!("boot-progress: precompiling lifecycle before runtime materialization");
+        let started = Instant::now();
+        let precompiled =
+            match precompile_lifecycle_for_world(&compilation, &procedures, &compile_index, &world)
+            {
+                Ok(precompiled) => precompiled,
+                Err(error) => {
+                    eprintln!("lifecycle precompile: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+        eprintln!(
+            "boot-progress: lifecycle-precompile-complete elapsed_ms={} targets={} bodies={} procedures={} deferred={}",
+            started.elapsed().as_millis(),
+            precompiled.targets(),
+            precompiled.reachable_bodies(),
+            precompiled.module_procedures(),
+            precompiled.deferred_procedures(),
+        );
+        prepared_boot = Some((map_path, world, precompiled));
+    }
     if command == Command::Boot {
         eprintln!("boot-progress: materializing globals and type defaults");
     }
@@ -125,36 +214,29 @@ fn main() -> ExitCode {
     if command == Command::Boot {
         eprintln!("boot-progress: indexing procedures and lifecycle dispatch");
     }
-    let procedures = ProcedureRegistry::build(&compilation);
     let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
-    if command == Command::Boot {
-        eprintln!("boot-progress: loading map");
-    }
-    let (map_path, map_source) = match load_map(&compilation, requested_map.as_deref()) {
-        Ok(map) => map,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::FAILURE;
-        }
+    let mut boot_precompiled = None;
+    let (map_path, world) = if let Some((map_path, world, precompiled)) = prepared_boot.take() {
+        boot_precompiled = Some(precompiled);
+        (map_path, world)
+    } else {
+        let (map_path, map_source) = match load_map(&compilation, requested_map.as_deref()) {
+            Ok(map) => map,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let map = match dm_map::parse(&map_source) {
+            Ok(map) => map,
+            Err(error) => {
+                eprintln!("{map_path}: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        (map_path, dm_world::build_plan(&map, &compilation))
     };
-    if command == Command::Boot {
-        eprintln!("boot-progress: parsing map {map_path}");
-    }
-    let map = match dm_map::parse(&map_source) {
-        Ok(map) => map,
-        Err(error) => {
-            eprintln!("{map_path}: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let world = dm_world::build_plan(&map, &compilation);
     let plan = build_initialization_plan(&runtime, &index, &world, map_path.clone());
-    // `WorldPlan` and `InitializationPlan` own everything needed after this
-    // point.  Keeping the raw DMM text and parsed map alive through lifecycle
-    // bytecode compilation needlessly retains a second copy of the largest
-    // boot input at the process's peak-memory phase.
-    drop(map);
-    drop(map_source);
 
     print_plan_summary(&map_path, &index, &procedures, &plan);
     if command == Command::Sweep {
@@ -174,6 +256,22 @@ fn main() -> ExitCode {
         ));
     }
     if command == Command::Boot {
+        let readiness = master_controller_readiness(&compilation, &runtime);
+        if let Some(probe) = &readiness {
+            eprintln!(
+                "boot-progress: readiness probe global={} fields={} expected={:?}",
+                probe.global,
+                probe.fields.len(),
+                probe.expected
+            );
+        }
+        // The executable lifecycle module, RuntimeImage, LifecycleIndex, and
+        // initialization plan own all data required from this point onward.
+        // Retaining the full syntax compilation and procedure registry across
+        // dynamic station-map loading needlessly keeps the cold compiler graph
+        // resident at the server's peak heap size.
+        drop(procedures);
+        drop(compilation);
         eprintln!("boot-progress: preflighting map initializer plans");
         let map_types = world
             .templates()
@@ -212,29 +310,41 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        // ExecutionState already retains the shared compiled initializer
+        // catalog used by VM `new`. These RuntimeImage-only allocation caches
+        // serve host-side bulk allocation and can be dropped without causing
+        // Genesis constructors to rebuild them.
+        let released = runtime.release_allocation_caches();
+        eprintln!(
+            "boot-progress: released allocation caches initializer_plans={} initializer_programs={} datum_plans={}",
+            released.initializer_plans, released.initializer_programs, released.allocation_plans,
+        );
         // Allocation is the last consumer of the coordinate/template plan.
         // Runtime execution uses the compact allocation and initialization
         // event plan, so release the map plan before compiling lifecycle code.
         drop(world);
-        let readiness = master_controller_readiness(&compilation, &runtime);
-        if let Some(probe) = &readiness {
-            eprintln!(
-                "boot-progress: readiness probe global={} fields={} expected={:?}",
-                probe.global,
-                probe.fields.len(),
-                probe.expected
-            );
-        }
-        let execution = match execute_initialization_plan_with_scheduler_policy(
-            &compilation,
-            &procedures,
-            &index,
-            &plan,
-            &allocation,
-            &mut runtime,
-            SchedulerDrainLimits::default(),
-            readiness.as_ref(),
-        ) {
+        let precompiled = boot_precompiled.as_mut().expect("boot preparation exists");
+        let audit_runtime = env::var_os("DREAM64_BOOT_AUDIT_RUNTIME").is_some();
+        let execution = match if audit_runtime {
+            audit_initialization_plan_with_precompiled(
+                &index,
+                &plan,
+                &allocation,
+                &mut runtime,
+                SchedulerDrainLimits::default(),
+                precompiled,
+            )
+        } else {
+            execute_initialization_plan_with_precompiled(
+                &index,
+                &plan,
+                &allocation,
+                &mut runtime,
+                SchedulerDrainLimits::default(),
+                readiness.as_ref(),
+                precompiled,
+            )
+        } {
             Ok(execution) => execution,
             Err(error) => {
                 eprintln!("initialization: {error}");
@@ -242,8 +352,70 @@ fn main() -> ExitCode {
             }
         };
         print_boot_summary(&allocation, &execution);
+        if execution.scheduler.termination != SchedulerDrainTermination::HeadlessReady {
+            eprintln!(
+                "initialization stopped before authoritative readiness: {:?}",
+                execution.scheduler.termination
+            );
+            return ExitCode::FAILURE;
+        }
+        eprintln!("boot-progress: headless ready; entering persistent scheduler loop");
+        let mut slices = 0u64;
+        loop {
+            let slice_started = Instant::now();
+            let tick_duration = precompiled.persistent_tick_duration();
+            let scheduler = match advance_persistent_scheduler(
+                precompiled,
+                &mut runtime,
+                SchedulerDrainLimits {
+                    max_ticks: 1,
+                    max_rounds: 10_000,
+                },
+            ) {
+                Ok(scheduler) => scheduler,
+                Err(error) => {
+                    eprintln!("persistent scheduler: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            slices = slices.saturating_add(1);
+            if slices == 1 || slices % 100 == 0 {
+                eprintln!(
+                    "server-progress: scheduler slice={} tick={} rounds={} completed={} pending={} termination={:?}",
+                    slices,
+                    scheduler.final_tick,
+                    scheduler.rounds,
+                    scheduler.completed_tasks,
+                    scheduler.pending_tasks,
+                    scheduler.termination,
+                );
+            }
+            if let Some(remaining) = tick_duration.checked_sub(slice_started.elapsed()) {
+                std::thread::sleep(remaining);
+            }
+        }
     }
     ExitCode::SUCCESS
+}
+
+fn project_cache_file(environment: &Path) -> PathBuf {
+    let canonical = fs::canonicalize(environment).unwrap_or_else(|_| environment.to_path_buf());
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in canonical.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let cache_root = env::var_os("DREAM64_CACHE_DIR").map_or_else(
+        || {
+            env::current_exe()
+                .ok()
+                .and_then(|path| path.parent()?.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| PathBuf::from("target"))
+                .join("dream64-cache")
+        },
+        PathBuf::from,
+    );
+    cache_root.join(format!("project-{hash:016x}.bin"))
 }
 
 fn format_runtime_diagnostic(diagnostic: &RuntimeInitializerDiagnostic) -> String {

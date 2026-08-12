@@ -47,7 +47,8 @@ fn field(name: &str) -> FieldName {
 #[test]
 fn lifecycle_procedures_read_and_write_glob_associative_lists_with_inherited_bare_keys() {
     let types = concat!(
-        "var/global/list/loading_bays = list()\n",
+        "/datum/controller/global_vars\n\tvar/global/list/loading_bays = list()\n",
+        "var/global/datum/controller/global_vars/GLOB = new /datum/controller/global_vars\n",
         "/obj/loading_bay\n\tvar/loading_id = \"cargo\"\n\tvar/observed = 0\n",
         "/obj/loading_bay/active/New()\n",
         "\tGLOB.loading_bays[loading_id] = 41\n",

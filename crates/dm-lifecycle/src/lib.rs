@@ -43,8 +43,6 @@ impl LifecycleKind {
         Self::Destroy,
     ];
 
-    const INITIALIZATION: [Self; 3] = [Self::New, Self::Initialize, Self::LateInitialize];
-
     const fn procedure_name(self) -> &'static str {
         match self {
             Self::Genesis => "Genesis",
@@ -529,7 +527,8 @@ pub struct InitializationPlan {
     pub world_type: Option<usize>,
     /// Resolved map placements in cell and initializer order.
     pub map_atoms: Vec<PlannedAtom>,
-    /// Globals-first, world-Genesis/world-New, then mapped lifecycle events.
+    /// Globals-first, world Genesis, compiled-map construction, world New, then
+    /// either engine-managed or project-managed atom initialization.
     pub events: Vec<InitializationEvent>,
     /// Recoverable source-aware diagnostics.
     pub diagnostics: Vec<LifecycleDiagnostic>,
@@ -642,6 +641,127 @@ pub struct HeadlessReadinessProbe {
     pub expected: Value,
 }
 
+/// Lifecycle bytecode linked before runtime/world materialization so boot does
+/// not overlap its closure/spec peak with the resident runtime heap.
+pub struct PrecompiledLifecycle {
+    executable: dm_semantics::ExecutableProcedures,
+    persistent_state: Option<dm_vm::ExecutionState>,
+    targets: usize,
+    reachable_bodies: usize,
+    closure: dm_semantics::ProcedureClosureStats,
+}
+
+impl PrecompiledLifecycle {
+    /// Exact effective lifecycle roots selected from the world/map plan.
+    #[must_use]
+    pub const fn targets(&self) -> usize {
+        self.targets
+    }
+
+    /// Reachable implementation bodies retained by symbolic linking.
+    #[must_use]
+    pub const fn reachable_bodies(&self) -> usize {
+        self.reachable_bodies
+    }
+
+    /// Deterministic dependency-closure counters.
+    #[must_use]
+    pub const fn closure_stats(&self) -> &dm_semantics::ProcedureClosureStats {
+        &self.closure
+    }
+
+    /// Symbolically linked procedure bodies, including deferred bodies.
+    #[must_use]
+    pub fn module_procedures(&self) -> usize {
+        self.executable.stats().procedures
+    }
+
+    /// Deferred bodies not materialized during precompile.
+    #[must_use]
+    pub fn deferred_procedures(&self) -> usize {
+        self.executable.module().deferred_procedure_count()
+    }
+
+    /// Host duration of one current BYOND world tick for persistent pacing.
+    #[must_use]
+    pub fn persistent_tick_duration(&self) -> std::time::Duration {
+        let tick_lag = self
+            .persistent_state
+            .as_ref()
+            .and_then(|state| {
+                let world = state.global(&FieldName::parse("world").ok()?)?;
+                let Value::Datum(world) = world else {
+                    return None;
+                };
+                state
+                    .heap()
+                    .datum_field(*world, &FieldName::parse("tick_lag").ok()?)
+                    .ok()?
+                    .as_number()
+            })
+            .filter(|tick_lag| tick_lag.is_finite() && *tick_lag > 0.0)
+            .unwrap_or(1.0);
+        std::time::Duration::from_secs_f64(f64::from(tick_lag) / 10.0)
+    }
+}
+
+/// Selects and symbolically links the exact world/map lifecycle roots without
+/// constructing a runtime image or allocating map atoms.
+pub fn precompile_lifecycle_for_world(
+    compilation: &Compilation,
+    procedures: &ProcedureRegistry,
+    index: &LifecycleIndex,
+    world: &WorldPlan,
+) -> Result<PrecompiledLifecycle, dm_vm::CompileError> {
+    let mut targets = BTreeSet::new();
+    if let Some(world_type) = index.find_path("/world") {
+        for kind in [LifecycleKind::Genesis, LifecycleKind::New] {
+            if let LifecycleResolution::Resolved(target) = world_type.targets.get(kind) {
+                targets.insert(target.implementation);
+            }
+        }
+    }
+    let map_kinds: &[LifecycleKind] = if project_manages_atom_initialization(index) {
+        &[LifecycleKind::New]
+    } else {
+        &[
+            LifecycleKind::New,
+            LifecycleKind::Initialize,
+            LifecycleKind::LateInitialize,
+        ]
+    };
+    for node in world
+        .templates()
+        .values()
+        .flat_map(|template| &template.initializers)
+        .filter_map(|initializer| match initializer.resolution {
+            InitializerResolution::Resolved { node, .. } => Some(node),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>()
+    {
+        let Some(lifecycle) = index.find_node(node) else {
+            continue;
+        };
+        for &kind in map_kinds {
+            if let LifecycleResolution::Resolved(target) = lifecycle.targets.get(kind) {
+                targets.insert(target.implementation);
+            }
+        }
+    }
+    let target_count = targets.len();
+    let (reachable, closure) =
+        procedures.implementation_closure_with_stats(compilation, targets.iter().copied());
+    let executable = procedures.compile_vm_all_symbolic_with_eager_roots(compilation, targets)?;
+    Ok(PrecompiledLifecycle {
+        executable,
+        persistent_state: None,
+        targets: target_count,
+        reachable_bodies: reachable.len(),
+        closure,
+    })
+}
+
 impl Default for SchedulerDrainLimits {
     fn default() -> Self {
         Self {
@@ -732,6 +852,12 @@ pub enum InitializationExecutionError {
         target: Box<LifecycleTarget>,
         /// Original VM failure.
         error: Box<RuntimeError>,
+    },
+    /// Diagnostic execution completed all independent map lifecycle hooks and
+    /// collected one or more unique runtime failures.
+    AuditFailures {
+        /// Number of unique procedure/error groups printed during the audit.
+        failures: usize,
     },
     /// A spawned or sleeping task failed during the scheduler drain.
     Scheduler(RuntimeError),
@@ -957,6 +1083,10 @@ impl std::fmt::Display for InitializationExecutionError {
                     target.procedure_path
                 )
             }
+            Self::AuditFailures { failures } => write!(
+                formatter,
+                "lifecycle audit collected {failures} unique runtime failure groups"
+            ),
             Self::Scheduler(error) => write!(formatter, "scheduled startup task failed: {error}"),
         }
     }
@@ -975,7 +1105,8 @@ impl std::error::Error for InitializationExecutionError {
             Self::MissingMapDatum { .. }
             | Self::MissingTarget { .. }
             | Self::MissingVmTarget { .. }
-            | Self::MissingWorldDatum => None,
+            | Self::MissingWorldDatum
+            | Self::AuditFailures { .. } => None,
         }
     }
 }
@@ -1065,7 +1196,6 @@ pub fn execute_initialization_plan_with_scheduler_policy(
     readiness: Option<&HeadlessReadinessProbe>,
 ) -> Result<InitializationExecution, InitializationExecutionError> {
     eprintln!("boot-progress: selecting lifecycle targets");
-    let bindings = map_datum_bindings(plan, allocation, runtime);
     let targets = plan
         .events
         .iter()
@@ -1085,9 +1215,117 @@ pub fn execute_initialization_plan_with_scheduler_policy(
         closure_stats.dynamic_candidates_considered,
     );
     eprintln!("boot-progress: compiling lifecycle targets");
-    let executable = procedures
+    let mut executable = procedures
         .compile_vm_implementations_symbolic_dynamic(compilation, targets)
         .map_err(InitializationExecutionError::Compile)?;
+    execute_initialization_plan_with_executable(
+        index,
+        plan,
+        allocation,
+        runtime,
+        scheduler_limits,
+        readiness,
+        &mut executable,
+        None,
+        false,
+    )
+}
+
+/// Executes a plan using lifecycle bytecode linked before runtime/world
+/// materialization.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_initialization_plan_with_precompiled(
+    index: &LifecycleIndex,
+    plan: &InitializationPlan,
+    allocation: &WorldAllocation,
+    runtime: &mut RuntimeImage,
+    scheduler_limits: SchedulerDrainLimits,
+    readiness: Option<&HeadlessReadinessProbe>,
+    precompiled: &mut PrecompiledLifecycle,
+) -> Result<InitializationExecution, InitializationExecutionError> {
+    eprintln!(
+        "boot-progress: using precompiled lifecycle targets={} bodies={} procedures={} deferred={}",
+        precompiled.targets,
+        precompiled.reachable_bodies,
+        precompiled.module_procedures(),
+        precompiled.deferred_procedures(),
+    );
+    if readiness.is_some() {
+        execute_initialization_plan_with_executable(
+            index,
+            plan,
+            allocation,
+            runtime,
+            scheduler_limits,
+            readiness,
+            &mut precompiled.executable,
+            Some(&mut precompiled.persistent_state),
+            false,
+        )
+    } else {
+        execute_initialization_plan_with_executable(
+            index,
+            plan,
+            allocation,
+            runtime,
+            scheduler_limits,
+            None,
+            &mut precompiled.executable,
+            None,
+            false,
+        )
+    }
+}
+
+/// Executes all independent mapped lifecycle hooks while collecting unique
+/// runtime failures instead of stopping at the first failed map datum.
+///
+/// World/Genesis failures remain fail-fast because every mapped object depends
+/// on that shared state. A failed datum is skipped for its remaining lifecycle
+/// phases so one root problem does not create duplicate Initialize/Late errors.
+#[allow(clippy::too_many_arguments)]
+pub fn audit_initialization_plan_with_precompiled(
+    index: &LifecycleIndex,
+    plan: &InitializationPlan,
+    allocation: &WorldAllocation,
+    runtime: &mut RuntimeImage,
+    scheduler_limits: SchedulerDrainLimits,
+    precompiled: &mut PrecompiledLifecycle,
+) -> Result<InitializationExecution, InitializationExecutionError> {
+    eprintln!(
+        "boot-progress: auditing precompiled lifecycle targets={} bodies={} procedures={} deferred={}",
+        precompiled.targets,
+        precompiled.reachable_bodies,
+        precompiled.module_procedures(),
+        precompiled.deferred_procedures(),
+    );
+    execute_initialization_plan_with_executable(
+        index,
+        plan,
+        allocation,
+        runtime,
+        scheduler_limits,
+        None,
+        &mut precompiled.executable,
+        None,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn execute_initialization_plan_with_executable(
+    index: &LifecycleIndex,
+    plan: &InitializationPlan,
+    allocation: &WorldAllocation,
+    runtime: &mut RuntimeImage,
+    scheduler_limits: SchedulerDrainLimits,
+    readiness: Option<&HeadlessReadinessProbe>,
+    executable: &mut dm_semantics::ExecutableProcedures,
+    persistent_state: Option<&mut Option<dm_vm::ExecutionState>>,
+    collect_runtime_errors: bool,
+) -> Result<InitializationExecution, InitializationExecutionError> {
+    eprintln!("boot-progress: selecting lifecycle targets");
+    let bindings = map_datum_bindings(plan, allocation, runtime);
     eprintln!(
         "boot-progress: compiled lifecycle targets deferred={} materialized={}",
         executable.module().deferred_procedure_count(),
@@ -1119,13 +1357,23 @@ pub fn execute_initialization_plan_with_scheduler_policy(
     }
     let execution = (|| {
         eprintln!("boot-progress: applying dynamic map overrides");
-        apply_dynamic_map_overrides(plan, allocation, &bindings, runtime, &mut state)?;
+        apply_dynamic_map_overrides(
+            plan,
+            allocation,
+            &bindings,
+            runtime,
+            &mut state,
+            executable.module_mut(),
+        )?;
         eprintln!("boot-progress: applied dynamic map overrides");
         let mut result = InitializationExecution {
             world,
             ..InitializationExecution::default()
         };
         let mut seen = BTreeSet::new();
+        let mut initialized_during_new = BTreeSet::new();
+        let mut failed_datums = BTreeSet::new();
+        let mut audit_failures = BTreeSet::new();
         let total_lifecycle_events = plan
             .events
             .iter()
@@ -1163,6 +1411,22 @@ pub fn execute_initialization_plan_with_scheduler_policy(
                 result.duplicate_map_events += 1;
                 continue;
             }
+            if failed_datums.contains(&datum) {
+                continue;
+            }
+            if matches!(subject, EventSubject::MapAtom(_))
+                && matches!(
+                    event_kind(*event),
+                    LifecycleKind::Initialize | LifecycleKind::LateInitialize
+                )
+                && initialized_during_new.contains(&datum)
+            {
+                // Monk/tg's INITIALIZE_IMMEDIATE macro temporarily enables
+                // SSatoms from inside New(), which runs Initialize and queues
+                // any LateInitialize itself. Do not synthesize those hooks a
+                // second time for datums carrying INITIALIZED_1 afterward.
+                continue;
+            }
             let target = event_target(*event, index).ok_or_else(|| {
                 InitializationExecutionError::MissingTarget {
                     type_index: event_type_index(*event),
@@ -1174,18 +1438,70 @@ pub fn execute_initialization_plan_with_scheduler_policy(
                 .ok_or_else(|| InitializationExecutionError::MissingVmTarget {
                     procedure_path: target.procedure_path.clone(),
                 })?;
-            let value = execute_module_in_context(
+            let arguments = if matches!(subject, EventSubject::MapAtom(_))
+                && event_kind(*event) == LifecycleKind::New
+            {
+                vec![
+                    state
+                        .heap()
+                        .datum_field(
+                            datum,
+                            &FieldName::parse("loc")
+                                .expect("built-in atom loc field name is valid"),
+                        )
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                ]
+            } else {
+                Vec::new()
+            };
+            let value = match execute_module_in_context(
                 executable.module(),
                 entry,
-                &[],
+                &arguments,
                 &mut state,
                 &ExecutionContext::new(Value::Datum(datum), Value::Null),
-            )
-            .map_err(|error| InitializationExecutionError::Runtime {
-                event: *event,
-                target: Box::new(target.clone()),
-                error: Box::new(error),
-            })?;
+            ) {
+                Ok(value) => value,
+                Err(error)
+                    if collect_runtime_errors && matches!(subject, EventSubject::MapAtom(_)) =>
+                {
+                    failed_datums.insert(datum);
+                    let key = format!("{}: {error}", target.procedure_path);
+                    if audit_failures.insert(key.clone()) {
+                        eprintln!(
+                            "boot-audit-runtime-error: group={} event={:?} datum={:?} {}",
+                            audit_failures.len(),
+                            event_kind(*event),
+                            datum,
+                            key,
+                        );
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    return Err(InitializationExecutionError::Runtime {
+                        event: *event,
+                        target: Box::new(target.clone()),
+                        error: Box::new(error),
+                    });
+                }
+            };
+            if matches!(subject, EventSubject::MapAtom(_))
+                && event_kind(*event) == LifecycleKind::New
+                && state
+                    .heap()
+                    .datum_field(
+                        datum,
+                        &FieldName::parse("flags_1")
+                            .expect("project atom initialization flag field is valid"),
+                    )
+                    .ok()
+                    .and_then(Value::as_number)
+                    .is_some_and(|flags| (flags as i32) & (1 << 7) != 0)
+            {
+                initialized_during_new.insert(datum);
+            }
             result.events.push(ExecutedLifecycleEvent {
                 event: *event,
                 datum,
@@ -1194,11 +1510,27 @@ pub fn execute_initialization_plan_with_scheduler_policy(
             });
         }
         eprintln!("boot-progress: completed lifecycle events");
+        if !audit_failures.is_empty() {
+            eprintln!(
+                "boot-audit-summary: unique_runtime_failure_groups={} failed_datums={}",
+                audit_failures.len(),
+                failed_datums.len(),
+            );
+            return Err(InitializationExecutionError::AuditFailures {
+                failures: audit_failures.len(),
+            });
+        }
         result.scheduler =
             drain_startup_scheduler(executable.module(), &mut state, scheduler_limits, readiness)?;
         Ok(result)
     })();
-    runtime.restore_execution_state(state);
+    if execution.is_ok()
+        && let Some(persistent_state) = persistent_state
+    {
+        *persistent_state = Some(state);
+    } else {
+        runtime.restore_execution_state(state);
+    }
     execution
 }
 
@@ -1238,7 +1570,9 @@ fn drain_startup_scheduler(
         drain.final_tick = state.scheduler_tick();
     }
     drain.pending_tasks = state.scheduled_task_count();
-    if drain.pending_tasks == 0 {
+    if readiness.is_some_and(|probe| readiness_probe_matches(state, probe)) {
+        drain.termination = SchedulerDrainTermination::HeadlessReady;
+    } else if drain.pending_tasks == 0 {
         drain.termination = SchedulerDrainTermination::StableIdle;
     }
     eprintln!(
@@ -1250,6 +1584,49 @@ fn drain_startup_scheduler(
         drain.pending_tasks
     );
     Ok(drain)
+}
+
+/// Advances persistent scheduled server work in a bounded host-loop slice.
+/// Pending continuations remain in the runtime image for the next slice.
+pub fn advance_persistent_scheduler(
+    precompiled: &mut PrecompiledLifecycle,
+    _runtime: &mut RuntimeImage,
+    limits: SchedulerDrainLimits,
+) -> Result<SchedulerDrain, InitializationExecutionError> {
+    let mut state = precompiled
+        .persistent_state
+        .take()
+        .expect("persistent scheduler requires completed precompiled lifecycle execution");
+    let start_tick = state.scheduler_tick();
+    let mut result =
+        drain_startup_scheduler(precompiled.executable.module(), &mut state, limits, None);
+    if let Ok(drain) = &mut result
+        && drain.termination == SchedulerDrainTermination::TickLimit
+    {
+        let boundary = start_tick.saturating_add(limits.max_ticks);
+        let advance = boundary.saturating_sub(state.scheduler_tick());
+        match advance_scheduler(
+            precompiled.executable.module(),
+            advance,
+            ExecutionLimits::default(),
+            &mut state,
+        )
+        .map_err(InitializationExecutionError::Scheduler)
+        {
+            Ok(completed) => {
+                drain.rounds = drain.rounds.saturating_add(1);
+                drain.completed_tasks = drain.completed_tasks.saturating_add(completed.len());
+                drain.final_tick = state.scheduler_tick();
+                drain.pending_tasks = state.scheduled_task_count();
+                if drain.pending_tasks == 0 {
+                    drain.termination = SchedulerDrainTermination::StableIdle;
+                }
+            }
+            Err(error) => result = Err(error),
+        }
+    }
+    precompiled.persistent_state = Some(state);
+    result
 }
 
 fn readiness_probe_matches(state: &dm_vm::ExecutionState, probe: &HeadlessReadinessProbe) -> bool {
@@ -1400,6 +1777,7 @@ fn apply_dynamic_map_overrides(
     bindings: &[Option<DatumId>],
     runtime: &RuntimeImage,
     state: &mut dm_vm::ExecutionState,
+    module: &mut dm_vm::Module,
 ) -> Result<(), InitializationExecutionError> {
     for (atom_index, atom) in plan.map_atoms.iter().enumerate() {
         let Some(datum) = bindings.get(atom_index).and_then(|datum| *datum) else {
@@ -1418,7 +1796,7 @@ fn apply_dynamic_map_overrides(
                 }
             })?;
             let value = runtime
-                .evaluate_datum_expression(datum, &assignment.value.raw, state)
+                .evaluate_datum_expression_linked(datum, &assignment.value.raw, state, module)
                 .map_err(|error| InitializationExecutionError::MapExpression {
                     atom_index,
                     field: assignment.name.clone(),
@@ -1763,6 +2141,21 @@ fn initialization_events(
             type_index,
         });
     }
+    // BYOND constructs every compiled-map atom after global/Genesis bootstrap
+    // but before world/New. Tg/Monk's SSatoms then owns Initialize and
+    // LateInitialize during Master subsystem startup. Running those hooks
+    // synthetically before the Master task is drained observes uninitialized
+    // subsystems (greyscale, materials, lighting, ...), producing cascades that
+    // cannot occur in the real engine pipeline.
+    for (atom_index, atom) in atoms.iter().enumerate() {
+        if has_target(index, atom.type_index, LifecycleKind::New) {
+            events.push(InitializationEvent::Lifecycle {
+                subject: EventSubject::MapAtom(atom_index),
+                kind: LifecycleKind::New,
+                type_index: atom.type_index,
+            });
+        }
+    }
     if let Some(type_index) = world_type
         && has_target(index, type_index, LifecycleKind::New)
     {
@@ -1772,18 +2165,31 @@ fn initialization_events(
             type_index,
         });
     }
-    for kind in LifecycleKind::INITIALIZATION {
-        for (atom_index, atom) in atoms.iter().enumerate() {
-            if has_target(index, atom.type_index, kind) {
-                events.push(InitializationEvent::Lifecycle {
-                    subject: EventSubject::MapAtom(atom_index),
-                    kind,
-                    type_index: atom.type_index,
-                });
+    if !project_manages_atom_initialization(index) {
+        for kind in [LifecycleKind::Initialize, LifecycleKind::LateInitialize] {
+            for (atom_index, atom) in atoms.iter().enumerate() {
+                if has_target(index, atom.type_index, kind) {
+                    events.push(InitializationEvent::Lifecycle {
+                        subject: EventSubject::MapAtom(atom_index),
+                        kind,
+                        type_index: atom.type_index,
+                    });
+                }
             }
         }
     }
     events
+}
+
+fn project_manages_atom_initialization(index: &LifecycleIndex) -> bool {
+    index
+        .find_path("/datum/controller/subsystem/atoms")
+        .is_some_and(|lifecycle| {
+            matches!(
+                lifecycle.targets.get(LifecycleKind::Initialize),
+                LifecycleResolution::Resolved(_)
+            )
+        })
 }
 
 fn has_target(index: &LifecycleIndex, type_index: usize, kind: LifecycleKind) -> bool {
@@ -1806,13 +2212,16 @@ mod tests {
     use dm_runtime::RuntimeImage;
     use dm_semantics::ProcedureRegistry;
     use dm_value::{FieldName, TypePath, Value};
-    use dm_vm::execute_module_in_state;
+    use dm_vm::{ExecutionContext, execute_module_in_context, execute_module_in_state};
     use dm_world::{WorldCoordinate, allocate_world, build_plan};
 
     use super::{
-        EventSubject, InitializationEvent, LifecycleIndex, LifecycleKind, LifecycleResolution,
-        build_initialization_plan, construct_datum, delete_datum, execute_initialization_plan,
-        sweep_lifecycle_compatibility,
+        EventSubject, HeadlessReadinessProbe, InitializationEvent, InitializationExecutionError,
+        LifecycleIndex, LifecycleKind, LifecycleResolution, SchedulerDrainLimits,
+        SchedulerDrainTermination, advance_persistent_scheduler,
+        audit_initialization_plan_with_precompiled, build_initialization_plan, construct_datum,
+        delete_datum, execute_initialization_plan, execute_initialization_plan_with_precompiled,
+        precompile_lifecycle_for_world, sweep_lifecycle_compatibility,
     };
 
     static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
@@ -2033,7 +2442,7 @@ mod tests {
         assert!(matches!(
             plan.events[1],
             InitializationEvent::Lifecycle {
-                subject: EventSubject::World,
+                subject: EventSubject::MapAtom(_),
                 kind: LifecycleKind::New,
                 ..
             }
@@ -2055,11 +2464,56 @@ mod tests {
     }
 
     #[test]
+    fn monk_pipeline_constructs_compiled_atoms_before_world_new_and_defers_init_to_ssatoms() {
+        let source = concat!(
+            "/world/Genesis()\n/world/New()\n",
+            "/atom/New(loc)\n/atom/Initialize()\n/atom/LateInitialize()\n",
+            "/datum/controller/subsystem/atoms/Initialize()\n",
+            "/area/test\n/turf/test\n/obj/test\n",
+        );
+        let (_fixture, compilation, runtime, index) = index(source);
+        let map = parse(concat!(
+            "\"a\" = (/obj/test, /turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .expect("one-cell subsystem-managed map should parse");
+        let world = build_plan(&map, &compilation);
+        let plan = build_initialization_plan(&runtime, &index, &world, "managed.dmm");
+        let lifecycle: Vec<_> = plan
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                InitializationEvent::Lifecycle { subject, kind, .. } => Some((*subject, *kind)),
+                InitializationEvent::Globals => None,
+            })
+            .collect();
+
+        assert_eq!(lifecycle[0], (EventSubject::World, LifecycleKind::Genesis));
+        let world_new = lifecycle
+            .iter()
+            .position(|event| *event == (EventSubject::World, LifecycleKind::New))
+            .expect("world New should be planned");
+        assert!(
+            lifecycle[1..world_new]
+                .iter()
+                .all(
+                    |(subject, kind)| matches!(subject, EventSubject::MapAtom(_))
+                        && *kind == LifecycleKind::New
+                )
+        );
+        assert!(lifecycle[world_new + 1..].is_empty());
+        assert!(!lifecycle.iter().any(|(_, kind)| matches!(
+            kind,
+            LifecycleKind::Initialize | LifecycleKind::LateInitialize
+        )));
+    }
+
+    #[test]
     fn executes_map_lifecycles_in_phase_order_without_compiling_unrelated_procs() {
         let source = concat!(
             "var/global/lifecycle_count = 1\n",
             "/world/New()\n\tsrc.stage = 5\n\tglobal.lifecycle_count += 1\n",
-            "/atom/proc/New()\n\tsrc.stage = 10\n",
+            "/atom/proc/New(loc)\n\tsrc.stage = (args.len * 10) + (args[1] == src.loc)\n",
             "/atom/proc/Initialize()\n\tsrc.stage += 1\n\tglobal.lifecycle_count += 1\n",
             "/atom/proc/LateInitialize()\n\tsrc.stage += 100\n",
             "/area/test\n/turf/test\n/obj/test\n",
@@ -2129,9 +2583,276 @@ mod tests {
         for datum in allocation.allocation_order() {
             assert_eq!(
                 runtime.heap().datum_field(*datum, &stage),
-                Ok(&Value::number(111.0))
+                Ok(&Value::number(112.0))
             );
         }
+    }
+
+    #[test]
+    fn map_new_that_initializes_through_ssatoms_is_not_initialized_twice() {
+        let source = concat!(
+            "var/global/initialize_count = 0\n",
+            "/world/New()\n",
+            "/atom\n\tvar/flags_1 = 0\n\tvar/stage = 0\n",
+            "/atom/proc/New(loc)\n\tsrc.Initialize(1)\n",
+            "/atom/proc/Initialize(mapload)\n\tif(flags_1 & 128)\n\t\treturn -1\n\tflags_1 |= 128\n\tstage += 1\n\tglobal.initialize_count += 1\n\treturn 0\n",
+            "/atom/proc/LateInitialize()\n\tstage += 100\n",
+            "/area/test\n/turf/test\n/obj/test\n",
+        );
+        let (_fixture, compilation, mut runtime, index) = index(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/obj/test, /turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .expect("map should parse");
+        let world = build_plan(&map, &compilation);
+        let plan = build_initialization_plan(&runtime, &index, &world, "test.dmm");
+        let allocation = allocate_world(&world, &mut runtime).expect("world should allocate");
+
+        let execution = execute_initialization_plan(
+            &compilation,
+            &procedures,
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+        )
+        .expect("immediate initialization should not be repeated");
+
+        assert_eq!(execution.events.len(), 4, "world New plus three atom News");
+        assert_eq!(
+            runtime
+                .variables()
+                .iter()
+                .find(|variable| variable.path.ends_with("/initialize_count"))
+                .expect("counter global")
+                .value,
+            Value::number(3.0),
+        );
+        for datum in allocation.allocation_order() {
+            assert_eq!(
+                runtime
+                    .heap()
+                    .datum_field(*datum, &FieldName::parse("stage").expect("stage field"),),
+                Ok(&Value::number(1.0)),
+                "synthetic Initialize/LateInitialize must be skipped after New initialized it",
+            );
+        }
+    }
+
+    #[test]
+    fn precompiled_lifecycle_links_dynamic_map_expressions_to_project_procs() {
+        let source = concat!(
+            "/proc/map_value()\n\treturn 37\n",
+            "/area/test\n/turf/test\n/obj/test\n\tvar/value = 0\n\tNew()\n\t\tmap_value()\n",
+        );
+        let (_fixture, compilation) = Fixture::compile(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/obj/test{value = map_value()}, /turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .expect("map should parse");
+        let world = build_plan(&map, &compilation);
+        let compile_index = LifecycleIndex::build_compile_only(&compilation, &procedures);
+        let mut precompiled =
+            precompile_lifecycle_for_world(&compilation, &procedures, &compile_index, &world)
+                .expect("lifecycle should precompile without a runtime image");
+
+        let mut runtime =
+            RuntimeImage::from_compilation(&compilation).expect("runtime image should materialize");
+        let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
+        let plan = build_initialization_plan(&runtime, &index, &world, "test.dmm");
+        let allocation = allocate_world(&world, &mut runtime).expect("world should allocate");
+        execute_initialization_plan_with_precompiled(
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+            SchedulerDrainLimits::default(),
+            None,
+            &mut precompiled,
+        )
+        .expect("precompiled lifecycle and linked map expression should execute");
+
+        let object = allocation
+            .allocation_order()
+            .iter()
+            .copied()
+            .find(|datum| {
+                runtime
+                    .heap()
+                    .datum(*datum)
+                    .is_ok_and(|record| record.type_path().as_str() == "/obj/test")
+            })
+            .expect("mapped object should exist");
+        assert_eq!(
+            runtime
+                .heap()
+                .datum_field(object, &FieldName::parse("value").unwrap()),
+            Ok(&Value::number(37.0))
+        );
+    }
+
+    #[test]
+    fn precompiled_global_initializer_family_smoke_executes_transitive_file_constructor() {
+        let source = concat!(
+            "var/global/datum/controller/global_vars/GLOB\n",
+            "var/global/smoke = \"\"\n",
+            "/proc/trim(value)\n\treturn trimtext(value)\n",
+            "/proc/file2list(filename, separator = \"\\n\", trim_file = TRUE)\n",
+            "\tif(trim_file)\n",
+            "\t\treturn splittext(trim(file2text(filename)), separator)\n",
+            "\treturn splittext(file2text(filename), separator)\n",
+            "/datum/controller/global_vars\n",
+            "\tvar/datum/advertisements/advertisements\n",
+            "\tproc/InitGlobaladvertisements()\n",
+            "\t\tadvertisements = new\n",
+            "\tproc/Initialize()\n",
+            "\t\tfor(var/global_init in typesof(/datum/controller/global_vars/proc))\n",
+            "\t\t\tif(global_init == /datum/controller/global_vars/proc/Initialize)\n",
+            "\t\t\t\tcontinue\n",
+            "\t\t\tcall(src, global_init)()\n",
+            "/datum/advertisements\n",
+            "\tvar/result = \"\"\n",
+            "\tNew()\n",
+            "\t\tresult = load_file(\"advertisements.txt\")\n",
+            "\tproc/load_file(filename)\n",
+            "\t\tvar/list/lines = file2list(filename)\n",
+            "\t\tvar/output = \"\"\n",
+            "\t\tfor(var/line in lines)\n",
+            "\t\t\toutput += line[1]\n",
+            "\t\treturn output\n",
+            "/world/Genesis()\n",
+            "\tGLOB = new\n",
+            "\tGLOB.Initialize()\n",
+            "\tglobal.smoke = GLOB.advertisements.result\n",
+            "/area/test\n/turf/test\n",
+        );
+        let (fixture, compilation) = Fixture::compile(source);
+        fs::write(
+            fixture.0.join("advertisements.txt"),
+            "- advertisement separator\n",
+        )
+        .expect("advertisement fixture should be written");
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .expect("smoke selector map should parse");
+        let world = build_plan(&map, &compilation);
+        let compile_index = LifecycleIndex::build_compile_only(&compilation, &procedures);
+        let genesis = compile_index
+            .find_path("/world")
+            .and_then(
+                |lifecycle| match lifecycle.targets.get(LifecycleKind::Genesis) {
+                    LifecycleResolution::Resolved(target) => Some(target.implementation),
+                    _ => None,
+                },
+            )
+            .expect("world Genesis should resolve");
+        let precompiled =
+            precompile_lifecycle_for_world(&compilation, &procedures, &compile_index, &world)
+                .expect("global initializer family should precompile");
+        let entry = precompiled
+            .executable
+            .implementation(genesis)
+            .expect("Genesis should be retained by precompile");
+        let mut runtime = RuntimeImage::from_compilation(&compilation)
+            .expect("tiny smoke runtime should materialize");
+        let world_datum = runtime
+            .canonical_world()
+            .expect("canonical world should exist");
+        let mut state = runtime.take_execution_state();
+        state.set_global(
+            FieldName::parse("world").expect("world field name"),
+            Value::Datum(world_datum),
+        );
+        execute_module_in_context(
+            precompiled.executable.module(),
+            entry,
+            &[],
+            &mut state,
+            &ExecutionContext::new(Value::Datum(world_datum), Value::Null),
+        )
+        .expect("transitive generated global initializer should execute before map allocation");
+        assert_eq!(
+            state.global(&FieldName::parse("smoke").unwrap()),
+            Some(&Value::text("-")),
+        );
+    }
+
+    #[test]
+    fn generated_global_qdel_executes_full_item_destroy_chain_before_map_allocation() {
+        let source = concat!(
+            "var/global/datum/controller/global_vars/GLOB\n",
+            "var/global/destroy_trace = \"\"\n",
+            "/proc/qdel(datum/to_delete)\n\treturn to_delete.Destroy()\n",
+            "/datum/controller/global_vars\n",
+            "\tproc/InitGlobalcleanup()\n",
+            "\t\tvar/obj/item/temporary = new\n",
+            "\t\tqdel(temporary)\n",
+            "\tproc/Initialize()\n",
+            "\t\tfor(var/global_init in typesof(/datum/controller/global_vars/proc))\n",
+            "\t\t\tif(global_init == /datum/controller/global_vars/proc/Initialize)\n",
+            "\t\t\t\tcontinue\n",
+            "\t\t\tcall(src, global_init)()\n",
+            "/datum/Destroy()\n\tglobal.destroy_trace += \"D\"\n\treturn 1\n",
+            "/atom/Destroy()\n\tglobal.destroy_trace += \"A\"\n\treturn ..()\n",
+            "/atom/movable/Destroy()\n\tglobal.destroy_trace += \"M\"\n\treturn ..()\n",
+            "/obj/Destroy()\n",
+            "\tvis_locs = null\n",
+            "\tglobal.destroy_trace += \"O\"\n",
+            "\treturn ..()\n",
+            "/obj/item/Destroy()\n\tglobal.destroy_trace += \"I\"\n\treturn ..()\n",
+            "/world/Genesis()\n",
+            "\tGLOB = new /datum/controller/global_vars\n",
+            "\tGLOB.Initialize()\n",
+            "/area/test\n/turf/test\n",
+        );
+        let (_fixture, compilation) = Fixture::compile(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .unwrap();
+        let world = build_plan(&map, &compilation);
+        let compile_index = LifecycleIndex::build_compile_only(&compilation, &procedures);
+        let genesis = compile_index
+            .find_path("/world")
+            .and_then(
+                |lifecycle| match lifecycle.targets.get(LifecycleKind::Genesis) {
+                    LifecycleResolution::Resolved(target) => Some(target.implementation),
+                    _ => None,
+                },
+            )
+            .unwrap();
+        let precompiled =
+            precompile_lifecycle_for_world(&compilation, &procedures, &compile_index, &world)
+                .expect("generated qdel/Destroy family should precompile");
+        let entry = precompiled.executable.implementation(genesis).unwrap();
+        let mut runtime = RuntimeImage::from_compilation(&compilation).unwrap();
+        let world_datum = runtime.canonical_world().unwrap();
+        let mut state = runtime.take_execution_state();
+        state.set_global(
+            FieldName::parse("world").unwrap(),
+            Value::Datum(world_datum),
+        );
+        execute_module_in_context(
+            precompiled.executable.module(),
+            entry,
+            &[],
+            &mut state,
+            &ExecutionContext::new(Value::Datum(world_datum), Value::Null),
+        )
+        .expect("generated initializer qdel should execute every inherited Destroy body");
+        assert_eq!(
+            state.global(&FieldName::parse("destroy_trace").unwrap()),
+            Some(&Value::text("IOMAD")),
+        );
     }
 
     #[test]
@@ -2171,6 +2892,180 @@ mod tests {
                 .find(|variable| variable.path.ends_with("/finished"))
                 .map(|variable| &variable.value),
             Some(&Value::number(1.0))
+        );
+    }
+
+    #[test]
+    fn readiness_and_persistent_slices_preserve_delayed_server_work() {
+        let source = concat!(
+            "var/global/ready = 0\nvar/global/pulses = 0\n",
+            "/world/New()\n\tset waitfor = FALSE\n\tsleep(2)\n\tglobal.ready = 1\n\tsleep(20)\n\tglobal.pulses = 1\n",
+            "/area/test\n/turf/test\n",
+        );
+        let (_fixture, compilation) = Fixture::compile(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .unwrap();
+        let world = build_plan(&map, &compilation);
+        let compile_index = LifecycleIndex::build_compile_only(&compilation, &procedures);
+        let mut precompiled =
+            precompile_lifecycle_for_world(&compilation, &procedures, &compile_index, &world)
+                .unwrap();
+        let mut runtime = RuntimeImage::from_compilation(&compilation).unwrap();
+        let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
+        let plan = build_initialization_plan(&runtime, &index, &world, "test.dmm");
+        let allocation = allocate_world(&world, &mut runtime).unwrap();
+        let readiness = HeadlessReadinessProbe {
+            qualified_storage: None,
+            global: FieldName::parse("ready").unwrap(),
+            fields: vec![],
+            expected: Value::number(1.0),
+        };
+        let execution = execute_initialization_plan_with_precompiled(
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+            SchedulerDrainLimits {
+                max_ticks: 10,
+                max_rounds: 10,
+            },
+            Some(&readiness),
+            &mut precompiled,
+        )
+        .unwrap();
+        assert_eq!(
+            execution.scheduler.termination,
+            SchedulerDrainTermination::HeadlessReady
+        );
+        assert_eq!(execution.scheduler.pending_tasks, 1);
+        assert_eq!(
+            precompiled.persistent_tick_duration(),
+            std::time::Duration::from_millis(100)
+        );
+
+        let first = advance_persistent_scheduler(
+            &mut precompiled,
+            &mut runtime,
+            SchedulerDrainLimits {
+                max_ticks: 5,
+                max_rounds: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first.final_tick, 7,
+            "idle slices must advance toward future work"
+        );
+        assert_eq!(first.pending_tasks, 1);
+        for _ in 0..3 {
+            advance_persistent_scheduler(
+                &mut precompiled,
+                &mut runtime,
+                SchedulerDrainLimits {
+                    max_ticks: 5,
+                    max_rounds: 10,
+                },
+            )
+            .unwrap();
+        }
+        let final_slice = advance_persistent_scheduler(
+            &mut precompiled,
+            &mut runtime,
+            SchedulerDrainLimits {
+                max_ticks: 1,
+                max_rounds: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(final_slice.pending_tasks, 0);
+        assert_eq!(
+            final_slice.termination,
+            SchedulerDrainTermination::StableIdle
+        );
+    }
+
+    #[test]
+    fn monk_like_master_stages_reach_readiness_through_waitfor_scheduler() {
+        let source = concat!(
+            "var/global/datum/controller/master/Master\n",
+            "var/global/trace = \"\"\n",
+            "var/global/ready = 0\n",
+            "/proc/dispatch_initialize(target)\n",
+            "\tcall(target, \"Initialize\")()\n",
+            "/proc/finish_subsystem_stage()\n",
+            "\tsleep(2)\n",
+            "\tglobal.trace += \"S\"\n",
+            "\tglobal.ready = 2\n",
+            "/datum/controller/master\n",
+            "\tNew()\n",
+            "\t\tglobal.Master = src\n",
+            "\t\tglobal.trace += \"N\"\n",
+            "\tproc/Initialize()\n",
+            "\t\tset waitfor = FALSE\n",
+            "\t\tglobal.trace += \"I\"\n",
+            "\t\tfinish_subsystem_stage()\n",
+            "/world/Genesis()\n",
+            "\tMaster = new /datum/controller/master\n",
+            "/world/New()\n",
+            "\tglobal.trace += \"W\"\n",
+            "\tConfigLoaded()\n",
+            "\tdispatch_initialize(Master)\n",
+            "/world/proc/ConfigLoaded()\n",
+            "\tglobal.trace += \"C\"\n",
+            "/area/test\n/turf/test\n",
+        );
+        let (_fixture, compilation) = Fixture::compile(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .expect("one-cell staged smoke map should parse");
+        let world = build_plan(&map, &compilation);
+        let compile_index = LifecycleIndex::build_compile_only(&compilation, &procedures);
+        let mut precompiled =
+            precompile_lifecycle_for_world(&compilation, &procedures, &compile_index, &world)
+                .expect("Master stages should link lazily before runtime allocation");
+        assert!(precompiled.deferred_procedures() > 0);
+
+        let mut runtime = RuntimeImage::from_compilation(&compilation).unwrap();
+        let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
+        let plan = build_initialization_plan(&runtime, &index, &world, "staged-smoke.dmm");
+        let allocation = allocate_world(&world, &mut runtime).unwrap();
+        let readiness = HeadlessReadinessProbe {
+            qualified_storage: None,
+            global: FieldName::parse("ready").unwrap(),
+            fields: vec![],
+            expected: Value::number(2.0),
+        };
+        let execution = execute_initialization_plan_with_precompiled(
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+            SchedulerDrainLimits {
+                max_ticks: 10,
+                max_rounds: 20,
+            },
+            Some(&readiness),
+            &mut precompiled,
+        )
+        .expect("Master staged startup should reach readiness");
+        assert_eq!(
+            execution.scheduler.termination,
+            SchedulerDrainTermination::HeadlessReady,
+        );
+        assert_eq!(execution.scheduler.final_tick, 2);
+        assert_eq!(
+            precompiled
+                .persistent_state
+                .as_ref()
+                .and_then(|state| state.global(&FieldName::parse("trace").unwrap())),
+            Some(&Value::text("NWCIS")),
         );
     }
 
@@ -2382,5 +3277,44 @@ mod tests {
             "/world/proc/New"
         );
         assert_eq!(sweep.issues[0].locations[0].source.path, "types.dm");
+    }
+
+    #[test]
+    fn runtime_audit_collects_independent_map_failures_in_one_execution() {
+        let source = concat!(
+            "/area/test\n/turf/test\n",
+            "/obj/first\n/obj/first/Initialize()\n\tvar/list/missing\n\treturn missing[1]\n",
+            "/obj/second\n/obj/second/Initialize()\n\tvar/list/missing\n\treturn missing[2]\n",
+        );
+        let (_fixture, compilation, mut runtime, index) = index(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/obj/first, /turf/test, /area/test)\n",
+            "\"b\" = (/obj/second, /turf/test, /area/test)\n",
+            "(1,1,1) = {\"\nab\n\"}\n",
+        ))
+        .expect("two-cell audit map should parse");
+        let world = build_plan(&map, &compilation);
+        let compile_index = LifecycleIndex::build_compile_only(&compilation, &procedures);
+        let mut precompiled =
+            precompile_lifecycle_for_world(&compilation, &procedures, &compile_index, &world)
+                .expect("both failing Initialize bodies should link");
+        let plan = build_initialization_plan(&runtime, &index, &world, "audit.dmm");
+        let allocation = allocate_world(&world, &mut runtime).expect("audit world should allocate");
+
+        let error = audit_initialization_plan_with_precompiled(
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+            SchedulerDrainLimits::default(),
+            &mut precompiled,
+        )
+        .expect_err("audit should return its grouped failure count");
+
+        assert!(matches!(
+            error,
+            InitializationExecutionError::AuditFailures { failures: 2 }
+        ));
     }
 }

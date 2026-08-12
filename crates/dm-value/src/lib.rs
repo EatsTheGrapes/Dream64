@@ -13,6 +13,7 @@
 
 #![cfg_attr(not(test), deny(missing_docs))]
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -140,6 +141,12 @@ pub enum Value {
     Number(DmNumberBits),
     /// Immutable text with content-based semantics.
     Text(Arc<str>),
+    /// A BYOND file/resource value carrying its project-relative path.
+    ///
+    /// File values are intentionally distinct from text: `file("x")` and
+    /// resource literals satisfy `isfile()`, while an ordinary string that
+    /// happens to contain the same spelling does not.
+    File(Arc<str>),
     /// A canonical type path value.
     TypePath(TypePath),
     /// A type path carrying evaluated per-construction field overrides.
@@ -163,6 +170,12 @@ impl Value {
         Self::Text(value.into())
     }
 
+    /// Creates a first-class BYOND file/resource value.
+    #[must_use]
+    pub fn file(value: impl Into<Arc<str>>) -> Self {
+        Self::File(value.into())
+    }
+
     /// Returns the stored binary32 number when this value is numeric.
     #[must_use]
     pub const fn as_number(&self) -> Option<f32> {
@@ -170,6 +183,7 @@ impl Value {
             Self::Number(number) => Some(number.to_f32()),
             Self::Null
             | Self::Text(_)
+            | Self::File(_)
             | Self::TypePath(_)
             | Self::ModifiedTypePath(_)
             | Self::Datum(_)
@@ -191,6 +205,7 @@ impl Value {
                 left.to_f32().partial_cmp(&right.to_f32()) == Some(std::cmp::Ordering::Equal)
             }
             (Self::Text(left), Self::Text(right)) => left == right,
+            (Self::File(left), Self::File(right)) => left == right,
             (Self::TypePath(left), Self::TypePath(right)) => left == right,
             (Self::ModifiedTypePath(left), Self::ModifiedTypePath(right)) => left == right,
             (Self::Datum(left), Self::Datum(right)) => left == right,
@@ -212,6 +227,7 @@ impl fmt::Display for Value {
             Self::Null => formatter.write_str("null"),
             Self::Number(number) => write!(formatter, "{}", number.to_f32()),
             Self::Text(text) => write!(formatter, "{text:?}"),
+            Self::File(path) => write!(formatter, "file({path:?})"),
             Self::TypePath(path) => write!(formatter, "{path}"),
             Self::ModifiedTypePath(path) => write!(formatter, "{}{{...}}", path.base),
             Self::Datum(id) => write!(formatter, "datum({id:?})"),
@@ -797,6 +813,7 @@ struct Slot<T> {
 struct Arena<T> {
     slots: Vec<Slot<T>>,
     free: Vec<u32>,
+    live: usize,
 }
 
 impl<T> Default for Arena<T> {
@@ -804,12 +821,14 @@ impl<T> Default for Arena<T> {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
+            live: 0,
         }
     }
 }
 
 impl<T> Arena<T> {
     fn insert(&mut self, value: T) -> (u32, u32) {
+        self.live += 1;
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
             debug_assert!(slot.value.is_none());
@@ -844,6 +863,7 @@ impl<T> Arena<T> {
             return None;
         }
         let value = slot.value.take()?;
+        self.live -= 1;
         if let Some(next_generation) = slot.generation.checked_add(1) {
             slot.generation = next_generation;
             self.free.push(index);
@@ -856,6 +876,15 @@ impl<T> Arena<T> {
             let index = u32::try_from(index).ok()?;
             Some((index, slot.generation, slot.value.as_ref()?))
         })
+    }
+
+    fn live_generation(&self, index: u32) -> Option<u32> {
+        let slot = self.slots.get(index as usize)?;
+        slot.value.as_ref().map(|_| slot.generation)
+    }
+
+    const fn len(&self) -> usize {
+        self.live
     }
 }
 
@@ -871,6 +900,82 @@ impl ValueHeap {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Returns the number of currently live datum identities.
+    #[must_use]
+    pub fn live_datum_count(&self) -> usize {
+        self.datums.len()
+    }
+
+    /// Returns the number of currently live list identities.
+    #[must_use]
+    pub fn live_list_count(&self) -> usize {
+        self.lists.len()
+    }
+
+    /// Reclaims every list that is unreachable from live datum fields or the
+    /// additional runtime roots supplied by the caller.
+    ///
+    /// DM lists may recursively contain other lists, including through
+    /// associative keys and values. This performs a complete transitive mark
+    /// before invalidating unreachable handles, so aliases retained by a live
+    /// datum or runtime frame preserve their identity.
+    pub fn collect_unreachable_lists(&mut self, roots: &[Value]) -> usize {
+        fn enqueue(value: &Value, pending: &mut Vec<ListId>) {
+            match value {
+                Value::List(list) => pending.push(*list),
+                Value::ModifiedTypePath(path) => {
+                    for (_, value) in path.overrides() {
+                        enqueue(value, pending);
+                    }
+                }
+                Value::Null
+                | Value::Number(_)
+                | Value::Text(_)
+                | Value::File(_)
+                | Value::TypePath(_)
+                | Value::Datum(_) => {}
+            }
+        }
+
+        let mut pending = Vec::new();
+        for (_, datum) in self.datums() {
+            for (_, value) in datum.fields() {
+                enqueue(value, &mut pending);
+            }
+        }
+        for value in roots {
+            enqueue(value, &mut pending);
+        }
+
+        let mut marked = HashSet::new();
+        while let Some(list) = pending.pop() {
+            if !marked.insert(list) {
+                continue;
+            }
+            let Ok(values) = self.list(list) else {
+                continue;
+            };
+            for (_, value) in values.positions() {
+                enqueue(value, &mut pending);
+            }
+            for (_, value) in values.associations() {
+                enqueue(value, &mut pending);
+            }
+        }
+
+        let unreachable = self
+            .lists
+            .iter()
+            .map(|(index, generation, _)| ListId { index, generation })
+            .filter(|list| !marked.contains(list))
+            .collect::<Vec<_>>();
+        for list in &unreachable {
+            let removed = self.lists.remove(list.index, list.generation);
+            debug_assert!(removed.is_some());
+        }
+        unreachable.len()
     }
 
     /// Allocates an empty mutable list.
@@ -1045,6 +1150,26 @@ impl ValueHeap {
             .map(|(index, generation, datum)| (DatumId { index, generation }, datum))
     }
 
+    /// Returns the live datum identity occupying an arena slot, if any.
+    ///
+    /// BYOND reference text encodes the stable object slot. Resolving that
+    /// text needs the slot's current generation without scanning every live
+    /// datum in large worlds.
+    #[must_use]
+    pub fn datum_id_at_index(&self, index: u32) -> Option<DatumId> {
+        self.datums
+            .live_generation(index)
+            .map(|generation| DatumId { index, generation })
+    }
+
+    /// Returns the live list identity occupying an arena slot, if any.
+    #[must_use]
+    pub fn list_id_at_index(&self, index: u32) -> Option<ListId> {
+        self.lists
+            .live_generation(index)
+            .map(|generation| ListId { index, generation })
+    }
+
     /// Deallocates a datum and invalidates every alias to its identity.
     ///
     /// # Errors
@@ -1056,24 +1181,23 @@ impl ValueHeap {
             .ok_or(ValueError::StaleDatum(id))
     }
 
-    /// Evaluates DM truth while rejecting stale heap references.
+    /// Evaluates DM truth, treating deleted heap references as null.
     ///
     /// Null, numeric zero (including signed zero), and empty text are false.
-    /// Live datum/list references and type paths are true. NaN is currently
-    /// true because it is nonzero; this requires differential confirmation.
-    ///
-    /// # Errors
-    ///
-    /// Returns a stale-handle error when a heap reference is no longer live.
+    /// Live datum/list references and type paths are true. Deleted datum/list
+    /// references are false, matching BYOND's null-like hard-delete behavior.
+    /// NaN is currently true because it is nonzero; this requires differential
+    /// confirmation.
     pub fn truthy(&self, value: &Value) -> Result<bool, ValueError> {
         match value {
             Value::Null => Ok(false),
             Value::Number(number) => Ok(number.to_f32() != 0.0),
             Value::Text(text) => Ok(!text.is_empty()),
+            Value::File(_) => Ok(true),
             Value::TypePath(_) => Ok(true),
             Value::ModifiedTypePath(_) => Ok(true),
-            Value::Datum(id) => self.datum(*id).map(|_| true),
-            Value::List(id) => self.list(*id).map(|_| true),
+            Value::Datum(id) => Ok(self.datum(*id).is_ok()),
+            Value::List(id) => Ok(self.list(*id).is_ok()),
         }
     }
 }
@@ -1449,14 +1573,8 @@ mod tests {
 
         heap.destroy_list(list).unwrap();
         heap.destroy_datum(datum).unwrap();
-        assert_eq!(
-            heap.truthy(&Value::List(list)),
-            Err(ValueError::StaleList(list))
-        );
-        assert_eq!(
-            heap.truthy(&Value::Datum(datum)),
-            Err(ValueError::StaleDatum(datum))
-        );
+        assert!(!heap.truthy(&Value::List(list)).unwrap());
+        assert!(!heap.truthy(&Value::Datum(datum)).unwrap());
     }
 
     #[test]
@@ -1467,5 +1585,53 @@ mod tests {
         list.add(text("three"));
         let positions: Vec<usize> = list.positions().map(|(index, _)| index).collect();
         assert_eq!(positions, [1, 2, 3]);
+    }
+
+    #[test]
+    fn live_heap_counts_track_allocation_reuse_and_destruction() {
+        let mut heap = ValueHeap::new();
+        let list = heap.allocate_list();
+        let datum = heap.allocate_datum(TypePath::parse("/datum/example").unwrap());
+        assert_eq!(heap.live_list_count(), 1);
+        assert_eq!(heap.live_datum_count(), 1);
+        heap.destroy_list(list).unwrap();
+        heap.destroy_datum(datum).unwrap();
+        assert_eq!(heap.live_list_count(), 0);
+        assert_eq!(heap.live_datum_count(), 0);
+        let reused = heap.allocate_list();
+        assert_ne!(reused, list);
+        assert_eq!(heap.live_list_count(), 1);
+    }
+
+    #[test]
+    fn list_collection_preserves_recursive_roots_and_live_datum_fields() {
+        let mut heap = ValueHeap::new();
+        let frame_root = heap.allocate_list();
+        let nested = heap.allocate_list();
+        let datum_root = heap.allocate_list();
+        let garbage = heap.allocate_list();
+        heap.list_mut(frame_root)
+            .unwrap()
+            .set_key(text("nested"), Value::List(nested));
+        heap.list_mut(nested).unwrap().add(Value::List(frame_root));
+        let datum = heap.allocate_datum(TypePath::parse("/datum/test").unwrap());
+        heap.set_datum_field(datum, field("owned"), Value::List(datum_root))
+            .unwrap();
+
+        assert_eq!(
+            heap.collect_unreachable_lists(&[Value::List(frame_root)]),
+            1
+        );
+        assert!(heap.list(frame_root).is_ok());
+        assert!(heap.list(nested).is_ok());
+        assert!(heap.list(datum_root).is_ok());
+        assert!(matches!(
+            heap.list(garbage),
+            Err(ValueError::StaleList(id)) if id == garbage
+        ));
+
+        let reused = heap.allocate_list();
+        assert_eq!(reused.index(), garbage.index());
+        assert_ne!(reused.generation(), garbage.generation());
     }
 }

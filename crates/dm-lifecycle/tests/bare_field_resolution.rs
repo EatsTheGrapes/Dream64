@@ -104,7 +104,7 @@ fn lifecycle_procedures_read_and_write_inherited_fields_without_src() {
 fn parameters_and_locals_shadow_same_named_instance_fields() {
     let types = concat!(
         "/obj/parameter\n\tvar/value = 3\n\tvar/seen = 0\n",
-        "/obj/parameter/New(value = 8)\n\tseen = value\n\tvalue += 1\n",
+        "/obj/parameter/New(loc, value = 8)\n\tseen = value\n\tvalue += 1\n",
         "/obj/local\n\tvar/value = 3\n\tvar/seen = 0\n",
         "/obj/local/New()\n\tvar/value = 5\n\tvalue += 1\n\tseen = value\n",
         "/turf/boot\n/area/boot\n",
