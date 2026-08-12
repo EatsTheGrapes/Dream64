@@ -4117,7 +4117,7 @@ mod tests {
 
     #[test]
     fn dynamic_dummy_mob_exposes_null_client_during_initialize_add_verb() {
-        const PROCEDURES: &str = "/proc/add_verb(mob/target)\n\tif(!target.client)\n\t\treturn isnull(target.client)\n\treturn 0\n/mob/living/carbon/human/dummy/proc/Initialize()\n\treturn add_verb(src)\n/mob/living/carbon/human/dummy/New()\n\tglobal.add_verb_result = Initialize()\n/proc/run()\n\tnew /mob/living/carbon/human/dummy\n\treturn global.add_verb_result\n";
+        const PROCEDURES: &str = "/proc/add_verb(mob/target)\n\tif(!target.client)\n\t\treturn isnull(target.client)\n\treturn 0\n/mob/living/carbon/human/dummy/proc/Initialize()\n\treturn add_verb(src)\n/mob/living/carbon/human/dummy/New()\n\tglobal.add_verb_result = src.Initialize()\n/proc/run()\n\tnew /mob/living/carbon/human/dummy\n\treturn global.add_verb_result\n";
         let fixture = Fixture::new();
         fixture.write("world.dme", "#include \"types.dm\"\n");
         fixture.write(
