@@ -52,7 +52,7 @@ pub(super) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
         "json_decode" | "md5" => (0, 1),
         "json_encode" => (0, 2),
         "log" | "arctan" | "text2ascii" | "text2ascii_char" | "text2num" => (1, 2),
-        "image" => (0, 6),
+        "image" => (0, 7),
         "qdel" | "typecacheof" | "icon" => (0, 5),
         "view" => (0, 2),
         "oview" | "viewers" | "oviewers" | "hearers" | "ohearers" => (0, 2),
@@ -273,12 +273,7 @@ pub(super) fn execute_standard_builtin(
         "json_encode" => json_encode_builtin(arguments, state),
         "md5" => md5_builtin(arguments),
         "image" => image_builtin(arguments, state),
-        "icon" => resource_datum_builtin(
-            "/icon",
-            &["icon", "icon_state", "dir", "frame", "moving"],
-            arguments,
-            state,
-        ),
+        "icon" => icon_builtin(arguments, state),
         "sound" => resource_datum_builtin(
             "/sound",
             &[
@@ -457,6 +452,8 @@ pub(super) fn execute_external_call(
         }
         "hash_string" if arguments.len() == 2 => rust_g_hash_string(arguments, state),
         "hash_file" if arguments.len() == 2 => rust_g_hash_file(arguments, state),
+        "url_encode" if arguments.len() == 1 => rust_g_url_encode(arguments, state),
+        "url_decode" if arguments.len() == 1 => rust_g_url_decode(arguments, state),
         "json_is_valid" if arguments.len() == 1 => {
             let input = strict_text(&arguments[0], state, "json_is_valid input")?;
             Ok(Value::text(
@@ -1103,9 +1100,17 @@ fn icon_states_builtin(arguments: &[Value], state: &mut ExecutionState) -> Resul
         value => value,
     };
     let requested = strict_text(&resource, state, "icon_states resource")?;
-    let resolved =
-        relaxed_resolved_file_path(&[Value::text(requested)], state, "icon_states resource")?;
-    let metadata = read_dmi_metadata(&resolved)?;
+    let resolved = relaxed_resolved_file_path(
+        &[Value::text(requested.clone())],
+        state,
+        "icon_states resource",
+    )?;
+    let metadata = read_dmi_metadata(&resolved).map_err(|error| {
+        format!(
+            "icon_states failed for resource {requested:?} resolved to '{}': {error}",
+            resolved.display()
+        )
+    })?;
     let list = state.heap_mut().allocate_list();
     let values = state
         .heap_mut()
@@ -1291,7 +1296,7 @@ fn iconforge_load_gags_config(
             icon_path.display()
         )));
     }
-    state.load_iconforge_gags_config(config_path);
+    state.load_iconforge_gags_config(config_path, icon_path);
     Ok(Value::text("OK"))
 }
 
@@ -1340,8 +1345,16 @@ fn iconforge_gags(arguments: &[Value], state: &mut ExecutionState) -> Result<Val
         parent = resolved;
     }
     let output = resolved_file_path(&arguments[2..3], state, "iconforge output path")?;
-    fs::write(&output, [])
-        .map_err(|error| format!("IconForge error: Failed to create headless output: {error}"))?;
+    let source = state
+        .iconforge_gags_source(&config_path)
+        .ok_or_else(|| format!("IconForge error: Config {config_path} lost its source DMI"))?;
+    fs::copy(source, &output).map_err(|error| {
+        format!(
+            "IconForge error: Failed to create headless output '{}' from '{}': {error}",
+            output.display(),
+            source.display()
+        )
+    })?;
     Ok(Value::text("OK"))
 }
 
@@ -1702,9 +1715,9 @@ fn resource_datum_builtin(
     arguments: &[Value],
     state: &mut ExecutionState,
 ) -> Result<Value, String> {
-    let datum = state
-        .heap_mut()
-        .allocate_datum(TypePath::parse(path).map_err(|error| error.to_string())?);
+    let path = TypePath::parse(path).map_err(|error| error.to_string())?;
+    let datum = state.heap_mut().allocate_datum(path.clone());
+    state.seed_native_datum_defaults(datum, &path)?;
     for (field, value) in fields.iter().zip(arguments) {
         state
             .heap_mut()
@@ -1716,6 +1729,59 @@ fn resource_datum_builtin(
             .map_err(|error| error.to_string())?;
     }
     Ok(Value::Datum(datum))
+}
+
+/// Constructs BYOND's mutable `/icon` value.
+///
+/// An existing `/icon` is a copy-constructor input, not the backing resource
+/// stored in the new icon's `icon` field. OpenDream's `DreamObjectIcon`
+/// mirrors BYOND by copying its complete `DreamIcon` here. This is observable
+/// in tg-derived `getFlatIcon()`, which starts every render with
+/// `flat_template = icon(file); flat = icon(flat_template)` and then mutates
+/// `flat` independently.
+fn icon_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+    if let Some(Value::Datum(source)) = arguments.first()
+        && super::is_icon_datum(*source, &state.heap)
+    {
+        return super::clone_icon_datum(*source, &mut state.heap).map(Value::Datum);
+    }
+
+    let icon = resource_datum_builtin(
+        "/icon",
+        &["icon", "icon_state", "dir", "frame", "moving"],
+        arguments,
+        state,
+    )?;
+
+    // A BYOND /icon owns the dimensions of the selected DMI frame, not the
+    // engine's 32x32 fallback. Large canvas DMIs (Monkestation's holomap is
+    // 480x480) immediately observe this through Width()/Height(). Keep the
+    // constructor permissive for synthetic/missing headless resources, but
+    // seed exact metadata whenever the backing resource is available.
+    if let (Value::Datum(icon), Some(Value::File(_) | Value::Text(_))) = (&icon, arguments.first())
+        && let Ok(resolved) =
+            relaxed_resolved_file_path(&arguments[..1], state, "icon constructor resource")
+        && let Ok(metadata) = read_dmi_metadata(&resolved)
+    {
+        state
+            .heap_mut()
+            .set_datum_field(
+                *icon,
+                FieldName::parse("_dream64_width").expect("internal icon width is valid"),
+                Value::number(metadata.width as f32),
+            )
+            .map_err(|error| error.to_string())?;
+        state
+            .heap_mut()
+            .set_datum_field(
+                *icon,
+                FieldName::parse("_dream64_height").expect("internal icon height is valid"),
+                Value::number(metadata.height as f32),
+            )
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(icon)
 }
 
 fn fcopy_rsc(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
@@ -2194,6 +2260,61 @@ fn rust_g_hash_file(arguments: &[Value], state: &ExecutionState) -> Result<Value
     let bytes = fs::read(&path)
         .map_err(|error| format!("hash_file failed to read '{}': {error}", path.display()))?;
     Ok(Value::text(format!("{:x}", md5::compute(bytes))))
+}
+
+fn rust_g_url_encode(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
+    let text = strict_text(&arguments[0], state, "url_encode input")?;
+    let mut encoded = String::with_capacity(text.len());
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in text.bytes() {
+        match byte {
+            b' ' => encoded.push('+'),
+            b'*' | b'-' | b'.' | b'0'..=b'9' | b'A'..=b'Z' | b'_' | b'a'..=b'z' => {
+                encoded.push(char::from(byte));
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+                encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            }
+        }
+    }
+    Ok(Value::text(encoded))
+}
+
+fn rust_g_url_decode(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
+    let text = strict_text(&arguments[0], state, "url_decode input")?;
+    let source = text.as_bytes();
+    let mut decoded = Vec::with_capacity(source.len());
+    let mut index = 0;
+    while index < source.len() {
+        if source[index] == b'+' {
+            decoded.push(b' ');
+            index += 1;
+            continue;
+        }
+        if source[index] == b'%'
+            && index + 2 < source.len()
+            && let (Some(high), Some(low)) =
+                (hex_nibble(source[index + 1]), hex_nibble(source[index + 2]))
+        {
+            decoded.push((high << 4) | low);
+            index += 3;
+            continue;
+        }
+        decoded.push(source[index]);
+        index += 1;
+    }
+    Ok(Value::text(String::from_utf8_lossy(&decoded).into_owned()))
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn json_encode_builtin(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
@@ -2863,64 +2984,265 @@ fn typecacheof_builtin(arguments: &[Value], state: &mut ExecutionState) -> Resul
 
 fn image_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
     let image_path = TypePath::parse("/image").expect("\"/image\" is a canonical BYOND type path");
-    let image = state.heap_mut().allocate_datum(image_path);
-    let datum = state
-        .heap_mut()
-        .datum_mut(image)
-        .map_err(|error| error.to_string())?;
+    let image = state.heap_mut().allocate_datum(image_path.clone());
+    state.seed_native_datum_defaults(image, &image_path)?;
 
+    // DreamObjectImage.Initialize starts with a complete cloned appearance,
+    // not an icon resource whose value happens to be the source object. This
+    // distinction is observable in getFlatIcon(image(layer_image)): the new
+    // image must expose layer_image.icon, icon_state, offsets, and nested
+    // appearances while remaining independently mutable.
     for (name, value) in [
         ("alpha", Value::number(255.0)),
+        ("appearance", Value::Null),
         ("appearance_flags", Value::number(0.0)),
         ("blend_mode", Value::number(0.0)),
         ("color", Value::Null),
+        ("desc", Value::Null),
         ("dir", Value::number(2.0)),
+        ("filters", Value::Null),
+        ("glide_size", Value::number(0.0)),
         ("icon", Value::Null),
         ("icon_state", Value::Null),
+        ("invisibility", Value::number(0.0)),
         ("layer", Value::number(0.0)),
         ("loc", Value::Null),
+        ("maptext", Value::Null),
+        ("maptext_height", Value::number(32.0)),
+        ("maptext_width", Value::number(32.0)),
+        ("maptext_x", Value::number(0.0)),
+        ("maptext_y", Value::number(0.0)),
+        ("mouse_drag_pointer", Value::Null),
+        ("mouse_drop_pointer", Value::Null),
+        ("mouse_drop_zone", Value::number(0.0)),
+        ("mouse_opacity", Value::number(1.0)),
+        ("mouse_over_pointer", Value::Null),
         ("name", Value::Null),
+        ("opacity", Value::number(0.0)),
         ("overlays", Value::Null),
         ("plane", Value::number(0.0)),
+        ("pixel_w", Value::number(0.0)),
+        ("pixel_x", Value::number(0.0)),
+        ("pixel_y", Value::number(0.0)),
+        ("pixel_z", Value::number(0.0)),
+        ("render_source", Value::Null),
+        ("render_target", Value::Null),
         ("transform", Value::Null),
         ("underlays", Value::Null),
         ("vis_contents", Value::Null),
     ] {
-        let _ = datum.set_field(FieldName::parse(name).expect("image field name"), value);
+        state
+            .heap_mut()
+            .set_datum_field(
+                image,
+                FieldName::parse(name).expect("image field name"),
+                value,
+            )
+            .map_err(|error| error.to_string())?;
     }
 
-    if let Some(icon) = arguments.first() {
-        let _ = datum.set_field(
-            FieldName::parse("icon").expect("field name icon"),
-            icon.clone(),
-        );
+    for name in ["overlays", "underlays", "vis_contents", "filters"] {
+        let list = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .set_datum_field(
+                image,
+                FieldName::parse(name).expect("image list field name"),
+                Value::List(list),
+            )
+            .map_err(|error| error.to_string())?;
     }
-    if let Some(location) = arguments.get(1) {
-        let _ = datum.set_field(
-            FieldName::parse("loc").expect("field name loc"),
-            location.clone(),
-        );
+
+    if let Some(source) = arguments.first() {
+        copy_image_appearance(source, image, state)?;
     }
-    if let Some(icon_state) = arguments.get(2) {
-        let _ = datum.set_field(
-            FieldName::parse("icon_state").expect("field name icon_state"),
-            icon_state.clone(),
-        );
+
+    if let Some(Value::Datum(location)) = arguments.get(1) {
+        state
+            .heap_mut()
+            .set_datum_field(
+                image,
+                FieldName::parse("loc").expect("field name loc"),
+                Value::Datum(*location),
+            )
+            .map_err(|error| error.to_string())?;
     }
-    if let Some(layer) = arguments.get(3) {
-        let _ = datum.set_field(
-            FieldName::parse("layer").expect("field name layer"),
-            layer.clone(),
-        );
-    }
-    if let Some(direction) = arguments.get(4) {
-        let _ = datum.set_field(
-            FieldName::parse("dir").expect("field name dir"),
-            direction.clone(),
-        );
+    for (index, name) in ["icon_state", "layer", "dir", "pixel_x", "pixel_y"]
+        .into_iter()
+        .enumerate()
+    {
+        let Some(value) = arguments.get(index + 2) else {
+            break;
+        };
+        // Optional nulls preserve the copied appearance. In particular,
+        // image(existing_image) must not reset its icon state or layer.
+        if matches!(value, Value::Null) {
+            continue;
+        }
+        if name == "dir" && !value.as_number().is_some_and(|value| value > 0.0) {
+            continue;
+        }
+        state
+            .heap_mut()
+            .set_datum_field(
+                image,
+                FieldName::parse(name).expect("image override field name"),
+                value.clone(),
+            )
+            .map_err(|error| error.to_string())?;
     }
 
     Ok(Value::Datum(image))
+}
+
+const IMAGE_APPEARANCE_SCALARS: [&str; 31] = [
+    "alpha",
+    "appearance_flags",
+    "blend_mode",
+    "color",
+    "desc",
+    "dir",
+    "glide_size",
+    "icon",
+    "icon_state",
+    "invisibility",
+    "layer",
+    "maptext",
+    "maptext_height",
+    "maptext_width",
+    "maptext_x",
+    "maptext_y",
+    "mouse_drag_pointer",
+    "mouse_drop_pointer",
+    "mouse_drop_zone",
+    "mouse_opacity",
+    "mouse_over_pointer",
+    "name",
+    "opacity",
+    "plane",
+    "pixel_w",
+    "pixel_x",
+    "pixel_y",
+    "pixel_z",
+    "render_source",
+    "render_target",
+    "transform",
+];
+
+pub(super) fn is_appearance_source(path: &TypePath) -> bool {
+    let path = path.as_str();
+    path == "/image"
+        || path.starts_with("/image/")
+        || path == "/mutable_appearance"
+        || path.starts_with("/mutable_appearance/")
+        || ["/atom", "/area", "/turf", "/obj", "/mob"]
+            .into_iter()
+            .any(|root| path == root || path.starts_with(&format!("{root}/")))
+}
+
+fn copy_image_appearance(
+    source: &Value,
+    destination: DatumId,
+    state: &mut ExecutionState,
+) -> Result<(), String> {
+    if let Value::Datum(icon) = source
+        && state.heap().datum(*icon).is_ok_and(|datum| {
+            let path = datum.type_path().as_str();
+            path == "/icon" || path.starts_with("/icon/")
+        })
+    {
+        let resource = icon_backing_resource(source, state, 0)?;
+        state
+            .heap_mut()
+            .set_datum_field(
+                destination,
+                FieldName::parse("icon").expect("image icon field"),
+                resource,
+            )
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    let Value::Datum(source_datum) = source else {
+        // A resource value creates a fresh appearance with that resource as
+        // its icon. Invalid scalar values follow BYOND/OpenDream by producing
+        // the default appearance instead of storing the scalar as `icon`.
+        if matches!(source, Value::File(_)) {
+            state
+                .heap_mut()
+                .set_datum_field(
+                    destination,
+                    FieldName::parse("icon").expect("image icon field"),
+                    source.clone(),
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        return Ok(());
+    };
+    let mut source = *source_datum;
+    let source_path = state
+        .heap()
+        .datum(source)
+        .map_err(|error| error.to_string())?
+        .type_path()
+        .clone();
+    if !is_appearance_source(&source_path) {
+        return Ok(());
+    }
+
+    // Dream64 currently represents BYOND's first-class `appearance` value as
+    // an image-shaped datum. Honor it when present so image(atom) observes a
+    // previously assigned complete appearance rather than the atom's stale
+    // declaration fields.
+    if let Ok(Value::Datum(appearance)) = state.heap().datum_field(
+        source,
+        &FieldName::parse("appearance").expect("appearance field"),
+    ) && state
+        .heap()
+        .datum(*appearance)
+        .is_ok_and(|datum| is_appearance_source(datum.type_path()))
+    {
+        source = *appearance;
+    }
+
+    let mut copied = Vec::new();
+    for name in IMAGE_APPEARANCE_SCALARS {
+        let field = FieldName::parse(name).expect("appearance scalar field");
+        if let Ok(value) = super::datum_field_or_initial(state, source, &field) {
+            copied.push((field, value));
+        }
+    }
+    // MutableAppearance.GetCopy copies each visual collection into an
+    // independent container while retaining the contained appearance/atom
+    // identities. ValueHeap::copy_list has precisely those shallow-copy
+    // semantics.
+    for name in ["overlays", "underlays", "vis_contents", "filters"] {
+        let field = FieldName::parse(name).expect("appearance list field");
+        if let Ok(Value::List(list)) = super::datum_field_or_initial(state, source, &field) {
+            let copy = state
+                .heap_mut()
+                .copy_list(list)
+                .map_err(|error| error.to_string())?;
+            copied.push((field, Value::List(copy)));
+        }
+    }
+    for (field, value) in copied {
+        state
+            .heap_mut()
+            .set_datum_field(destination, field, value)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+pub(super) fn appearance_snapshot_builtin(
+    source: DatumId,
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    let appearance = state
+        .heap_mut()
+        .allocate_datum(TypePath::parse("/mutable_appearance").expect("built-in appearance path"));
+    copy_image_appearance(&Value::Datum(source), appearance, state)?;
+    Ok(Value::Datum(appearance))
 }
 
 fn strict_text(value: &Value, state: &ExecutionState, context: &str) -> Result<String, String> {
@@ -4335,7 +4657,7 @@ fn turn(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String
 }
 
 fn ckey(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
-    let key = strict_text(&arguments[0], state, "ckey")?;
+    let key = runtime_text(&arguments[0], state, "ckey")?;
     Ok(Value::text(
         key.chars()
             .filter(|character| character.is_alphanumeric())
@@ -4345,7 +4667,7 @@ fn ckey(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
 }
 
 fn ckey_ex(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
-    let key = strict_text(&arguments[0], state, "ckeyEx")?;
+    let key = runtime_text(&arguments[0], state, "ckeyEx")?;
     Ok(Value::text(
         key.chars()
             .filter(|character| {
@@ -4537,6 +4859,20 @@ pub(super) fn execute_list_compound_operator(
     right: &Value,
     state: &mut ExecutionState,
 ) -> Result<Value, String> {
+    if !matches!(right, Value::List(_)) {
+        let incremental = match operator {
+            CompoundAssignmentOperator::Add => {
+                state.mutate_vis_contents_scalar(left, right, true)?
+            }
+            CompoundAssignmentOperator::Subtract => {
+                state.mutate_vis_contents_scalar(left, right, false)?
+            }
+            _ => None,
+        };
+        if incremental.is_some() {
+            return Ok(Value::List(left));
+        }
+    }
     let visibility_before = state
         .is_visibility_list(left)
         .then(|| state.visibility_members(left))
@@ -4698,6 +5034,14 @@ fn list_add(
 ) -> Result<Value, String> {
     if arguments.is_empty() {
         return Err("list.Add requires at least one item".to_owned());
+    }
+    if let [value] = arguments
+        && !matches!(value, Value::List(_))
+        && state
+            .mutate_vis_contents_scalar(list, value, true)?
+            .is_some()
+    {
+        return Ok(Value::Null);
     }
     let values = flattened_list_arguments(arguments, state)?;
     let visibility_before = state
@@ -5067,10 +5411,17 @@ fn list_insert(
 }
 
 fn list_join(list: ListId, arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
-    if arguments.is_empty() || arguments.len() > 3 {
-        return Err("list.Join requires Glue and optional Start/End".to_owned());
+    if arguments.len() > 3 {
+        return Err("list.Join accepts optional Glue, Start, and End".to_owned());
     }
-    let glue = runtime_text(&arguments[0], state, "list.Join Glue")?;
+    // BYOND declares Glue as a string but permits it to be omitted. OpenDream
+    // observes the missing slot as null and TryGetValueAsString consequently
+    // supplies an empty separator. Monkestation relies on this exact shape in
+    // `generate_icon_key().Join()` while building human preview appearances.
+    let glue = arguments.first().map_or_else(
+        || Ok(String::new()),
+        |value| runtime_text(value, state, "list.Join Glue"),
+    )?;
     let source = state.heap.list(list).map_err(|error| error.to_string())?;
     let len = source.len();
     let limit = i64::try_from(len).unwrap_or(i64::MAX - 1).saturating_add(1);
@@ -5153,6 +5504,12 @@ fn list_remove(
             "list.Remove requires at least one item"
         }
         .to_owned());
+    }
+    if let [value] = arguments
+        && !matches!(value, Value::List(_))
+        && let Some(removed) = state.mutate_vis_contents_scalar(list, value, false)?
+    {
+        return Ok(Value::number(f32::from(removed)));
     }
     let visibility_before = state
         .is_visibility_list(list)
@@ -6579,6 +6936,11 @@ mod color_text_file_tests {
             Ok(Value::text("OK"))
         );
         assert!(root.join("tmp/gags/test.dmi").is_file());
+        assert_eq!(
+            fs::read(root.join("tmp/gags/test.dmi")).unwrap(),
+            b"headless fixture",
+            "headless GAGS output must remain a valid copy of the source DMI rather than an empty placeholder",
+        );
         let generated = execute_external_call(
             &library,
             &Value::text("iconforge_generate"),
@@ -6732,8 +7094,8 @@ mod color_text_file_tests {
         let description = concat!(
             "# BEGIN DMI\n",
             "version = 4.0\n",
-            "width = 32\n",
-            "height = 32\n",
+            "width = 480\n",
+            "height = 480\n",
             "state = \"cloak\"\n",
             "dirs = 1\n",
             "frames = 1\n",
@@ -6754,8 +7116,8 @@ mod color_text_file_tests {
             png.extend_from_slice(&[0; 4]);
         };
         let mut header = Vec::new();
-        header.extend_from_slice(&64u32.to_be_bytes());
-        header.extend_from_slice(&64u32.to_be_bytes());
+        header.extend_from_slice(&960u32.to_be_bytes());
+        header.extend_from_slice(&960u32.to_be_bytes());
         header.extend_from_slice(&[8, 6, 0, 0, 0]);
         push_chunk(b"IHDR", &header);
         let mut text = b"Description\0\0".to_vec();
@@ -6777,8 +7139,8 @@ mod color_text_file_tests {
             panic!("DMI metadata should be JSON text");
         };
         let decoded: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(decoded["width"], 32);
-        assert_eq!(decoded["height"], 32);
+        assert_eq!(decoded["width"], 480);
+        assert_eq!(decoded["height"], 480);
         assert_eq!(decoded["states"][0]["name"], "cloak");
         assert_eq!(decoded["states"][1]["name"], "admin");
         assert_eq!(decoded["states"][1]["dirs"], 4);
@@ -6798,6 +7160,27 @@ mod color_text_file_tests {
                 .map(|(_, value)| value.clone())
                 .collect::<Vec<_>>(),
             vec![Value::text("cloak"), Value::text("admin")],
+        );
+        let icon = execute_standard_builtin(
+            "icon",
+            &[Value::file("icons/test.dmi"), Value::text("cloak")],
+            &mut state,
+        )
+        .unwrap();
+        let Value::Datum(icon) = icon else {
+            panic!("icon() should return an icon datum");
+        };
+        assert_eq!(
+            state
+                .heap()
+                .datum_field(icon, &FieldName::parse("_dream64_width").unwrap()),
+            Ok(&Value::number(480.0)),
+        );
+        assert_eq!(
+            state
+                .heap()
+                .datum_field(icon, &FieldName::parse("_dream64_height").unwrap()),
+            Ok(&Value::number(480.0)),
         );
     }
 
@@ -7094,6 +7477,61 @@ mod color_text_file_tests {
             panic!("timer should return numeric text")
         };
         assert!(microseconds.parse::<f64>().is_ok());
+    }
+
+    #[test]
+    fn rust_g_url_codec_matches_ref_tags_and_form_encoding() {
+        let mut state = ExecutionState::new();
+        let library = Value::text("rust_g");
+        // Monkestation's REF() wraps this result in literal brackets when a
+        // datum opts into tag-backed references. Spaces use `+`; Unicode is
+        // encoded bytewise as UTF-8; URL-reserved characters are escaped.
+        let tag = "suicide: Résumé /?x=1+2&[]#%";
+        let encoded = "suicide%3A+R%C3%A9sum%C3%A9+%2F%3Fx%3D1%2B2%26%5B%5D%23%25";
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("url_encode"),
+                &[Value::text(tag)],
+                &mut state,
+            ),
+            Ok(Value::text(encoded)),
+        );
+        assert_eq!(
+            format!("[{encoded}]"),
+            "[suicide%3A+R%C3%A9sum%C3%A9+%2F%3Fx%3D1%2B2%26%5B%5D%23%25]",
+            "REF() keeps the encoded rust-g payload inside literal brackets",
+        );
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("url_decode"),
+                &[Value::text(encoded)],
+                &mut state,
+            ),
+            Ok(Value::text(tag)),
+        );
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("url_decode"),
+                &[Value::text("a+b=c%20d&e%23f=g;%2b=%zz")],
+                &mut state,
+            ),
+            Ok(Value::text("a b=c d&e#f=g;+=%zz")),
+            "decode treats plus as space and leaves malformed escapes intact",
+        );
+        assert!(
+            execute_external_call(
+                &library,
+                &Value::text("url_encode_extra"),
+                &[Value::text(tag)],
+                &mut state,
+            )
+            .unwrap_err()
+            .contains("installed host bridge"),
+            "nearby unknown exports must remain strict",
+        );
     }
 
     #[test]

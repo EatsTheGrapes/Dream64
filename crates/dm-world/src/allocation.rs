@@ -435,13 +435,14 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
             if let Some(datum) = self.areas.get(&key).copied() {
                 datum
             } else {
-                let datum = self.allocate_initializer(snapshot.coordinate, initializer)?;
+                let datum =
+                    self.allocate_initializer(snapshot.coordinate, initializer, category)?;
                 self.areas.insert(key, datum);
                 self.stats.unique_areas += 1;
                 datum
             }
         } else {
-            self.allocate_initializer(snapshot.coordinate, initializer)?
+            self.allocate_initializer(snapshot.coordinate, initializer, category)?
         };
         snapshot.source_order.push(datum);
         match category {
@@ -463,11 +464,16 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
         &mut self,
         coordinate: WorldCoordinate,
         initializer: &PlannedInitializer,
+        category: AtomCategory,
     ) -> Result<DatumId, WorldAllocationError> {
         let type_path = TypePath::parse(&initializer.path)?;
-        let datum = self
-            .image
-            .allocate_datum_in_state(&type_path, &mut self.state)?;
+        let datum = if matches!(category, AtomCategory::Area | AtomCategory::Turf) {
+            self.image
+                .allocate_compact_map_datum_in_state(&type_path, &mut self.state)?
+        } else {
+            self.image
+                .allocate_datum_in_state(&type_path, &mut self.state)?
+        };
         // BYOND exposes map placement coordinates as built-in atom fields.
         // They are not map-variable overrides, so materialize them before
         // applying source-defined overrides and before lifecycle code runs.

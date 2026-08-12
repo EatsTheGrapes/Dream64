@@ -131,6 +131,13 @@ pub enum Instruction {
         name: String,
         /// Number of already-evaluated arguments.
         argument_count: u16,
+        /// Name of each source argument, or `None` for a positional argument.
+        ///
+        /// Most native procedures consume their arguments positionally. Image
+        /// construction is the important exception during startup: BYOND
+        /// reorders named `icon_state`, `layer`, and direction arguments before
+        /// `/image/New` applies them to the copied appearance.
+        argument_names: Vec<Option<String>>,
     },
     /// Calls an engine-native method on the current `src` datum.
     NativeSrcMethod {
@@ -2748,6 +2755,7 @@ fn compile_assignment_statement(
                     {
                         *type_path = Some(Box::new(Expression::TypePath(inferred.clone())));
                     }
+                    infer_contextual_locate(&mut value, locals.global_type(&name));
                     emit_expression(&value, locals, instructions, procedures)?;
                     if operator != "=" {
                         instructions.push(compound_instruction(operator)?);
@@ -2781,6 +2789,7 @@ fn compile_assignment_statement(
             {
                 *type_path = Some(Box::new(Expression::TypePath(inferred.clone())));
             }
+            infer_contextual_locate(&mut value, locals.local_type(&name));
             emit_expression(&value, locals, instructions, procedures)?;
             if operator != "=" {
                 instructions.push(compound_instruction(operator)?);
@@ -5318,10 +5327,11 @@ fn compile_local(
         let mut value = ExpressionParser::new(&tokens[assignment + 1..]).parse()?;
         if let Expression::New { type_path, .. } = &mut value
             && type_path.is_none()
-            && let Some(inferred) = declared_type
+            && let Some(inferred) = declared_type.as_ref()
         {
-            *type_path = Some(Box::new(Expression::TypePath(inferred)));
+            *type_path = Some(Box::new(Expression::TypePath(inferred.clone())));
         }
+        infer_contextual_locate(&mut value, declared_type.as_ref());
         emit_expression(&value, locals, instructions, procedures)?;
     } else if suffix < declaration_end {
         let mut dimensions = 0u8;
@@ -5365,6 +5375,19 @@ fn compile_local(
         instructions[jump] = Instruction::LoadStaticLocalOrJump { slot, target };
     }
     Ok(name)
+}
+
+fn infer_contextual_locate(expression: &mut Expression, declared_type: Option<&TypePath>) {
+    let Some(declared_type) = declared_type else {
+        return;
+    };
+    let arguments = match expression {
+        Expression::Locate { arguments } | Expression::LocateIn { arguments, .. } => arguments,
+        _ => return,
+    };
+    if arguments.is_empty() {
+        arguments.push(Expression::TypePath(declared_type.clone()));
+    }
 }
 
 fn declared_local_type(tokens: &[SpannedToken], name: &str) -> Option<TypePath> {
@@ -7842,6 +7865,23 @@ fn emit_expression(
         Expression::StandardBuiltin { name, arguments } => {
             let argument_count = u16::try_from(arguments.len())
                 .map_err(|_| compile_error("native builtin has more than 65535 arguments"))?;
+            // `newlist(/type, ...)` is syntax sugar for constructing each
+            // argument with an ordinary zero-argument `new`, then collecting
+            // the resulting objects into a list.  Lower it to AllocateDatum
+            // so inherited defaults, instance initializers, New(), scheduler
+            // suspension, and atom registration are identical to explicit
+            // construction.  A project-defined /proc/newlist still wins.
+            if name == "newlist" && !procedures.contains_key(name) {
+                for argument in arguments {
+                    if matches!(argument, Expression::NamedArgument { .. }) {
+                        return Err(compile_error("newlist does not take named arguments"));
+                    }
+                    emit_expression(argument, locals, instructions, procedures)?;
+                    instructions.push(Instruction::AllocateDatum { argument_count: 0 });
+                }
+                instructions.push(Instruction::MakeList(argument_count));
+                return Ok(());
+            }
             for argument in arguments {
                 if let Expression::ArgList(value) = argument {
                     // A single expanded list is already the native ABI used
@@ -7871,19 +7911,40 @@ fn emit_expression(
                 instructions.push(Instruction::StandardBuiltin {
                     name: name.clone(),
                     argument_count,
+                    argument_names: arguments
+                        .iter()
+                        .map(|argument| match argument {
+                            Expression::NamedArgument { name, .. } => Some(name.clone()),
+                            _ => None,
+                        })
+                        .collect(),
                 });
             }
         }
         Expression::NativeSrcMethod { name, arguments } => {
-            let argument_count = u16::try_from(arguments.len())
-                .map_err(|_| compile_error("native method has more than 65535 arguments"))?;
-            for argument in arguments {
-                emit_expression(argument, locals, instructions, procedures)?;
+            // Several BYOND engine method names are also valid project proc
+            // names. Monkestation's legacy spritesheet datum declares
+            // `/datum/asset/spritesheet/proc/Insert`; that project method must
+            // win over `/icon.Insert`, just like project global builtins do.
+            if let Some(procedure) = procedures.get(name).copied() {
+                let argument_count =
+                    emit_call_arguments(arguments, locals, instructions, procedures)?;
+                instructions.push(Instruction::Call {
+                    procedure,
+                    argument_count,
+                    argument_names: vec![None; arguments.len()],
+                });
+            } else {
+                let argument_count = u16::try_from(arguments.len())
+                    .map_err(|_| compile_error("native method has more than 65535 arguments"))?;
+                for argument in arguments {
+                    emit_expression(argument, locals, instructions, procedures)?;
+                }
+                instructions.push(Instruction::NativeSrcMethod {
+                    name: name.clone(),
+                    argument_count,
+                });
             }
-            instructions.push(Instruction::NativeSrcMethod {
-                name: name.clone(),
-                argument_count,
-            });
         }
         Expression::ExternalCall {
             library,
@@ -8784,7 +8845,7 @@ pub struct ExecutionState {
     external_timers: BTreeMap<String, Instant>,
     iconforge_jobs: BTreeMap<String, (bool, String)>,
     iconforge_next_job: u64,
-    iconforge_gags_configs: BTreeSet<String>,
+    iconforge_gags_configs: BTreeMap<String, PathBuf>,
     sql_jobs: BTreeMap<String, (bool, String)>,
     sql_next_job: u64,
     procedure_static_locals: BTreeMap<(String, u16), Value>,
@@ -8850,7 +8911,7 @@ impl ExecutionState {
             external_timers: BTreeMap::new(),
             iconforge_jobs: BTreeMap::new(),
             iconforge_next_job: 0,
-            iconforge_gags_configs: BTreeSet::new(),
+            iconforge_gags_configs: BTreeMap::new(),
             sql_jobs: BTreeMap::new(),
             sql_next_job: 0,
             procedure_static_locals: BTreeMap::new(),
@@ -8862,6 +8923,36 @@ impl ExecutionState {
         };
         state.rebuild_world_geometry();
         state
+    }
+
+    /// Allocates one inert map datum with sparse inherited scalar defaults.
+    ///
+    /// Effective scalar values remain available through the immutable initial
+    /// value catalog, while runtime list/datum initializers still execute and
+    /// receive fresh per-instance identities. Structural map fields such as
+    /// coordinates and `loc` are supplied by the world allocator afterward.
+    /// The datum is not inserted into `world.contents`; the bulk map handoff
+    /// installs authoritative spatial membership once allocation completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a runtime initialization error when a per-instance initializer
+    /// cannot be evaluated or stored.
+    pub fn allocate_compact_map_datum(&mut self, type_path: TypePath) -> Result<DatumId, String> {
+        let datum = self.heap.allocate_datum(type_path.clone());
+        initialize_existing_datum(self, datum, type_path, true, true)?;
+        Ok(datum)
+    }
+
+    /// Replaces the sparse-default identity set transferred with a runtime heap.
+    pub fn set_compact_default_datums(&mut self, datums: HashSet<DatumId>) {
+        self.compact_default_datums = datums;
+    }
+
+    /// Removes and returns the sparse-default identities for a host heap handoff.
+    #[must_use]
+    pub fn take_compact_default_datums(&mut self) -> HashSet<DatumId> {
+        std::mem::take(&mut self.compact_default_datums)
     }
 
     fn rebuild_world_geometry(&mut self) {
@@ -9013,6 +9104,74 @@ impl ExecutionState {
                 _ => None,
             })
             .collect())
+    }
+
+    /// Applies one scalar `vis_contents` addition or removal without
+    /// normalizing and diffing the complete relationship list.
+    ///
+    /// Returns `None` for ordinary lists and for `vis_locs`, whose direct
+    /// mutation keeps using the general synchronization path. A handled
+    /// `vis_contents` mutation returns whether its membership changed.
+    pub(crate) fn mutate_vis_contents_scalar(
+        &mut self,
+        list: ListId,
+        value: &Value,
+        add: bool,
+    ) -> Result<Option<bool>, String> {
+        let Some((owner, true)) = self.visibility_owner(list) else {
+            return Ok(None);
+        };
+
+        if add {
+            if matches!(value, Value::Null) {
+                return Ok(Some(false));
+            }
+            if !self.visibility_list_accepts(value) {
+                return Err(format!(
+                    "visibility lists can only contain atoms, received {value}"
+                ));
+            }
+        }
+
+        let Value::Datum(member) = value else {
+            return Ok(Some(false));
+        };
+        let member_value = Value::Datum(*member);
+        let contains = self
+            .heap
+            .list(list)
+            .map_err(|error| error.to_string())?
+            .contains(&member_value);
+        if contains == add {
+            return Ok(Some(false));
+        }
+
+        if add {
+            self.heap
+                .list_mut(list)
+                .map_err(|error| error.to_string())?
+                .add(member_value);
+        } else {
+            self.heap
+                .list_mut(list)
+                .map_err(|error| error.to_string())?
+                .remove_last(&member_value);
+        }
+
+        let reciprocal = self.ensure_visibility_list(*member, false)?;
+        let owner_value = Value::Datum(owner);
+        let reciprocal = self
+            .heap
+            .list_mut(reciprocal)
+            .map_err(|error| error.to_string())?;
+        if add {
+            if !reciprocal.contains(&owner_value) {
+                reciprocal.add(owner_value);
+            }
+        } else {
+            while reciprocal.remove_last(&owner_value).is_some() {}
+        }
+        Ok(Some(true))
     }
 
     fn ensure_visibility_list(
@@ -9350,12 +9509,16 @@ impl ExecutionState {
         self.iconforge_jobs.remove(id).map(|(_, result)| result)
     }
 
-    pub(crate) fn load_iconforge_gags_config(&mut self, path: String) {
-        self.iconforge_gags_configs.insert(path);
+    pub(crate) fn load_iconforge_gags_config(&mut self, path: String, source: PathBuf) {
+        self.iconforge_gags_configs.insert(path, source);
     }
 
     pub(crate) fn has_iconforge_gags_config(&self, path: &str) -> bool {
-        self.iconforge_gags_configs.contains(path)
+        self.iconforge_gags_configs.contains_key(path)
+    }
+
+    pub(crate) fn iconforge_gags_source(&self, path: &str) -> Option<&std::path::Path> {
+        self.iconforge_gags_configs.get(path).map(PathBuf::as_path)
     }
 
     pub(crate) fn clear_iconforge(&mut self) {
@@ -9537,6 +9700,26 @@ impl ExecutionState {
             .and_then(|fields| fields.get(field))
     }
 
+    /// Seeds effective project and engine defaults on a datum allocated by a
+    /// native constructor (`image()`, `icon()`, `sound()`, and peers). Native
+    /// constructors historically allocated raw heap datums, bypassing the
+    /// inherited `/datum` fields that ordinary `new` installs.
+    pub(crate) fn seed_native_datum_defaults(
+        &mut self,
+        datum: DatumId,
+        path: &TypePath,
+    ) -> Result<(), String> {
+        let defaults = self.initial_values.get(path).cloned().unwrap_or_default();
+        for (field, value) in defaults {
+            if self.heap.datum_field(datum, &field).is_err() {
+                self.heap
+                    .set_datum_field(datum, field, value)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the project root used for relative filesystem paths.
     #[must_use]
     pub fn project_root(&self) -> Option<&std::path::Path> {
@@ -9577,24 +9760,22 @@ impl ExecutionState {
         }
 
         let mut roots = Vec::new();
-        roots.extend(self.globals.values().cloned());
-        roots.extend(self.initial_globals.values().cloned());
-        roots.extend(
-            self.initial_values
-                .values()
-                .flat_map(BTreeMap::values)
-                .cloned(),
+        extend_list_roots(&mut roots, self.globals.values());
+        extend_list_roots(&mut roots, self.initial_globals.values());
+        extend_list_roots(
+            &mut roots,
+            self.initial_values.values().flat_map(BTreeMap::values),
         );
-        roots.extend(self.procedure_static_locals.values().cloned());
-        roots.extend(
+        extend_list_roots(&mut roots, self.procedure_static_locals.values());
+        extend_list_roots(
+            &mut roots,
             self.savefiles
                 .values()
-                .flat_map(|savefile| savefile.entries.values())
-                .cloned(),
+                .flat_map(|savefile| savefile.entries.values()),
         );
-        roots.extend(self.environment_overrides.values().flatten().cloned());
-        roots.extend(self.last_animation_target.iter().cloned());
-        roots.extend(self.host_value_roots.iter().cloned());
+        extend_list_roots(&mut roots, self.environment_overrides.values().flatten());
+        extend_list_roots(&mut roots, self.last_animation_target.iter());
+        extend_list_roots(&mut roots, &self.host_value_roots);
         roots.extend(self.global_vars_proxy.map(Value::List));
         roots.extend(
             self.datum_vars_by_datum
@@ -9604,13 +9785,13 @@ impl ExecutionState {
         );
 
         let mut add_frame_roots = |frame: &CallFrame| {
-            roots.extend(frame.locals.iter().cloned());
-            roots.extend(frame.stack.iter().cloned());
-            roots.push(frame.result.clone());
-            roots.push(frame.src.clone());
-            roots.push(frame.usr.clone());
-            roots.extend(frame.arguments.iter().cloned());
-            roots.extend(frame.caller_result_override.iter().cloned());
+            extend_list_roots(&mut roots, &frame.locals);
+            extend_list_roots(&mut roots, &frame.stack);
+            extend_list_roots(&mut roots, std::iter::once(&frame.result));
+            extend_list_roots(&mut roots, std::iter::once(&frame.src));
+            extend_list_roots(&mut roots, std::iter::once(&frame.usr));
+            extend_list_roots(&mut roots, &frame.arguments);
+            extend_list_roots(&mut roots, frame.caller_result_override.iter());
         };
         for frame in active_frames {
             add_frame_roots(frame);
@@ -9659,6 +9840,31 @@ impl ExecutionState {
                 self.next_list_collection
             );
         }
+    }
+}
+
+fn extend_list_roots<'a>(roots: &mut Vec<Value>, values: impl IntoIterator<Item = &'a Value>) {
+    roots.extend(
+        values
+            .into_iter()
+            .filter(|value| value_can_reach_list(value))
+            .cloned(),
+    );
+}
+
+fn value_can_reach_list(value: &Value) -> bool {
+    match value {
+        Value::List(_) => true,
+        Value::ModifiedTypePath(path) => path
+            .overrides()
+            .iter()
+            .any(|(_, value)| value_can_reach_list(value)),
+        Value::Null
+        | Value::Number(_)
+        | Value::Text(_)
+        | Value::File(_)
+        | Value::TypePath(_)
+        | Value::Datum(_) => false,
     }
 }
 
@@ -10679,17 +10885,15 @@ fn run_frames(
                 let value = if let Value::Datum(regex) = arguments[1]
                     && is_regex_datum(regex, state)
                 {
-                    Value::text(
-                        replace_text_regex(
-                            module,
-                            state,
-                            regex,
-                            &arguments,
-                            character_indices,
-                            &frame_context(&frames[frame_index]),
-                        )
-                        .map_err(|message| execution_error(module, &frames, message))?,
+                    replace_text_regex(
+                        module,
+                        state,
+                        regex,
+                        &arguments,
+                        character_indices,
+                        &frame_context(&frames[frame_index]),
                     )
+                    .map_err(|message| execution_error(module, &frames, message))?
                 } else {
                     replace_text_builtin(&arguments, exact, character_indices, &state.heap)
                         .map_err(|message| execution_error(module, &frames, message))?
@@ -10719,6 +10923,7 @@ fn run_frames(
             Instruction::StandardBuiltin {
                 name,
                 argument_count,
+                argument_names,
             } => {
                 let count = usize::from(argument_count);
                 if count > frames[frame_index].stack.len() {
@@ -10727,6 +10932,12 @@ fn run_frames(
                 let arguments = {
                     let stack = &mut frames[frame_index].stack;
                     stack.split_off(stack.len() - count)
+                };
+                let arguments = if name == "image" {
+                    order_image_arguments(&arguments, &argument_names)
+                        .map_err(|message| execution_error(module, &frames, message))?
+                } else {
+                    arguments
                 };
                 let value = if name == "del" {
                     execute_del(
@@ -10760,6 +10971,34 @@ fn run_frames(
                         format!("native method {name} requires a datum src"),
                     ));
                 };
+                // Parser-level recognition of engine method names cannot by
+                // itself decide whether the current project type declares a
+                // same-named proc. Resolve that virtual project method first;
+                // only fall back to the native icon/matrix implementation
+                // when the runtime type has no such proc.
+                if let Ok((target, context)) = dynamic_call_target(
+                    module,
+                    state,
+                    &Value::Datum(src),
+                    &Value::text(name.as_str()),
+                    &frame_context(&frames[frame_index]),
+                    false,
+                ) {
+                    if frames.len() >= limits.max_call_depth {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("maximum call depth {} exceeded", limits.max_call_depth),
+                        ));
+                    }
+                    let target_program = module
+                        .resolve_procedure(target)
+                        .map_err(|message| execution_error(module, &frames, message))?;
+                    let mut target_frame = make_frame(target, target_program, &arguments, &context);
+                    mark_boot_trace_frame(&mut target_frame, module, state, executed_steps);
+                    frames.push(target_frame);
+                    continue;
+                }
                 let value = match name.as_str() {
                     "MapColors" if is_icon_datum(src, &state.heap) => {
                         apply_icon_map_colors(src, &arguments, &mut state.heap)
@@ -11922,6 +12161,26 @@ fn run_frames(
                                 .type_parent(&runtime_type)
                                 .cloned()
                                 .map_or(Value::Null, Value::TypePath)
+                        } else if name.as_str() == "appearance"
+                            && builtins::is_appearance_source(&runtime_type)
+                            && matches!(
+                                datum_field_or_initial(state, datum, &name),
+                                Ok(Value::Null) | Err(ValueError::MissingField(_))
+                            )
+                        {
+                            builtins::appearance_snapshot_builtin(datum, state)
+                                .map_err(|message| execution_error(module, &frames, message))?
+                        } else if name.as_str() == "transform"
+                            && builtins::is_appearance_source(&runtime_type)
+                            && matches!(
+                                datum_field_or_initial(state, datum, &name),
+                                Ok(Value::Null) | Err(ValueError::MissingField(_))
+                            )
+                        {
+                            Value::Datum(
+                                allocate_matrix([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], &mut state.heap)
+                                    .map_err(|message| execution_error(module, &frames, message))?,
+                            )
                         } else if let Some(value) = lazy_atom_list_field(state, datum, &name)
                             .map_err(|message| execution_error(module, &frames, message))?
                         {
@@ -11970,7 +12229,7 @@ fn run_frames(
                                 },
                             }
                         } else {
-                            match datum_field_or_initial(state, datum, &name) {
+                            match datum_field_or_shared(state, datum, &name) {
                                 Ok(value) => value,
                                 Err(error) => {
                                     return Err(execution_error(
@@ -12085,7 +12344,7 @@ fn run_frames(
                 };
                 match receiver {
                     Value::Datum(datum) => {
-                        assign_datum_field(state, datum, name.clone(), value.clone())
+                        assign_datum_or_shared_field(state, datum, name.clone(), value.clone())
                             .map_err(|message| execution_error(module, &frames, message))?;
                     }
                     Value::List(list) if name.as_str() == "len" => {
@@ -13280,17 +13539,15 @@ fn run_frames(
                         replacement_arguments
                             .push(arguments.get(1).cloned().unwrap_or(Value::Null));
                         replacement_arguments.extend(arguments.iter().skip(2).cloned());
-                        Value::text(
-                            replace_text_regex(
-                                module,
-                                state,
-                                *datum,
-                                &replacement_arguments,
-                                false,
-                                &frame_context(&frames[frame_index]),
-                            )
-                            .map_err(|message| execution_error(module, &frames, message))?,
+                        replace_text_regex(
+                            module,
+                            state,
+                            *datum,
+                            &replacement_arguments,
+                            false,
+                            &frame_context(&frames[frame_index]),
                         )
+                        .map_err(|message| execution_error(module, &frames, message))?
                     } else {
                         execute_regex_method(*datum, method, &arguments, state)
                             .map_err(|message| execution_error(module, &frames, message))?
@@ -13490,19 +13747,51 @@ fn boot_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("DREAM64_BOOT_TRACE").is_some())
 }
 
+fn boot_dashboard_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DREAM64_BOOT_DASHBOARD").is_some())
+}
+
 fn mark_boot_trace_frame(
     frame: &mut CallFrame,
     module: &Module,
     state: &ExecutionState,
     executed_steps: u64,
 ) {
-    if !boot_trace_enabled() {
+    let trace_enabled = boot_trace_enabled();
+    if !trace_enabled && !boot_dashboard_enabled() {
         return;
     }
     let path = module
         .paths
         .get(frame.procedure.index())
         .map_or("<missing>", String::as_str);
+    // Monkestation's title subsystem owns the authoritative startup display:
+    // Master reports subsystem begin/end here, and Mapping/Assets use the same
+    // API for their indented child rows. Mirror those semantic events into the
+    // headless trace so the visible console can render the real checklist
+    // instead of guessing progress from procedure materialization.
+    if path.contains("/datum/controller/subsystem/title/proc/add_init_text@") {
+        eprintln!(
+            "boot-vm: init-display|event=add|category={}|name={}|stage={}|seconds={}",
+            boot_trace_display_value(frame.arguments.first()),
+            boot_trace_display_value(frame.arguments.get(1)),
+            boot_trace_display_value(frame.arguments.get(2)),
+            boot_trace_display_value(frame.arguments.get(3)),
+        );
+    } else if path.contains("/datum/controller/subsystem/title/proc/remove_init_text@") {
+        eprintln!(
+            "boot-vm: init-display|event=remove|category={}",
+            boot_trace_display_value(frame.arguments.first()),
+        );
+    }
+    // The polished boot dashboard needs only the authoritative title
+    // subsystem events above. Keep the much heavier initializer/heartbeat
+    // instrumentation behind DREAM64_BOOT_TRACE so visible production boots
+    // can show real progress without paying full-trace overhead.
+    if !trace_enabled {
+        return;
+    }
     let traced = path.contains("/datum/controller/global_vars/proc/InitGlobal")
         || [
             "/proc/make_datum_reference_lists",
@@ -13528,6 +13817,17 @@ fn mark_boot_trace_frame(
         module.materialized_deferred_procedure_count(),
     ));
     frame.boot_trace_step = executed_steps;
+}
+
+fn boot_trace_display_value(value: Option<&Value>) -> String {
+    let raw = match value {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::Text(text) | Value::File(text)) => text.to_string(),
+        Some(Value::TypePath(path)) => path.to_string(),
+        Some(Value::Number(number)) => number.to_f32().to_string(),
+        Some(value) => value.to_string(),
+    };
+    raw.replace(['\r', '\n', '|'], " ")
 }
 
 fn make_frame_named(
@@ -14479,6 +14779,14 @@ fn is_atom_type_path(path: &TypePath) -> bool {
         })
 }
 
+fn is_appearance_type_path(path: &TypePath) -> bool {
+    let path = path.as_str();
+    path == "/image"
+        || path.starts_with("/image/")
+        || path == "/mutable_appearance"
+        || path.starts_with("/mutable_appearance/")
+}
+
 fn is_turf_type_path(path: &TypePath) -> bool {
     path.as_str() == "/turf" || path.as_str().starts_with("/turf/")
 }
@@ -14508,7 +14816,9 @@ fn lazy_atom_list_field(
         .datum(datum)
         .map_err(|error| error.to_string())?
         .type_path();
-    if !is_atom_type_path(runtime_type) {
+    let appearance_list = is_appearance_type_path(runtime_type)
+        && matches!(field.as_str(), "filters" | "overlays" | "underlays");
+    if !is_atom_type_path(runtime_type) && !appearance_list {
         return Ok(None);
     }
     let list = match kind {
@@ -14921,8 +15231,11 @@ fn replace_text_regex(
     arguments: &[Value],
     character_indices: bool,
     caller_context: &ExecutionContext,
-) -> Result<String, String> {
-    let source = builtin_text(&arguments[0], &state.heap, "replacetext text")?;
+) -> Result<Value, String> {
+    let Value::Text(source) = &arguments[0] else {
+        return Ok(Value::Null);
+    };
+    let source = source.to_string();
     let field = |name| FieldName::parse(name).expect("regex field is valid");
     let pattern = state
         .heap()
@@ -15001,7 +15314,7 @@ fn replace_text_regex(
             break;
         }
     }
-    Ok(format!("{prefix}{target}{suffix}"))
+    Ok(Value::text(format!("{prefix}{target}{suffix}")))
 }
 
 fn copy_text_builtin(
@@ -15827,10 +16140,8 @@ fn typesof_builtin(
 }
 
 /// Evaluates the small family of BYOND value/type classifiers that need heap
-/// access for datum runtime paths. Type paths deliberately participate in
-/// `istype`: lifecycle helpers commonly validate deferred type values before
-/// constructing them.  `isloc` is variadic, unlike the other simple
-/// classifiers: all its supplied values must be atoms.
+/// access for datum runtime paths. `isloc` is variadic, unlike the other
+/// simple classifiers: all its supplied values must be atoms.
 fn type_predicate_builtin(
     kind: TypePredicateKind,
     arguments: &[Value],
@@ -15922,7 +16233,6 @@ fn type_predicate_builtin(
                     || (target.as_str() == "/alist" && state.is_associative_list(*list)));
             }
             let candidate = match value {
-                Value::TypePath(path) => path,
                 Value::Datum(datum) => heap
                     .datum(*datum)
                     .map_err(|error| error.to_string())?
@@ -16634,6 +16944,45 @@ fn datum_field_or_initial(
     }
 }
 
+/// Reads an ordinary datum member, falling back to inherited type-static
+/// storage only when no instance member of that name exists. BYOND permits
+/// shared/static variables to be accessed through dynamically typed datum
+/// expressions, so compile-time binding is an optimization rather than a
+/// correctness requirement.
+fn datum_field_or_shared(
+    state: &ExecutionState,
+    datum: DatumId,
+    field: &FieldName,
+) -> Result<Value, ValueError> {
+    match datum_field_or_initial(state, datum, field) {
+        Ok(value) => Ok(value),
+        Err(error @ ValueError::MissingField(_)) => {
+            let Some(storage) = datum_shared_storage(state, datum, field) else {
+                return Err(error);
+            };
+            Ok(state.global(&storage).cloned().unwrap_or(Value::Null))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn assign_datum_or_shared_field(
+    state: &mut ExecutionState,
+    datum: DatumId,
+    field: FieldName,
+    value: Value,
+) -> Result<(), String> {
+    if matches!(
+        datum_field_or_initial(state, datum, &field),
+        Err(ValueError::MissingField(_))
+    ) && let Some(storage) = datum_shared_storage(state, datum, &field)
+    {
+        state.set_global(storage, value);
+        return Ok(());
+    }
+    assign_datum_field(state, datum, field, value)
+}
+
 fn assign_datum_field(
     state: &mut ExecutionState,
     datum: DatumId,
@@ -17072,6 +17421,53 @@ fn runtime_argument_count(stack: &mut Vec<Value>, encoded: u16) -> Result<usize,
     Ok(count as usize)
 }
 
+/// Places `image()` arguments into `/image/New(icon, loc, icon_state, layer,
+/// dir, pixel_x, pixel_y)` slots.
+///
+/// BYOND has one constructor-specific positional rule: when the second
+/// argument is text it is `icon_state`, not `loc`, and every following
+/// positional argument shifts over one slot. OpenDream performs the same
+/// reordering for keyed calls before `DreamObjectImage.Initialize` observes
+/// them. Keeping it at the VM call boundary means the native image constructor
+/// can apply copied appearance state first and explicit overrides second.
+fn order_image_arguments(
+    arguments: &[Value],
+    argument_names: &[Option<String>],
+) -> Result<Vec<Value>, String> {
+    const NAMES: [&str; 7] = [
+        "icon",
+        "loc",
+        "icon_state",
+        "layer",
+        "dir",
+        "pixel_x",
+        "pixel_y",
+    ];
+    if arguments.len() != argument_names.len() {
+        return Err("image argument metadata does not match its value count".to_owned());
+    }
+    let mut ordered = vec![Value::Null; NAMES.len().max(arguments.len())];
+    let mut skipping_location = false;
+    for (index, (name, value)) in argument_names.iter().zip(arguments).enumerate() {
+        let destination = if let Some(name) = name {
+            NAMES
+                .iter()
+                .position(|candidate| candidate == name)
+                .ok_or_else(|| format!("image has no argument named {name:?}"))?
+        } else {
+            if index == 1 && matches!(value, Value::Text(_)) {
+                skipping_location = true;
+            }
+            index + usize::from(skipping_location)
+        };
+        if destination >= ordered.len() {
+            return Err("image has too many constructor arguments".to_owned());
+        }
+        ordered[destination] = value.clone();
+    }
+    Ok(ordered)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -17080,7 +17476,7 @@ mod tests {
     use dm_core::{DmNumberBits, SourceSpan};
     use dm_lexer::{SpannedToken, TokenKind, lex};
     use dm_syntax::{DefinitionKind, parse};
-    use dm_value::{FieldName, TypePath};
+    use dm_value::{FieldName, ModifiedTypePath, TypePath};
 
     use super::{
         CompoundListIndexOperator, ExecutionContext, ExecutionLimits, ExecutionState,
@@ -17092,8 +17488,8 @@ mod tests {
         compile_procedure_with_resolver_and_fields, condition_tokens, dm_builtin_numeric_constant,
         execute, execute_in_context, execute_in_state, execute_module, execute_module_in_context,
         execute_module_in_state, execute_module_with_limits, execute_module_with_limits_in_state,
-        execute_with_limits, execute_with_limits_in_state, interpolated_expression_close,
-        matrix_components,
+        execute_with_limits, execute_with_limits_in_state, extend_list_roots,
+        interpolated_expression_close, matrix_components,
     };
 
     #[test]
@@ -17368,14 +17764,69 @@ mod tests {
     }
 
     #[test]
-    fn newlist_constructs_one_fresh_datum_for_each_type_path() {
+    fn newlist_uses_full_inherited_defaults_and_constructor_semantics() {
         let syntax = parse(
-            "/proc/run()\n\tvar/list/items = newlist(/datum/one, /datum/two)\n\treturn length(items) + istype(items[1], /datum/one) + istype(items[2], /datum/two)\n",
+            "/obj/item/New()\n\tsrc.new_ran = 7\n/proc/run()\n\treturn newlist(/obj/item/apc_powercord, /obj/item/apc_powercord)\n",
         )
         .expect("source should parse");
         let module = compile_module(&syntax.definitions).expect("newlist should compile");
         let entry = module.procedure_id("/proc/run").expect("entry");
-        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(4.0)));
+        let apc = TypePath::parse("/obj/item/apc_powercord").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_type_parents(BTreeMap::from([
+            (TypePath::parse("/datum").unwrap(), None),
+            (
+                TypePath::parse("/atom").unwrap(),
+                Some(TypePath::parse("/datum").unwrap()),
+            ),
+            (
+                TypePath::parse("/atom/movable").unwrap(),
+                Some(TypePath::parse("/atom").unwrap()),
+            ),
+            (
+                TypePath::parse("/obj").unwrap(),
+                Some(TypePath::parse("/atom/movable").unwrap()),
+            ),
+            (
+                TypePath::parse("/obj/item").unwrap(),
+                Some(TypePath::parse("/obj").unwrap()),
+            ),
+            (apc.clone(), Some(TypePath::parse("/obj/item").unwrap())),
+        ]));
+        state.set_initial_values(BTreeMap::from([(
+            apc,
+            BTreeMap::from([(field("gc_destroyed"), Value::number(0.0))]),
+        )]));
+
+        let Value::List(items) = execute_module_in_state(&module, entry, &[], &mut state)
+            .expect("newlist should construct both items")
+        else {
+            panic!("newlist should return a list");
+        };
+        let created = state
+            .heap()
+            .list(items)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| match value {
+                Value::Datum(datum) => *datum,
+                value => panic!("newlist should contain datums, received {value}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(created.len(), 2);
+        assert_ne!(created[0], created[1]);
+        for datum in created {
+            assert_eq!(
+                state.heap().datum_field(datum, &field("gc_destroyed")),
+                Ok(&Value::number(0.0)),
+                "newlist must apply effective inherited defaults before New",
+            );
+            assert_eq!(
+                state.heap().datum_field(datum, &field("new_ran")),
+                Ok(&Value::number(7.0)),
+                "newlist must dispatch inherited New for each fresh object",
+            );
+        }
     }
 
     #[test]
@@ -17966,6 +18417,57 @@ mod tests {
     }
 
     #[test]
+    fn list_gc_large_scalar_default_catalog_builds_bounded_root_snapshot() {
+        let mut state = ExecutionState::new();
+        let direct = state.heap_mut().allocate_list();
+        let nested = state.heap_mut().allocate_list();
+        let garbage = state.heap_mut().allocate_list();
+
+        let mut defaults = BTreeMap::new();
+        for index in 0..100_000 {
+            defaults.insert(
+                FieldName::parse(&format!("scalar_{index}")).unwrap(),
+                Value::number(index as f32),
+            );
+        }
+        defaults.insert(field("direct_list"), Value::List(direct));
+        defaults.insert(
+            field("modified_path"),
+            Value::ModifiedTypePath(Arc::new(ModifiedTypePath::new(
+                TypePath::parse("/datum/outer").unwrap(),
+                vec![(
+                    field("nested"),
+                    Value::ModifiedTypePath(Arc::new(ModifiedTypePath::new(
+                        TypePath::parse("/datum/inner").unwrap(),
+                        vec![(field("held"), Value::List(nested))],
+                    ))),
+                )],
+            ))),
+        );
+        state.set_initial_values(BTreeMap::from([(
+            TypePath::parse("/datum/catalog_entry").unwrap(),
+            defaults,
+        )]));
+
+        let mut snapshot = Vec::new();
+        extend_list_roots(
+            &mut snapshot,
+            state.initial_values.values().flat_map(BTreeMap::values),
+        );
+        assert_eq!(
+            snapshot.len(),
+            2,
+            "scalar defaults must not consume list-GC root snapshot capacity"
+        );
+
+        state.next_list_collection = 1;
+        state.maybe_collect_unreachable_lists(&[]);
+        assert!(state.heap().list(direct).is_ok());
+        assert!(state.heap().list(nested).is_ok());
+        assert!(state.heap().list(garbage).is_err());
+    }
+
+    #[test]
     fn sized_list_construction_supports_gc_and_master_initialization_shapes() {
         let syntax = parse(
             "/proc/build_gc_queues(count)\n\tvar/list/queues = new /list(count)\n\tfor(var/i in 1 to count)\n\t\tqueues[i] = list()\n\treturn queues\n/proc/build_stages(count)\n\tvar/list/stages = new(count)\n\tfor(var/i in 1 to count)\n\t\tstages[i] = list(i)\n\treturn stages\n",
@@ -18455,6 +18957,24 @@ mod tests {
         let syntax = parse(source).expect("source should parse");
         let program = compile_procedure(&syntax.definitions[0]).expect("list clamp should compile");
         assert_eq!(execute(&program, &[]), Ok(Value::number(160.0)));
+    }
+
+    #[test]
+    fn ckey_and_ckey_ex_accept_null_like_byond() {
+        let source = "/proc/test()\n\treturn ckey(null)".to_owned() + "\n";
+        let syntax = parse(&source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("ckey should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::text("")));
+
+        let source = "/proc/test()\n\treturn ckey(123)".to_owned() + "\n";
+        let syntax = parse(&source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("ckey should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::text("123")));
+
+        let source = "/proc/test()\n\treturn ckeyEx(null)".to_owned() + "\n";
+        let syntax = parse(&source).expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("ckeyEx should compile");
+        assert_eq!(execute(&program, &[]), Ok(Value::text("")));
     }
 
     #[test]
@@ -20635,6 +21155,41 @@ mod tests {
     }
 
     #[test]
+    fn list_join_defaults_match_monkestation_bodypart_render_keys() {
+        let source = parse(
+            "/datum/bodypart/proc/generate_icon_key()\n\
+             \treturn list(\"human\", \"left_arm\", 2)\n\
+             /proc/run()\n\
+             \tvar/datum/bodypart/limb = new\n\
+             \tvar/exact_monk_shape = limb.generate_icon_key().Join()\n\
+             \tvar/null_glue = list(\"a\", \"b\", \"c\", \"d\").Join(null, 2, 0)\n\
+             \tvar/range = list(\"a\", \"b\", \"c\", \"d\").Join(\"-\", 2, 4)\n\
+             \tvar/negative_end = list(\"a\", \"b\", \"c\", \"d\").Join(\"-\", 1, -1)\n\
+             \tvar/empty_range = list(\"a\", \"b\").Join(\",\", 0, 0)\n\
+             \treturn list(exact_monk_shape, null_glue, range, negative_end, empty_range)\n",
+        )
+        .expect("Monkestation bodypart Join fixture should parse");
+        let module = compile_module(&source.definitions)
+            .expect("Monkestation bodypart Join fixture should compile");
+        let mut state = ExecutionState::new();
+        let Value::List(result) = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/run").unwrap(),
+            &[],
+            &mut state,
+        )
+        .expect("all documented Join default and range forms should execute") else {
+            panic!("Join fixture should return its observations");
+        };
+        let result = state.heap().list(result).unwrap();
+        assert_eq!(result.get(1), Ok(&Value::text("humanleft_arm2")));
+        assert_eq!(result.get(2), Ok(&Value::text("bcd")));
+        assert_eq!(result.get(3), Ok(&Value::text("b-c")));
+        assert_eq!(result.get(4), Ok(&Value::text("a-b-c")));
+        assert_eq!(result.get(5), Ok(&Value::text("")));
+    }
+
+    #[test]
     fn vis_contents_and_vis_locs_stay_reciprocal_across_mutation_and_destroy_cleanup() {
         let syntax = parse(
             "/proc/link(atom/owner, atom/child)\n\towner.vis_contents = null\n\tchild.vis_locs = null\n\towner.vis_contents.Add(child)\n\tvar/added = (owner.vis_contents.len == 1 && child.vis_locs[1] == owner)\n\towner.vis_contents.Remove(child)\n\tvar/removed = (owner.vis_contents.len == 0 && child.vis_locs.len == 0)\n\towner.vis_contents = list(child, child, null)\n\tvar/assigned = (owner.vis_contents.len == 1 && child.vis_locs.len == 1)\n\towner.vis_contents.Cut()\n\tvar/cut = (owner.vis_contents.len == 0 && child.vis_locs.len == 0)\n\towner.vis_contents += child\n\tchild.vis_locs = null\n\tvar/destroy_cleanup = (owner.vis_contents.len == 0 && child.vis_locs.len == 0)\n\treturn added + removed + assigned + cut + destroy_cleanup\n",
@@ -20658,6 +21213,32 @@ mod tests {
                 &mut state,
             ),
             Ok(Value::number(5.0))
+        );
+    }
+
+    #[test]
+    fn scalar_and_bulk_vis_contents_mutation_match_and_cleanup_reciprocals() {
+        let syntax = parse(
+            "/proc/run(atom/scalar_owner, atom/bulk_owner, atom/first, atom/second)\n\tscalar_owner.vis_contents = null\n\tbulk_owner.vis_contents = null\n\tfirst.vis_locs = null\n\tsecond.vis_locs = null\n\tscalar_owner.vis_contents += first\n\tscalar_owner.vis_contents.Add(second)\n\tscalar_owner.vis_contents += first\n\tscalar_owner.vis_contents += null\n\tvar/scalar_shape = (scalar_owner.vis_contents.len == 2 && first.vis_locs.len == 1 && first.vis_locs[1] == scalar_owner && second.vis_locs.len == 1 && second.vis_locs[1] == scalar_owner)\n\tbulk_owner.vis_contents += list(first, second, first, null)\n\tvar/bulk_shape = (bulk_owner.vis_contents.len == 2 && first.vis_locs.len == 2 && first.vis_locs[2] == bulk_owner && second.vis_locs.len == 2 && second.vis_locs[2] == bulk_owner)\n\tscalar_owner.vis_contents -= first\n\tscalar_owner.vis_contents.Remove(second)\n\tvar/scalar_cleanup = (scalar_owner.vis_contents.len == 0 && first.vis_locs.len == 1 && first.vis_locs[1] == bulk_owner && second.vis_locs.len == 1 && second.vis_locs[1] == bulk_owner)\n\tbulk_owner.vis_contents -= list(first, second)\n\tvar/bulk_cleanup = (bulk_owner.vis_contents.len == 0 && first.vis_locs.len == 0 && second.vis_locs.len == 0)\n\treturn scalar_shape + bulk_shape + scalar_cleanup + bulk_cleanup\n",
+        )
+        .expect("scalar and bulk visibility fixture should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("scalar and bulk visibility fixture should compile");
+        let mut state = ExecutionState::new();
+        let datums = ["scalar_owner", "bulk_owner", "first", "second"].map(|name| {
+            state
+                .heap_mut()
+                .allocate_datum(TypePath::parse(&format!("/atom/movable/{name}")).unwrap())
+        });
+
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/run").unwrap(),
+                &datums.map(Value::Datum),
+                &mut state,
+            ),
+            Ok(Value::number(4.0))
         );
     }
 
@@ -20733,6 +21314,59 @@ mod tests {
             state.heap().live_list_count(),
             8,
             "four first accesses materialize overlays, underlays, filters, and verbs once"
+        );
+    }
+
+    #[test]
+    fn mutable_appearance_overlay_lists_materialize_lazily_for_scalar_addition() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/mutable_appearance/container = new\n\tvar/mutable_appearance/member = new\n\tcontainer.overlays += member\n\treturn list(container.overlays.len, container.overlays[1] == member, container.overlays == container.overlays)\n/mutable_appearance\n",
+        )
+        .expect("mutable appearance list fixture should parse");
+        let module = compile_module(
+            &syntax
+                .definitions
+                .iter()
+                .filter(|definition| matches!(definition.kind, DefinitionKind::Procedure))
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .expect("mutable appearance list fixture should compile");
+        let entry = module.procedure_id("/proc/run").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_type_parents(
+            [
+                (TypePath::parse("/datum").unwrap(), None),
+                (
+                    TypePath::parse("/image").unwrap(),
+                    Some(TypePath::parse("/datum").unwrap()),
+                ),
+                (
+                    TypePath::parse("/mutable_appearance").unwrap(),
+                    Some(TypePath::parse("/image").unwrap()),
+                ),
+            ]
+            .into(),
+        );
+        let Value::List(result) = execute_module_with_limits_in_state(
+            &module,
+            entry,
+            &[],
+            ExecutionLimits::default(),
+            &mut state,
+        )
+        .expect("mutable appearance overlay addition should execute") else {
+            panic!("fixture should return a list")
+        };
+        assert_eq!(
+            state
+                .heap()
+                .list(result)
+                .unwrap()
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>(),
+            vec![Value::number(1.0), Value::number(1.0), Value::number(1.0)]
         );
     }
 
@@ -23128,7 +23762,7 @@ mod tests {
             ("/proc/test()\n\treturn isloc(/turf)\n", 0.0),
             (
                 "/proc/test()\n\treturn istype(/datum/example, /datum)\n",
-                1.0,
+                0.0,
             ),
             (
                 "/proc/test()\n\treturn istype(new /datum/example, /datum)\n",
@@ -23151,6 +23785,40 @@ mod tests {
                     .any(|instruction| matches!(instruction, Instruction::TypePredicate { .. }))
             );
         }
+    }
+
+    #[test]
+    fn qualified_istype_keeps_client_colour_type_paths_on_the_constructor_branch() {
+        let syntax = parse(concat!(
+            "/proc/add_client_colour(colour_type_or_datum)\n",
+            "\tvar/datum/client_colour/colour\n",
+            "\tif(istype(colour_type_or_datum, /datum/client_colour))\n",
+            "\t\tcolour = colour_type_or_datum\n",
+            "\telse if(ispath(colour_type_or_datum, /datum/client_colour))\n",
+            "\t\tcolour = new colour_type_or_datum\n",
+            "\treturn colour\n",
+            "/proc/qdel_fixture(datum/to_delete)\n",
+            "\tif(!istype(to_delete))\n",
+            "\t\treturn 0\n",
+            "\tto_delete.gc_destroyed = 1\n",
+            "\treturn to_delete.gc_destroyed\n",
+            "/proc/run()\n",
+            "\tvar/datum/client_colour/colour = add_client_colour(/datum/client_colour/blind)\n",
+            "\tif(ispath(colour) || !istype(colour, /datum/client_colour))\n",
+            "\t\treturn -2\n",
+            "\treturn qdel_fixture(colour)\n",
+        ))
+        .expect("client-colour qdel fixture should parse");
+        let procedures = syntax
+            .definitions
+            .iter()
+            .filter(|definition| definition.kind == DefinitionKind::Procedure)
+            .cloned()
+            .collect::<Vec<_>>();
+        let module = compile_module(&procedures)
+            .expect("client-colour type path should compile through dynamic new");
+        let entry = module.procedure_id("/proc/run").expect("run entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(1.0)));
     }
 
     #[test]
@@ -24044,6 +24712,22 @@ mod tests {
     }
 
     #[test]
+    fn replacetext_regex_returns_null_for_null_haystack() {
+        let syntax = parse(
+            "/proc/run(input)\n\tvar/static/regex/css = new(@\"[^a-zA-Z0-9]\", \"g\")\n\treturn replacetext(input, css, \"\")\n",
+        )
+        .expect("regex replacetext fixture should parse");
+        let module =
+            compile_module(&syntax.definitions).expect("regex replacetext fixture should compile");
+        let entry = module.procedure_id("/proc/run").unwrap();
+        assert_eq!(
+            execute_module(&module, entry, &[Value::Null]),
+            Ok(Value::Null),
+            "BYOND/OpenDream return null rather than erroring for a non-text regex haystack",
+        );
+    }
+
+    #[test]
     fn regex_replace_method_sanitizes_all_global_matches() {
         let syntax = parse(
             "/proc/sanitize(value)\n\tvar/regex/forbidden = new(@\"[^A-Za-z0-9._-]\", \"g\")\n\treturn forbidden.Replace(value, \"\")\n",
@@ -24172,6 +24856,59 @@ mod tests {
     }
 
     #[test]
+    fn atom_transform_read_materializes_an_identity_matrix_for_native_methods() {
+        let syntax = parse(
+            "/proc/run(obj/item)\n\titem.transform.Scale(2, 2)\n\tvar/matrix/copy = item.transform\n\treturn copy ~= matrix(1, 0, 0, 0, 1, 0)\n/obj\n",
+        )
+        .expect("atom transform fixture should parse");
+        let definitions = syntax
+            .definitions
+            .iter()
+            .filter(|definition| matches!(definition.kind, DefinitionKind::Procedure))
+            .cloned()
+            .collect::<Vec<_>>();
+        let module = compile_module(&definitions).expect("atom transform fixture should compile");
+        let entry = module.procedure_id("/proc/run").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_type_parents(
+            [
+                (TypePath::parse("/datum").unwrap(), None),
+                (
+                    TypePath::parse("/atom").unwrap(),
+                    Some(TypePath::parse("/datum").unwrap()),
+                ),
+                (
+                    TypePath::parse("/obj").unwrap(),
+                    Some(TypePath::parse("/atom").unwrap()),
+                ),
+            ]
+            .into(),
+        );
+        state.set_initial_values(BTreeMap::from([(
+            TypePath::parse("/obj").unwrap(),
+            BTreeMap::from([(field("transform"), Value::Null)]),
+        )]));
+        let item = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(item, field("transform"), Value::Null)
+            .unwrap();
+        assert_eq!(
+            execute_module_with_limits_in_state(
+                &module,
+                entry,
+                &[Value::Datum(item)],
+                ExecutionLimits::default(),
+                &mut state,
+            ),
+            Ok(Value::number(1.0)),
+            "each appearance transform read returns an identity matrix copy, matching OpenDream",
+        );
+    }
+
+    #[test]
     fn matrix_transform_methods_mutate_the_six_public_fields() {
         let syntax = parse(
             "/proc/run()\n\tvar/matrix/value = matrix(1, 2, 3, 4, 5, 6)\n\tvalue.Translate(2)\n\tvalue.Turn(90)\n\treturn value ~= matrix(4, 5, 8, -1, -2, -5)\n",
@@ -24272,6 +25009,67 @@ mod tests {
             ),
             Ok(Value::Datum(processor))
         );
+    }
+
+    #[test]
+    fn empty_locate_infers_typed_local_destination_for_contractor_preview() {
+        let syntax = parse(concat!(
+            "/proc/find_declared(list/held_items)\n",
+            "\tvar/obj/item/melee/baton/telescopic/contractor_baton/baton = locate() in held_items\n",
+            "\treturn baton.flags_1\n",
+            "/proc/find_assigned(list/held_items)\n",
+            "\tvar/obj/item/melee/baton/telescopic/contractor_baton/baton\n",
+            "\tbaton = locate() in held_items\n",
+            "\treturn baton.flags_1\n",
+        ))
+        .expect("contractor preview locate fixture should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("contextual empty locate should infer its typed destination");
+        let mut state = ExecutionState::new();
+        let baton_base =
+            TypePath::parse("/obj/item/melee/baton/telescopic/contractor_baton").unwrap();
+        let baton_type =
+            TypePath::parse("/obj/item/melee/baton/telescopic/contractor_baton/loaded").unwrap();
+        let decoy_type = TypePath::parse("/obj/item/decoy").unwrap();
+        state.set_type_parents(BTreeMap::from([
+            (baton_base.clone(), None),
+            (baton_type.clone(), Some(baton_base)),
+            (decoy_type.clone(), None),
+        ]));
+        let decoy = state.heap_mut().allocate_datum(decoy_type);
+        state
+            .heap_mut()
+            .set_datum_field(decoy, field("flags_1"), Value::number(99.0))
+            .unwrap();
+        let baton = state.heap_mut().allocate_datum(baton_type);
+        state
+            .heap_mut()
+            .set_datum_field(baton, field("flags_1"), Value::number(1.0))
+            .unwrap();
+        let held_items = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(held_items)
+            .unwrap()
+            .add(Value::Datum(decoy));
+        state
+            .heap_mut()
+            .list_mut(held_items)
+            .unwrap()
+            .add(Value::Datum(baton));
+
+        for path in ["/proc/find_declared", "/proc/find_assigned"] {
+            assert_eq!(
+                execute_module_in_state(
+                    &module,
+                    module.procedure_id(path).unwrap(),
+                    &[Value::List(held_items)],
+                    &mut state,
+                ),
+                Ok(Value::number(1.0)),
+                "{path} must lower locate() as locate(the declared type)",
+            );
+        }
     }
 
     #[test]
@@ -24714,6 +25512,105 @@ mod tests {
         assert_eq!(
             state.heap().datum_field(title, &field("icon")),
             Ok(&Value::file("icons/runtime/default_title.dmi")),
+        );
+    }
+
+    #[test]
+    fn icon_copy_constructor_preserves_render_state_and_mutates_independently() {
+        // Exact constructor shape at the start of Monkestation's getFlatIcon:
+        // `flat_template = icon(file, state); flat = icon(flat_template)`.
+        let syntax = parse(
+            "/proc/get_flat_icon_constructor_probe()\n\
+             \tvar/icon/flat_template = icon('icons/blanks/32x32.dmi', \"nothing\")\n\
+             \tflat_template.Scale(48, 64)\n\
+             \tflat_template.DrawBox(\"#ffffff\", 1, 1, 8, 8)\n\
+             \tvar/icon/flat = icon(flat_template)\n\
+             \tflat.DrawBox(\"#000000\", 2, 2, 4, 4)\n\
+             \tflat.Scale(20, 30)\n\
+             \treturn list(flat_template, flat)\n",
+        )
+        .expect("getFlatIcon-shaped icon copy fixture should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("getFlatIcon-shaped icon copy fixture should compile");
+        let mut state = ExecutionState::new();
+        let Value::List(result) = execute_module_in_state(
+            &module,
+            module
+                .procedure_id("/proc/get_flat_icon_constructor_probe")
+                .unwrap(),
+            &[],
+            &mut state,
+        )
+        .expect("icon copy constructor should execute") else {
+            panic!("icon copy fixture should return its two icons");
+        };
+        let values = state
+            .heap()
+            .list(result)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        let [Value::Datum(template), Value::Datum(flat)] = values.as_slice() else {
+            panic!("icon copy fixture should return two icon datums");
+        };
+
+        assert_ne!(template, flat, "the copy must have independent identity");
+        assert_eq!(
+            state.heap().datum_field(*template, &field("icon")),
+            Ok(&Value::file("icons/blanks/32x32.dmi")),
+        );
+        assert_eq!(
+            state.heap().datum_field(*flat, &field("icon")),
+            Ok(&Value::file("icons/blanks/32x32.dmi")),
+            "the clone must retain the backing resource instead of nesting the source datum",
+        );
+        assert_eq!(
+            state
+                .heap()
+                .datum_field(*template, &field("_dream64_width")),
+            Ok(&Value::number(48.0)),
+            "mutating the clone must not change the template width",
+        );
+        assert_eq!(
+            state
+                .heap()
+                .datum_field(*template, &field("_dream64_height")),
+            Ok(&Value::number(64.0)),
+            "mutating the clone must not change the template height",
+        );
+        assert_eq!(
+            state.heap().datum_field(*flat, &field("_dream64_width")),
+            Ok(&Value::number(20.0)),
+        );
+        assert_eq!(
+            state.heap().datum_field(*flat, &field("_dream64_height")),
+            Ok(&Value::number(30.0)),
+        );
+
+        let Value::List(template_operations) = state
+            .heap()
+            .datum_field(*template, &field("_dream64_icon_operations"))
+            .unwrap()
+        else {
+            panic!("template should retain its operation list");
+        };
+        let Value::List(flat_operations) = state
+            .heap()
+            .datum_field(*flat, &field("_dream64_icon_operations"))
+            .unwrap()
+        else {
+            panic!("clone should retain its copied operation list");
+        };
+        assert_ne!(
+            template_operations, flat_operations,
+            "the operation list itself must be copied",
+        );
+        assert_eq!(state.heap().list(*template_operations).unwrap().len(), 2);
+        assert_eq!(
+            state.heap().list(*flat_operations).unwrap().len(),
+            4,
+            "operations added to the clone must not leak back to the template",
         );
     }
 
@@ -25381,6 +26278,10 @@ mod tests {
                 .any(|instruction| matches!(instruction, Instruction::StandardBuiltin { name, .. } if name == "image"))
         );
         let mut state = ExecutionState::new();
+        state.set_initial_values(BTreeMap::from([(
+            TypePath::parse("/image").unwrap(),
+            BTreeMap::from([(field("filter_data"), Value::Null)]),
+        )]));
         let result =
             execute_in_state(&program, &[], &mut state).expect("image constructor should execute");
         let Value::Datum(image) = result else {
@@ -25394,11 +26295,127 @@ mod tests {
         assert_eq!(datum.field(&field("layer")), Ok(&Value::number(4.0)));
         assert_eq!(datum.field(&field("dir")), Ok(&Value::number(2.0)));
         assert_eq!(datum.field(&field("alpha")), Ok(&Value::number(255.0)));
+        assert_eq!(datum.field(&field("filter_data")), Ok(&Value::Null));
         assert_eq!(
             datum.field(&field("appearance_flags")),
             Ok(&Value::number(0.0))
         );
-        assert_eq!(datum.field(&field("overlays")), Ok(&Value::Null));
+        let Value::List(overlays) = datum.field(&field("overlays")).unwrap() else {
+            panic!("image overlays should be a live engine list");
+        };
+        assert_eq!(state.heap().list(*overlays).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn image_from_layer_image_copies_appearance_before_named_overrides() {
+        let syntax = parse(
+            "/proc/build_flatten_layer()\n\tvar/image/layer_image = image('icons/source.dmi', \"source\", 4, 8, 3, -2)\n\tlayer_image.alpha = 123\n\tlayer_image.blend_mode = 2\n\tlayer_image.plane = -7\n\tlayer_image.overlays += image('icons/overlay.dmi', \"overlay\")\n\tvar/image/copy = image(layer_image, icon_state = \"override\", layer = 9)\n\treturn list(layer_image, copy)\n",
+        )
+        .expect("getFlatIcon-shaped image copy source should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("getFlatIcon-shaped image copy source should compile");
+        let procedure = module
+            .procedure_id("/proc/build_flatten_layer")
+            .expect("image copy fixture entry should exist");
+        let mut state = ExecutionState::new();
+        let Value::List(result) = execute_module_in_state(&module, procedure, &[], &mut state)
+            .expect("image(layer_image) should execute")
+        else {
+            panic!("image copy fixture should return both images");
+        };
+        let values = state.heap().list(result).unwrap();
+        let Value::Datum(source) = values.get(1).unwrap() else {
+            panic!("first result should be the source image");
+        };
+        let Value::Datum(copy) = values.get(2).unwrap() else {
+            panic!("second result should be the copied image");
+        };
+        for (name, expected) in [
+            ("icon", Value::file("icons/source.dmi")),
+            ("icon_state", Value::text("override")),
+            ("layer", Value::number(9.0)),
+            ("dir", Value::number(8.0)),
+            ("pixel_x", Value::number(3.0)),
+            ("pixel_y", Value::number(-2.0)),
+            ("alpha", Value::number(123.0)),
+            ("blend_mode", Value::number(2.0)),
+            ("plane", Value::number(-7.0)),
+        ] {
+            assert_eq!(
+                state.heap().datum_field(*copy, &field(name)),
+                Ok(&expected),
+                "copied image field {name}"
+            );
+        }
+        assert_eq!(
+            state.heap().datum_field(*source, &field("icon_state")),
+            Ok(&Value::text("source")),
+            "explicit copy overrides must not mutate the source"
+        );
+        let Value::List(source_overlays) = state
+            .heap()
+            .datum_field(*source, &field("overlays"))
+            .unwrap()
+        else {
+            panic!("source overlays should be a list");
+        };
+        let Value::List(copy_overlays) =
+            state.heap().datum_field(*copy, &field("overlays")).unwrap()
+        else {
+            panic!("copied overlays should be a list");
+        };
+        assert_ne!(
+            source_overlays, copy_overlays,
+            "appearance collections must have independent list identities"
+        );
+        assert_eq!(state.heap().list(*source_overlays).unwrap().len(), 1);
+        assert_eq!(state.heap().list(*copy_overlays).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn image_accepts_mutable_appearance_atom_and_icon_sources() {
+        let syntax = parse(
+            "/proc/build_sources()\n\tvar/mutable_appearance/mutable = new()\n\tmutable.icon = 'icons/mutable.dmi'\n\tmutable.icon_state = \"mutable\"\n\tmutable.pixel_x = 7\n\tvar/obj/source = new\n\tsource.icon = 'icons/atom.dmi'\n\tsource.icon_state = \"atom\"\n\tvar/icon/icon_source = icon('icons/icon.dmi')\n\treturn list(image(mutable), image(source), image(icon_source))\n",
+        )
+        .expect("appearance source fixture should parse");
+        let module =
+            compile_module(&syntax.definitions).expect("appearance source fixture should compile");
+        let procedure = module
+            .procedure_id("/proc/build_sources")
+            .expect("appearance source fixture entry should exist");
+        let mut state = ExecutionState::new();
+        let Value::List(result) =
+            execute_module_in_state(&module, procedure, &[], &mut state).expect("source copies")
+        else {
+            panic!("source copy fixture should return a list");
+        };
+        let values = state.heap().list(result).unwrap();
+        let images = (1..=3)
+            .map(|index| match values.get(index).unwrap() {
+                Value::Datum(image) => *image,
+                value => panic!("source copy result {index} should be an image, got {value}"),
+            })
+            .collect::<Vec<_>>();
+        for (image, icon, icon_state) in [
+            (images[0], "icons/mutable.dmi", "mutable"),
+            (images[1], "icons/atom.dmi", "atom"),
+            (images[2], "icons/icon.dmi", ""),
+        ] {
+            assert_eq!(
+                state.heap().datum_field(image, &field("icon")),
+                Ok(&Value::file(icon))
+            );
+            if !icon_state.is_empty() {
+                assert_eq!(
+                    state.heap().datum_field(image, &field("icon_state")),
+                    Ok(&Value::text(icon_state))
+                );
+            }
+        }
+        assert_eq!(
+            state.heap().datum_field(images[0], &field("pixel_x")),
+            Ok(&Value::number(7.0))
+        );
     }
 
     #[test]
@@ -26064,6 +27081,142 @@ mod tests {
             Ok(Value::number(1157.0))
         );
         assert_eq!(state.global(&field("counter")), Some(&Value::number(7.0)));
+    }
+
+    #[test]
+    fn dynamic_field_access_resolves_inherited_shared_storage_after_instance_fields() {
+        let source = concat!(
+            "/proc/read_member(datum/value)\n\treturn value.all_layers\n",
+            "/proc/write_member(datum/value, replacement)\n",
+            "\tvalue.all_layers = replacement\n",
+            "\treturn value.all_layers\n",
+        );
+        let syntax = parse(source).expect("dynamic shared-member source should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("dynamic shared-member source should compile");
+        let mut state = ExecutionState::new();
+        let runtime_type = TypePath::parse("/datum/bodypart_overlay/mutant").unwrap();
+        let storage = FieldName::static_storage("/datum/bodypart_overlay/var/all_layers");
+        state.set_shared_fields(Arc::new(BTreeMap::from([(
+            runtime_type.clone(),
+            BTreeMap::from([(field("all_layers"), storage.clone())]),
+        )])));
+        state.set_global(storage.clone(), Value::number(7.0));
+
+        let inherited = state.heap_mut().allocate_datum(runtime_type.clone());
+        let read = module.procedure_id("/proc/read_member").unwrap();
+        let write = module.procedure_id("/proc/write_member").unwrap();
+        assert_eq!(
+            execute_module_in_state(&module, read, &[Value::Datum(inherited)], &mut state),
+            Ok(Value::number(7.0))
+        );
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                write,
+                &[Value::Datum(inherited), Value::number(9.0)],
+                &mut state,
+            ),
+            Ok(Value::number(9.0))
+        );
+        assert_eq!(state.global(&storage), Some(&Value::number(9.0)));
+
+        let shadowed = state.heap_mut().allocate_datum(runtime_type);
+        state
+            .heap_mut()
+            .set_datum_field(shadowed, field("all_layers"), Value::number(3.0))
+            .unwrap();
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                write,
+                &[Value::Datum(shadowed), Value::number(4.0)],
+                &mut state,
+            ),
+            Ok(Value::number(4.0))
+        );
+        assert_eq!(state.global(&storage), Some(&Value::number(9.0)));
+    }
+
+    #[test]
+    fn atom_appearance_read_returns_a_truthy_snapshot_for_overlay_normalization() {
+        let source = concat!(
+            "/proc/normalize(atom/target)\n",
+            "\tvar/list/new_overlays = list(target)\n",
+            "\tnew_overlays[1] = target.appearance\n",
+            "\tfor(var/overlay in new_overlays)\n",
+            "\t\tif(!overlay)\n",
+            "\t\t\tnew_overlays -= overlay\n",
+            "\treturn new_overlays[1]\n",
+        );
+        let syntax = parse(source).expect("appearance normalization source should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("appearance normalization source should compile");
+        let mut state = ExecutionState::new();
+        let target = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/item/uniform").unwrap());
+        for (name, value) in [
+            ("appearance", Value::Null),
+            ("icon", Value::file("icons/uniform.dmi")),
+            ("icon_state", Value::text("uniform")),
+            ("dir", Value::number(2.0)),
+        ] {
+            state
+                .heap_mut()
+                .set_datum_field(target, field(name), value)
+                .unwrap();
+        }
+
+        let normalized = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/normalize").unwrap(),
+            &[Value::Datum(target)],
+            &mut state,
+        )
+        .expect("a copied atom appearance must remain in the overlay list");
+        let Value::Datum(appearance) = normalized else {
+            panic!("atom.appearance should produce an appearance datum")
+        };
+        let appearance = state.heap().datum(appearance).unwrap();
+        assert_eq!(appearance.type_path().as_str(), "/mutable_appearance");
+        assert_eq!(
+            appearance.field(&field("icon_state")),
+            Ok(&Value::text("uniform"))
+        );
+        assert_eq!(appearance.field(&field("dir")), Ok(&Value::number(2.0)));
+    }
+
+    #[test]
+    fn project_insert_method_wins_over_native_icon_insert() {
+        let source = concat!(
+            "/datum/sheet/proc/Insert(key, value)\n\treturn key == \"antag\" && value == 7\n",
+            "/datum/sheet/proc/create_spritesheets()\n\treturn Insert(\"antag\", 7)\n",
+            "/proc/run()\n",
+            "\tvar/datum/sheet/sheet = new\n",
+            "\treturn sheet.create_spritesheets()\n",
+        );
+        let syntax = parse(source).expect("project Insert source should parse");
+        let module = compile_module(&syntax.definitions).expect("project Insert should compile");
+        let create = module
+            .procedure_id("/datum/sheet/proc/create_spritesheets")
+            .unwrap();
+        assert!(module
+            .resolve_procedure(create)
+            .unwrap()
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::NativeSrcMethod { name, .. } if name == "Insert")));
+        let mut state = ExecutionState::new();
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/run").unwrap(),
+                &[],
+                &mut state,
+            ),
+            Ok(Value::number(1.0))
+        );
     }
 
     #[test]

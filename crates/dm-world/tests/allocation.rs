@@ -232,3 +232,82 @@ fn materializes_map_dimensions_and_initial_world_contents() {
         "a shared area's contents include both turfs and both mapped movables"
     );
 }
+
+#[test]
+fn large_inert_map_keeps_turf_defaults_sparse_and_dynamic_lists_per_cell() {
+    const SIDE: usize = 64;
+    const SCALARS: usize = 96;
+    let mut source = String::from("/area/scaled\n/turf/scaled\n");
+    for index in 0..SCALARS {
+        source.push_str(&format!("\tvar/scalar_{index} = {index}\n"));
+    }
+    source.push_str("\tvar/list/per_cell[2]\n");
+    let (_project, compilation) = TestProject::compile(&source);
+
+    let row = "a".repeat(SIDE);
+    let rows = std::iter::repeat_n(row, SIDE)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let map = parse(&format!(
+        "\"a\" = (/turf/scaled, /area/scaled)\n(1,1,1) = {{\"\n{rows}\n\"}}\n"
+    ))
+    .expect("scaled map should parse");
+    let plan = build_plan(&map, &compilation);
+    let mut image = RuntimeImage::from_compilation(&compilation).expect("image should materialize");
+    let allocation = allocate_world(&plan, &mut image).expect("scaled world should allocate");
+
+    let turf_count = SIDE * SIDE;
+    assert_eq!(allocation.stats().turfs, turf_count);
+    let materialized_fields = allocation
+        .snapshots()
+        .iter()
+        .map(|snapshot| {
+            image
+                .heap()
+                .datum(snapshot.turf.expect("every scaled cell has a turf"))
+                .unwrap()
+                .field_len()
+        })
+        .sum::<usize>();
+    assert!(
+        materialized_fields <= turf_count * 6,
+        "compact turfs should own only per-cell list/contents and x/y/z/loc; owned {materialized_fields} fields"
+    );
+    let eager_scalar_fields = turf_count * SCALARS;
+    assert!(
+        eager_scalar_fields >= materialized_fields * 16,
+        "the scaling gate must prove sparse allocation, not a small constant reduction"
+    );
+
+    let first = allocation.snapshots()[0].turf.unwrap();
+    let second = allocation.snapshots()[1].turf.unwrap();
+    assert!(
+        image
+            .heap()
+            .datum_field(first, &field("scalar_95"))
+            .is_err(),
+        "untouched scalar defaults must not be copied into each turf"
+    );
+    let first_list = image
+        .heap()
+        .datum_field(first, &field("per_cell"))
+        .expect("first per-cell suffix array");
+    let second_list = image
+        .heap()
+        .datum_field(second, &field("per_cell"))
+        .expect("second per-cell suffix array");
+    assert_ne!(first_list, second_list, "dynamic lists must not alias");
+    for value in [first_list, second_list] {
+        let Value::List(list) = value else {
+            panic!("per-cell suffix array should be a list");
+        };
+        assert_eq!(image.heap().list(*list).unwrap().len(), 2);
+    }
+
+    let field_slot_bytes = std::mem::size_of::<(FieldName, Value)>();
+    eprintln!(
+        "compact-map-scale turfs={turf_count} materialized_fields={materialized_fields} field_slot_bytes={field_slot_bytes} compact_field_bytes={} eager_scalar_bytes={}",
+        materialized_fields * field_slot_bytes,
+        eager_scalar_fields * field_slot_bytes,
+    );
+}

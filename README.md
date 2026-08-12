@@ -101,5 +101,7 @@ cargo run -p dm-lifecycle -- boot path\to\world.dme path\to\map.dmm
 
 This currently runs the supported `New()`, `Initialize()`, and
 `LateInitialize()` bodies against the allocated `/world`, areas, turfs, and
-movables. The output is a deterministic summary; it is not yet a persistent
-server loop.
+movables. The output is a deterministic startup summary and then enters an
+optional persistent scheduler loop for headless runtime work; set
+`DREAM64_BOOT_MAX_SLICES` to terminate the loop after a fixed number of
+iterations for deterministic smoke runs.

@@ -3342,26 +3342,21 @@ fn declared_receiver_types(
         }
     }
     for line in &definition.body {
-        if !matches!(line.tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(name)) if name == "var")
-        {
-            continue;
-        }
-        let assignment = line
+        let is_local_declaration = matches!(
+            line.tokens.first().map(|token| &token.kind),
+            Some(TokenKind::Identifier(name)) if name == "var"
+        );
+        let is_for_declaration = matches!(
+            line.tokens.first().map(|token| &token.kind),
+            Some(TokenKind::Identifier(name)) if name == "for"
+        ) && line
             .tokens
             .iter()
-            .position(|token| matches!(&token.kind, TokenKind::Operator(op) if op == "="))
-            .unwrap_or(line.tokens.len());
-        let Some(name) =
-            line.tokens[..assignment]
-                .iter()
-                .rev()
-                .find_map(|token| match &token.kind {
-                    TokenKind::Identifier(name) if !matches!(name.as_str(), "var" | "as") => {
-                        Some(name.as_str())
-                    }
-                    _ => None,
-                })
-        else {
+            .any(|token| matches!(&token.kind, TokenKind::Identifier(name) if name == "var"));
+        if !is_local_declaration && !is_for_declaration {
+            continue;
+        }
+        let Some(name) = parameter_declaration_name(&line.tokens) else {
             continue;
         };
         if let Some(path) = declared_type_path(&line.tokens, name) {
@@ -3641,8 +3636,74 @@ fn construction_dependencies(
         }
     }
 
+    let project_newlist = by_owner_name
+        .keys()
+        .any(|(owner, name)| owner.is_none() && name == "newlist");
     for line in &definition.body {
         let tokens = &line.tokens;
+        if !project_newlist {
+            for newlist_index in tokens.iter().enumerate().filter_map(|(index, token)| {
+                matches!(&token.kind, TokenKind::Identifier(name) if name == "newlist")
+                    .then_some(index)
+            }) {
+                if !matches!(
+                    tokens.get(newlist_index + 1).map(|token| &token.kind),
+                    Some(TokenKind::Punctuation('('))
+                ) {
+                    continue;
+                }
+                let mut cursor = newlist_index + 2;
+                let mut argument_start = cursor;
+                let mut depth = 0usize;
+                let mut closed = false;
+                while cursor < tokens.len() {
+                    let boundary = match tokens[cursor].kind {
+                        TokenKind::Punctuation('(' | '[' | '{') => {
+                            depth += 1;
+                            false
+                        }
+                        TokenKind::Punctuation(')') if depth == 0 => {
+                            closed = true;
+                            true
+                        }
+                        TokenKind::Punctuation(')' | ']' | '}') => {
+                            depth = depth.saturating_sub(1);
+                            false
+                        }
+                        TokenKind::Punctuation(',') if depth == 0 => true,
+                        _ => false,
+                    };
+                    if boundary {
+                        let argument = &tokens[argument_start..cursor];
+                        if !argument.is_empty() {
+                            if matches!(argument.first().map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "/")
+                            {
+                                if let Some(owner) = type_node_from_tokens(compilation, argument, 0)
+                                    && let Some(target) = effective_constructor_target(
+                                        compilation,
+                                        procedures,
+                                        by_owner_name,
+                                        owner,
+                                    )
+                                {
+                                    result.targets.insert(target);
+                                }
+                            } else {
+                                result.unbounded = true;
+                            }
+                        }
+                        argument_start = cursor + 1;
+                        if closed {
+                            break;
+                        }
+                    }
+                    cursor += 1;
+                }
+                if !closed {
+                    result.unbounded = true;
+                }
+            }
+        }
         for new_index in tokens.iter().enumerate().filter_map(|(index, token)| {
             matches!(&token.kind, TokenKind::Identifier(name) if name == "new").then_some(index)
         }) {
@@ -3776,6 +3837,21 @@ fn static_proc_reference_paths(
                 };
                 segments.push(segment.clone());
                 index += 2;
+            }
+            // tgstation's TYPE_PROC_REF(/owner/type, name) expands to
+            // nameof(/owner/type.proc/name). Retain that exact callback even
+            // though the parser represents the owner path and `.proc/name`
+            // as separate token runs.
+            if !segments.is_empty()
+                && matches!(tokens.get(index).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == ".")
+                && matches!(tokens.get(index + 1).map(|token| &token.kind), Some(TokenKind::Identifier(segment)) if segment == "proc")
+                && matches!(tokens.get(index + 2).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "/")
+                && let Some(TokenKind::Identifier(name)) =
+                    tokens.get(index + 3).map(|token| &token.kind)
+            {
+                paths.insert(format!("/{}/proc/{name}", segments.join("/")));
+                index += 4;
+                continue;
             }
             if let Some(proc_index) = segments.iter().position(|segment| segment == "proc")
                 && proc_index + 1 < segments.len()
@@ -4625,6 +4701,10 @@ pub fn standard_instance_field_names(path: &str) -> &'static [&'static str] {
             "name",
             "overlays",
             "plane",
+            "pixel_x",
+            "pixel_y",
+            "pixel_w",
+            "pixel_z",
             "transform",
             "underlays",
             "vis_contents",
@@ -5318,6 +5398,63 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(stores.len(), 1);
         assert_eq!(initials, stores);
+    }
+
+    #[test]
+    fn typed_for_in_receiver_reads_inherited_static_list_by_shared_identity() {
+        let compilation = TestProject::compile(
+            "/datum/bodypart_overlay\n\tvar/static/list/all_layers = list(1, 2, 4)\n/datum/bodypart_overlay/mutant\n/proc/read_layers(list/bodypart_overlays)\n\tvar/list/first\n\tfor(var/datum/bodypart_overlay/overlay as anything in bodypart_overlays)\n\t\tfirst = overlay.all_layers\n\treturn first\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let entry = procedure_by_path(&registry, "/proc/read_layers")
+            .effective_target
+            .expect("read_layers implementation");
+        let executable = registry
+            .compile_vm_implementations(&compilation, [entry])
+            .expect("typed loop receiver static access should lower");
+        let program = executable
+            .module()
+            .procedure(executable.implementation(entry).unwrap())
+            .expect("read_layers program");
+        let storage = FieldName::static_storage("/datum/bodypart_overlay/var/all_layers");
+        assert!(program.instructions.iter().any(
+            |instruction| matches!(instruction, Instruction::LoadGlobal(field) if field == &storage)
+        ));
+        assert!(!program.instructions.iter().any(
+            |instruction| matches!(instruction, Instruction::LoadField(field) if field.as_str() == "all_layers")
+        ));
+
+        let mut state = ExecutionState::new();
+        let shared = state.heap_mut().allocate_list();
+        for layer in [1.0, 2.0, 4.0] {
+            state
+                .heap_mut()
+                .list_mut(shared)
+                .unwrap()
+                .add(Value::number(layer));
+        }
+        let overlay = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/bodypart_overlay/mutant").unwrap());
+        let overlays = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(overlays)
+            .unwrap()
+            .add(Value::Datum(overlay));
+        state.set_global(storage, Value::List(shared));
+
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(entry).unwrap(),
+                &[Value::List(overlays)],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::List(shared)),
+            "every instance receiver must observe the one inherited static list",
+        );
     }
 
     #[test]
@@ -6392,7 +6529,7 @@ GLOBAL_REAL(Master, /datum/controller/master)
     #[test]
     fn construction_closure_narrows_typed_and_subtypesof_families() {
         let compilation = TestProject::compile(
-            "/proc/from_loop()\n\tfor(var/path in subtypesof(/datum/base))\n\t\tvar/datum/value = new path\n/proc/from_typesof()\n\tfor(var/path in typesof(/datum/base))\n\t\tvar/datum/value = new path\n/proc/from_typecache()\n\tfor(var/datum/base/path as anything in typecacheof(path = /datum/base, ignore_root_path = TRUE))\n\t\tvar/datum/value = new path\n/proc/from_typed(datum/base/path)\n\tvar/datum/value = new path\n/proc/from_unknown(path)\n\tvar/datum/value = new path\n/datum/base/New()\n/datum/base/child/New()\n/datum/unrelated/New()\n",
+            "/proc/from_loop()\n\tfor(var/path in subtypesof(/datum/base))\n\t\tvar/datum/value = new path\n/proc/from_typesof()\n\tfor(var/path in typesof(/datum/base))\n\t\tvar/datum/value = new path\n/proc/from_typecache()\n\tfor(var/datum/base/path as anything in typecacheof(path = /datum/base, ignore_root_path = TRUE))\n\t\tvar/datum/value = new path\n/proc/from_typed(datum/base/path)\n\tvar/datum/value = new path\n/proc/from_unknown(path)\n\tvar/datum/value = new path\n/proc/from_newlist()\n\treturn newlist(/datum/base/child)\n/proc/from_dynamic_newlist(path)\n\treturn newlist(path)\n/datum/base/New()\n/datum/base/child/New()\n/datum/unrelated/New()\n",
         );
         let registry = ProcedureRegistry::build(&compilation);
         let target = |path| {
@@ -6432,6 +6569,15 @@ GLOBAL_REAL(Master, /datum/controller/master)
             unknown.contains(&unrelated_new),
             "a genuinely untyped construction must retain all New candidates"
         );
+
+        let newlist = registry.implementation_closure(&compilation, [target("/proc/from_newlist")]);
+        assert!(newlist.contains(&child_new));
+        assert!(!newlist.contains(&unrelated_new));
+        let dynamic_newlist =
+            registry.implementation_closure(&compilation, [target("/proc/from_dynamic_newlist")]);
+        assert!(dynamic_newlist.contains(&base_new));
+        assert!(dynamic_newlist.contains(&child_new));
+        assert!(dynamic_newlist.contains(&unrelated_new));
     }
 
     #[test]
@@ -6654,6 +6800,58 @@ GLOBAL_REAL(Master, /datum/controller/master)
                 .implementation_closure(&compilation, [register])
                 .contains(&callback),
             "PROC_REF-style nameof(.proc/name) callbacks must remain linked",
+        );
+    }
+
+    #[test]
+    fn typed_proc_ref_retains_signal_callback_for_subtype_receiver() {
+        let compilation = TestProject::compile(
+            "/datum/module/proc/register(datum/module/syndicate/receiver)\n\tvar/callback = nameof(/datum/module.proc/add_overlay)\n\treturn call(receiver, callback)()\n/datum/module/proc/add_overlay()\n\treturn 42\n/datum/module/syndicate\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let register = procedure_by_path(&registry, "/datum/module/proc/register")
+            .effective_target
+            .unwrap();
+        let callback = procedure_by_path(&registry, "/datum/module/proc/add_overlay")
+            .effective_target
+            .unwrap();
+
+        assert!(
+            registry
+                .implementation_closure(&compilation, [register])
+                .contains(&callback),
+            "TYPE_PROC_REF-style nameof(/owner.proc/name) must retain the callback",
+        );
+        let executable = registry
+            .compile_vm_implementations(&compilation, [register])
+            .expect("typed callback should link");
+        let mut state = ExecutionState::new();
+        state.set_type_parents(
+            [
+                (TypePath::parse("/datum").unwrap(), None),
+                (
+                    TypePath::parse("/datum/module").unwrap(),
+                    Some(TypePath::parse("/datum").unwrap()),
+                ),
+                (
+                    TypePath::parse("/datum/module/syndicate").unwrap(),
+                    Some(TypePath::parse("/datum/module").unwrap()),
+                ),
+            ]
+            .into(),
+        );
+        let receiver = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/module/syndicate").unwrap());
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                executable.implementation(register).unwrap(),
+                &[Value::Datum(receiver)],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::number(42.0)),
         );
     }
 

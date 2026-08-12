@@ -579,9 +579,13 @@ fn initializer(
     file_id: FileId,
     definition: &Definition,
 ) -> Option<InitializerSyntax> {
-    let equals = definition.header.iter().position(
-        |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
-    )?;
+    let Some(equals) = definition
+        .header
+        .iter()
+        .position(|token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="))
+    else {
+        return suffix_array_initializer(compilation, file_id, definition);
+    };
     let equals_token = &definition.header[equals];
     let initializer_start = equals + 1;
     let mut depth = 0usize;
@@ -609,6 +613,107 @@ fn initializer(
         .get(expanded_span.start..expanded_span.end)?
         .to_owned();
     let tokens = definition.header[initializer_start..initializer_end].to_vec();
+    let evaluation = evaluate_constant(&tokens);
+    let class = classify_evaluation(&evaluation);
+    Some(InitializerSyntax {
+        text,
+        tokens: tokens.clone(),
+        expanded_span,
+        original_span: file.original_span(expanded_span),
+        class,
+        evaluation,
+        dependencies: initializer_dependencies(&tokens),
+    })
+}
+
+/// Rewrites a suffix-declared array (`var/list/items[x][y]`) to the equivalent
+/// per-allocation list constructor (`new /list(x, y)`). The dimensions retain
+/// their expanded source tokens so runtime name binding and diagnostics behave
+/// exactly like an ordinary initializer expression.
+fn suffix_array_initializer(
+    compilation: &Compilation,
+    file_id: FileId,
+    definition: &Definition,
+) -> Option<InitializerSyntax> {
+    let suffix_start = definition
+        .header
+        .iter()
+        .position(|token| token.kind == TokenKind::Punctuation('['))?;
+    let mut dimensions = Vec::<Vec<SpannedToken>>::new();
+    let mut cursor = suffix_start;
+    let mut expanded_end = definition.header[suffix_start].span.end;
+    while cursor < definition.header.len()
+        && definition.header[cursor].kind == TokenKind::Punctuation('[')
+    {
+        let open = cursor;
+        cursor += 1;
+        let mut depth = 1usize;
+        let dimension_start = cursor;
+        while cursor < definition.header.len() && depth > 0 {
+            match definition.header[cursor].kind {
+                TokenKind::Punctuation('[') => depth += 1,
+                TokenKind::Punctuation(']') => depth -= 1,
+                _ => {}
+            }
+            cursor += 1;
+        }
+        if depth != 0 {
+            return None;
+        }
+        let close = cursor - 1;
+        expanded_end = definition.header[close].span.end;
+        dimensions.push(definition.header[dimension_start..close].to_vec());
+        if close == open {
+            return None;
+        }
+    }
+
+    // `var/list/items[]` is BYOND's declaration spelling for a fresh empty
+    // list. Empty dimensions mixed with sized dimensions are not a valid array
+    // constructor and remain available to the normal compiler diagnostics.
+    if dimensions.len() > 1 && dimensions.iter().any(Vec::is_empty) {
+        return None;
+    }
+
+    let expanded_span = SourceSpan::new(definition.header[suffix_start].span.start, expanded_end);
+    let wrapper_span = expanded_span;
+    let mut tokens = vec![
+        SpannedToken {
+            kind: TokenKind::Identifier("new".to_owned()),
+            span: wrapper_span,
+        },
+        SpannedToken {
+            kind: TokenKind::Operator("/".to_owned()),
+            span: wrapper_span,
+        },
+        SpannedToken {
+            kind: TokenKind::Identifier("list".to_owned()),
+            span: wrapper_span,
+        },
+        SpannedToken {
+            kind: TokenKind::Punctuation('('),
+            span: wrapper_span,
+        },
+    ];
+    for (index, dimension) in dimensions.iter().enumerate() {
+        if index > 0 {
+            tokens.push(SpannedToken {
+                kind: TokenKind::Punctuation(','),
+                span: wrapper_span,
+            });
+        }
+        tokens.extend(dimension.iter().cloned());
+    }
+    tokens.push(SpannedToken {
+        kind: TokenKind::Punctuation(')'),
+        span: wrapper_span,
+    });
+
+    let file = compilation.project().file(file_id)?;
+    let source = file.compiler_text().ok()?;
+    let text = source
+        .get(expanded_span.start..expanded_span.end)?
+        .to_owned();
     let evaluation = evaluate_constant(&tokens);
     let class = classify_evaluation(&evaluation);
     Some(InitializerSyntax {
@@ -666,7 +771,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use dm_compiler::CompilerDatabase;
-    use dm_lexer::{TokenKind, lex};
+    use dm_lexer::{SpannedToken, TokenKind, lex};
 
     use super::{
         AssignmentKind, ConstantEvaluation, ConstantListEntry, ConstantValue, InitializerClass,
@@ -975,5 +1080,115 @@ mod tests {
 
         assert_eq!(registry.entries()[0].storage, StorageClass::Instance);
         assert_eq!(registry.entries()[1].storage, StorageClass::Static);
+    }
+
+    #[test]
+    fn suffix_arrays_become_ordered_runtime_initializers_for_every_storage_lifetime() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"arrays.dm\"\n");
+        fixture.write(
+            "arrays.dm",
+            "#define TOTAL_LAYERS 45\nvar/global/global_grid[2][3]\n/datum/base\n\tvar/list/items[TOTAL_LAYERS]\n\tvar/static/list/shared[5]\n/datum/base/child\n\tvar/list/dynamic[dimension][2]\n\tvar/dimension = 6\n",
+        );
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.0.join("world.dme"))
+            .expect("fixture should compile");
+        let registry = VariableRegistry::build(&compilation);
+        let entries = registry.entries();
+
+        let suffix_entries = entries
+            .iter()
+            .filter(|entry| {
+                entry.initializer.as_ref().is_some_and(|initializer| {
+                    matches!(
+                        initializer.tokens.as_slice(),
+                        [
+                            SpannedToken {
+                                kind: TokenKind::Identifier(new),
+                                ..
+                            },
+                            SpannedToken {
+                                kind: TokenKind::Operator(slash),
+                                ..
+                            },
+                            SpannedToken {
+                                kind: TokenKind::Identifier(list),
+                                ..
+                            },
+                            ..
+                        ] if new == "new" && slash == "/" && list == "list"
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(suffix_entries.len(), 4);
+        assert_eq!(suffix_entries[0].storage, StorageClass::Global);
+        assert_eq!(suffix_entries[1].storage, StorageClass::Instance);
+        assert_eq!(suffix_entries[2].storage, StorageClass::Static);
+        assert_eq!(suffix_entries[3].storage, StorageClass::Instance);
+        assert!(suffix_entries.iter().all(|entry| {
+            entry.initializer.as_ref().is_some_and(|initializer| {
+                initializer.class
+                    == InitializerClass::RequiresRuntime(RuntimeBlocker::NewExpression)
+            })
+        }));
+        assert!(
+            suffix_entries[1]
+                .initializer
+                .as_ref()
+                .unwrap()
+                .tokens
+                .iter()
+                .any(|token| matches!(&token.kind, TokenKind::Number(number) if number == "45"))
+        );
+        assert_eq!(
+            suffix_entries[3].initializer.as_ref().unwrap().dependencies,
+            vec![super::InitializerDependency {
+                name: "dimension".to_owned()
+            }]
+        );
+
+        let plans = registry.initialization_plans();
+        assert_eq!(
+            plans.global_steps.len(),
+            2,
+            "global and static arrays run once"
+        );
+        assert_eq!(plans.type_defaults.len(), 2);
+        assert_eq!(plans.type_defaults[0].owner.path, "/datum/base");
+        assert_eq!(plans.type_defaults[0].steps.len(), 1);
+        assert_eq!(plans.type_defaults[1].owner.path, "/datum/base/child");
+        assert_eq!(plans.type_defaults[1].steps.len(), 2);
+        assert!(plans.type_defaults[1].steps[0].path.ends_with("/dynamic"));
+    }
+
+    #[test]
+    fn empty_suffix_array_is_a_fresh_empty_list_initializer() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"arrays.dm\"\n");
+        fixture.write("arrays.dm", "/datum/example\n\tvar/list/items[]\n");
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.0.join("world.dme"))
+            .expect("fixture should compile");
+        let registry = VariableRegistry::build(&compilation);
+        let initializer = registry.entries()[0]
+            .initializer
+            .as_ref()
+            .expect("empty suffix array should synthesize an initializer");
+        let kinds = initializer
+            .tokens
+            .iter()
+            .map(|token| token.kind.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Identifier("new".to_owned()),
+                TokenKind::Operator("/".to_owned()),
+                TokenKind::Identifier("list".to_owned()),
+                TokenKind::Punctuation('('),
+                TokenKind::Punctuation(')'),
+            ]
+        );
     }
 }

@@ -12,11 +12,18 @@ $ErrorActionPreference = "Stop"
 $workspace = (Resolve-Path "$PSScriptRoot\..").Path
 $Executable = (Resolve-Path $Executable).Path
 $log = Join-Path $workspace "monkestation-headless-boot-$BootNumber.console.log"
+# Keep only the active boot trace. These files are intentionally ignored by
+# Git, and pruning them here prevents long debugging sessions from filling the
+# workspace with obsolete multi-megabyte logs.
+Get-ChildItem -LiteralPath $workspace -File -Filter "monkestation-headless-boot-*.console.log" -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -ne $log } |
+    Remove-Item -Force
 if ($FullTrace) {
     $env:DREAM64_BOOT_TRACE = "1"
 } else {
     Remove-Item Env:DREAM64_BOOT_TRACE -ErrorAction SilentlyContinue
 }
+$env:DREAM64_BOOT_DASHBOARD = "1"
 if ($AuditRuntime) {
     $env:DREAM64_BOOT_AUDIT_RUNTIME = "1"
 } else {
@@ -44,6 +51,9 @@ $ready = $false
 $failed = $false
 $lastPhase = "starting"
 $initializerCount = 0
+$startupChecklistShown = $false
+$startupChecklistCompleted = 0
+$startupChecklistActive = @{}
 
 function Write-BootLine {
     param([string] $Line)
@@ -64,10 +74,70 @@ function Write-BootLine {
     if ($Line -match "HEADLESS READY|HeadlessReady") {
         $script:ready = $true
         Write-Progress -Activity "Dream64 map lifecycle" -Completed
+        $readySeconds = ((Get-Date) - $started).TotalSeconds
         Write-Host ""
         Write-Host "  ============================================================" -ForegroundColor Green
-        Write-Host "                 HEADLESS READY - SERVER LIVE" -ForegroundColor Green
+        Write-Host ("                 GAME READY! ({0:N1}s)" -f $readySeconds) -ForegroundColor Yellow
+        Write-Host "              HEADLESS READY - SERVER LIVE" -ForegroundColor Green
         Write-Host "  ============================================================" -ForegroundColor Green
+        return
+    }
+    if ($Line.StartsWith("boot-vm: init-display|")) {
+        $fields = @{}
+        foreach ($part in $Line.Split('|') | Select-Object -Skip 1) {
+            $separator = $part.IndexOf('=')
+            if ($separator -ge 0) {
+                $fields[$part.Substring(0, $separator)] = $part.Substring($separator + 1)
+            }
+        }
+        $eventName = [string]$fields['event']
+        $category = [string]$fields['category']
+        if ($eventName -eq 'add') {
+            $rawLabel = ([string]$fields['name'] -replace '<[^>]+>', '').Trim()
+            $isChild = $rawLabel.StartsWith('>')
+            $label = ($rawLabel -replace '^[>\-]\s*', '').Trim()
+            $marker = if ($isChild) { '  >' } else { '-' }
+            $stage = ([string]$fields['stage'] -replace '<[^>]+>', '').Trim()
+            $seconds = 0.0
+            [void][double]::TryParse(
+                [string]$fields['seconds'],
+                [Globalization.NumberStyles]::Float,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref]$seconds
+            )
+            if (-not $startupChecklistShown) {
+                $script:startupChecklistShown = $true
+                Write-Host ""
+                Write-Host "  STARTUP CHECKLIST" -ForegroundColor Cyan
+                Write-Host "  ------------------------------------------------------------" -ForegroundColor DarkCyan
+            }
+            if ($stage -match 'INITIALIZING|CREATING|LOADING') {
+                $script:startupChecklistActive[$category] = @{
+                    Label = $label
+                    Marker = $marker
+                    Started = [Diagnostics.Stopwatch]::GetTimestamp()
+                }
+                Write-Host ("  {0} " -f $marker) -ForegroundColor Yellow -NoNewline
+                Write-Host ("{0}  {1}" -f $label, $stage) -ForegroundColor White
+            } elseif ($stage -match 'DONE') {
+                $script:startupChecklistCompleted++
+                $script:startupChecklistActive.Remove($category)
+                $duration = if ($seconds -gt 0) { " ({0:N1}s)" -f $seconds } else { "" }
+                Write-Host ("  {0} " -f $marker) -ForegroundColor Green -NoNewline
+                Write-Host ("{0}  DONE{1}" -f $label, $duration) -ForegroundColor Green
+            } elseif ($stage -match 'FAILED|ERROR') {
+                $script:startupChecklistActive.Remove($category)
+                Write-Host ("  {0} " -f $marker) -ForegroundColor Red -NoNewline
+                Write-Host ("{0}  {1}" -f $label, $stage) -ForegroundColor Red
+            }
+        } elseif ($eventName -eq 'remove' -and $startupChecklistActive.ContainsKey($category)) {
+            $active = $startupChecklistActive[$category]
+            $script:startupChecklistActive.Remove($category)
+            $script:startupChecklistCompleted++
+            $elapsed = ([Diagnostics.Stopwatch]::GetTimestamp() - [int64]$active.Started) / [Diagnostics.Stopwatch]::Frequency
+            Write-Host ("  {0} " -f $active.Marker) -ForegroundColor Green -NoNewline
+            Write-Host ("{0}  DONE ({1:N1}s)" -f $active.Label, $elapsed) -ForegroundColor Green
+        }
         return
     }
     if ($Line -match "boot-vm: heartbeat steps=([0-9]+) depth=([0-9]+) procedure=(.+) instruction=([0-9]+)") {
@@ -90,8 +160,9 @@ function Write-BootLine {
         return
     }
     if ($Line -match "boot-vm: subsystem-constructor type=([^ ]+) procedure=(.+)") {
-        Write-Host "  [$stamp] SUBSYSTEM      " -ForegroundColor Magenta -NoNewline
-        Write-Host "$($Matches[1]) -> $($Matches[2])" -ForegroundColor White
+        # Constructor inventory is useful in the ignored full trace, but it is
+        # not subsystem initialization progress. The authoritative SStitle
+        # events below replace this noisy preflight list in the dashboard.
         return
     }
     if ($Line -match "boot-audit-runtime-error: group=([0-9]+).*") {
@@ -128,7 +199,7 @@ function Write-BootLine {
         Write-Host "  $Line" -ForegroundColor DarkRed
         return
     }
-    if ($Line -match "boot-vm: (deferred|initializer-|global-read|slow-instruction)") {
+    if ($Line -match "boot-vm: (deferred|initializer-|global-read|slow-instruction|dcs-|list-gc)") {
         return
     }
     if ($Line.Trim().Length -gt 0) {

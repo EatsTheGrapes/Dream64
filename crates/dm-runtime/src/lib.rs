@@ -6,7 +6,7 @@
 
 #![cfg_attr(not(test), deny(missing_docs))]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -222,6 +222,10 @@ fn materialize_builtin_atom_defaults(
         ("loc", Value::Null),
         ("name", Value::Null),
         ("plane", Value::number(0.0)),
+        ("pixel_x", Value::number(0.0)),
+        ("pixel_y", Value::number(0.0)),
+        ("pixel_w", Value::number(0.0)),
+        ("pixel_z", Value::number(0.0)),
         ("transform", Value::Null),
     ];
     for (name, value) in is_atom
@@ -548,6 +552,10 @@ fn builtin_initial_fields(path: &TypePath, world_name: &str) -> BTreeMap<FieldNa
                 ("name", Value::Null),
                 ("overlays", Value::Null),
                 ("plane", Value::number(0.0)),
+                ("pixel_x", Value::number(0.0)),
+                ("pixel_y", Value::number(0.0)),
+                ("pixel_w", Value::number(0.0)),
+                ("pixel_z", Value::number(0.0)),
                 ("transform", Value::Null),
                 ("underlays", Value::Null),
                 ("vis_contents", Value::Null),
@@ -785,6 +793,7 @@ fn complete_runtime_phase(
 /// A deterministic runtime-ready constant image for one compiled project.
 pub struct RuntimeImage {
     heap: ValueHeap,
+    compact_default_datums: HashSet<DatumId>,
     variables: Vec<RuntimeVariable>,
     types: BTreeMap<TypePath, RuntimeType>,
     type_paths: Arc<BTreeSet<TypePath>>,
@@ -1109,6 +1118,38 @@ impl InitializerProcedureFrontier {
                         // from arbitrary runtime data. A reduced inventory is
                         // not sound for that expression.
                         self.requires_complete_inventory = true;
+                    } else if name == "newlist" && is_call_head {
+                        let mut cursor = index + 2;
+                        let mut argument_start = cursor;
+                        let mut depth = 0usize;
+                        let mut closed = false;
+                        while cursor < initializer.tokens.len() {
+                            match initializer.tokens[cursor].kind {
+                                TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
+                                TokenKind::Punctuation(')') if depth == 0 => {
+                                    self.include_newlist_argument(
+                                        &initializer.tokens[argument_start..cursor],
+                                    );
+                                    index = cursor;
+                                    closed = true;
+                                    break;
+                                }
+                                TokenKind::Punctuation(')' | ']' | '}') => {
+                                    depth = depth.saturating_sub(1);
+                                }
+                                TokenKind::Punctuation(',') if depth == 0 => {
+                                    self.include_newlist_argument(
+                                        &initializer.tokens[argument_start..cursor],
+                                    );
+                                    argument_start = cursor + 1;
+                                }
+                                _ => {}
+                            }
+                            cursor += 1;
+                        }
+                        if !closed {
+                            self.requires_dynamic_constructors = true;
+                        }
                     } else if name == "new" {
                         let mut cursor = index + 1;
                         if matches!(
@@ -1203,6 +1244,36 @@ impl InitializerProcedureFrontier {
                 _ => {}
             }
             index += 1;
+        }
+    }
+
+    fn include_newlist_argument(&mut self, tokens: &[dm_lexer::SpannedToken]) {
+        if tokens.is_empty() {
+            return;
+        }
+        let mut cursor = 0usize;
+        let mut segments = Vec::new();
+        while cursor + 1 < tokens.len()
+            && matches!(&tokens[cursor].kind, TokenKind::Operator(operator) if operator == "/")
+        {
+            let TokenKind::Identifier(segment) = &tokens[cursor + 1].kind else {
+                break;
+            };
+            segments.push(segment.clone());
+            cursor += 2;
+        }
+        if segments.is_empty() {
+            self.requires_dynamic_constructors = true;
+            return;
+        }
+        if segments.len() == 1 && segments[0] == "list" {
+            return;
+        }
+        match TypePath::parse(&format!("/{}", segments.join("/"))) {
+            Ok(path) => {
+                self.constructed_types.insert(path);
+            }
+            Err(_) => self.requires_dynamic_constructors = true,
         }
     }
 }
@@ -1344,6 +1415,7 @@ impl RuntimeImage {
         complete_runtime_phase(&mut observer, phase, phase_started, Some(types.len()));
         let mut image = Self {
             heap: ValueHeap::new(),
+            compact_default_datums: HashSet::new(),
             variables: Vec::new(),
             types,
             type_paths,
@@ -1870,6 +1942,7 @@ impl RuntimeImage {
     #[must_use]
     pub fn take_execution_state(&mut self) -> ExecutionState {
         let mut state = ExecutionState::from_heap(std::mem::take(&mut self.heap));
+        state.set_compact_default_datums(std::mem::take(&mut self.compact_default_datums));
         state.set_shared_type_paths(Arc::clone(&self.type_paths));
         state.set_shared_type_parents(Arc::clone(&self.type_parents));
         state.set_shared_initial_values(Arc::clone(&self.initial_values));
@@ -1921,6 +1994,7 @@ impl RuntimeImage {
             }
         }
         self.procedure_static_locals = state.take_procedure_static_locals();
+        self.compact_default_datums = state.take_compact_default_datums();
         self.heap = state.into_heap();
     }
 
@@ -2034,6 +2108,36 @@ impl RuntimeImage {
                 .set_datum_field(datum, initializer.field.clone(), value)?;
         }
         self.stats.dynamic_initializers_materialized += plan.len();
+        self.stats.datums_allocated += 1;
+        self.stats.stateful_datums_allocated += 1;
+        Ok(datum)
+    }
+
+    /// Allocates one inert map atom using sparse inherited scalar defaults.
+    ///
+    /// Per-instance dynamic initializers still execute in source order and
+    /// materialize their results. Untouched scalar defaults remain available
+    /// through the execution state's initial-value catalog, avoiding a copy of
+    /// every inherited field for every mapped turf or area.
+    ///
+    /// # Errors
+    ///
+    /// Returns an instance-initializer or runtime-value error when compact map
+    /// allocation cannot complete.
+    pub fn allocate_compact_map_datum_in_state(
+        &mut self,
+        type_path: &TypePath,
+        state: &mut ExecutionState,
+    ) -> Result<DatumId, RuntimeImageError> {
+        if !self.types.contains_key(type_path) {
+            return Err(RuntimeImageError::UnknownType(type_path.clone()));
+        }
+        let datum = state
+            .allocate_compact_map_datum(type_path.clone())
+            .map_err(|message| RuntimeImageError::InstanceInitializer {
+                path: type_path.to_string(),
+                message,
+            })?;
         self.stats.datums_allocated += 1;
         self.stats.stateful_datums_allocated += 1;
         Ok(datum)
@@ -3032,7 +3136,7 @@ mod tests {
     use dm_compiler::CompilerDatabase;
     use dm_globals::{StorageClass, UnsupportedCategory, VariableRegistry};
     use dm_lexer::{TokenKind, lex};
-    use dm_semantics::standard_instance_field_names;
+    use dm_semantics::{ProcedureRegistry, standard_instance_field_names};
     use dm_value::{FieldName, TypePath, Value};
     use dm_vm::{compile_initializer, compile_module, execute_module_in_state};
 
@@ -3433,6 +3537,67 @@ mod tests {
             "only child New and its exact parent-call target should be retained"
         );
         assert_eq!(image.stats().initializer_module_materialized_procedures, 2);
+    }
+
+    #[test]
+    fn newlist_instance_initializer_constructs_contents_with_datum_defaults_and_new() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/datum\n\tvar/gc_destroyed\n/obj/item\n\tvar/new_ran\n\tNew()\n\t\tnew_ran = 7\n/obj/item/apc_powercord\n/obj/item/organ/internal/cyberimp/arm/item_set/power_cord\n\tcontents = newlist(/obj/item/apc_powercord)\n/proc/run()\n\treturn new /obj/item/organ/internal/cyberimp/arm/item_set/power_cord\n",
+        );
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.0.join("world.dme"))
+            .expect("power-cord fixture should compile");
+        let executable = ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("power-cord fixture should lower");
+        let module = executable.module();
+        let mut image = RuntimeImage::from_compilation(&compilation)
+            .expect("power-cord defaults should materialize");
+        assert_eq!(image.stats().initializer_typed_constructor_targets, 1);
+        assert_eq!(image.stats().initializer_dynamic_constructor_frontier, 0);
+        let mut state = image.take_execution_state();
+        let run = (0..)
+            .map_while(|index| module.procedure_id_at(index))
+            .find(|procedure| {
+                module
+                    .procedure_path(*procedure)
+                    .is_some_and(|path| path == "/proc/run" || path.starts_with("/proc/run@"))
+            })
+            .expect("run procedure");
+        let Value::Datum(implant) = execute_module_in_state(module, run, &[], &mut state)
+            .expect("power-cord implant should allocate through ordinary new")
+        else {
+            panic!("run should return the power-cord implant");
+        };
+        let Value::List(contents) = state
+            .heap()
+            .datum_field(implant, &field("contents"))
+            .expect("contents initializer")
+        else {
+            panic!("power-cord contents should be a list");
+        };
+        let Value::Datum(powercord) = state
+            .heap()
+            .list(*contents)
+            .unwrap()
+            .get(1)
+            .expect("one newlist item")
+        else {
+            panic!("newlist should contain the constructed power cord");
+        };
+        assert_eq!(
+            state.heap().datum_field(*powercord, &field("gc_destroyed")),
+            Ok(&Value::Null),
+            "qdel must see the inherited /datum field on newlist objects",
+        );
+        assert_eq!(
+            state.heap().datum_field(*powercord, &field("new_ran")),
+            Ok(&Value::number(7.0)),
+            "newlist must invoke the inherited item New",
+        );
     }
 
     #[test]
@@ -3882,6 +4047,134 @@ mod tests {
     }
 
     #[test]
+    fn suffix_arrays_materialize_before_descendant_new_with_fresh_multidimensional_storage() {
+        const SOURCE: &str = "#define TOTAL_LAYERS 45\nvar/global/global_grid[2][3]\nvar/global/constructor_result = 0\n/datum/array_owner\n\tvar/static/list/shared[4]\n/mob/living/carbon\n\tvar/list/overlays_standing[TOTAL_LAYERS]\n\tvar/width = 2\n\tvar/list/dynamic_grid[width][3]\n/mob/living/carbon/human/dummy\n\tNew()\n\t\tglobal.constructor_result = overlays_standing.len * 100 + dynamic_grid.len * 10 + dynamic_grid[1].len\n/proc/run()\n\tvar/mob/living/carbon/human/dummy/first = new /mob/living/carbon/human/dummy\n\tvar/mob/living/carbon/human/dummy/second = new /mob/living/carbon/human/dummy\n\tfirst.overlays_standing[1] = 9\n\treturn list(global.constructor_result, isnull(second.overlays_standing[1]), first.overlays_standing == second.overlays_standing)\n";
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write("types.dm", SOURCE);
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.0.join("world.dme"))
+            .expect("suffix-array fixture should compile");
+        let executable = ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("constructor fixture should lower");
+        let module = executable.module();
+        let mut image =
+            RuntimeImage::from_compilation(&compilation).expect("fixture should materialize");
+        assert!(image.diagnostics().is_empty(), "{:?}", image.diagnostics());
+
+        let global_grid = image
+            .variables()
+            .iter()
+            .find(|variable| variable.path.ends_with("/global_grid"))
+            .expect("global suffix array should materialize once");
+        let Value::List(global_grid_id) = &global_grid.value else {
+            panic!("global suffix array should be a list");
+        };
+        let global_rows = image
+            .heap()
+            .list(*global_grid_id)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| match value {
+                Value::List(row) => *row,
+                value => panic!("global array row should be a list, received {value}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(global_rows.len(), 2);
+        assert_ne!(global_rows[0], global_rows[1]);
+        assert!(
+            global_rows
+                .iter()
+                .all(|row| image.heap().list(*row).unwrap().len() == 3)
+        );
+
+        let shared = image
+            .variables()
+            .iter()
+            .find(|variable| variable.path.ends_with("/shared"))
+            .expect("static suffix array should materialize once");
+        assert_eq!(shared.storage, StorageClass::Static);
+        let Value::List(shared_id) = &shared.value else {
+            panic!("static suffix array should be a list");
+        };
+        assert_eq!(image.heap().list(*shared_id).unwrap().len(), 4);
+
+        let dummy = type_path("/mob/living/carbon/human/dummy");
+        let first = image
+            .allocate_datum(&dummy)
+            .expect("first dummy allocation");
+        let second = image
+            .allocate_datum(&dummy)
+            .expect("second dummy allocation");
+        let first_overlays = image
+            .heap()
+            .datum_field(first, &field("overlays_standing"))
+            .expect("inherited suffix array must exist before New")
+            .clone();
+        let second_overlays = image
+            .heap()
+            .datum_field(second, &field("overlays_standing"))
+            .expect("second inherited suffix array must exist")
+            .clone();
+        let (Value::List(first_overlays), Value::List(second_overlays)) =
+            (first_overlays, second_overlays)
+        else {
+            panic!("overlays_standing should be a list on every descendant");
+        };
+        assert_ne!(first_overlays, second_overlays, "instances must not alias");
+        assert_eq!(image.heap().list(first_overlays).unwrap().len(), 45);
+        assert_eq!(image.heap().list(second_overlays).unwrap().len(), 45);
+
+        let Value::List(first_grid) = image
+            .heap()
+            .datum_field(first, &field("dynamic_grid"))
+            .expect("dynamic dimension should materialize")
+            .clone()
+        else {
+            panic!("dynamic grid should be a list");
+        };
+        let rows = image
+            .heap()
+            .list(first_grid)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| match value {
+                Value::List(row) => *row,
+                value => panic!("dynamic grid row should be a list, received {value}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0], rows[1]);
+        assert!(
+            rows.iter()
+                .all(|row| image.heap().list(*row).unwrap().len() == 3)
+        );
+
+        // Prove the same initialization happens on the VM allocation path and
+        // therefore before the descendant constructor body observes the field.
+        let expanded = image.take_execution_state();
+        let mut state = expanded;
+        let run = (0..)
+            .map_while(|index| module.procedure_id_at(index))
+            .find(|procedure| {
+                module
+                    .procedure_path(*procedure)
+                    .is_some_and(|path| path == "/proc/run" || path.starts_with("/proc/run@"))
+            })
+            .expect("run procedure");
+        let Value::List(result) = execute_module_in_state(module, run, &[], &mut state)
+            .expect("descendant New should observe initialized suffix arrays")
+        else {
+            panic!("constructor probe should return a list");
+        };
+        let result = state.heap().list(result).unwrap();
+        assert_eq!(result.get(1), Ok(&Value::number(4523.0)));
+        assert_eq!(result.get(2), Ok(&Value::number(1.0)));
+        assert_eq!(result.get(3), Ok(&Value::number(0.0)));
+    }
+
+    #[test]
     fn preflights_unique_initializer_plans_without_allocating_datums() {
         let fixture = Fixture::new();
         fixture.write("world.dme", "#include \"types.dm\"\n");
@@ -4116,6 +4409,124 @@ mod tests {
     }
 
     #[test]
+    fn compact_map_defaults_survive_host_handoffs_and_preserve_dm_reflection_and_retyping() {
+        const SOURCE: &str = "/area/map_base\n\tvar/area_scalar = 7\n\tvar/list/area_fresh[2]\n/area/map_base/placed\n\tarea_scalar = 9\n/turf/map_base\n\tvar/turf_scalar = 11\n\tvar/list/turf_fresh[3]\n/turf/map_base/placed\n\tturf_scalar = 13\n/turf/map_base/retyped\n\tturf_scalar = 17\n/proc/probe(turf/map_base/placed/cell, area/map_base/placed/region)\n\tvar/list/cell_vars = cell.vars\n\tvar/list/area_vars = region.vars\n\tvar/before = cell.turf_scalar\n\tcell.turf_scalar = 15\n\treturn list(before, initial(cell.turf_scalar), cell.turf_scalar, cell_vars[\"turf_scalar\"], cell.turf_fresh.len, region.area_scalar, initial(region.area_scalar), area_vars[\"area_scalar\"], region.area_fresh.len)\n/proc/retype(turf/map_base/placed/cell)\n\tvar/list/old_fresh = cell.turf_fresh\n\tvar/turf/map_base/retyped/replacement = new /turf/map_base/retyped(cell)\n\treturn list(replacement == cell, replacement.x, replacement.y, replacement.z, replacement.loc == cell.loc, replacement.turf_scalar, initial(replacement.turf_scalar), replacement.turf_fresh.len, replacement.turf_fresh != old_fresh)\n";
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write("types.dm", SOURCE);
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.0.join("world.dme"))
+            .expect("compact map fixture should compile");
+        let executable = ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("compact map probes should lower");
+        let module = executable.module();
+        let procedure = |selector: &str| {
+            (0..)
+                .map_while(|index| module.procedure_id_at(index))
+                .find(|procedure| {
+                    module.procedure_path(*procedure).is_some_and(|path| {
+                        path == selector
+                            || path
+                                .strip_prefix(selector)
+                                .is_some_and(|suffix| suffix.starts_with('@'))
+                    })
+                })
+                .unwrap_or_else(|| panic!("missing compact-map probe {selector}"))
+        };
+
+        let mut image =
+            RuntimeImage::from_compilation(&compilation).expect("fixture should materialize");
+        let mut state = image.take_execution_state();
+        let turf_path = type_path("/turf/map_base/placed");
+        let area_path = type_path("/area/map_base/placed");
+        let first = image
+            .allocate_compact_map_datum_in_state(&turf_path, &mut state)
+            .expect("first compact turf");
+        let second = image
+            .allocate_compact_map_datum_in_state(&turf_path, &mut state)
+            .expect("second compact turf");
+        let area = image
+            .allocate_compact_map_datum_in_state(&area_path, &mut state)
+            .expect("compact area");
+        for (name, value) in [("x", 4.0), ("y", 5.0), ("z", 2.0)] {
+            state
+                .heap_mut()
+                .set_datum_field(first, field(name), Value::number(value))
+                .unwrap();
+        }
+        state
+            .heap_mut()
+            .set_datum_field(first, field("loc"), Value::Datum(area))
+            .unwrap();
+
+        assert!(
+            state
+                .heap()
+                .datum_field(first, &field("turf_scalar"))
+                .is_err(),
+            "untouched inherited scalars must remain sparse"
+        );
+        assert!(
+            state
+                .heap()
+                .datum_field(area, &field("area_scalar"))
+                .is_err(),
+            "area scalar defaults must remain sparse"
+        );
+        let first_fresh = state
+            .heap()
+            .datum_field(first, &field("turf_fresh"))
+            .expect("dynamic turf initializer")
+            .clone();
+        let second_fresh = state
+            .heap()
+            .datum_field(second, &field("turf_fresh"))
+            .expect("second dynamic turf initializer")
+            .clone();
+        assert_ne!(first_fresh, second_fresh, "dynamic defaults must be fresh");
+
+        // The world allocator returns this state to RuntimeImage before the
+        // lifecycle layer takes it again. Sparse identity must cross both
+        // ownership transfers or valid field reads become missing-field errors.
+        image.restore_execution_state(state);
+        let mut state = image.take_execution_state();
+        let Value::List(probe) = execute_module_in_state(
+            module,
+            procedure("/proc/probe"),
+            &[Value::Datum(first), Value::Datum(area)],
+            &mut state,
+        )
+        .expect("compact defaults should remain observable after handoff") else {
+            panic!("probe should return a list");
+        };
+        let probe = state.heap().list(probe).unwrap();
+        for (index, expected) in [13.0, 13.0, 15.0, 15.0, 3.0, 9.0, 9.0, 9.0, 2.0]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(probe.get(index + 1), Ok(&Value::number(expected)));
+        }
+
+        let Value::List(retyped) = execute_module_in_state(
+            module,
+            procedure("/proc/retype"),
+            &[Value::Datum(first)],
+            &mut state,
+        )
+        .expect("compact map turf should retype in place") else {
+            panic!("retype should return a list");
+        };
+        let retyped = state.heap().list(retyped).unwrap();
+        for (index, expected) in [1.0, 4.0, 5.0, 2.0, 1.0, 17.0, 17.0, 3.0, 1.0]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(retyped.get(index + 1), Ok(&Value::number(expected)));
+        }
+    }
+
+    #[test]
     fn dynamic_dummy_mob_exposes_null_client_during_initialize_add_verb() {
         const PROCEDURES: &str = "/proc/add_verb(mob/target)\n\tif(!target.client)\n\t\treturn isnull(target.client)\n\treturn 0\n/mob/living/carbon/human/dummy/proc/Initialize()\n\treturn add_verb(src)\n/mob/living/carbon/human/dummy/New()\n\tglobal.add_verb_result = src.Initialize()\n/proc/run()\n\tnew /mob/living/carbon/human/dummy\n\treturn global.add_verb_result\n";
         let fixture = Fixture::new();
@@ -4241,6 +4652,24 @@ mod tests {
             );
         }
         for (name, expected) in [
+            ("alpha", 255.0),
+            ("appearance_flags", 0.0),
+            ("blend_mode", 0.0),
+            ("dir", 2.0),
+            ("layer", 0.0),
+            ("plane", 0.0),
+            ("pixel_x", 0.0),
+            ("pixel_y", 0.0),
+            ("pixel_w", 0.0),
+            ("pixel_z", 0.0),
+        ] {
+            assert_eq!(
+                image.heap().datum_field(appearance, &field(name)),
+                Ok(&Value::number(expected)),
+                "unexpected materialized /image appearance default for {name}",
+            );
+        }
+        for (name, expected) in [
             ("appearance", Value::Null),
             ("desc", Value::Null),
             ("gender", Value::text("neuter")),
@@ -4259,20 +4688,83 @@ mod tests {
     }
 
     #[test]
+    fn mutable_appearance_pixel_defaults_support_build_worn_icon_centering() {
+        const SOURCE: &str = concat!(
+            "/datum\n",
+            "\tvar/list/filter_data\n",
+            "/proc/center_image(image/image_to_center, x_dimension, y_dimension)\n",
+            "\timage_to_center.pixel_w = -((x_dimension / 32) - 1) * 16\n",
+            "\timage_to_center.pixel_z = -((y_dimension / 32) - 1) * 16\n",
+            "\treturn image_to_center\n",
+            "/proc/build_worn_icon()\n",
+            "\tvar/mutable_appearance/standing = new /mutable_appearance\n",
+            "\tstanding = center_image(standing, 64, 96)\n",
+            "\tstanding.pixel_x += 3\n",
+            "\tstanding.pixel_y -= 2\n",
+            "\treturn list(standing.pixel_x, standing.pixel_y, standing.pixel_w, standing.pixel_z, isnull(standing.filter_data))\n",
+        );
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write("types.dm", SOURCE);
+        let mut image = fixture.image();
+        let syntax = dm_syntax::parse(SOURCE).expect("appearance fixture should parse");
+        let executable = syntax
+            .definitions
+            .iter()
+            .filter(|definition| {
+                matches!(
+                    definition.kind,
+                    dm_syntax::DefinitionKind::Procedure
+                        | dm_syntax::DefinitionKind::ProcedureOverride
+                        | dm_syntax::DefinitionKind::Verb
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let module = compile_module(&executable).expect("appearance fixture should lower");
+        let mut state = image.take_execution_state();
+
+        let Value::List(result) = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/build_worn_icon").unwrap(),
+            &[],
+            &mut state,
+        )
+        .expect("build_worn_icon-shaped appearance offsets should execute") else {
+            panic!("appearance probe should return a list");
+        };
+        let result = state.heap().list(result).unwrap();
+        for (index, expected) in [3.0, -2.0, -16.0, -32.0].into_iter().enumerate() {
+            assert_eq!(result.get(index + 1), Ok(&Value::number(expected)));
+        }
+        assert_eq!(result.get(5), Ok(&Value::number(1.0)));
+    }
+
+    #[test]
     fn parentless_engine_types_inherit_base_datum_storage() {
         let fixture = Fixture::new();
         fixture.write("world.dme", "#include \"types.dm\"\n");
         fixture.write(
             "types.dm",
-            "/datum\n\tvar/datum_flags = 0\n/regex/example\n/icon/example\n",
+            "/datum\n\tvar/datum_flags = 0\n\tvar/list/filter_data\n/regex/example\n/icon/example\n/image/example\n/mutable_appearance/example\n",
         );
         let mut image = fixture.image();
-        for path in ["/regex/example", "/icon/example"] {
+        for path in [
+            "/regex/example",
+            "/icon/example",
+            "/image/example",
+            "/mutable_appearance/example",
+        ] {
             let datum = image.allocate_datum(&type_path(path)).unwrap();
             assert_eq!(
                 image.heap().datum_field(datum, &field("datum_flags")),
                 Ok(&Value::number(0.0)),
                 "{path} must inherit /datum fields",
+            );
+            assert_eq!(
+                image.heap().datum_field(datum, &field("filter_data")),
+                Ok(&Value::Null),
+                "{path} must inherit project /datum fields",
             );
         }
     }

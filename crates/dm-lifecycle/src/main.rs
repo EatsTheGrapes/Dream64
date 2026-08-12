@@ -360,6 +360,18 @@ fn run_main() -> ExitCode {
             return ExitCode::FAILURE;
         }
         eprintln!("boot-progress: headless ready; entering persistent scheduler loop");
+        let max_slices = env::var_os("DREAM64_BOOT_MAX_SLICES")
+            .and_then(|limit| {
+                limit
+                    .to_str()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(Some)
+                    .or_else(|| {
+                        eprintln!("DREAM64_BOOT_MAX_SLICES ignored: not a valid u64: {limit:?}");
+                        None
+                    })
+            })
+            .flatten();
         let mut slices = 0u64;
         loop {
             let slice_started = Instant::now();
@@ -389,6 +401,16 @@ fn run_main() -> ExitCode {
                     scheduler.pending_tasks,
                     scheduler.termination,
                 );
+            }
+            if scheduler.termination == SchedulerDrainTermination::StableIdle {
+                eprintln!("boot-progress: startup scheduler reached stable idle; stopping");
+                return ExitCode::SUCCESS;
+            }
+            if let Some(limit) = max_slices
+                && slices >= limit
+            {
+                eprintln!("boot-progress: reached DREAM64_BOOT_MAX_SLICES={limit}; stopping");
+                return ExitCode::SUCCESS;
             }
             if let Some(remaining) = tick_duration.checked_sub(slice_started.elapsed()) {
                 std::thread::sleep(remaining);
