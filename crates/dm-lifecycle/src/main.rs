@@ -10,17 +10,23 @@ use dm_compiler::{Compilation, CompilerDatabase};
 use dm_lifecycle::{
     HeadlessReadinessProbe, LifecycleIndex, LifecycleKind, LifecycleResolution,
     SchedulerDrainLimits, SchedulerDrainTermination, advance_persistent_scheduler,
+    artifact::{ArtifactSection, CompiledArtifact},
     audit_initialization_plan_with_precompiled, build_initialization_plan,
     execute_boot_initialization_plan_with_precompiled, precompile_lifecycle_for_world,
-    sweep_lifecycle_compatibility, sweep_lifecycle_compatibility_with_closures,
+    precompile_lifecycle_for_world_with_executable, sweep_lifecycle_compatibility,
+    sweep_lifecycle_compatibility_with_closures,
 };
+use dm_project::Project;
 use dm_runtime::{RuntimeImage, RuntimeImageConstructionEvent, RuntimeInitializerDiagnostic};
-use dm_semantics::ProcedureRegistry;
+use dm_semantics::{ExecutableProcedures, ProcedureRegistry};
 use dm_value::{FieldName, Value};
 use dm_world::allocate_world;
 
+const MAX_EAGER_ARTIFACT_DIAGNOSTICS: usize = 32;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Command {
+    Compile,
     Plan,
     Boot,
     Sweep,
@@ -51,10 +57,18 @@ fn main() -> ExitCode {
 fn run_main() -> ExitCode {
     let mut arguments = env::args_os().skip(1);
     let Some(first) = arguments.next() else {
-        eprintln!("usage: dm-lifecycle [plan|boot|sweep|sweep-closure] <world.dme> [map.dmm]");
+        eprintln!(
+            "usage: dm-lifecycle [compile|plan|boot|sweep|sweep-closure] <world.dme> [map.dmm]"
+        );
         return ExitCode::from(2);
     };
-    let (command, environment) = if first.as_os_str() == OsStr::new("plan") {
+    let (command, environment) = if first.as_os_str() == OsStr::new("compile") {
+        let Some(environment) = arguments.next() else {
+            eprintln!("usage: dm-lifecycle compile <world.dme>");
+            return ExitCode::from(2);
+        };
+        (Command::Compile, PathBuf::from(environment))
+    } else if first.as_os_str() == OsStr::new("plan") {
         let Some(environment) = arguments.next() else {
             eprintln!("usage: dm-lifecycle plan <world.dme> [map.dmm]");
             return ExitCode::from(2);
@@ -83,43 +97,108 @@ fn run_main() -> ExitCode {
     };
     let requested_map = arguments.next().map(PathBuf::from);
     if arguments.next().is_some() {
-        eprintln!("usage: dm-lifecycle [plan|boot|sweep|sweep-closure] <world.dme> [map.dmm]");
+        eprintln!(
+            "usage: dm-lifecycle [compile|plan|boot|sweep|sweep-closure] <world.dme> [map.dmm]"
+        );
+        return ExitCode::from(2);
+    }
+    if command == Command::Compile && requested_map.is_some() {
+        eprintln!("usage: dm-lifecycle compile <world.dme>");
         return ExitCode::from(2);
     }
     let compile_started = Instant::now();
-    if command == Command::Boot {
-        eprintln!("boot-progress: compiling project {}", environment.display());
+    let cached_compilation = matches!(command, Command::Compile | Command::Boot);
+    if cached_compilation {
+        let progress = if command == Command::Compile {
+            "compile-progress"
+        } else {
+            "boot-progress"
+        };
+        eprintln!(
+            "{progress}: preparing compiled executable {}",
+            environment.display()
+        );
     }
     let cache_file = project_cache_file(&environment);
-    let compilation_result = if command == Command::Boot {
-        CompilerDatabase::new()
-            .compile_cached(&environment, &cache_file)
-            .map(|(compilation, cache_hit)| (compilation, Some(cache_hit)))
+    let artifact_file = executable_artifact_file(&environment);
+    let mut cached_executable = None;
+    let mut cached_procedures = None;
+    let compilation_result: Result<_, String> = if cached_compilation {
+        prepare_compiled_executable(&environment, &cache_file, &artifact_file).map(|prepared| {
+            let progress = if command == Command::Compile {
+                "compile-progress"
+            } else {
+                "boot-progress"
+            };
+            eprintln!(
+                "{progress}: executable-artifact executable_artifact={} artifact={} miss_reason={:?} lowering_new={} lowering_deferred={} procedures={}",
+                if prepared.artifact_hit { "hit" } else { "miss" },
+                artifact_file.display(),
+                prepared.miss_reason.as_deref().unwrap_or("none"),
+                prepared.new_lowerings,
+                prepared.executable.module().deferred_procedure_count(),
+                prepared.executable.module().procedure_count(),
+            );
+            let cache = PreparedCacheStats {
+                project_snapshot_hit: prepared.project_snapshot_hit,
+                parsed_syntax_hit: prepared.parsed_syntax_hit,
+                artifact_hit: prepared.artifact_hit,
+            };
+            cached_executable = Some(prepared.executable);
+            cached_procedures = Some(prepared.procedures);
+            (prepared.compilation, Some(cache))
+        })
     } else {
         CompilerDatabase::new()
             .compile(&environment)
             .map(|compilation| (compilation, None))
+            .map_err(|error| error.to_string())
     };
-    let (compilation, project_cache_hit) = match compilation_result {
+    let (compilation, project_cache) = match compilation_result {
         Ok(compilation) => compilation,
         Err(error) => {
             eprintln!("{}: {error}", environment.display());
             return ExitCode::FAILURE;
         }
     };
-    if command == Command::Boot {
+    if cached_compilation {
+        let progress = if command == Command::Compile {
+            "compile-progress"
+        } else {
+            "boot-progress"
+        };
         eprintln!(
-            "boot-progress: project-compile-complete elapsed_ms={} preprocessing_cache={} cache={}",
+            "{progress}: project-compile-complete elapsed_ms={} preprocessing_cache={} parsed_syntax_cache={} cache={}",
             compile_started.elapsed().as_millis(),
-            if project_cache_hit == Some(true) {
+            if project_cache.is_some_and(|cache| cache.project_snapshot_hit) {
                 "hit"
             } else {
                 "miss"
             },
+            project_cache
+                .and_then(|cache| cache.parsed_syntax_hit)
+                .map_or("skipped", |hit| if hit { "hit" } else { "miss" }),
             cache_file.display(),
         );
     }
-    let procedures = ProcedureRegistry::build(&compilation);
+    if command == Command::Compile {
+        eprintln!(
+            "compile-progress: artifact-ready project_files={} parsed_files={} definitions={} executable_artifact={} artifact={}",
+            compilation.stats().project_files,
+            compilation.stats().parsed_files,
+            compilation.stats().definitions,
+            if project_cache.is_some_and(|cache| cache.artifact_hit) {
+                "hit"
+            } else {
+                "miss"
+            },
+            artifact_file.display(),
+        );
+        return ExitCode::SUCCESS;
+    }
+    let procedures = cached_procedures
+        .take()
+        .unwrap_or_else(|| ProcedureRegistry::build(&compilation));
     let mut prepared_boot = None;
     if command == Command::Boot {
         eprintln!("boot-progress: loading map");
@@ -144,15 +223,25 @@ fn run_main() -> ExitCode {
         let compile_index = LifecycleIndex::build_compile_only(&compilation, &procedures);
         eprintln!("boot-progress: precompiling lifecycle before runtime materialization");
         let started = Instant::now();
-        let precompiled =
-            match precompile_lifecycle_for_world(&compilation, &procedures, &compile_index, &world)
-            {
-                Ok(precompiled) => precompiled,
-                Err(error) => {
-                    eprintln!("lifecycle precompile: {error}");
-                    return ExitCode::FAILURE;
-                }
-            };
+        let precompiled = match cached_executable.take() {
+            Some(executable) => Ok(precompile_lifecycle_for_world_with_executable(
+                &compilation,
+                &procedures,
+                &compile_index,
+                &world,
+                executable,
+            )),
+            None => {
+                precompile_lifecycle_for_world(&compilation, &procedures, &compile_index, &world)
+            }
+        };
+        let precompiled = match precompiled {
+            Ok(precompiled) => precompiled,
+            Err(error) => {
+                eprintln!("lifecycle precompile: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
         eprintln!(
             "boot-progress: lifecycle-precompile-complete elapsed_ms={} targets={} bodies={} procedures={} deferred={}",
             started.elapsed().as_millis(),
@@ -206,7 +295,7 @@ fn run_main() -> ExitCode {
     if command == Command::Boot {
         let stats = runtime.stats();
         eprintln!(
-            "boot-progress: initializer frontier selectors={} typed_constructors={} dynamic_constructor_fallback={} complete_inventory_fallback={} module_procedures={} deferred={} materialized={}",
+            "boot-progress: initializer frontier selectors={} typed_constructors={} dynamic_constructor_fallback={} complete_inventory_fallback={} module_procedures={} deferred={} materialized={} direct_initial_values={} shared_reflection_entries={}",
             stats.initializer_frontier_selectors,
             stats.initializer_typed_constructor_targets,
             stats.initializer_dynamic_constructor_frontier,
@@ -214,6 +303,8 @@ fn run_main() -> ExitCode {
             stats.initializer_module_procedures,
             stats.initializer_module_deferred_procedures,
             stats.initializer_module_materialized_procedures,
+            stats.execution_initial_value_entries,
+            stats.shared_reflection_entries,
         );
     }
     for diagnostic in runtime.diagnostics() {
@@ -401,18 +492,15 @@ fn run_main() -> ExitCode {
             slices = slices.saturating_add(1);
             if slices == 1 || slices % 100 == 0 {
                 eprintln!(
-                    "server-progress: scheduler slice={} tick={} rounds={} completed={} pending={} termination={:?}",
+                    "server-progress: scheduler slice={} tick={} rounds={} completed={} failed={} pending={} termination={:?}",
                     slices,
                     scheduler.final_tick,
                     scheduler.rounds,
                     scheduler.completed_tasks,
+                    scheduler.failed_tasks,
                     scheduler.pending_tasks,
                     scheduler.termination,
                 );
-            }
-            if scheduler.termination == SchedulerDrainTermination::StableIdle {
-                eprintln!("boot-progress: startup scheduler reached stable idle; stopping");
-                return ExitCode::SUCCESS;
             }
             if let Some(limit) = max_slices
                 && slices >= limit
@@ -426,6 +514,159 @@ fn run_main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+const COMPILATION_ARTIFACT_SECTION: u32 = 1;
+const EXECUTABLE_ARTIFACT_SECTION: u32 = 2;
+
+#[derive(Clone, Copy)]
+struct PreparedCacheStats {
+    project_snapshot_hit: bool,
+    parsed_syntax_hit: Option<bool>,
+    artifact_hit: bool,
+}
+
+struct PreparedCompiledExecutable {
+    compilation: Compilation,
+    procedures: ProcedureRegistry,
+    executable: ExecutableProcedures,
+    project_snapshot_hit: bool,
+    parsed_syntax_hit: Option<bool>,
+    artifact_hit: bool,
+    miss_reason: Option<String>,
+    new_lowerings: usize,
+}
+
+fn prepare_compiled_executable(
+    environment: &Path,
+    cache_file: &Path,
+    artifact_file: &Path,
+) -> Result<PreparedCompiledExecutable, String> {
+    // The compact project snapshot validates every discovered input before we
+    // trust the heavyweight executable. On a warm boot this is the only
+    // non-artifact project load and does not lex, parse, build an object tree,
+    // lower a body, or construct runtime state.
+    let (project, project_snapshot_hit) = Project::load_cached_exact(environment, cache_file)
+        .map_err(|error| format!("project snapshot: {error}"))?;
+    let project_fingerprint = *project.content_fingerprint().as_bytes();
+    let miss_reason = if project_snapshot_hit {
+        match decode_compiled_executable(artifact_file, project_fingerprint) {
+            Ok((compilation, executable)) => {
+                let procedures = ProcedureRegistry::build(&compilation);
+                return Ok(PreparedCompiledExecutable {
+                    compilation,
+                    procedures,
+                    executable,
+                    project_snapshot_hit,
+                    parsed_syntax_hit: None,
+                    artifact_hit: true,
+                    miss_reason: None,
+                    new_lowerings: 0,
+                });
+            }
+            Err(error) => error,
+        }
+    } else {
+        "project snapshot changed or was not cached".to_owned()
+    };
+    drop(project);
+
+    // One miss performs exactly one ordinary frontend compilation followed by
+    // one complete symbolic link and deterministic eager materialization.
+    let (compilation, cache_stats) = CompilerDatabase::new()
+        .compile_cached_with_stats(environment, cache_file)
+        .map_err(|error| error.to_string())?;
+    let procedures = ProcedureRegistry::build(&compilation);
+    let executable = procedures
+        .compile_vm_all_symbolic_deferred(&compilation)
+        .map_err(|error| format!("complete executable lowering: {error}"))?;
+    let executable = executable
+        .into_fully_eager_bounded(MAX_EAGER_ARTIFACT_DIAGNOSTICS)
+        .map_err(|error| format!("complete executable lowering: {error}"))?;
+    if executable.module().deferred_procedure_count() != 0 {
+        return Err("complete executable lowering retained deferred procedures".to_owned());
+    }
+    let new_lowerings = executable.module().procedure_count();
+    let compilation_payload = compilation.encode_compiled_artifact();
+    let executable_payload = executable.encode_compiled_artifact()?;
+    eprintln!(
+        "compile-progress: executable-artifact-payloads frontend_bytes={} executable_bytes={}",
+        compilation_payload.len(),
+        executable_payload.len(),
+    );
+    let fingerprint = *compilation.project().content_fingerprint().as_bytes();
+    let artifact = CompiledArtifact::new(
+        fingerprint,
+        vec![
+            ArtifactSection::new(COMPILATION_ARTIFACT_SECTION, compilation_payload),
+            ArtifactSection::new(EXECUTABLE_ARTIFACT_SECTION, executable_payload),
+        ],
+    )
+    .map_err(|error| format!("build executable artifact: {error}"))?;
+    let write_stats = artifact
+        .write_atomic_with_stats(artifact_file)
+        .map_err(|error| format!("write executable artifact: {error}"))?;
+    eprintln!(
+        "compile-progress: executable-artifact-write encoded_bytes={} payload_bytes={} peak_staging_bytes={} write_calls={}",
+        write_stats.encoded_bytes,
+        write_stats.payload_bytes,
+        write_stats.peak_staging_bytes,
+        write_stats.write_calls,
+    );
+    Ok(PreparedCompiledExecutable {
+        compilation,
+        procedures,
+        executable,
+        project_snapshot_hit,
+        parsed_syntax_hit: Some(cache_stats.parsed_syntax_hit),
+        artifact_hit: false,
+        miss_reason: Some(miss_reason),
+        new_lowerings,
+    })
+}
+
+fn decode_compiled_executable(
+    artifact_file: &Path,
+    project_fingerprint: [u8; 16],
+) -> Result<(Compilation, ExecutableProcedures), String> {
+    let artifact = CompiledArtifact::read_from(artifact_file, project_fingerprint)
+        .map_err(|error| error.to_string())?;
+    let storage = artifact.storage_stats();
+    eprintln!(
+        "boot-progress: executable-artifact-storage payload_bytes={} backing_bytes={} backing_allocations={}",
+        storage.payload_bytes, storage.backing_bytes, storage.backing_allocations,
+    );
+    if artifact.sections().len() != 2 {
+        return Err(format!(
+            "compiled executable contains {} sections instead of 2",
+            artifact.sections().len()
+        ));
+    }
+    let compilation = Compilation::decode_compiled_artifact(
+        artifact
+            .section(COMPILATION_ARTIFACT_SECTION)
+            .ok_or_else(|| "compiled executable is missing the frontend section".to_owned())?
+            .payload(),
+    )?;
+    if compilation.project().content_fingerprint().as_bytes() != &project_fingerprint {
+        return Err(
+            "compiled executable frontend fingerprint disagrees with its envelope".to_owned(),
+        );
+    }
+    let executable = ExecutableProcedures::decode_compiled_artifact(
+        artifact
+            .section(EXECUTABLE_ARTIFACT_SECTION)
+            .ok_or_else(|| "compiled executable is missing the bytecode section".to_owned())?
+            .payload(),
+    )?;
+    if executable.module().deferred_procedure_count() != 0 {
+        return Err("compiled executable contains deferred procedures".to_owned());
+    }
+    Ok((compilation, executable))
+}
+
+fn executable_artifact_file(environment: &Path) -> PathBuf {
+    environment.with_extension("d64")
 }
 
 fn project_cache_file(environment: &Path) -> PathBuf {
@@ -658,4 +899,225 @@ fn load_map(
         .text()
         .map_err(|error| format!("{}: {error}", file.relative_path.display()))?;
     Ok((file.relative_path.display().to_string(), source.to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use dm_value::Value;
+    use dm_vm::{ExecutionState, execute_module_in_state};
+
+    use super::{
+        decode_compiled_executable, executable_artifact_file, prepare_compiled_executable,
+    };
+
+    static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture {
+        root: PathBuf,
+        environment: PathBuf,
+        source: PathBuf,
+        cache: PathBuf,
+        artifact: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let sequence = NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "dream64-executable-artifact-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).expect("scratch directory should be created");
+            let environment = root.join("world.dme");
+            let source = root.join("code.dm");
+            let cache = root.join("project.bin");
+            let artifact = root.join("project.d64");
+            fs::write(&environment, "#include \"code.dm\"\n")
+                .expect("environment should be written");
+            Self::write_source(&source, 1);
+            Self {
+                root,
+                environment,
+                source,
+                cache,
+                artifact,
+            }
+        }
+
+        fn write_source(path: &Path, value: u8) {
+            fs::write(
+                path,
+                format!("/proc/make()\n\tvar/list/items = list({value})\n\treturn items\n"),
+            )
+            .expect("source should be written");
+        }
+
+        fn prepare(&self) -> super::PreparedCompiledExecutable {
+            prepare_compiled_executable(&self.environment, &self.cache, &self.artifact)
+                .expect("artifact preparation should succeed")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn executable_artifact_is_a_lowercase_d64_sibling_of_the_environment() {
+        let environment = Path::new("Monkestation2.0").join("tgstation.DmE");
+        assert_eq!(
+            executable_artifact_file(&environment),
+            Path::new("Monkestation2.0").join("tgstation.d64")
+        );
+    }
+
+    #[test]
+    fn unchanged_artifact_hits_and_source_byte_change_rebuilds() {
+        let fixture = Fixture::new();
+        let first = fixture.prepare();
+        assert!(!first.artifact_hit);
+        assert!(first.new_lowerings > 0);
+        let first_fingerprint = first.compilation.project().content_fingerprint();
+        let artifact_bytes = fs::read(&fixture.artifact).expect("artifact should exist");
+        drop(first);
+
+        let warm = fixture.prepare();
+        assert!(warm.artifact_hit);
+        assert_eq!(warm.new_lowerings, 0);
+        assert!(warm.project_snapshot_hit);
+        assert_eq!(
+            fs::read(&fixture.artifact).expect("artifact should remain readable"),
+            artifact_bytes,
+            "a hit must not rewrite or recompile the executable"
+        );
+        drop(warm);
+
+        let original_metadata =
+            fs::metadata(&fixture.source).expect("source metadata should exist");
+        let original_modified = original_metadata
+            .modified()
+            .expect("source mtime should be readable");
+        Fixture::write_source(&fixture.source, 2);
+        fs::File::options()
+            .write(true)
+            .open(&fixture.source)
+            .expect("changed source should open")
+            .set_times(fs::FileTimes::new().set_modified(original_modified))
+            .expect("original source timestamp should be restored");
+        let changed_metadata =
+            fs::metadata(&fixture.source).expect("changed metadata should exist");
+        assert_eq!(changed_metadata.len(), original_metadata.len());
+        assert_eq!(changed_metadata.modified().unwrap(), original_modified);
+        let changed = fixture.prepare();
+        assert!(!changed.artifact_hit);
+        assert!(changed.new_lowerings > 0);
+        assert_ne!(
+            changed.compilation.project().content_fingerprint(),
+            first_fingerprint
+        );
+    }
+
+    #[test]
+    fn engine_mismatch_and_corruption_each_fall_back_once() {
+        let fixture = Fixture::new();
+        drop(fixture.prepare());
+
+        let mut wrong_engine = fs::read(&fixture.artifact).expect("artifact should exist");
+        wrong_engine[56] ^= 0xff;
+        refresh_envelope_checksums(&mut wrong_engine);
+        fs::write(&fixture.artifact, wrong_engine).expect("mismatched artifact should be written");
+        let rebuilt_engine = fixture.prepare();
+        assert!(!rebuilt_engine.artifact_hit);
+        assert!(
+            rebuilt_engine
+                .miss_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("engine semantics mismatch"))
+        );
+        drop(rebuilt_engine);
+
+        let mut corrupt = fs::read(&fixture.artifact).expect("rebuilt artifact should exist");
+        let payload_offset = corrupt.len() / 2;
+        corrupt[payload_offset] ^= 0xff;
+        fs::write(&fixture.artifact, corrupt).expect("corrupt artifact should be written");
+        let rebuilt_corrupt = fixture.prepare();
+        assert!(!rebuilt_corrupt.artifact_hit);
+        assert!(
+            rebuilt_corrupt
+                .miss_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("checksum mismatch"))
+        );
+    }
+
+    #[test]
+    fn independently_loaded_executables_use_distinct_heaps() {
+        let fixture = Fixture::new();
+        let prepared = fixture.prepare();
+        let fingerprint = *prepared
+            .compilation
+            .project()
+            .content_fingerprint()
+            .as_bytes();
+        let semantic_entry = prepared
+            .procedures
+            .procedures()
+            .iter()
+            .find(|procedure| procedure.path.to_string() == "/proc/make")
+            .and_then(|procedure| procedure.effective_target)
+            .expect("fixture semantic entry should exist");
+        drop(prepared);
+        let (_, left) = decode_compiled_executable(&fixture.artifact, fingerprint)
+            .expect("first executable should load");
+        let (_, right) = decode_compiled_executable(&fixture.artifact, fingerprint)
+            .expect("second executable should load");
+        let left_entry = left
+            .implementation(semantic_entry)
+            .expect("first fixture entry should exist");
+        let right_entry = right
+            .implementation(semantic_entry)
+            .expect("second fixture entry should exist");
+        let mut left_state = ExecutionState::new();
+        let mut right_state = ExecutionState::new();
+        let Value::List(left_list) =
+            execute_module_in_state(left.module(), left_entry, &[], &mut left_state)
+                .expect("first execution should succeed")
+        else {
+            panic!("first execution should return a list")
+        };
+        let Value::List(right_list) =
+            execute_module_in_state(right.module(), right_entry, &[], &mut right_state)
+                .expect("second execution should succeed")
+        else {
+            panic!("second execution should return a list")
+        };
+        left_state
+            .heap_mut()
+            .list_mut(left_list)
+            .expect("first result should be live")
+            .add(Value::number(99.0));
+        assert_eq!(left_state.heap().list(left_list).unwrap().len(), 2);
+        assert_eq!(right_state.heap().list(right_list).unwrap().len(), 1);
+        assert_eq!(left_state.heap().live_list_count(), 1);
+        assert_eq!(right_state.heap().live_list_count(), 1);
+    }
+
+    fn refresh_envelope_checksums(bytes: &mut [u8]) {
+        let header_length = u32::from_le_bytes(bytes[28..32].try_into().unwrap()) as usize;
+        let header_checksum_offset = header_length - 4;
+        let header_checksum = crc32fast::hash(&bytes[..header_checksum_offset]);
+        bytes[header_checksum_offset..header_length]
+            .copy_from_slice(&header_checksum.to_le_bytes());
+        let footer = bytes.len() - 32;
+        let body_checksum = crc32fast::hash(&bytes[..footer]);
+        bytes[footer + 16..footer + 20].copy_from_slice(&body_checksum.to_le_bytes());
+        let footer_checksum = crc32fast::hash(&bytes[footer..footer + 28]);
+        bytes[footer + 28..footer + 32].copy_from_slice(&footer_checksum.to_le_bytes());
+    }
 }

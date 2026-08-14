@@ -1,16 +1,39 @@
 param(
     [Parameter(Mandatory = $true)]
     [int] $BootNumber,
-    [string] $Executable = "$PSScriptRoot\..\target\release\dm-lifecycle.exe",
+    [string] $Executable,
     [string] $Dme = "C:\Users\Administrator\Desktop\RBMK Project\Monkestation2.0\tgstation.dme",
     [string] $Map = "C:\Users\Administrator\Desktop\RBMK Project\Monkestation2.0\_maps\map_files\generic\CentCom.dmm",
     [switch] $FullTrace,
-    [switch] $AuditRuntime
+    [switch] $AuditRuntime,
+    [switch] $ProfileAtoms,
+    [switch] $ProfileStartup
 )
 
 $ErrorActionPreference = "Stop"
+$launcherErrorLog = Join-Path $PSScriptRoot "..\target\boot-visible-$BootNumber.launcher-error.log"
+Remove-Item -LiteralPath $launcherErrorLog -Force -ErrorAction SilentlyContinue
+trap {
+    $rendered = $_ | Out-String
+    [IO.File]::WriteAllText(
+        $launcherErrorLog,
+        $rendered,
+        [Text.UTF8Encoding]::new($false)
+    )
+    Write-Host $rendered -ForegroundColor Red
+    exit 1
+}
 $workspace = (Resolve-Path "$PSScriptRoot\..").Path
+if ([string]::IsNullOrWhiteSpace($Executable)) {
+    $Executable = Join-Path $workspace "target\release\dm-lifecycle.exe"
+}
 $Executable = (Resolve-Path $Executable).Path
+$Dme = (Resolve-Path -LiteralPath $Dme).Path
+$monkRoot = Split-Path -Parent $Dme
+$tguiBuild = Join-Path $monkRoot "tools\build\build.bat"
+if (-not (Test-Path -LiteralPath $tguiBuild -PathType Leaf)) {
+    throw "Monkestation TGUI build entrypoint not found: $tguiBuild"
+}
 $log = Join-Path $workspace "monkestation-headless-boot-$BootNumber.console.log"
 # Keep only the active boot trace. These files are intentionally ignored by
 # Git, and pruning them here prevents long debugging sessions from filling the
@@ -29,7 +52,23 @@ if ($AuditRuntime) {
 } else {
     Remove-Item Env:DREAM64_BOOT_AUDIT_RUNTIME -ErrorAction SilentlyContinue
 }
-$Host.UI.RawUI.WindowTitle = "Dream64 - Monkestation Headless Boot $BootNumber"
+if ($ProfileAtoms) {
+    $env:DREAM64_PROFILE_ATOMS = "1"
+} else {
+    Remove-Item Env:DREAM64_PROFILE_ATOMS -ErrorAction SilentlyContinue
+}
+if ($ProfileStartup) {
+    $env:DREAM64_PROFILE_STARTUP = "1"
+} else {
+    Remove-Item Env:DREAM64_PROFILE_STARTUP -ErrorAction SilentlyContinue
+}
+try {
+    $Host.UI.RawUI.WindowTitle = "Dream64 - Monkestation Headless Boot $BootNumber"
+} catch {
+    # Some Windows Terminal/ConPTY hosts do not expose a writable RawUI title.
+    # The launcher must remain functional when decoration is unavailable.
+    Write-Warning "Could not set the console title: $($_.Exception.Message)"
+}
 
 Clear-Host
 Write-Host ""
@@ -38,6 +77,20 @@ Write-Host "  /  MONKESTATION HEADLESS" -ForegroundColor White
 Write-Host "  Boot $BootNumber" -ForegroundColor DarkGray
 Write-Host "  ============================================================" -ForegroundColor DarkCyan
 Write-Host "  Optimized 64-bit release | Runtime audit: $AuditRuntime | Full trace: $log" -ForegroundColor DarkGray
+Write-Host ""
+
+# Use Monkestation's exact incremental TGUI target. Juke owns its Bun/package
+# cache and input/output freshness checks; Dream64 remains the only DM compiler
+# and server process in this launcher.
+Write-Host "  Preparing Monkestation TGUI assets..." -ForegroundColor Cyan
+& $tguiBuild tgui
+$tguiExitCode = $LASTEXITCODE
+if ($tguiExitCode -ne 0) {
+    Write-Host ""
+    Write-Host "  TGUI build failed (exit $tguiExitCode); Dream64 was not started." -ForegroundColor Red
+    exit $tguiExitCode
+}
+Write-Host "  TGUI assets ready." -ForegroundColor Green
 Write-Host ""
 
 $writer = [IO.StreamWriter]::new(
@@ -54,11 +107,53 @@ $initializerCount = 0
 $startupChecklistShown = $false
 $startupChecklistCompleted = 0
 $startupChecklistActive = @{}
+$peakWorkingSetBytes = [int64]0
+$peakPrivateBytes = [int64]0
+
+function Get-BootMemorySnapshot {
+    $processName = [IO.Path]::GetFileNameWithoutExtension($Executable)
+    try {
+        $process = Get-Process -Name $processName -ErrorAction SilentlyContinue |
+            Where-Object { $_.StartTime -ge $started.AddSeconds(-5) } |
+            Sort-Object StartTime -Descending |
+            Select-Object -First 1
+    } catch {
+        return $null
+    }
+    if (-not $process) {
+        return $null
+    }
+
+    $script:peakWorkingSetBytes = [math]::Max(
+        $script:peakWorkingSetBytes,
+        [int64]$process.PeakWorkingSet64
+    )
+    $script:peakPrivateBytes = [math]::Max(
+        $script:peakPrivateBytes,
+        [int64]$process.PrivateMemorySize64
+    )
+    return [pscustomobject]@{
+        WorkingSetBytes = [int64]$process.WorkingSet64
+        PrivateBytes = [int64]$process.PrivateMemorySize64
+        PeakWorkingSetBytes = $script:peakWorkingSetBytes
+        PeakPrivateBytes = $script:peakPrivateBytes
+    }
+}
 
 function Write-BootLine {
     param([string] $Line)
 
     $script:writer.WriteLine($Line)
+    if ($Line -match "HEADLESS READY|HeadlessReady|boot-vm: heap-gc") {
+        $memory = Get-BootMemorySnapshot
+    } else {
+        $memory = $null
+    }
+    if ($memory -and $Line -match "boot-vm: heap-gc") {
+        $script:writer.WriteLine(
+            "boot-dashboard-memory working_set_bytes=$($memory.WorkingSetBytes) private_bytes=$($memory.PrivateBytes) peak_working_set_bytes=$($memory.PeakWorkingSetBytes) peak_private_bytes=$($memory.PeakPrivateBytes)"
+        )
+    }
     $elapsed = (Get-Date) - $started
     $stamp = "{0:mm\:ss}" -f $elapsed
 
@@ -75,10 +170,22 @@ function Write-BootLine {
         $script:ready = $true
         Write-Progress -Activity "Dream64 map lifecycle" -Completed
         $readySeconds = ((Get-Date) - $started).TotalSeconds
+        if ($memory) {
+            $memoryLine = "boot-dashboard-memory ready_working_set_bytes=$($memory.WorkingSetBytes) ready_private_bytes=$($memory.PrivateBytes) peak_working_set_bytes=$($memory.PeakWorkingSetBytes) peak_private_bytes=$($memory.PeakPrivateBytes)"
+            $script:writer.WriteLine($memoryLine)
+        }
         Write-Host ""
         Write-Host "  ============================================================" -ForegroundColor Green
         Write-Host ("                 GAME READY! ({0:N1}s)" -f $readySeconds) -ForegroundColor Yellow
         Write-Host "              HEADLESS READY - SERVER LIVE" -ForegroundColor Green
+        if ($memory) {
+            Write-Host (
+                "       RAM READY {0:N2} GiB private / {1:N2} GiB working | peak {2:N2} GiB" -f
+                    ($memory.PrivateBytes / 1GB),
+                    ($memory.WorkingSetBytes / 1GB),
+                    ($memory.PeakWorkingSetBytes / 1GB)
+            ) -ForegroundColor Cyan
+        }
         Write-Host "  ============================================================" -ForegroundColor Green
         return
     }

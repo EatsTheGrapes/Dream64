@@ -12,6 +12,7 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Cursor, Read};
 
 use dm_compiler::Compilation;
 use dm_core::{FileId, SourceSpan};
@@ -104,6 +105,15 @@ const NATIVE_PARENT_BUILTINS: &str = concat!(
     // `/datum/New` or `/datum/Del` declaration exists.
     "/datum/New(...)\n\treturn null\n",
     "/datum/Del()\n\treturn null\n",
+    // BYOND owns the terminal movable Bump implementation. Its ordinary
+    // obstacle path has no action and returns null; retaining the entry is
+    // nevertheless required so a source override can legally call `..()`.
+    "/atom/movable/Bump(atom/Obstacle)\n\treturn null\n",
+    // `/generator.Rand()` and the `/icon` manipulation family are methods on
+    // engine-owned datum types. Source helpers may invoke them as bare member
+    // calls from an override even though no project definition exists.
+    "/generator/Rand()\n\treturn _dream64_generator_rand(src)\n",
+    "/icon/SwapColor(old_rgb, new_rgb)\n\treturn _dream64_icon_swap_color(src, old_rgb, new_rgb)\n",
     "/world/Profile(command, type, format)\n\treturn _dream64_world_profile(command, type, format)\n",
     "/world/GetConfig(config_set, param)\n\treturn _dream64_world_get_config(config_set, param)\n",
     "/world/SetConfig(config_set, param, value)\n\treturn _dream64_world_set_config(config_set, param, value)\n",
@@ -114,6 +124,8 @@ const NATIVE_PARENT_BUILTINS: &str = concat!(
 
 fn native_parent_index(
     path: &CodePath,
+    owner_type: Option<NodeId>,
+    compilation: &Compilation,
     native_parent_indices: &BTreeMap<String, usize>,
 ) -> Option<usize> {
     let path = path.to_string();
@@ -122,11 +134,40 @@ fn native_parent_index(
             "/datum/proc/New"
         } else if path.ends_with("/proc/Del") {
             "/datum/proc/Del"
+        } else if path.ends_with("/proc/Bump")
+            && owner_type.is_some_and(|owner| {
+                compilation
+                    .code_tree()
+                    .find(&dm_syntax::DefinitionPath::new(vec![
+                        "atom".to_owned(),
+                        "movable".to_owned(),
+                    ]))
+                    .is_some_and(|movable| type_is_descendant_or_same(compilation, owner, movable))
+            })
+        {
+            "/atom/movable/proc/Bump"
         } else {
             return None;
         };
         native_parent_indices.get(terminal).copied()
     })
+}
+
+fn native_member_index(
+    selector: &str,
+    mut owner_type: Option<NodeId>,
+    compilation: &Compilation,
+    native_indices: &BTreeMap<String, usize>,
+) -> Option<usize> {
+    while let Some(owner) = owner_type {
+        let node = compilation.code_tree().node(owner)?;
+        let path = format!("{}/proc/{selector}", node.path);
+        if let Some(index) = native_indices.get(&path) {
+            return Some(*index);
+        }
+        owner_type = node.parent_type;
+    }
+    None
 }
 /// Tree-local identity of a canonical procedure.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -272,6 +313,168 @@ pub struct ExecutableProcedureStats {
 }
 
 impl ExecutableProcedures {
+    /// Materializes every deferred project body and returns an artifact-ready
+    /// executable with no retained source definitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first deferred preflight or lowering failure in stable
+    /// procedure order.
+    pub fn into_fully_eager(mut self) -> Result<Self, dm_vm::CompileError> {
+        self.module = self.module.into_fully_eager()?;
+        Ok(self)
+    }
+
+    /// Attempts every deferred project body and returns bounded aggregate
+    /// diagnostics suitable for a complete compiled-artifact build.
+    ///
+    /// Ordinary lazy dispatch and [`Self::into_fully_eager`] retain their
+    /// existing first-error behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns all failures counted across the pass with only the requested
+    /// leading diagnostic sample retained.
+    pub fn into_fully_eager_bounded(
+        mut self,
+        diagnostic_limit: usize,
+    ) -> Result<Self, dm_vm::FullyEagerCompileErrors> {
+        self.module
+            .materialize_fully_eager_bounded(diagnostic_limit)?;
+        Ok(self)
+    }
+
+    /// Encodes this fully eager executable and its semantic implementation
+    /// mapping for a Dream64 compiled artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the module remains deferred or cannot be encoded.
+    #[doc(hidden)]
+    pub fn encode_compiled_artifact(&self) -> Result<Vec<u8>, String> {
+        let segments = self.encode_compiled_artifact_segments()?;
+        let total_length = segments.iter().map(Vec::len).sum();
+        let mut output = Vec::with_capacity(total_length);
+        for segment in segments {
+            output.extend_from_slice(&segment);
+        }
+        debug_assert_eq!(output.len(), total_length);
+        Ok(output)
+    }
+
+    /// Encodes the executable artifact as ordered byte segments without
+    /// copying its portable module into a second contiguous allocation.
+    #[doc(hidden)]
+    pub fn encode_compiled_artifact_segments(&self) -> Result<Vec<Vec<u8>>, String> {
+        let module = self
+            .module
+            .encode_portable()
+            .map_err(|error| error.to_string())?;
+        let mut header = EXECUTABLE_ARTIFACT_MAGIC.to_vec();
+        executable_artifact_write_len(&mut header, module.len());
+        let mut tail = Vec::new();
+        executable_artifact_write_len(&mut tail, self.implementations.len());
+        for (implementation, procedure) in &self.implementations {
+            executable_artifact_write_u32(&mut tail, implementation.procedure.0);
+            executable_artifact_write_u32(&mut tail, implementation.index);
+            let path = self.module.procedure_path(*procedure).ok_or_else(|| {
+                format!(
+                    "implementation {}:{} references a missing VM procedure",
+                    implementation.procedure.index(),
+                    implementation.index()
+                )
+            })?;
+            executable_artifact_write_string(&mut tail, path);
+        }
+        for value in [
+            self.stats.procedures,
+            self.stats.src_field_bindings,
+            self.stats.global_field_bindings,
+            self.stats.static_registry_builds,
+            self.stats.global_binding_index_lookups,
+            self.stats.typed_global_index_lookups,
+            self.stats.inherited_field_name_lookups,
+        ] {
+            executable_artifact_write_len(&mut tail, value);
+        }
+        Ok(vec![header, module, tail])
+    }
+
+    /// Decodes a fully eager executable and reconstructs its semantic mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt, truncated, oversized, or internally
+    /// inconsistent payloads.
+    #[doc(hidden)]
+    pub fn decode_compiled_artifact(bytes: &[u8]) -> Result<Self, String> {
+        let mut input = Cursor::new(bytes);
+        let mut magic = vec![0; EXECUTABLE_ARTIFACT_MAGIC.len()];
+        input
+            .read_exact(&mut magic)
+            .map_err(|_| "compiled executable is truncated before its header".to_owned())?;
+        if magic != EXECUTABLE_ARTIFACT_MAGIC {
+            return Err("compiled executable has an unsupported header".to_owned());
+        }
+        let module_bytes = executable_artifact_read_bytes(&mut input, "module")?;
+        let module =
+            dm_vm::Module::decode_portable(module_bytes).map_err(|error| error.to_string())?;
+        let mapping_count = executable_artifact_read_count(&mut input, "implementation count")?;
+        let mut implementations = BTreeMap::new();
+        for _ in 0..mapping_count {
+            let semantic = ProcedureImplementationId {
+                procedure: ProcedureId(executable_artifact_read_u32(
+                    &mut input,
+                    "semantic procedure identity",
+                )?),
+                index: executable_artifact_read_u32(&mut input, "semantic implementation index")?,
+            };
+            let path = executable_artifact_read_string(&mut input)?;
+            let procedure = module.procedure_id(&path).ok_or_else(|| {
+                format!("compiled executable mapping references unknown path {path}")
+            })?;
+            if implementations.insert(semantic, procedure).is_some() {
+                return Err(format!(
+                    "compiled executable repeats semantic implementation {}:{}",
+                    semantic.procedure.index(),
+                    semantic.index()
+                ));
+            }
+        }
+        let stats = ExecutableProcedureStats {
+            procedures: executable_artifact_read_len(&mut input, "procedure statistic")?,
+            src_field_bindings: executable_artifact_read_len(&mut input, "src binding statistic")?,
+            global_field_bindings: executable_artifact_read_len(
+                &mut input,
+                "global binding statistic",
+            )?,
+            static_registry_builds: executable_artifact_read_len(
+                &mut input,
+                "registry build statistic",
+            )?,
+            global_binding_index_lookups: executable_artifact_read_len(
+                &mut input,
+                "global lookup statistic",
+            )?,
+            typed_global_index_lookups: executable_artifact_read_len(
+                &mut input,
+                "typed global lookup statistic",
+            )?,
+            inherited_field_name_lookups: executable_artifact_read_len(
+                &mut input,
+                "inherited field lookup statistic",
+            )?,
+        };
+        if input.position() != bytes.len() as u64 {
+            return Err("compiled executable contains trailing bytes".to_owned());
+        }
+        Ok(Self {
+            module,
+            implementations,
+            stats,
+        })
+    }
+
     /// Returns the compiled VM module.
     #[must_use]
     pub const fn module(&self) -> &dm_vm::Module {
@@ -301,6 +504,80 @@ impl ExecutableProcedures {
     pub const fn stats(&self) -> &ExecutableProcedureStats {
         &self.stats
     }
+}
+
+const EXECUTABLE_ARTIFACT_MAGIC: &[u8] = b"DREAM64-EXECUTABLE\0\x01";
+const MAX_EXECUTABLE_ARTIFACT_ITEMS: usize = 16_777_216;
+const MAX_EXECUTABLE_ARTIFACT_STRING_BYTES: usize = 268_435_456;
+
+fn executable_artifact_write_u32(output: &mut Vec<u8>, value: u32) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn executable_artifact_write_len(output: &mut Vec<u8>, value: usize) {
+    output.extend_from_slice(&(value as u64).to_le_bytes());
+}
+
+fn executable_artifact_write_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
+    executable_artifact_write_len(output, bytes.len());
+    output.extend_from_slice(bytes);
+}
+
+fn executable_artifact_write_string(output: &mut Vec<u8>, value: &str) {
+    executable_artifact_write_bytes(output, value.as_bytes());
+}
+
+fn executable_artifact_read_u32(input: &mut Cursor<&[u8]>, what: &str) -> Result<u32, String> {
+    let mut bytes = [0; 4];
+    input
+        .read_exact(&mut bytes)
+        .map_err(|_| format!("compiled executable is truncated while reading {what}"))?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn executable_artifact_read_len(input: &mut Cursor<&[u8]>, what: &str) -> Result<usize, String> {
+    let mut bytes = [0; 8];
+    input
+        .read_exact(&mut bytes)
+        .map_err(|_| format!("compiled executable is truncated while reading {what}"))?;
+    usize::try_from(u64::from_le_bytes(bytes))
+        .map_err(|_| format!("compiled executable {what} exceeds this platform"))
+}
+
+fn executable_artifact_read_count(input: &mut Cursor<&[u8]>, what: &str) -> Result<usize, String> {
+    let count = executable_artifact_read_len(input, what)?;
+    if count > MAX_EXECUTABLE_ARTIFACT_ITEMS {
+        return Err(format!(
+            "compiled executable {what} exceeds the limit of {MAX_EXECUTABLE_ARTIFACT_ITEMS}"
+        ));
+    }
+    Ok(count)
+}
+
+fn executable_artifact_read_bytes<'artifact>(
+    input: &mut Cursor<&'artifact [u8]>,
+    what: &str,
+) -> Result<&'artifact [u8], String> {
+    let length = executable_artifact_read_len(input, &format!("{what} length"))?;
+    let start = usize::try_from(input.position())
+        .map_err(|_| format!("compiled executable {what} offset exceeds this platform"))?;
+    let end = start
+        .checked_add(length)
+        .filter(|end| *end <= input.get_ref().len())
+        .ok_or_else(|| format!("compiled executable {what} is truncated"))?;
+    input.set_position(end as u64);
+    Ok(&input.get_ref()[start..end])
+}
+
+fn executable_artifact_read_string(input: &mut Cursor<&[u8]>) -> Result<String, String> {
+    let bytes = executable_artifact_read_bytes(input, "string")?;
+    if bytes.len() > MAX_EXECUTABLE_ARTIFACT_STRING_BYTES {
+        return Err(format!(
+            "compiled executable string exceeds the limit of {MAX_EXECUTABLE_ARTIFACT_STRING_BYTES} bytes"
+        ));
+    }
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| "compiled executable contains non-UTF-8 text".to_owned())
 }
 
 impl ProcedureRegistry {
@@ -1169,7 +1446,14 @@ impl ProcedureRegistry {
                                 })
                         })
                         .transpose()?
-                        .or_else(|| native_parent_index(&procedure.path, &native_parent_indices))
+                        .or_else(|| {
+                            native_parent_index(
+                                &procedure.path,
+                                procedure.owner_type,
+                                compilation,
+                                &native_parent_indices,
+                            )
+                        })
                 } else {
                     None
                 };
@@ -1181,17 +1465,40 @@ impl ProcedureRegistry {
                 let mut static_calls: BTreeMap<_, _> = selectors
                     .iter()
                     .filter_map(|selector| {
-                        self.static_call_target(implementation.id, selector, compilation)
-                            .and_then(|target| {
-                                indices.get(&target).copied().or_else(|| {
-                                    // Independent body inventories intentionally omit the
-                                    // target implementation. Point a semantically resolved
-                                    // call at an inert standard procedure so lowering can
-                                    // validate the caller without recursively compiling it.
-                                    (!include_parent_targets).then_some(ordered.len())
+                        let project_target =
+                            self.static_call_target(implementation.id, selector, compilation);
+                        let project_member = project_target.filter(|target| {
+                            self.procedure(target.procedure())
+                                .is_some_and(|procedure| procedure.owner_type.is_some())
+                        });
+                        let native_member = native_member_index(
+                            selector,
+                            procedure.owner_type,
+                            compilation,
+                            &native_parent_indices,
+                        );
+                        let target = if let Some(project_member) = project_member {
+                            // A real project member always overrides an engine-owned method.
+                            // Independent body inventories intentionally omit the target
+                            // implementation, so preserve that resolution with the inert
+                            // procedure instead of falling through to the native member.
+                            indices.get(&project_member).copied().or_else(|| {
+                                (!include_parent_targets).then_some(ordered.len())
+                            })
+                        } else {
+                            native_member.or_else(|| {
+                                project_target.and_then(|target| {
+                                    indices.get(&target).copied().or_else(|| {
+                                        // Independent body inventories intentionally omit the
+                                        // target implementation. Point a semantically resolved
+                                        // call at an inert standard procedure so lowering can
+                                        // validate the caller without recursively compiling it.
+                                        (!include_parent_targets).then_some(ordered.len())
+                                    })
                                 })
                             })
-                            .map(|target| (selector.clone(), target))
+                        };
+                        target.map(|target| (selector.clone(), target))
                     })
                     .collect();
                 for selector in selectors {
@@ -1522,19 +1829,18 @@ fn normalize_upward_paths(
             }
         }
         if matches!(line.tokens.first().map(|token| &token.kind), Some(TokenKind::Identifier(name)) if name == "var")
-            && let Some(annotation) = line.tokens.iter().position(
-                |token| matches!(&token.kind, TokenKind::Identifier(name) if name == "as"),
-            )
         {
             let assignment = line.tokens.iter().position(
                 |token| matches!(&token.kind, TokenKind::Operator(operator) if operator == "="),
             );
-            if let Some(assignment) = assignment
-                && annotation < assignment
-            {
-                line.tokens.drain(annotation..assignment);
-            } else {
-                line.tokens.drain(annotation..);
+            // A declaration annotation belongs to the declaration side of
+            // `=`.  The same `as` token on the RHS is expression syntax,
+            // notably `input(...) as num|null`, and must survive lowering.
+            let declaration_end = assignment.unwrap_or(line.tokens.len());
+            if let Some(annotation) = line.tokens[..declaration_end].iter().position(
+                |token| matches!(&token.kind, TokenKind::Identifier(name) if name == "as"),
+            ) {
+                line.tokens.drain(annotation..declaration_end);
             }
         }
     }
@@ -1770,6 +2076,9 @@ fn declared_member_type(
 ) -> Option<dm_syntax::DefinitionPath> {
     while let Some(type_id) = owner {
         let type_node = compilation.code_tree().node(type_id)?;
+        if let Some(path) = engine_builtin_member_type(&type_node.path, name) {
+            return Some(path);
+        }
         let mut segments = type_node.path.segments().to_vec();
         segments.extend(["var".to_owned(), name.to_owned()]);
         if let Some(field) = compilation
@@ -1791,6 +2100,26 @@ fn declared_member_type(
         owner = type_node.parent_type;
     }
     None
+}
+
+/// Statically typed reference fields supplied by the BYOND object model
+/// rather than a project `/var` declaration. OpenDream exposes the same
+/// reciprocal `Mob.Client` and `Client.Mob` types in its runtime metadata.
+fn engine_builtin_member_type(owner: &CodePath, name: &str) -> Option<dm_syntax::DefinitionPath> {
+    let owner = owner.to_string();
+    let path = if (owner == "/mob" || owner.starts_with("/mob/")) && name == "client" {
+        "/client"
+    } else if (owner == "/client" || owner.starts_with("/client/")) && name == "mob" {
+        "/mob"
+    } else {
+        return None;
+    };
+    Some(dm_syntax::DefinitionPath::new(
+        path.trim_start_matches('/')
+            .split('/')
+            .map(str::to_owned)
+            .collect(),
+    ))
 }
 
 #[derive(Default)]
@@ -4436,20 +4765,35 @@ fn collect_call_selectors(tokens: &[dm_lexer::SpannedToken], selectors: &mut BTr
 }
 
 fn ternary_colon(tokens: &[dm_lexer::SpannedToken], colon: usize) -> bool {
-    let mut depth = 0usize;
-    let mut pending = 0usize;
+    // A ternary can appear inside any delimited expression, notably
+    // `new(user ? user : drop_location())`. Keep an independent pending count
+    // at each delimiter depth so a colon in that expression is not mistaken
+    // for DM's dynamic member-access syntax.
+    let mut pending_by_depth = vec![0usize];
     for token in &tokens[..colon] {
         match &token.kind {
-            TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
-            TokenKind::Punctuation(')' | ']' | '}') => depth = depth.saturating_sub(1),
-            TokenKind::Operator(operator) if operator == "?" && depth == 0 => pending += 1,
-            TokenKind::Operator(operator) if operator == ":" && depth == 0 && pending > 0 => {
-                pending -= 1
+            TokenKind::Punctuation('(' | '[' | '{') => pending_by_depth.push(0),
+            TokenKind::Operator(operator) if operator == "?[" => pending_by_depth.push(0),
+            TokenKind::Punctuation(')' | ']' | '}') if pending_by_depth.len() > 1 => {
+                pending_by_depth.pop();
+            }
+            TokenKind::Operator(operator) if operator == "?" => {
+                *pending_by_depth
+                    .last_mut()
+                    .expect("the root delimiter depth always exists") += 1;
+            }
+            TokenKind::Operator(operator)
+                if operator == ":"
+                    && pending_by_depth.last().is_some_and(|pending| *pending > 0) =>
+            {
+                *pending_by_depth
+                    .last_mut()
+                    .expect("the root delimiter depth always exists") -= 1;
             }
             _ => {}
         }
     }
-    pending > 0
+    pending_by_depth.last().is_some_and(|pending| *pending > 0)
 }
 
 fn direct_instance_fields(
@@ -4596,6 +4940,7 @@ pub fn standard_instance_field_names(path: &str) -> &'static [&'static str] {
             "render_source",
             "render_target",
             "suffix",
+            "text",
             "transform",
             "underlays",
             "vis_contents",
@@ -4645,6 +4990,7 @@ pub fn standard_instance_field_names(path: &str) -> &'static [&'static str] {
             "images",
             "inactivity",
             "mob",
+            "mouse_pointer_icon",
             "perspective",
             "pixel_w",
             "pixel_x",
@@ -4683,6 +5029,7 @@ pub fn standard_instance_field_names(path: &str) -> &'static [&'static str] {
             "bound2",
             "gravity",
             "gradient",
+            "color_change",
             "transform",
             "icon",
             "icon_state",
@@ -4766,12 +5113,12 @@ mod tests {
     use dm_value::{FieldName, TypePath};
     use dm_vm::{
         ExecutionContext, ExecutionState, Instruction, RuntimeError, Value, execute_module,
-        execute_module_in_context,
+        execute_module_in_context, execute_module_in_state,
     };
 
     use super::{
-        Procedure, ProcedureImplementationKind, ProcedureRegistry, direct_static_fields,
-        inherited_static_fields,
+        ExecutableProcedures, Procedure, ProcedureImplementationKind, ProcedureRegistry,
+        direct_static_fields, inherited_static_fields,
     };
 
     static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
@@ -4808,6 +5155,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn compiled_executable_artifact_round_trips_eager_module_and_semantic_mapping() {
+        let compilation = TestProject::compile(
+            "/datum/base\n\tproc/value()\n\t\treturn 1\n/datum/child\n\tparent_type = /datum/base\n\tvalue()\n\t\treturn ..() + 1\n/proc/read(datum/child/source)\n\treturn source.value()\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let executable = registry
+            .compile_vm_all_symbolic_deferred(&compilation)
+            .expect("symbolic module should link")
+            .into_fully_eager()
+            .expect("fixture procedures should lower eagerly");
+
+        let encoded = executable
+            .encode_compiled_artifact()
+            .expect("eager executable should encode");
+        let segments = executable
+            .encode_compiled_artifact_segments()
+            .expect("segmented executable should encode");
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments.concat(), encoded);
+        assert_eq!(
+            encoded,
+            executable
+                .encode_compiled_artifact()
+                .expect("encoding should be deterministic")
+        );
+        let decoded = ExecutableProcedures::decode_compiled_artifact(&encoded)
+            .expect("executable should decode");
+        assert_eq!(decoded.module(), executable.module());
+        assert_eq!(decoded.stats(), executable.stats());
+        for procedure in registry.procedures() {
+            for implementation in &procedure.implementations {
+                let before = executable
+                    .implementation(implementation.id)
+                    .expect("linked implementation should exist");
+                let after = decoded
+                    .implementation(implementation.id)
+                    .expect("decoded implementation should exist");
+                assert_eq!(
+                    executable.module().procedure_path(before),
+                    decoded.module().procedure_path(after)
+                );
+            }
+        }
+        assert_eq!(decoded.module().deferred_procedure_count(), 0);
+
+        let mut bad_header = encoded.clone();
+        bad_header[0] ^= 0xff;
+        assert!(ExecutableProcedures::decode_compiled_artifact(&bad_header).is_err());
+        assert!(
+            ExecutableProcedures::decode_compiled_artifact(&encoded[..encoded.len() - 1]).is_err()
+        );
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(ExecutableProcedures::decode_compiled_artifact(&trailing).is_err());
+    }
+
+    #[test]
+    fn avd_empty_variadic_signature_preserves_rhs_input_constraints() {
+        let compilation = TestProject::compile(concat!(
+            "/datum/admin_verb/set_server_fps/__avd_do_verb(client/user,)\n",
+            "\tvar/cfg_fps = 20\n",
+            "\tvar/new_fps = round(input(user, \"FPS\", \"FPS\", 20) as num | null)\n",
+            "\tif(new_fps <= 0)\n",
+            "\t\treturn cfg_fps\n",
+            "\treturn new_fps\n",
+        ));
+        let registry = ProcedureRegistry::build(&compilation);
+        let executable = registry
+            .compile_vm_all_symbolic_deferred(&compilation)
+            .expect("AVD-shaped symbolic module should link")
+            .into_fully_eager()
+            .expect("RHS input constraints must survive semantic normalization");
+
+        assert_eq!(executable.module().deferred_procedure_count(), 0);
+        assert!(executable.module().procedure_paths().any(|path| {
+            path.starts_with("/datum/admin_verb/set_server_fps/proc/__avd_do_verb@")
+        }));
     }
 
     fn procedure_by_path<'registry>(
@@ -5351,6 +5778,21 @@ mod tests {
     }
 
     #[test]
+    fn inferred_new_follows_builtin_mob_client_into_a_typed_safe_field() {
+        let compilation = TestProject::compile(concat!(
+            "/datum/meta_token_holder\n",
+            "\tvar/client/owner\n",
+            "/client\n",
+            "\tvar/datum/meta_token_holder/client_token_holder\n",
+            "/mob/Login()\n",
+            "\tclient?.client_token_holder = new(client)\n",
+        ));
+        ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("the built-in typed mob.client edge must qualify safe-field new");
+    }
+
+    #[test]
     fn inferred_new_uses_typed_parameter_default_and_for_receiver_field() {
         let compilation = TestProject::compile(
             "/datum/point\n/proc/copy_to(datum/point/p = new)\n\treturn p\n/datum/gas\n/obj/pipe\n\tvar/datum/gas/air_temporary\n/proc/store(var/list/members)\n\tfor(var/obj/pipe/member in members)\n\t\tmember.air_temporary = new\n",
@@ -5877,6 +6319,54 @@ GLOBAL_REAL(Master, /datum/controller/master)
     }
 
     #[test]
+    fn switch_arm_local_does_not_hide_documented_atom_and_particle_fields() {
+        let compilation = TestProject::compile(concat!(
+            "/obj/machinery/chem_recipe_debug/proc/ui_act(action)\n",
+            "\tswitch(action)\n",
+            "\t\tif(\"setTargetList\")\n",
+            "\t\t\tvar/text = \"local\"\n",
+            "\t\t\tif(!text)\n",
+            "\t\t\t\treturn 1\n",
+            "\t\tif(\"setEdit\")\n",
+            "\t\t\tif(!text)\n",
+            "\t\t\t\treturn 2\n",
+            "/particles/proc/return_ui_representation()\n",
+            "\treturn color_change\n",
+        ));
+        let registry = ProcedureRegistry::build(&compilation);
+        let ui_act = procedure_by_path(&registry, "/obj/machinery/chem_recipe_debug/proc/ui_act");
+        let particles = procedure_by_path(&registry, "/particles/proc/return_ui_representation");
+        let executable = registry
+            .compile_vm_implementations(
+                &compilation,
+                [
+                    ui_act.effective_target.expect("ui_act body"),
+                    particles
+                        .effective_target
+                        .expect("particle representation body"),
+                ],
+            )
+            .expect("BYOND engine fields should bind outside the local's lexical switch arm");
+
+        for (target, expected_field) in [
+            (ui_act.effective_target.unwrap(), "text"),
+            (particles.effective_target.unwrap(), "color_change"),
+        ] {
+            let entry = executable
+                .implementation(target)
+                .expect("selected implementation should be linked");
+            let program = executable
+                .module()
+                .procedure(entry)
+                .expect("selected implementation should have bytecode");
+            assert!(program.instructions.iter().any(|instruction| matches!(
+                instruction,
+                Instruction::LoadField(field) if field.as_str() == expected_field
+            )));
+        }
+    }
+
+    #[test]
     fn mulebot_initialize_binds_deprecated_atom_suffix_field() {
         let compilation = TestProject::compile(
             "/atom\n/mob\n/mob/living\n/mob/living/simple_animal\n/mob/living/simple_animal/bot\n/mob/living/simple_animal/bot/mulebot\n\tvar/id\n\tproc/set_id(value)\n\t\tid = value\n\tInitialize(mapload)\n\t\tset_id(suffix || id || \"fallback\")\n\t\tsuffix = null\n\t\treturn suffix\n",
@@ -5947,6 +6437,45 @@ GLOBAL_REAL(Master, /datum/controller/master)
                 )
                 .unwrap_or_else(|error| panic!("{path} should bind engine fields: {error:?}"));
         }
+    }
+
+    #[test]
+    fn client_mouse_pointer_icon_is_a_null_initialized_engine_field() {
+        let compilation = TestProject::compile(
+            "/client/MouseDown(value)\n\tif(initial(mouse_pointer_icon))\n\t\treturn \"unexpected initial pointer\"\n\tmouse_pointer_icon = value\n\treturn mouse_pointer_icon\n",
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let procedure = procedure_by_path(&registry, "/client/proc/MouseDown");
+        let target = procedure
+            .effective_target
+            .expect("MouseDown should have a body");
+        let executable = registry
+            .compile_vm_implementations(&compilation, [target])
+            .expect("the documented client field should bind during lowering");
+        let entry = executable
+            .implementation(target)
+            .expect("MouseDown should be linked");
+        let mut state = ExecutionState::new();
+        let client = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/client").unwrap());
+        let pointer = Value::file("cursor.dmi");
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                entry,
+                std::slice::from_ref(&pointer),
+                &mut state,
+                &ExecutionContext::new(Value::Datum(client), Value::Null),
+            ),
+            Ok(pointer.clone())
+        );
+        assert_eq!(
+            state
+                .heap()
+                .datum_field(client, &FieldName::parse("mouse_pointer_icon").unwrap()),
+            Ok(&pointer)
+        );
     }
 
     #[test]
@@ -7024,6 +7553,33 @@ GLOBAL_REAL(Master, /datum/controller/master)
     }
 
     #[test]
+    fn inherited_bare_call_after_nested_ternary_colon_is_retained() {
+        let compilation = TestProject::compile(concat!(
+            "/atom/proc/drop_location()\n\treturn 7\n",
+            "/obj/proc/forward(value)\n\treturn value\n",
+            "/obj/proc/click_alt(user)\n",
+            "\treturn forward(user ? user : drop_location())\n",
+        ));
+        let registry = ProcedureRegistry::build(&compilation);
+        let click_alt = procedure_by_path(&registry, "/obj/proc/click_alt")
+            .effective_target
+            .expect("click_alt body");
+        let drop_location = procedure_by_path(&registry, "/atom/proc/drop_location")
+            .effective_target
+            .expect("drop_location body");
+
+        assert!(
+            registry
+                .implementation_closure(&compilation, [click_alt])
+                .contains(&drop_location),
+            "a ternary nested in a call must retain its bare inherited false-arm call",
+        );
+        registry
+            .compile_vm_implementations(&compilation, [click_alt])
+            .expect("the retained nested-ternary call should resolve during lowering");
+    }
+
+    #[test]
     fn explicit_construction_links_and_runs_glob_new_before_returning() {
         let compilation = TestProject::compile(
             "/var/global/datum/controller/global_vars/GLOB\n/datum/controller/global_vars/New(marker)\n\tGLOB = src\n\tsrc.marker = marker\n/proc/entry()\n\tvar/datum/controller/global_vars/created = new /datum/controller/global_vars(17)\n\treturn GLOB == created && created.marker == 17\n",
@@ -7742,6 +8298,157 @@ GLOBAL_REAL(Master, /datum/controller/master)
             Ok(Value::Null),
             "a subtype destructor may terminate at BYOND's engine /datum/Del",
         );
+    }
+
+    #[test]
+    fn movable_bump_parent_chain_terminates_at_the_engine_native() {
+        let compilation = TestProject::compile(concat!(
+            "/atom/movable/Bump(atom/obstacle)\n",
+            "\t. = ..()\n",
+            "\treturn isnull(.) * 7\n",
+            "/obj/crate/Bump(atom/obstacle)\n",
+            "\treturn ..() + 1\n",
+        ));
+
+        assert_eq!(
+            execute_effective(&compilation, "/atom/movable/proc/Bump", &[Value::Null]),
+            Ok(Value::number(7.0)),
+            "the project base override must observe BYOND's null terminal result",
+        );
+        assert_eq!(
+            execute_effective(&compilation, "/obj/crate/proc/Bump", &[Value::Null]),
+            Ok(Value::number(8.0)),
+            "a descendant override must traverse the project base before the native terminal",
+        );
+    }
+
+    #[test]
+    fn descendant_movable_bump_can_reach_the_native_without_a_source_base() {
+        let compilation =
+            TestProject::compile("/obj/crate/Bump(atom/obstacle)\n\treturn isnull(..())\n");
+
+        assert_eq!(
+            execute_effective(&compilation, "/obj/crate/proc/Bump", &[Value::Null]),
+            Ok(Value::number(1.0)),
+        );
+    }
+
+    #[test]
+    fn unrelated_bump_name_does_not_bind_to_the_movable_native() {
+        let compilation = TestProject::compile("/datum/example/Bump()\n\treturn ..()\n");
+        let error = execute_effective(&compilation, "/datum/example/proc/Bump", &[])
+            .expect_err("a datum procedure named Bump has no engine movable parent");
+
+        assert_eq!(
+            error.message,
+            "parent procedure call has no resolved target"
+        );
+    }
+
+    #[test]
+    fn engine_generator_icon_and_walk_surfaces_lower_eagerly_and_execute() {
+        let compilation = TestProject::compile(concat!(
+            "/proc/Rand()\n\treturn 99\n",
+            "/generator/proc/RandList()\n\treturn Rand()\n",
+            "/icon/proc/Opaque(background = \"#000000\")\n",
+            "\tSwapColor(null, background)\n",
+            "\treturn src\n",
+            "/proc/generator_result()\n",
+            "\tvar/generator/value = generator(\"num\", 4, 4)\n",
+            "\treturn value.RandList()\n",
+            "/proc/icon_result()\n",
+            "\tvar/icon/value = icon()\n",
+            "\treturn value.Opaque()\n",
+            "/proc/_walk(ref, dir, lag)\n\twalk(ref, dir, lag)\n",
+            "/proc/_walk_towards(ref, target, lag)\n\twalk_towards(ref, target, lag)\n",
+            "/proc/_walk_to(ref, target, minimum, lag)\n",
+            "\twalk_to(ref, target, minimum, lag)\n",
+            "/proc/_walk_away(ref, target, maximum, lag)\n",
+            "\twalk_away(ref, target, maximum, lag)\n",
+            "/proc/_walk_rand(ref, lag)\n\twalk_rand(ref, lag)\n",
+        ));
+        let registry = ProcedureRegistry::build(&compilation);
+        let generator_target = procedure_by_path(&registry, "/proc/generator_result")
+            .effective_target
+            .unwrap();
+        let icon_target = procedure_by_path(&registry, "/proc/icon_result")
+            .effective_target
+            .unwrap();
+        let executable = registry
+            .compile_vm_all_symbolic_deferred(&compilation)
+            .expect("engine surface fixture should link")
+            .into_fully_eager()
+            .expect("all Monk-shaped engine calls should lower eagerly");
+        assert_eq!(executable.module().deferred_procedure_count(), 0);
+
+        let mut state = ExecutionState::new();
+        assert_eq!(
+            execute_module_in_state(
+                executable.module(),
+                executable.implementation(generator_target).unwrap(),
+                &[],
+                &mut state,
+            ),
+            Ok(Value::number(4.0)),
+            "the engine-owned generator member must win over a same-name global proc",
+        );
+        let Value::Datum(icon) = execute_module_in_state(
+            executable.module(),
+            executable.implementation(icon_target).unwrap(),
+            &[],
+            &mut state,
+        )
+        .expect("the native icon member should execute") else {
+            panic!("Opaque should return its icon receiver")
+        };
+        let operations_field = FieldName::parse("_dream64_icon_operations").unwrap();
+        let Value::List(operations) = state
+            .heap()
+            .datum_field(icon, &operations_field)
+            .expect("SwapColor should record an icon operation")
+        else {
+            panic!("icon operations should be stored in a list")
+        };
+        let [(_, Value::List(operation))] = state
+            .heap()
+            .list(*operations)
+            .unwrap()
+            .positions()
+            .collect::<Vec<_>>()
+            .as_slice()
+        else {
+            panic!("Opaque should perform exactly one icon operation")
+        };
+        assert_eq!(
+            state.heap().list(*operation).unwrap().get(1),
+            Ok(&Value::text("SwapColor")),
+        );
+    }
+
+    #[test]
+    fn project_generator_member_overrides_engine_rand_in_full_and_independent_modules() {
+        let compilation = TestProject::compile(concat!(
+            "/generator/Rand()\n\treturn 99\n",
+            "/generator/proc/RandList()\n\treturn Rand()\n",
+            "/proc/run()\n",
+            "\tvar/generator/value = generator(\"num\", 4, 4)\n",
+            "\treturn value.RandList()\n",
+        ));
+        assert_eq!(
+            execute_effective(&compilation, "/proc/run", &[]),
+            Ok(Value::number(99.0)),
+        );
+
+        let registry = ProcedureRegistry::build(&compilation);
+        let rand_list = procedure_by_path(&registry, "/generator/proc/RandList")
+            .effective_target
+            .unwrap();
+        let mut independently = registry.compile_vm_bodies_independently(&compilation, [rand_list]);
+        let (compiled_id, result) = independently
+            .pop()
+            .expect("independent RandList body should be present");
+        assert_eq!(compiled_id, rand_list);
+        result.expect("a project member override should remain a valid independent call target");
     }
 
     #[test]

@@ -206,6 +206,7 @@ fn materialize_builtin_atom_defaults(
         ("render_source", Value::Null),
         ("render_target", Value::Null),
         ("suffix", Value::Null),
+        ("text", Value::Null),
         ("transform", Value::Null),
         ("vis_flags", Value::number(0.0)),
         ("x", Value::number(0.0)),
@@ -311,6 +312,7 @@ fn particle_defaults() -> &'static [(&'static str, Value)] {
             "bound2",
             "gravity",
             "gradient",
+            "color_change",
             "transform",
             "icon",
             "icon_state",
@@ -518,6 +520,7 @@ fn builtin_initial_fields(path: &TypePath, world_name: &str) -> BTreeMap<FieldNa
                 ("render_source", Value::Null),
                 ("render_target", Value::Null),
                 ("suffix", Value::Null),
+                ("text", Value::Null),
                 ("transform", Value::Null),
                 ("underlays", Value::Null),
                 ("vis_contents", Value::Null),
@@ -703,6 +706,10 @@ pub struct RuntimeImageStats {
     pub initializer_bindings_emitted: usize,
     /// Immutable type metadata snapshots built for execution-state transfers.
     pub execution_metadata_builds: usize,
+    /// Direct field values retained in the compact execution catalog.
+    pub execution_initial_value_entries: usize,
+    /// Effective owner-qualified static-field mappings retained for reflection.
+    pub shared_reflection_entries: usize,
     /// Per-type inherited-default allocation plans built on first allocation.
     pub datum_allocation_plans_built: usize,
     /// Datums allocated inside a caller-owned persistent execution state.
@@ -958,42 +965,27 @@ fn execution_metadata(
         .map(|(path, runtime_type)| (path.clone(), runtime_type.parent.clone()))
         .collect();
     let mut initial_values = BTreeMap::new();
-    for path in types.keys() {
-        let mut hierarchy = Vec::new();
-        let mut current = Some(path.clone());
-        let mut visited = BTreeSet::new();
-        while let Some(candidate) = current.take() {
-            if !visited.insert(candidate.clone()) {
-                break;
-            }
-            let Some(runtime_type) = types.get(&candidate) else {
-                break;
-            };
-            hierarchy.push(candidate.clone());
-            current.clone_from(&runtime_type.parent);
-        }
-        hierarchy.reverse();
-        let mut values = BTreeMap::new();
-        for ancestor in hierarchy {
-            values.extend(builtin_initial_fields(&ancestor, world_name));
-            if let Some(runtime_type) = types.get(&ancestor) {
-                values.extend(
-                    runtime_type
-                        .defaults
-                        .fields()
-                        .map(|(field, value)| (field.clone(), value.clone())),
-                );
-            }
-        }
+    for (path, runtime_type) in types {
+        // Store only fields owned by this type. ExecutionState already owns
+        // the immutable parent catalog and resolves scalar reads by walking it;
+        // eagerly cloning every inherited field into every descendant made the
+        // Monk catalog retain ~18.3 million Values for only ~54k types.
+        let mut values = builtin_initial_fields(path, world_name);
+        values.extend(
+            runtime_type
+                .defaults
+                .fields()
+                .map(|(field, value)| (field.clone(), value.clone())),
+        );
         values.insert(
             FieldName::parse("type").expect("built-in type field is valid"),
             Value::TypePath(path.clone()),
         );
         values.insert(
             FieldName::parse("parent_type").expect("built-in parent_type field is valid"),
-            types
-                .get(path)
-                .and_then(|runtime_type| runtime_type.parent.clone())
+            runtime_type
+                .parent
+                .clone()
                 .map_or(Value::Null, Value::TypePath),
         );
         initial_values.insert(path.clone(), values);
@@ -1372,6 +1364,8 @@ impl RuntimeImage {
         self.type_parents = Arc::new(type_parents);
         self.initial_values = Arc::new(initial_values);
         self.stats.execution_metadata_builds += 1;
+        self.stats.execution_initial_value_entries =
+            self.initial_values.values().map(BTreeMap::len).sum();
     }
     /// Compiles and materializes a project without allocating map atoms.
     ///
@@ -1479,6 +1473,7 @@ impl RuntimeImage {
         // all compile-time instance constants have been applied.
         let type_parents = type_parent_metadata(&types);
         let shared_fields = shared_reflection_fields(&registry, &type_parents)?;
+        let shared_reflection_entries = shared_fields.values().map(BTreeMap::len).sum();
         let global_types = declared_global_types(compilation, &registry);
         complete_runtime_phase(&mut observer, phase, phase_started, Some(types.len()));
         let mut image = Self {
@@ -1508,6 +1503,7 @@ impl RuntimeImage {
             project_root: compilation.project().root_directory.clone(),
             stats: RuntimeImageStats {
                 variables: registry.entries().len(),
+                shared_reflection_entries,
                 initializer_steps: plans.global_steps.len()
                     + plans
                         .type_defaults
@@ -3262,7 +3258,7 @@ impl std::error::Error for RuntimeImageLoadError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -3274,7 +3270,7 @@ mod tests {
     use dm_semantics::{ProcedureRegistry, standard_instance_field_names};
     use dm_value::{FieldName, TypePath, Value};
     use dm_vm::{
-        compile_initializer, compile_initializer_into_module, compile_module,
+        ExecutionState, compile_initializer, compile_initializer_into_module, compile_module,
         execute_module_in_state,
     };
 
@@ -3339,6 +3335,116 @@ mod tests {
 
     fn type_path(path: &str) -> TypePath {
         TypePath::parse(path).expect("test type path should be valid")
+    }
+
+    fn effective_image_field(
+        image: &RuntimeImage,
+        datum: dm_value::DatumId,
+        name: &FieldName,
+    ) -> Option<Value> {
+        let record = image.heap().datum(datum).ok()?;
+        record.field(name).cloned().ok().or_else(|| {
+            let mut current = Some(record.type_path());
+            while let Some(path) = current {
+                if let Some(value) = image
+                    .initial_values
+                    .get(path)
+                    .and_then(|fields| fields.get(name))
+                {
+                    return Some(value.clone());
+                }
+                current = image.type_parents.get(path).and_then(Option::as_ref);
+            }
+            None
+        })
+    }
+
+    fn effective_state_field(
+        state: &ExecutionState,
+        datum: dm_value::DatumId,
+        name: &FieldName,
+    ) -> Option<Value> {
+        let record = state.heap().datum(datum).ok()?;
+        record
+            .field(name)
+            .cloned()
+            .ok()
+            .or_else(|| state.initial_value(record.type_path(), name).cloned())
+    }
+
+    #[test]
+    fn execution_metadata_stores_direct_defaults_and_resolves_inheritance_lazily() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "world.dme",
+            "/datum/catalog_parent\n\tvar/inherited = 1\n\tvar/overridden = 2\n/datum/catalog_parent/child\n\toverridden = 3\n\tvar/owned = 4\n",
+        );
+        let mut image = fixture.image();
+        let parent = type_path("/datum/catalog_parent");
+        let child = type_path("/datum/catalog_parent/child");
+        let inherited = field("inherited");
+        let overridden = field("overridden");
+        let owned = field("owned");
+        let type_field = field("type");
+        let parent_type = field("parent_type");
+        let parent_values = image.initial_values.get(&parent).expect("parent catalog");
+        let child_values = image.initial_values.get(&child).expect("child catalog");
+        assert_eq!(parent_values.get(&inherited), Some(&Value::number(1.0)));
+        assert!(
+            !child_values.contains_key(&inherited),
+            "a descendant catalog must not clone unchanged inherited fields"
+        );
+        assert_eq!(child_values.get(&overridden), Some(&Value::number(3.0)));
+        assert_eq!(child_values.get(&owned), Some(&Value::number(4.0)));
+        assert_eq!(
+            child_values.get(&type_field),
+            Some(&Value::TypePath(child.clone()))
+        );
+        assert_eq!(
+            child_values.get(&parent_type),
+            Some(&Value::TypePath(parent.clone()))
+        );
+        let eager_child_entries = parent_values
+            .keys()
+            .chain(child_values.keys())
+            .collect::<BTreeSet<_>>()
+            .len();
+        assert!(
+            child_values.len() < eager_child_entries,
+            "direct catalog must retain fewer entries than an eager inherited map"
+        );
+        assert_eq!(
+            image.stats().execution_initial_value_entries,
+            image
+                .initial_values
+                .values()
+                .map(BTreeMap::len)
+                .sum::<usize>(),
+            "production telemetry reports exact retained catalog cardinality"
+        );
+        assert_eq!(
+            image.stats().shared_reflection_entries,
+            image
+                .shared_fields
+                .values()
+                .map(BTreeMap::len)
+                .sum::<usize>(),
+            "production telemetry reports exact retained reflection cardinality"
+        );
+
+        let state = image.take_execution_state();
+        assert_eq!(
+            state.initial_value(&child, &inherited),
+            Some(&Value::number(1.0))
+        );
+        assert_eq!(
+            state.initial_value(&child, &overridden),
+            Some(&Value::number(3.0))
+        );
+        assert_eq!(
+            state.initial_value(&child, &owned),
+            Some(&Value::number(4.0))
+        );
     }
 
     #[test]
@@ -3507,11 +3613,8 @@ mod tests {
             unreachable!("checked above")
         };
         assert_eq!(
-            image
-                .heap()
-                .datum(*first_datum)
-                .and_then(|datum| datum.field(&field("value"))),
-            Ok(&Value::number(8.0)),
+            effective_image_field(&image, *first_datum, &field("value")),
+            Some(Value::number(8.0)),
             "global new must see the completed inherited-default snapshot"
         );
         assert_eq!(
@@ -3535,13 +3638,15 @@ mod tests {
         else {
             panic!("logger should be a datum");
         };
-        let logger = image.heap().datum(*logger).expect("logger should be live");
         assert_eq!(
-            logger.field(&field("waiting_log_calls")),
-            Ok(&Value::Null),
+            effective_image_field(&image, *logger, &field("waiting_log_calls")),
+            Some(Value::Null),
             "an uninitialized declaration is still a real null-valued field"
         );
-        assert_eq!(logger.field(&field("initialized")), Ok(&Value::number(0.0)));
+        assert_eq!(
+            effective_image_field(&image, *logger, &field("initialized")),
+            Some(Value::number(0.0))
+        );
     }
 
     #[test]
@@ -3727,8 +3832,8 @@ mod tests {
             panic!("newlist should contain the constructed power cord");
         };
         assert_eq!(
-            state.heap().datum_field(*powercord, &field("gc_destroyed")),
-            Ok(&Value::Null),
+            effective_state_field(&state, *powercord, &field("gc_destroyed")),
+            Some(Value::Null),
             "qdel must see the inherited /datum field on newlist objects",
         );
         assert_eq!(
@@ -4780,6 +4885,16 @@ mod tests {
                 "semantic particle field {name} must have runtime storage",
             );
         }
+        assert_eq!(
+            image.heap().datum_field(object, &field("text")),
+            Ok(&Value::Null),
+            "the inherited /atom.text field must be materialized",
+        );
+        assert_eq!(
+            image.heap().datum_field(particles, &field("color_change")),
+            Ok(&Value::Null),
+            "the documented /particles.color_change field must be materialized",
+        );
         let appearance = image
             .allocate_datum(&type_path("/mutable_appearance/example"))
             .expect("mutable appearance should allocate");

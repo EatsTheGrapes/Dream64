@@ -9,6 +9,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fs;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use dm_core::{FileId, SourceSpan};
@@ -18,7 +20,10 @@ use dm_object_tree::{
     DiagnosticSeverity as TreeDiagnosticSeverity, NodeId, TreeDiagnostic,
 };
 use dm_project::{FileKind, PragmaSeverity, Project, ProjectError};
-use dm_syntax::{SyntaxError, SyntaxFile};
+use dm_syntax::{
+    Definition, DefinitionKind, DefinitionPath, Indentation, ParameterSyntax, SourceLine,
+    SyntaxError, SyntaxFile,
+};
 
 /// Reusable entry point for deterministic project compilations.
 ///
@@ -69,10 +74,66 @@ impl CompilerDatabase {
         root_file: impl AsRef<Path>,
         cache_file: impl AsRef<Path>,
     ) -> Result<(Compilation, bool), CompilerError> {
-        let (project, cache_hit) =
-            Project::load_cached(root_file, cache_file).map_err(CompilerError::Project)?;
-        Ok((compile_project(project), cache_hit))
+        let (compilation, stats) = self.compile_cached_with_stats(root_file, cache_file)?;
+        Ok((compilation, stats.project_snapshot_hit))
     }
+
+    /// Compiles a project through the preprocessing and parsed-syntax caches.
+    ///
+    /// The syntax cache is considered only after the project snapshot has
+    /// validated every discovered source/resource fingerprint. Its format also
+    /// embeds a fingerprint of the lexer and declaration parser sources, so a
+    /// frontend grammar change cannot silently reuse stale tokens or syntax.
+    /// Object-tree and semantic products are deliberately rebuilt on every
+    /// call and therefore never cross an engine-version boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same project discovery and source errors as [`Self::compile`]
+    /// when the cache is absent or stale.
+    pub fn compile_cached_with_stats(
+        &self,
+        root_file: impl AsRef<Path>,
+        cache_file: impl AsRef<Path>,
+    ) -> Result<(Compilation, CompilationCacheStats), CompilerError> {
+        let cache_file = cache_file.as_ref();
+        let (project, project_snapshot_hit) =
+            Project::load_cached(root_file, cache_file).map_err(CompilerError::Project)?;
+        let syntax_cache_file = parsed_syntax_cache_path(cache_file);
+        let cached_syntax = project_snapshot_hit
+            .then(|| {
+                fs::read(&syntax_cache_file)
+                    .ok()
+                    .and_then(|bytes| decode_parsed_syntax_cache(&bytes, &project))
+            })
+            .flatten();
+        let parsed_syntax_hit = cached_syntax.is_some();
+        let (syntax_files, syntax_diagnostics) =
+            cached_syntax.unwrap_or_else(|| parse_project_syntax(&project));
+        if !parsed_syntax_hit {
+            if let Some(parent) = syntax_cache_file.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let encoded = encode_parsed_syntax_cache(&syntax_files);
+            let _ = fs::write(&syntax_cache_file, encoded);
+        }
+        Ok((
+            compile_project_from_syntax(project, syntax_files, syntax_diagnostics),
+            CompilationCacheStats {
+                project_snapshot_hit,
+                parsed_syntax_hit,
+            },
+        ))
+    }
+}
+
+/// Cache hits observed while compiling one project.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CompilationCacheStats {
+    /// The immutable preprocessed project snapshot passed filesystem validation.
+    pub project_snapshot_hit: bool,
+    /// Parsed declaration syntax was restored without lexing or parsing sources.
+    pub parsed_syntax_hit: bool,
 }
 
 /// A complete frontend snapshot for one project.
@@ -87,6 +148,187 @@ pub struct Compilation {
 }
 
 impl Compilation {
+    /// Encodes the complete immutable frontend result for inclusion in a
+    /// Dream64 compiled executable artifact.
+    ///
+    /// Loading this payload restores the preprocessed project, parsed syntax,
+    /// canonical object tree, declaration stream, diagnostics, and counters
+    /// without rerunning lexing, parsing, or object-tree construction.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn encode_compiled_artifact(&self) -> Vec<u8> {
+        let segments = self.encode_compiled_artifact_segments();
+        let total_length = segments.iter().map(Vec::len).sum();
+        let mut output = Vec::with_capacity(total_length);
+        for segment in segments {
+            output.extend_from_slice(&segment);
+        }
+        debug_assert_eq!(output.len(), total_length);
+        output
+    }
+
+    /// Encodes the frontend artifact as ordered byte segments without copying
+    /// its large project, syntax, and object-tree components into a second
+    /// contiguous allocation.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn encode_compiled_artifact_segments(&self) -> Vec<Vec<u8>> {
+        let project = self.project.encode_compiled_artifact();
+        let syntax = encode_parsed_syntax_cache(&self.syntax_files);
+        let code_tree = self.code_tree.encode_compiled_artifact();
+        let mut header = COMPILATION_ARTIFACT_MAGIC.to_vec();
+        syntax_cache_write_len(&mut header, project.len());
+        let mut syntax_header = Vec::with_capacity(std::mem::size_of::<u64>());
+        syntax_cache_write_len(&mut syntax_header, syntax.len());
+        let mut code_tree_header = Vec::with_capacity(std::mem::size_of::<u64>());
+        syntax_cache_write_len(&mut code_tree_header, code_tree.len());
+        let mut tail = Vec::new();
+
+        syntax_cache_write_len(&mut tail, self.declarations.len());
+        for declaration in &self.declarations {
+            syntax_cache_write_len(&mut tail, declaration.ordinal);
+            syntax_cache_write_len(&mut tail, declaration.file_id.index());
+            syntax_cache_write_len(&mut tail, declaration.definition_index);
+            syntax_cache_write_len(&mut tail, declaration.node.index());
+            syntax_cache_write_span(&mut tail, declaration.span);
+        }
+
+        syntax_cache_write_len(&mut tail, self.diagnostics.len());
+        for diagnostic in &self.diagnostics {
+            tail.push(compilation_artifact_diagnostic_kind(diagnostic.kind));
+            tail.push(match diagnostic.severity {
+                DiagnosticSeverity::Note => 0,
+                DiagnosticSeverity::Warning => 1,
+                DiagnosticSeverity::Error => 2,
+            });
+            syntax_cache_write_string(&mut tail, &diagnostic.message);
+            compilation_artifact_write_location(&mut tail, diagnostic.location.as_ref());
+            compilation_artifact_write_location(&mut tail, diagnostic.related.as_ref());
+        }
+        compilation_artifact_write_stats(&mut tail, self.stats);
+        vec![
+            header,
+            project,
+            syntax_header,
+            syntax,
+            code_tree_header,
+            code_tree,
+            tail,
+        ]
+    }
+
+    /// Decodes and validates one immutable frontend artifact payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns a descriptive error for a corrupt, truncated, incompatible, or
+    /// internally inconsistent payload.
+    #[doc(hidden)]
+    pub fn decode_compiled_artifact(bytes: &[u8]) -> Result<Self, String> {
+        let mut input = Cursor::new(bytes);
+        let mut magic = vec![0; COMPILATION_ARTIFACT_MAGIC.len()];
+        input
+            .read_exact(&mut magic)
+            .map_err(|_| "compiled frontend is truncated before its header".to_owned())?;
+        if magic != COMPILATION_ARTIFACT_MAGIC {
+            return Err("compiled frontend has an unsupported header".to_owned());
+        }
+        let project_bytes = compilation_artifact_read_bytes(&mut input, "project")?;
+        let project = Project::decode_compiled_artifact(project_bytes)?;
+        let syntax_bytes = compilation_artifact_read_bytes(&mut input, "syntax")?;
+        let (syntax_files, _) = decode_parsed_syntax_cache(syntax_bytes, &project)
+            .ok_or_else(|| "compiled frontend syntax payload is invalid".to_owned())?;
+        let code_tree_bytes = compilation_artifact_read_bytes(&mut input, "code tree")?;
+        let code_tree = CodeTree::decode_compiled_artifact(code_tree_bytes)?;
+
+        let declaration_count = compilation_artifact_read_count(&mut input, "declaration count")?;
+        let mut declarations = Vec::with_capacity(declaration_count);
+        for _ in 0..declaration_count {
+            let ordinal = compilation_artifact_read_len(&mut input, "declaration ordinal")?;
+            let file_id = FileId::from_index(compilation_artifact_read_len(
+                &mut input,
+                "declaration file identity",
+            )?);
+            let definition_index = compilation_artifact_read_len(&mut input, "definition index")?;
+            let node_index = compilation_artifact_read_len(&mut input, "node identity")?;
+            let node = code_tree
+                .nodes()
+                .get(node_index)
+                .ok_or_else(|| format!("compiled frontend references missing node {node_index}"))?
+                .id;
+            let span = compilation_artifact_read_span(&mut input)?;
+            declarations.push(CompilationDeclaration {
+                ordinal,
+                file_id,
+                definition_index,
+                node,
+                span,
+            });
+        }
+
+        let diagnostic_count = compilation_artifact_read_count(&mut input, "diagnostic count")?;
+        let mut diagnostics = Vec::with_capacity(diagnostic_count);
+        for _ in 0..diagnostic_count {
+            let kind = compilation_artifact_read_diagnostic_kind(&mut input)?;
+            let severity = match syntax_cache_read_byte(&mut input)
+                .ok_or_else(|| "compiled frontend is truncated at diagnostic severity".to_owned())?
+            {
+                0 => DiagnosticSeverity::Note,
+                1 => DiagnosticSeverity::Warning,
+                2 => DiagnosticSeverity::Error,
+                tag => {
+                    return Err(format!(
+                        "compiled frontend has unknown diagnostic severity {tag}"
+                    ));
+                }
+            };
+            let message = syntax_cache_read_string(&mut input)
+                .ok_or_else(|| "compiled frontend has invalid diagnostic text".to_owned())?;
+            let location = compilation_artifact_read_location(&mut input, &project)?;
+            let related = compilation_artifact_read_location(&mut input, &project)?;
+            diagnostics.push(Diagnostic {
+                kind,
+                severity,
+                message,
+                location,
+                related,
+            });
+        }
+        let stats = compilation_artifact_read_stats(&mut input)?;
+        if input.position() != bytes.len() as u64 {
+            return Err("compiled frontend contains trailing bytes".to_owned());
+        }
+        if syntax_files.len() != project.files.len() {
+            return Err("compiled frontend syntax/project table lengths disagree".to_owned());
+        }
+        for declaration in &declarations {
+            let Some(syntax) = syntax_files
+                .get(declaration.file_id.index())
+                .and_then(Option::as_ref)
+            else {
+                return Err(format!(
+                    "compiled frontend declaration references missing syntax file {}",
+                    declaration.file_id.index()
+                ));
+            };
+            if declaration.definition_index >= syntax.definitions.len() {
+                return Err(format!(
+                    "compiled frontend declaration references missing definition {}:{}",
+                    declaration.file_id.index(),
+                    declaration.definition_index
+                ));
+            }
+        }
+        Ok(Self {
+            project,
+            syntax_files,
+            code_tree,
+            declarations,
+            diagnostics,
+            stats,
+        })
+    }
+
     /// Returns the discovered project and its source/include tables.
     #[must_use]
     pub const fn project(&self) -> &Project {
@@ -296,11 +538,569 @@ impl std::error::Error for CompilerError {
     }
 }
 
-fn compile_project(project: Project) -> Compilation {
+const PARSED_SYNTAX_CACHE_MAGIC: &[u8] = b"DREAM64-PARSED-SYNTAX\0\x01";
+const PARSED_SYNTAX_FRONTEND_FINGERPRINT: u64 = syntax_frontend_fingerprint();
+
+const fn hash_source(mut hash: u64, source: &[u8]) -> u64 {
+    let mut index = 0;
+    while index < source.len() {
+        hash ^= source[index] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        index += 1;
+    }
+    hash
+}
+
+const fn syntax_frontend_fingerprint() -> u64 {
+    let hash = hash_source(
+        0xcbf2_9ce4_8422_2325,
+        include_bytes!("../../dm-lexer/src/lib.rs"),
+    );
+    hash_source(hash, include_bytes!("../../dm-syntax/src/lib.rs"))
+}
+
+fn parsed_syntax_cache_path(project_cache: &Path) -> PathBuf {
+    let mut name = project_cache.file_name().unwrap_or_default().to_os_string();
+    name.push(".syntax");
+    project_cache.with_file_name(name)
+}
+
+fn encode_parsed_syntax_cache(syntax_files: &[Option<SyntaxFile>]) -> Vec<u8> {
+    let mut output = Vec::new();
+    output.extend_from_slice(PARSED_SYNTAX_CACHE_MAGIC);
+    syntax_cache_write_u64(&mut output, PARSED_SYNTAX_FRONTEND_FINGERPRINT);
+    syntax_cache_write_len(&mut output, syntax_files.len());
+    for syntax in syntax_files {
+        let Some(syntax) = syntax else {
+            output.push(0);
+            continue;
+        };
+        output.push(1);
+        syntax_cache_write_len(&mut output, syntax.definitions.len());
+        for definition in &syntax.definitions {
+            syntax_cache_write_strings(&mut output, definition.path.segments());
+            output.push(match definition.kind {
+                DefinitionKind::Type => 0,
+                DefinitionKind::Procedure => 1,
+                DefinitionKind::ProcedureOverride => 2,
+                DefinitionKind::Verb => 3,
+                DefinitionKind::Variable => 4,
+                DefinitionKind::VariableOverride => 5,
+            });
+            match definition.parent {
+                Some(parent) => {
+                    output.push(1);
+                    syntax_cache_write_len(&mut output, parent);
+                }
+                None => output.push(0),
+            }
+            syntax_cache_write_indentation(&mut output, definition.indentation);
+            syntax_cache_write_span(&mut output, definition.span);
+            syntax_cache_write_tokens(&mut output, &definition.header);
+            syntax_cache_write_len(&mut output, definition.parameters.len());
+            for parameter in &definition.parameters {
+                syntax_cache_write_span(&mut output, parameter.span);
+                syntax_cache_write_tokens(&mut output, &parameter.tokens);
+            }
+            syntax_cache_write_len(&mut output, definition.body.len());
+            for line in &definition.body {
+                syntax_cache_write_indentation(&mut output, line.indentation);
+                syntax_cache_write_span(&mut output, line.span);
+                syntax_cache_write_tokens(&mut output, &line.tokens);
+            }
+        }
+    }
+    output
+}
+
+fn decode_parsed_syntax_cache(
+    bytes: &[u8],
+    project: &Project,
+) -> Option<(Vec<Option<SyntaxFile>>, Vec<Diagnostic>)> {
+    let mut input = Cursor::new(bytes);
+    let mut magic = vec![0; PARSED_SYNTAX_CACHE_MAGIC.len()];
+    input.read_exact(&mut magic).ok()?;
+    if magic != PARSED_SYNTAX_CACHE_MAGIC
+        || syntax_cache_read_u64(&mut input)? != PARSED_SYNTAX_FRONTEND_FINGERPRINT
+        || syntax_cache_read_len(&mut input)? != project.files.len()
+    {
+        return None;
+    }
     let mut syntax_files = Vec::with_capacity(project.files.len());
     let mut diagnostics = Vec::new();
-    let mut parsed_files = 0usize;
-    let mut definitions = 0usize;
+    for file in &project.files {
+        let present = syntax_cache_read_byte(&mut input)?;
+        let source_bearing = matches!(file.kind, FileKind::Environment | FileKind::Source);
+        if present == 0 {
+            if !source_bearing {
+                syntax_files.push(None);
+                continue;
+            }
+            let source = file.compiler_text().ok()?;
+            match dm_syntax::parse(source) {
+                Ok(_) => return None,
+                Err(error) => {
+                    let compiler_span = syntax_error_span(&error);
+                    diagnostics.push(syntax_diagnostic(
+                        file.id,
+                        file.path.clone(),
+                        file.original_span(compiler_span),
+                        &error,
+                    ));
+                    syntax_files.push(None);
+                }
+            }
+            continue;
+        }
+        if present != 1 || !source_bearing {
+            return None;
+        }
+        let definition_count = syntax_cache_read_len(&mut input)?;
+        let mut definitions = Vec::with_capacity(definition_count.min(1_000_000));
+        for definition_index in 0..definition_count {
+            let path = DefinitionPath::new(syntax_cache_read_strings(&mut input)?);
+            let kind = match syntax_cache_read_byte(&mut input)? {
+                0 => DefinitionKind::Type,
+                1 => DefinitionKind::Procedure,
+                2 => DefinitionKind::ProcedureOverride,
+                3 => DefinitionKind::Verb,
+                4 => DefinitionKind::Variable,
+                5 => DefinitionKind::VariableOverride,
+                _ => return None,
+            };
+            let parent = match syntax_cache_read_byte(&mut input)? {
+                0 => None,
+                1 => Some(syntax_cache_read_len(&mut input)?),
+                _ => return None,
+            };
+            if parent.is_some_and(|parent| parent >= definition_index) {
+                return None;
+            }
+            let indentation = syntax_cache_read_indentation(&mut input)?;
+            let span = syntax_cache_read_span(&mut input)?;
+            let header = syntax_cache_read_tokens(&mut input)?;
+            let parameter_count = syntax_cache_read_len(&mut input)?;
+            let mut parameters = Vec::with_capacity(parameter_count.min(1_000_000));
+            for _ in 0..parameter_count {
+                parameters.push(ParameterSyntax {
+                    span: syntax_cache_read_span(&mut input)?,
+                    tokens: syntax_cache_read_tokens(&mut input)?,
+                });
+            }
+            let line_count = syntax_cache_read_len(&mut input)?;
+            let mut body = Vec::with_capacity(line_count.min(1_000_000));
+            for _ in 0..line_count {
+                body.push(SourceLine {
+                    indentation: syntax_cache_read_indentation(&mut input)?,
+                    span: syntax_cache_read_span(&mut input)?,
+                    tokens: syntax_cache_read_tokens(&mut input)?,
+                });
+            }
+            definitions.push(Definition {
+                path,
+                kind,
+                parent,
+                indentation,
+                span,
+                header,
+                parameters,
+                body,
+            });
+        }
+        syntax_files.push(Some(SyntaxFile { definitions }));
+    }
+    (input.position() == bytes.len() as u64).then_some((syntax_files, diagnostics))
+}
+
+fn syntax_cache_write_tokens(output: &mut Vec<u8>, tokens: &[SpannedToken]) {
+    syntax_cache_write_len(output, tokens.len());
+    for token in tokens {
+        match &token.kind {
+            TokenKind::LineStart { tabs, spaces } => {
+                output.push(0);
+                syntax_cache_write_len(output, *tabs);
+                syntax_cache_write_len(output, *spaces);
+            }
+            TokenKind::Newline => output.push(1),
+            TokenKind::LineContinuation => output.push(2),
+            TokenKind::Identifier(value) => syntax_cache_write_tagged_string(output, 3, value),
+            TokenKind::Number(value) => syntax_cache_write_tagged_string(output, 4, value),
+            TokenKind::String(value) => syntax_cache_write_tagged_string(output, 5, value),
+            TokenKind::RawString(value) => syntax_cache_write_tagged_string(output, 6, value),
+            TokenKind::TextBlock(value) => syntax_cache_write_tagged_string(output, 7, value),
+            TokenKind::Resource(value) => syntax_cache_write_tagged_string(output, 8, value),
+            TokenKind::Punctuation(value) => {
+                output.push(9);
+                output.extend_from_slice(&u32::from(*value).to_le_bytes());
+            }
+            TokenKind::Operator(value) => syntax_cache_write_tagged_string(output, 10, value),
+        }
+        syntax_cache_write_span(output, token.span);
+    }
+}
+
+fn syntax_cache_read_tokens(input: &mut Cursor<&[u8]>) -> Option<Vec<SpannedToken>> {
+    let count = syntax_cache_read_len(input)?;
+    let mut tokens = Vec::with_capacity(count.min(1_000_000));
+    for _ in 0..count {
+        let kind = match syntax_cache_read_byte(input)? {
+            0 => TokenKind::LineStart {
+                tabs: syntax_cache_read_len(input)?,
+                spaces: syntax_cache_read_len(input)?,
+            },
+            1 => TokenKind::Newline,
+            2 => TokenKind::LineContinuation,
+            3 => TokenKind::Identifier(syntax_cache_read_string(input)?),
+            4 => TokenKind::Number(syntax_cache_read_string(input)?),
+            5 => TokenKind::String(syntax_cache_read_string(input)?),
+            6 => TokenKind::RawString(syntax_cache_read_string(input)?),
+            7 => TokenKind::TextBlock(syntax_cache_read_string(input)?),
+            8 => TokenKind::Resource(syntax_cache_read_string(input)?),
+            9 => {
+                let mut bytes = [0; 4];
+                input.read_exact(&mut bytes).ok()?;
+                TokenKind::Punctuation(char::from_u32(u32::from_le_bytes(bytes))?)
+            }
+            10 => TokenKind::Operator(syntax_cache_read_string(input)?),
+            _ => return None,
+        };
+        tokens.push(SpannedToken {
+            kind,
+            span: syntax_cache_read_span(input)?,
+        });
+    }
+    Some(tokens)
+}
+
+fn syntax_cache_write_tagged_string(output: &mut Vec<u8>, tag: u8, value: &str) {
+    output.push(tag);
+    syntax_cache_write_string(output, value);
+}
+
+fn syntax_cache_write_strings(output: &mut Vec<u8>, values: &[String]) {
+    syntax_cache_write_len(output, values.len());
+    for value in values {
+        syntax_cache_write_string(output, value);
+    }
+}
+
+fn syntax_cache_read_strings(input: &mut Cursor<&[u8]>) -> Option<Vec<String>> {
+    let count = syntax_cache_read_len(input)?;
+    if count == 0 {
+        return None;
+    }
+    let mut values = Vec::with_capacity(count.min(1_000_000));
+    for _ in 0..count {
+        values.push(syntax_cache_read_string(input)?);
+    }
+    Some(values)
+}
+
+fn syntax_cache_write_indentation(output: &mut Vec<u8>, indentation: Indentation) {
+    syntax_cache_write_len(output, indentation.tabs);
+    syntax_cache_write_len(output, indentation.spaces);
+}
+
+fn syntax_cache_read_indentation(input: &mut Cursor<&[u8]>) -> Option<Indentation> {
+    Some(Indentation {
+        tabs: syntax_cache_read_len(input)?,
+        spaces: syntax_cache_read_len(input)?,
+    })
+}
+
+fn syntax_cache_write_span(output: &mut Vec<u8>, span: SourceSpan) {
+    syntax_cache_write_len(output, span.start);
+    syntax_cache_write_len(output, span.end);
+}
+
+fn syntax_cache_read_span(input: &mut Cursor<&[u8]>) -> Option<SourceSpan> {
+    let start = syntax_cache_read_len(input)?;
+    let end = syntax_cache_read_len(input)?;
+    (start <= end).then(|| SourceSpan::new(start, end))
+}
+
+fn syntax_cache_write_string(output: &mut Vec<u8>, value: &str) {
+    syntax_cache_write_len(output, value.len());
+    output.extend_from_slice(value.as_bytes());
+}
+
+fn syntax_cache_read_string(input: &mut Cursor<&[u8]>) -> Option<String> {
+    let length = syntax_cache_read_len(input)?;
+    let remaining = input
+        .get_ref()
+        .len()
+        .checked_sub(usize::try_from(input.position()).ok()?)?;
+    if length > remaining {
+        return None;
+    }
+    let mut bytes = vec![0; length];
+    input.read_exact(&mut bytes).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn syntax_cache_write_len(output: &mut Vec<u8>, value: usize) {
+    syntax_cache_write_u64(output, value as u64);
+}
+
+fn syntax_cache_write_u64(output: &mut Vec<u8>, value: u64) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn syntax_cache_read_len(input: &mut Cursor<&[u8]>) -> Option<usize> {
+    usize::try_from(syntax_cache_read_u64(input)?).ok()
+}
+
+fn syntax_cache_read_u64(input: &mut Cursor<&[u8]>) -> Option<u64> {
+    let mut bytes = [0; 8];
+    input.read_exact(&mut bytes).ok()?;
+    Some(u64::from_le_bytes(bytes))
+}
+
+fn syntax_cache_read_byte(input: &mut Cursor<&[u8]>) -> Option<u8> {
+    let mut byte = [0];
+    input.read_exact(&mut byte).ok()?;
+    Some(byte[0])
+}
+
+const COMPILATION_ARTIFACT_MAGIC: &[u8] = b"DREAM64-COMPILATION\0\x01";
+const MAX_COMPILATION_ARTIFACT_ITEMS: usize = 16_777_216;
+
+fn compilation_artifact_read_bytes<'artifact>(
+    input: &mut Cursor<&'artifact [u8]>,
+    what: &str,
+) -> Result<&'artifact [u8], String> {
+    let length = syntax_cache_read_len(input)
+        .ok_or_else(|| format!("compiled frontend is truncated at {what} length"))?;
+    let start = usize::try_from(input.position())
+        .map_err(|_| format!("compiled frontend {what} offset exceeds this platform"))?;
+    let end = start
+        .checked_add(length)
+        .filter(|end| *end <= input.get_ref().len())
+        .ok_or_else(|| format!("compiled frontend {what} section is truncated"))?;
+    input.set_position(end as u64);
+    Ok(&input.get_ref()[start..end])
+}
+
+fn compilation_artifact_read_len(input: &mut Cursor<&[u8]>, what: &str) -> Result<usize, String> {
+    syntax_cache_read_len(input)
+        .ok_or_else(|| format!("compiled frontend is truncated while reading {what}"))
+}
+
+fn compilation_artifact_read_count(input: &mut Cursor<&[u8]>, what: &str) -> Result<usize, String> {
+    let count = compilation_artifact_read_len(input, what)?;
+    if count > MAX_COMPILATION_ARTIFACT_ITEMS {
+        return Err(format!(
+            "compiled frontend {what} exceeds the limit of {MAX_COMPILATION_ARTIFACT_ITEMS}"
+        ));
+    }
+    Ok(count)
+}
+
+fn compilation_artifact_read_span(input: &mut Cursor<&[u8]>) -> Result<SourceSpan, String> {
+    let start = compilation_artifact_read_len(input, "source span start")?;
+    let end = compilation_artifact_read_len(input, "source span end")?;
+    if start > end {
+        return Err("compiled frontend contains an inverted source span".to_owned());
+    }
+    Ok(SourceSpan::new(start, end))
+}
+
+fn compilation_artifact_write_location(
+    output: &mut Vec<u8>,
+    location: Option<&DiagnosticLocation>,
+) {
+    let Some(location) = location else {
+        output.push(0);
+        return;
+    };
+    output.push(1);
+    syntax_cache_write_len(output, location.file_id.index());
+    syntax_cache_write_string(output, &location.path.to_string_lossy());
+    match location.span {
+        Some(span) => {
+            output.push(1);
+            syntax_cache_write_span(output, span);
+        }
+        None => output.push(0),
+    }
+}
+
+fn compilation_artifact_read_location(
+    input: &mut Cursor<&[u8]>,
+    project: &Project,
+) -> Result<Option<DiagnosticLocation>, String> {
+    match syntax_cache_read_byte(input)
+        .ok_or_else(|| "compiled frontend is truncated at diagnostic location".to_owned())?
+    {
+        0 => Ok(None),
+        1 => {
+            let file_id = FileId::from_index(compilation_artifact_read_len(
+                input,
+                "diagnostic file identity",
+            )?);
+            if file_id.index() >= project.files.len() {
+                return Err(format!(
+                    "compiled frontend diagnostic references missing file {}",
+                    file_id.index()
+                ));
+            }
+            let path = PathBuf::from(
+                syntax_cache_read_string(input)
+                    .ok_or_else(|| "compiled frontend has invalid diagnostic path".to_owned())?,
+            );
+            let span = match syntax_cache_read_byte(input)
+                .ok_or_else(|| "compiled frontend is truncated at diagnostic span tag".to_owned())?
+            {
+                0 => None,
+                1 => Some(compilation_artifact_read_span(input)?),
+                tag => {
+                    return Err(format!(
+                        "compiled frontend has invalid diagnostic span tag {tag}"
+                    ));
+                }
+            };
+            Ok(Some(DiagnosticLocation {
+                file_id,
+                path,
+                span,
+            }))
+        }
+        tag => Err(format!(
+            "compiled frontend has invalid diagnostic location tag {tag}"
+        )),
+    }
+}
+
+const fn compilation_artifact_diagnostic_kind(kind: DiagnosticKind) -> u8 {
+    match kind {
+        DiagnosticKind::Syntax => 0,
+        DiagnosticKind::DuplicateFileUnit => 1,
+        DiagnosticKind::DuplicateDeclaration => 2,
+        DiagnosticKind::ConflictingNodeKind => 3,
+        DiagnosticKind::MalformedMemberPath => 4,
+        DiagnosticKind::SuspiciousMatrixCall => 5,
+        DiagnosticKind::ProcArgumentGlobal => 6,
+        DiagnosticKind::FallbackBuiltinArgument => 7,
+        DiagnosticKind::BadArgument => 8,
+        DiagnosticKind::InvalidArgumentCount => 9,
+        DiagnosticKind::InvalidStringInterpolation => 10,
+        DiagnosticKind::ReadOnlyAssignment => 11,
+        DiagnosticKind::WriteToConstant => 12,
+        DiagnosticKind::UntypedDereference => 13,
+        DiagnosticKind::InvalidIndexOperation => 14,
+        DiagnosticKind::RuntimeSearchOperator => 15,
+        DiagnosticKind::InvalidVarType => 16,
+        DiagnosticKind::UndefinedType => 17,
+        DiagnosticKind::FinalVariableOverride => 18,
+        DiagnosticKind::ConflictingVariableModifier => 19,
+        DiagnosticKind::GlobalVariableReinitialization => 20,
+        DiagnosticKind::InvalidNameofTarget => 21,
+        DiagnosticKind::InvalidConstantInitializer => 22,
+        DiagnosticKind::MissingResource => 23,
+        DiagnosticKind::InvalidWeightedPick => 24,
+        DiagnosticKind::InvalidExpandedDeclarationPath => 25,
+        DiagnosticKind::ReturnTypeRedefinition => 26,
+    }
+}
+
+fn compilation_artifact_read_diagnostic_kind(
+    input: &mut Cursor<&[u8]>,
+) -> Result<DiagnosticKind, String> {
+    match syntax_cache_read_byte(input)
+        .ok_or_else(|| "compiled frontend is truncated at diagnostic kind".to_owned())?
+    {
+        0 => Ok(DiagnosticKind::Syntax),
+        1 => Ok(DiagnosticKind::DuplicateFileUnit),
+        2 => Ok(DiagnosticKind::DuplicateDeclaration),
+        3 => Ok(DiagnosticKind::ConflictingNodeKind),
+        4 => Ok(DiagnosticKind::MalformedMemberPath),
+        5 => Ok(DiagnosticKind::SuspiciousMatrixCall),
+        6 => Ok(DiagnosticKind::ProcArgumentGlobal),
+        7 => Ok(DiagnosticKind::FallbackBuiltinArgument),
+        8 => Ok(DiagnosticKind::BadArgument),
+        9 => Ok(DiagnosticKind::InvalidArgumentCount),
+        10 => Ok(DiagnosticKind::InvalidStringInterpolation),
+        11 => Ok(DiagnosticKind::ReadOnlyAssignment),
+        12 => Ok(DiagnosticKind::WriteToConstant),
+        13 => Ok(DiagnosticKind::UntypedDereference),
+        14 => Ok(DiagnosticKind::InvalidIndexOperation),
+        15 => Ok(DiagnosticKind::RuntimeSearchOperator),
+        16 => Ok(DiagnosticKind::InvalidVarType),
+        17 => Ok(DiagnosticKind::UndefinedType),
+        18 => Ok(DiagnosticKind::FinalVariableOverride),
+        19 => Ok(DiagnosticKind::ConflictingVariableModifier),
+        20 => Ok(DiagnosticKind::GlobalVariableReinitialization),
+        21 => Ok(DiagnosticKind::InvalidNameofTarget),
+        22 => Ok(DiagnosticKind::InvalidConstantInitializer),
+        23 => Ok(DiagnosticKind::MissingResource),
+        24 => Ok(DiagnosticKind::InvalidWeightedPick),
+        25 => Ok(DiagnosticKind::InvalidExpandedDeclarationPath),
+        26 => Ok(DiagnosticKind::ReturnTypeRedefinition),
+        tag => Err(format!(
+            "compiled frontend has unknown diagnostic kind {tag}"
+        )),
+    }
+}
+
+fn compilation_artifact_write_stats(output: &mut Vec<u8>, stats: CompilationStats) {
+    for value in [
+        stats.project_files as u64,
+        stats.parsed_files as u64,
+        stats.project_bytes,
+        stats.definitions as u64,
+        stats.code_nodes as u64,
+        stats.code_declarations as u64,
+        stats.notes as u64,
+        stats.warnings as u64,
+        stats.errors as u64,
+    ] {
+        syntax_cache_write_u64(output, value);
+    }
+}
+
+fn compilation_artifact_read_stats(input: &mut Cursor<&[u8]>) -> Result<CompilationStats, String> {
+    let mut next = || {
+        syntax_cache_read_u64(input)
+            .ok_or_else(|| "compiled frontend is truncated in its statistics".to_owned())
+    };
+    let project_files = usize::try_from(next()?)
+        .map_err(|_| "compiled frontend project file count is too large".to_owned())?;
+    let parsed_files = usize::try_from(next()?)
+        .map_err(|_| "compiled frontend parsed file count is too large".to_owned())?;
+    let project_bytes = next()?;
+    let definitions = usize::try_from(next()?)
+        .map_err(|_| "compiled frontend definition count is too large".to_owned())?;
+    let code_nodes = usize::try_from(next()?)
+        .map_err(|_| "compiled frontend node count is too large".to_owned())?;
+    let code_declarations = usize::try_from(next()?)
+        .map_err(|_| "compiled frontend tree declaration count is too large".to_owned())?;
+    let notes = usize::try_from(next()?)
+        .map_err(|_| "compiled frontend note count is too large".to_owned())?;
+    let warnings = usize::try_from(next()?)
+        .map_err(|_| "compiled frontend warning count is too large".to_owned())?;
+    let errors = usize::try_from(next()?)
+        .map_err(|_| "compiled frontend error count is too large".to_owned())?;
+    Ok(CompilationStats {
+        project_files,
+        parsed_files,
+        project_bytes,
+        definitions,
+        code_nodes,
+        code_declarations,
+        notes,
+        warnings,
+        errors,
+    })
+}
+
+fn compile_project(project: Project) -> Compilation {
+    let (syntax_files, syntax_diagnostics) = parse_project_syntax(&project);
+    compile_project_from_syntax(project, syntax_files, syntax_diagnostics)
+}
+
+fn parse_project_syntax(project: &Project) -> (Vec<Option<SyntaxFile>>, Vec<Diagnostic>) {
+    let mut syntax_files = Vec::with_capacity(project.files.len());
+    let mut diagnostics = Vec::new();
 
     for file in &project.files {
         if !matches!(file.kind, FileKind::Environment | FileKind::Source) {
@@ -315,16 +1115,10 @@ fn compile_project(project: Project) -> Compilation {
             .expect("project loader validates source-bearing files as UTF-8");
         match dm_syntax::parse(source) {
             Ok(syntax) => {
-                parsed_files += 1;
-                definitions += syntax.definitions.len();
                 syntax_files.push(Some(syntax));
             }
             Err(error) => {
-                let compiler_span = match &error {
-                    SyntaxError::Lex(error) => error.span,
-                    SyntaxError::UnclosedDelimiter(span) => *span,
-                    SyntaxError::InfixNewline { span, .. } => *span,
-                };
+                let compiler_span = syntax_error_span(&error);
                 diagnostics.push(syntax_diagnostic(
                     file.id,
                     file.path.clone(),
@@ -335,6 +1129,30 @@ fn compile_project(project: Project) -> Compilation {
             }
         }
     }
+    (syntax_files, diagnostics)
+}
+
+fn syntax_error_span(error: &SyntaxError) -> SourceSpan {
+    match error {
+        SyntaxError::Lex(error) => error.span,
+        SyntaxError::UnclosedDelimiter(span) | SyntaxError::InfixNewline { span, .. } => *span,
+    }
+}
+
+fn compile_project_from_syntax(
+    project: Project,
+    syntax_files: Vec<Option<SyntaxFile>>,
+    mut diagnostics: Vec<Diagnostic>,
+) -> Compilation {
+    let parsed_files = syntax_files
+        .iter()
+        .filter(|syntax| syntax.is_some())
+        .count();
+    let definitions = syntax_files
+        .iter()
+        .flatten()
+        .map(|syntax| syntax.definitions.len())
+        .sum();
 
     let units = expanded_definition_units(&project, &syntax_files);
     let BuildOutput {
@@ -2263,7 +3081,7 @@ mod tests {
     use dm_core::SourceSpan;
     use dm_object_tree::NodeKind;
 
-    use super::{CompilerDatabase, DiagnosticKind};
+    use super::{Compilation, CompilerDatabase, DiagnosticKind, parsed_syntax_cache_path};
 
     static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
 
@@ -2304,6 +3122,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn compiled_frontend_artifact_round_trips_without_recompiling_the_tree() {
+        let fixture = TestProject::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/datum/base\n\tvar/value = 7\n\tproc/read()\n\t\treturn value\n/datum/child\n\tparent_type = /datum/base\n\tread()\n\t\treturn ..()\n",
+        );
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.path("world.dme"))
+            .expect("fixture should compile");
+
+        let encoded = compilation.encode_compiled_artifact();
+        assert_eq!(encoded, compilation.encode_compiled_artifact());
+        let segments = compilation.encode_compiled_artifact_segments();
+        assert_eq!(segments.len(), 7);
+        assert_eq!(segments.concat(), encoded);
+        let decoded =
+            Compilation::decode_compiled_artifact(&encoded).expect("artifact should decode");
+        assert_eq!(decoded.stats(), compilation.stats());
+        assert_eq!(decoded.declarations(), compilation.declarations());
+        assert_eq!(decoded.diagnostics(), compilation.diagnostics());
+        assert_eq!(decoded.code_tree(), compilation.code_tree());
+        assert_eq!(
+            decoded.project().content_fingerprint(),
+            compilation.project().content_fingerprint()
+        );
+        assert!(
+            decoded
+                .project()
+                .files
+                .iter()
+                .map(|file| decoded.syntax(file.id))
+                .eq(compilation
+                    .project()
+                    .files
+                    .iter()
+                    .map(|file| compilation.syntax(file.id)))
+        );
+
+        let mut bad_header = encoded.clone();
+        bad_header[0] ^= 0xff;
+        assert!(Compilation::decode_compiled_artifact(&bad_header).is_err());
+        assert!(Compilation::decode_compiled_artifact(&encoded[..encoded.len() - 1]).is_err());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(Compilation::decode_compiled_artifact(&trailing).is_err());
     }
 
     fn relative(path: &Path) -> &str {
@@ -3318,5 +4185,81 @@ mod tests {
         assert_eq!(first.stats().definitions, 3);
         assert_eq!(first.stats().code_declarations, 3);
         assert_eq!(first.stats().errors, 0);
+    }
+
+    #[test]
+    fn parsed_syntax_cache_hits_and_invalidates_with_project_and_format() {
+        let fixture = TestProject::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write("types.dm", "/datum/example\n\tvar/value = 3\n");
+        let cache = fixture.path("cache/project.bin");
+        let database = CompilerDatabase::new();
+
+        let (cold, cold_cache) = database
+            .compile_cached_with_stats(fixture.path("world.dme"), &cache)
+            .expect("cold cached compilation should succeed");
+        assert!(!cold_cache.project_snapshot_hit);
+        assert!(!cold_cache.parsed_syntax_hit);
+
+        let (warm, warm_cache) = database
+            .compile_cached_with_stats(fixture.path("world.dme"), &cache)
+            .expect("warm cached compilation should succeed");
+        assert!(warm_cache.project_snapshot_hit);
+        assert!(warm_cache.parsed_syntax_hit);
+        assert_eq!(cold.stats(), warm.stats());
+
+        let syntax_cache = parsed_syntax_cache_path(&cache);
+        fs::write(&syntax_cache, b"obsolete-format")
+            .expect("syntax cache corruption should be writable");
+        let (_, corrupt_cache) = database
+            .compile_cached_with_stats(fixture.path("world.dme"), &cache)
+            .expect("a corrupt syntax cache should rebuild safely");
+        assert!(corrupt_cache.project_snapshot_hit);
+        assert!(!corrupt_cache.parsed_syntax_hit);
+        let (_, repaired_cache) = database
+            .compile_cached_with_stats(fixture.path("world.dme"), &cache)
+            .expect("the rebuilt syntax cache should be reusable");
+        assert!(repaired_cache.parsed_syntax_hit);
+
+        fixture.write(
+            "types.dm",
+            "/datum/example\n\tvar/value = 300\n\tvar/changed = TRUE\n",
+        );
+        let (changed, changed_cache) = database
+            .compile_cached_with_stats(fixture.path("world.dme"), &cache)
+            .expect("a changed project should invalidate both cache tiers");
+        assert!(!changed_cache.project_snapshot_hit);
+        assert!(!changed_cache.parsed_syntax_hit);
+        assert_eq!(changed.stats().definitions, 3);
+    }
+
+    #[test]
+    fn parsed_syntax_cache_preserves_errors_without_discarding_valid_files() {
+        let fixture = TestProject::new();
+        fixture.write(
+            "world.dme",
+            "#include \"valid.dm\"\n#include \"invalid.dm\"\n",
+        );
+        fixture.write("valid.dm", "/datum/example\n\tvar/value = 3\n");
+        fixture.write(
+            "invalid.dm",
+            "/datum/broken\n\tvar/value = \"unterminated\n",
+        );
+        let cache = fixture.path("cache/project.bin");
+        let database = CompilerDatabase::new();
+
+        let (cold, cold_cache) = database
+            .compile_cached_with_stats(fixture.path("world.dme"), &cache)
+            .expect("cold compilation with a syntax diagnostic should complete");
+        assert!(!cold_cache.parsed_syntax_hit);
+        let (warm, warm_cache) = database
+            .compile_cached_with_stats(fixture.path("world.dme"), &cache)
+            .expect("warm compilation should restore valid files and reproduce the error");
+        assert!(warm_cache.parsed_syntax_hit);
+        assert_eq!(cold.stats(), warm.stats());
+        assert_eq!(cold.diagnostics().len(), warm.diagnostics().len());
+        assert_eq!(cold.diagnostics()[0].message, warm.diagnostics()[0].message);
+        assert!(warm.syntax(warm.project().files[1].id).is_some());
+        assert!(warm.syntax(warm.project().files[2].id).is_none());
     }
 }

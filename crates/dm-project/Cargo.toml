@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 dm-core = { path = "../dm-core" }
+md5 = "0.7"
 
 [lints]
 workspace = true
-

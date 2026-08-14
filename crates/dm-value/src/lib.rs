@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
 use dm_core::DmNumberBits;
@@ -301,11 +302,266 @@ impl DatumDefaults {
     }
 }
 
+// Small datums stay on the compact linear path. Larger datums pay for one
+// shared hash table in exchange for constant-time hot field access.
+const DATUM_FIELD_INDEX_THRESHOLD: usize = 16;
+
+// GC capacity reclamation requires meaningful absolute waste as well as a 50%
+// oversize ratio. Small vectors shrink exactly because Boot203 proved their
+// aggregate slack dominates; page-scale vectors retain growth headroom.
+const GC_VECTOR_SHRINK_MIN_WASTED_BYTES: usize = 64;
+const GC_SHRINK_RATIO_NUMERATOR: usize = 3;
+const GC_SHRINK_RATIO_DENOMINATOR: usize = 2;
+const GC_VECTOR_SHRINK_HEADROOM_DENOMINATOR: usize = 4;
+const GC_VECTOR_SMALL_ALLOCATION_BYTES: usize = 4 * 1_024;
+// Boot204 retained 7.32m spare datum-field-index slots and 2.90m spare list
+// association-index slots, but the slack was spread across hundreds of
+// thousands of indexes. A 128-slot per-index floor therefore reclaimed none
+// of it. Eight slots still represents at least 192 bytes of entry storage for
+// the smaller field index while allowing the hash table's bucket granularity
+// to decide whether a lower allocation can retain 25% growth headroom.
+const GC_INDEX_SHRINK_MIN_EXCESS_ENTRIES: usize = 8;
+const GC_INDEX_SHRINK_HEADROOM_DENOMINATOR: usize = 16;
+
+fn gc_vector_shrink_target<T>(values: &Vec<T>) -> Option<usize> {
+    let excess = values.capacity().saturating_sub(values.len());
+    let excess_bytes = excess.saturating_mul(std::mem::size_of::<T>());
+    let grossly_oversized = values
+        .capacity()
+        .saturating_mul(GC_SHRINK_RATIO_DENOMINATOR)
+        >= values.len().saturating_mul(GC_SHRINK_RATIO_NUMERATOR);
+    if !grossly_oversized || excess_bytes < GC_VECTOR_SHRINK_MIN_WASTED_BYTES {
+        return None;
+    }
+    // Boot203's average slack was only ~142 bytes per allocated list, so a
+    // page-scale floor alone misses the dominant millions-small-vectors case.
+    // Small allocations are likely stable metadata lists and shrink exactly;
+    // page-scale vectors retain 25% capacity for continued startup growth.
+    let allocation_bytes = values.capacity().saturating_mul(std::mem::size_of::<T>());
+    let target = if allocation_bytes < GC_VECTOR_SMALL_ALLOCATION_BYTES {
+        values.len()
+    } else {
+        let headroom = values
+            .len()
+            .saturating_add(GC_VECTOR_SHRINK_HEADROOM_DENOMINATOR - 1)
+            / GC_VECTOR_SHRINK_HEADROOM_DENOMINATOR;
+        values.len().saturating_add(headroom)
+    };
+    (target < values.capacity()).then_some(target)
+}
+
+fn gc_shrink_vector<T>(values: &mut Vec<T>) -> usize {
+    let Some(target) = gc_vector_shrink_target(values) else {
+        return 0;
+    };
+    let before = values.capacity();
+    values.shrink_to(target);
+    before
+        .saturating_sub(values.capacity())
+        .saturating_mul(std::mem::size_of::<T>())
+}
+
+fn gc_index_shrink_target(len: usize, capacity: usize) -> Option<usize> {
+    let excess = capacity.saturating_sub(len);
+    if excess < GC_INDEX_SHRINK_MIN_EXCESS_ENTRIES {
+        return None;
+    }
+    // Standard HashMap capacities move in coarse bucket classes. Boot205's
+    // retained indexes naturally sat below the old 1.5x ratio gate, and a 25%
+    // requested headroom still selected their current bucket class, producing
+    // zero successful shrinks. Ask for the next lower class only when it can
+    // retain at least 6.25% immediate growth; HashMap::shrink_to remains the
+    // final bucket-aware authority and safely no-ops otherwise.
+    let headroom = len.saturating_add(GC_INDEX_SHRINK_HEADROOM_DENOMINATOR - 1)
+        / GC_INDEX_SHRINK_HEADROOM_DENOMINATOR;
+    let target = len.saturating_add(headroom);
+    (target < capacity).then_some(target)
+}
+
+fn gc_index_ratio_bin(len: usize, capacity: usize) -> usize {
+    if capacity.saturating_mul(8) < len.saturating_mul(9) {
+        0
+    } else if capacity.saturating_mul(4) < len.saturating_mul(5) {
+        1
+    } else if capacity.saturating_mul(2) < len.saturating_mul(3) {
+        2
+    } else if capacity < len.saturating_mul(2) {
+        3
+    } else {
+        4
+    }
+}
+
+type DatumFieldIndex = HashMap<FieldName, usize>;
+
+#[derive(Default)]
+struct FieldIndexInterner {
+    by_layout: HashMap<(u64, u64), Arc<DatumFieldIndex>>,
+    by_pointer: HashMap<usize, Arc<DatumFieldIndex>>,
+}
+
+impl FieldIndexInterner {
+    fn layout_fingerprint(fields: &[(FieldName, Value)]) -> (u64, u64) {
+        let mut first = DefaultHasher::new();
+        let mut second = DefaultHasher::new();
+        fields.len().hash(&mut first);
+        0x9e37_79b9_7f4a_7c15u64.hash(&mut second);
+        fields.len().hash(&mut second);
+        for (position, (name, _)) in fields.iter().enumerate() {
+            name.hash(&mut first);
+            position.hash(&mut second);
+            name.hash(&mut second);
+        }
+        (first.finish(), second.finish())
+    }
+
+    fn matches_layout(index: &DatumFieldIndex, fields: &[(FieldName, Value)]) -> bool {
+        index.len() == fields.len()
+            && fields
+                .iter()
+                .enumerate()
+                .all(|(position, (name, _))| index.get(name) == Some(&position))
+    }
+
+    fn redirect(
+        index: &mut Arc<DatumFieldIndex>,
+        existing: &Arc<DatumFieldIndex>,
+        aggregate: &mut DatumStorageStats,
+    ) {
+        if Arc::ptr_eq(existing, index) {
+            return;
+        }
+        let old_capacity = index.capacity();
+        let releases_allocation = Arc::strong_count(index) == 1;
+        *index = Arc::clone(existing);
+        aggregate.deduplicated_field_indexes =
+            aggregate.deduplicated_field_indexes.saturating_add(1);
+        if releases_allocation {
+            aggregate.deduplicated_field_index_bytes =
+                aggregate.deduplicated_field_index_bytes.saturating_add(
+                    old_capacity.saturating_mul(std::mem::size_of::<(FieldName, usize)>()),
+                );
+        }
+    }
+
+    fn intern(
+        &mut self,
+        fields: &[(FieldName, Value)],
+        index: &mut Arc<DatumFieldIndex>,
+        aggregate: &mut DatumStorageStats,
+    ) -> bool {
+        let source_pointer = Arc::as_ptr(index) as usize;
+        if let Some(existing) = self.by_pointer.get(&source_pointer) {
+            aggregate.field_index_pointer_cache_hits =
+                aggregate.field_index_pointer_cache_hits.saturating_add(1);
+            Self::redirect(index, existing, aggregate);
+            return false;
+        }
+
+        aggregate.field_index_fingerprints_computed = aggregate
+            .field_index_fingerprints_computed
+            .saturating_add(1);
+        let fingerprint = Self::layout_fingerprint(fields);
+        if let Some(existing) = self.by_layout.get(&fingerprint) {
+            // Two independent fingerprints plus an exact name/position check
+            // make sharing collision-safe rather than hash-equality based.
+            aggregate.field_index_exact_layout_comparisons = aggregate
+                .field_index_exact_layout_comparisons
+                .saturating_add(1);
+            if Self::matches_layout(existing, fields) {
+                let canonical = Arc::clone(existing);
+                Self::redirect(index, &canonical, aggregate);
+                self.by_pointer.insert(source_pointer, canonical);
+                return false;
+            }
+            // An exact fingerprint collision must never merge unlike layouts.
+            // It is too rare to justify retaining an allocation-heavy collision
+            // side table throughout a memory-pressure GC.
+            aggregate.field_index_fingerprint_collisions = aggregate
+                .field_index_fingerprint_collisions
+                .saturating_add(1);
+            self.by_pointer.insert(source_pointer, Arc::clone(index));
+            return true;
+        }
+        let canonical = Arc::clone(index);
+        self.by_layout.insert(fingerprint, Arc::clone(&canonical));
+        self.by_pointer.insert(source_pointer, canonical);
+        true
+    }
+}
+
+/// Aggregate datum backing-storage telemetry collected during heap GC.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DatumStorageStats {
+    /// Materialized datum field entries.
+    pub field_len: usize,
+    /// Allocated datum field-vector capacity.
+    pub field_capacity: usize,
+    /// Field vectors whose significant excess capacity was released.
+    pub shrunk_field_vectors: usize,
+    /// Field-vector capacity bytes returned to the allocator.
+    pub reclaimed_capacity_bytes: usize,
+    /// Retained adaptive field lookup indexes.
+    pub field_indexes: usize,
+    /// Entries stored across retained field lookup indexes.
+    pub field_index_len: usize,
+    /// Hash-table capacity across retained field lookup indexes.
+    pub field_index_capacity: usize,
+    /// Index counts in capacity/length bins: `<1.125`, `<1.25`, `<1.5`,
+    /// `<2.0`, and `>=2.0`.
+    pub field_index_ratio_bins: [usize; 5],
+    /// Field lookup indexes whose excess bucket capacity was released.
+    pub shrunk_field_indexes: usize,
+    /// Hash-table capacity slots released from field lookup indexes.
+    pub reclaimed_field_index_capacity: usize,
+    /// Entry-storage bytes represented by released field-index capacity.
+    ///
+    /// This excludes the standard library hash table's private control-byte
+    /// allocation, so it is a conservative measure of allocator bytes freed.
+    pub reclaimed_field_index_bytes: usize,
+    /// Datum index identities redirected to an existing identical field layout.
+    pub deduplicated_field_indexes: usize,
+    /// Entry-storage bytes released by field-layout index sharing.
+    pub deduplicated_field_index_bytes: usize,
+    /// Distinct physical field-index allocations retained after interning.
+    pub physical_field_indexes: usize,
+    /// Entries across distinct physical field-index allocations.
+    pub physical_field_index_len: usize,
+    /// Capacity across distinct physical field-index allocations.
+    pub physical_field_index_capacity: usize,
+    /// Unlike layouts that produced both identical 128-bit fingerprints.
+    pub field_index_fingerprint_collisions: usize,
+    /// Physical index layouts fingerprinted during this collection.
+    pub field_index_fingerprints_computed: usize,
+    /// Logical indexes resolved through an already-seen physical Arc pointer.
+    pub field_index_pointer_cache_hits: usize,
+    /// Full layout verifications performed for matching fingerprints.
+    pub field_index_exact_layout_comparisons: usize,
+}
+
 /// One datum record retained by the heap.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 pub struct Datum {
     type_path: TypePath,
     fields: Vec<(FieldName, Value)>,
+    field_index: Option<Arc<DatumFieldIndex>>,
+}
+
+#[allow(clippy::missing_fields_in_debug)] // the cache is not logical datum state
+impl fmt::Debug for Datum {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Datum")
+            .field("type_path", &self.type_path)
+            .field("fields", &self.fields)
+            .finish()
+    }
+}
+
+impl PartialEq for Datum {
+    fn eq(&self, other: &Self) -> bool {
+        self.type_path == other.type_path && self.fields == other.fields
+    }
 }
 
 impl Datum {
@@ -333,6 +589,12 @@ impl Datum {
     ///
     /// Returns [`ValueError::MissingField`] when `name` is not materialized.
     pub fn field(&self, name: &FieldName) -> Result<&Value, ValueError> {
+        if let Some(field_index) = &self.field_index {
+            return field_index
+                .get(name)
+                .map(|&index| &self.fields[index].1)
+                .ok_or_else(|| ValueError::MissingField(name.clone()));
+        }
         self.fields
             .iter()
             .find(|(candidate, _)| candidate == name)
@@ -342,16 +604,55 @@ impl Datum {
 
     /// Inserts or updates a field while retaining first-insertion order.
     pub fn set_field(&mut self, name: FieldName, value: Value) -> Option<Value> {
-        set_named_field(&mut self.fields, name, value)
+        if let Some(index) = self
+            .field_index
+            .as_ref()
+            .and_then(|field_index| field_index.get(&name).copied())
+        {
+            return Some(std::mem::replace(&mut self.fields[index].1, value));
+        }
+
+        if let Some(field_index) = &mut self.field_index {
+            let index = self.fields.len();
+            self.fields.push((name.clone(), value));
+            let previous = Arc::make_mut(field_index).insert(name, index);
+            debug_assert!(previous.is_none());
+            return None;
+        }
+
+        let previous = set_named_field(&mut self.fields, name, value);
+        if previous.is_none() && self.fields.len() == DATUM_FIELD_INDEX_THRESHOLD {
+            self.build_field_index();
+        }
+        previous
     }
 
     /// Deletes a materialized field and returns its value when present.
     pub fn delete_field(&mut self, name: &FieldName) -> Option<Value> {
-        let index = self
-            .fields
-            .iter()
-            .position(|(candidate, _)| candidate == name)?;
-        Some(self.fields.remove(index).1)
+        let index = match &mut self.field_index {
+            Some(field_index) => {
+                let index = *field_index.get(name)?;
+                let removed = Arc::make_mut(field_index).remove(name);
+                debug_assert_eq!(removed, Some(index));
+                index
+            }
+            None => self
+                .fields
+                .iter()
+                .position(|(candidate, _)| candidate == name)?,
+        };
+        let value = self.fields.remove(index).1;
+
+        if self.fields.len() < DATUM_FIELD_INDEX_THRESHOLD {
+            self.field_index = None;
+        } else if let Some(field_index) = &mut self.field_index {
+            let field_index = Arc::make_mut(field_index);
+            for (offset, (shifted_name, _)) in self.fields[index..].iter().enumerate() {
+                let _ = field_index.insert(shifted_name.clone(), index + offset);
+            }
+        }
+
+        Some(value)
     }
 
     /// Applies one resolved type-default layer.
@@ -370,6 +671,75 @@ impl Datum {
     #[must_use]
     pub fn fields(&self) -> impl ExactSizeIterator<Item = (&FieldName, &Value)> {
         self.fields.iter().map(|(name, value)| (name, value))
+    }
+
+    fn build_field_index(&mut self) {
+        debug_assert!(self.fields.len() >= DATUM_FIELD_INDEX_THRESHOLD);
+        self.field_index = Some(Arc::new(
+            self.fields
+                .iter()
+                .enumerate()
+                .map(|(index, (name, _))| (name.clone(), index))
+                .collect(),
+        ));
+    }
+
+    fn compact_and_measure_for_gc(
+        &mut self,
+        aggregate: &mut DatumStorageStats,
+        field_indexes: &mut FieldIndexInterner,
+    ) {
+        let reclaimed = gc_shrink_vector(&mut self.fields);
+        aggregate.shrunk_field_vectors = aggregate
+            .shrunk_field_vectors
+            .saturating_add(usize::from(reclaimed > 0));
+        aggregate.reclaimed_capacity_bytes =
+            aggregate.reclaimed_capacity_bytes.saturating_add(reclaimed);
+        aggregate.field_len = aggregate.field_len.saturating_add(self.fields.len());
+        aggregate.field_capacity = aggregate
+            .field_capacity
+            .saturating_add(self.fields.capacity());
+
+        if let Some(index) = &mut self.field_index {
+            aggregate.field_indexes = aggregate.field_indexes.saturating_add(1);
+            let ratio_bin = gc_index_ratio_bin(index.len(), index.capacity());
+            aggregate.field_index_ratio_bins[ratio_bin] =
+                aggregate.field_index_ratio_bins[ratio_bin].saturating_add(1);
+            if Arc::strong_count(index) == 1
+                && let Some(target) = gc_index_shrink_target(index.len(), index.capacity())
+            {
+                let index = Arc::get_mut(index)
+                    .expect("a uniquely owned datum field index must be mutable");
+                let before = index.capacity();
+                index.shrink_to(target);
+                let reclaimed = before.saturating_sub(index.capacity());
+                aggregate.shrunk_field_indexes = aggregate
+                    .shrunk_field_indexes
+                    .saturating_add(usize::from(reclaimed > 0));
+                aggregate.reclaimed_field_index_capacity = aggregate
+                    .reclaimed_field_index_capacity
+                    .saturating_add(reclaimed);
+                aggregate.reclaimed_field_index_bytes =
+                    aggregate.reclaimed_field_index_bytes.saturating_add(
+                        reclaimed.saturating_mul(std::mem::size_of::<(FieldName, usize)>()),
+                    );
+            }
+            let physical_is_new = field_indexes.intern(&self.fields, index, aggregate);
+            aggregate.field_index_len = aggregate.field_index_len.saturating_add(index.len());
+            aggregate.field_index_capacity = aggregate
+                .field_index_capacity
+                .saturating_add(index.capacity());
+            if physical_is_new {
+                aggregate.physical_field_indexes =
+                    aggregate.physical_field_indexes.saturating_add(1);
+                aggregate.physical_field_index_len = aggregate
+                    .physical_field_index_len
+                    .saturating_add(index.len());
+                aggregate.physical_field_index_capacity = aggregate
+                    .physical_field_index_capacity
+                    .saturating_add(index.capacity());
+            }
+        }
     }
 }
 
@@ -392,7 +762,7 @@ fn set_named_field(
 /// the associated value. Associative reassignment preserves insertion order.
 #[derive(Clone, Debug, Default)]
 pub struct DmList {
-    storage: Option<Box<DmListStorage>>,
+    storage: Option<Arc<DmListStorage>>,
 }
 
 /// Lazily allocated storage for a non-empty or previously mutated DM list.
@@ -407,6 +777,118 @@ pub struct DmListStorage {
     associative: Vec<(Value, Value)>,
     order: Vec<ListOrder>,
     associative_index: Option<Box<HashMap<SemanticKey, usize>>>,
+    positional_remove_index: Option<Box<PositionalRemoveIndex>>,
+    /// Logically removed prefix for canonical purely positional lists. This
+    /// makes repeated `Cut(1, n)` queue drains amortized linear.
+    prefix_head: usize,
+}
+
+// Prefix cuts deliberately retain their backing vectors on the hot path so a
+// queue can be drained in constant time.  GC is a better place to pay the
+// compaction cost, but only after enough dead prefix has accumulated to repay
+// the copy and allocator churn.
+const GC_LIST_PREFIX_MIN_ENTRIES: usize = 1_024;
+const GC_LIST_PREFIX_MIN_BYTES: usize = 256 * 1_024;
+const GC_LIST_PREFIX_RATIO_DENOMINATOR: usize = 4;
+// Boot203 reached Lighting with 10.23m spare payload slots and 6.85m spare
+// order slots spread across the live list population. Requiring one vector to
+// waste 256 KiB reclaimed only a single vector, despite roughly 260 MiB of
+// aggregate slack. Reclaim medium/large vectors once they are at least 50%
+// over live length. Small vectors shrink exactly because their aggregate
+// waste dominates; page-scale vectors retain 25% growth headroom so a
+// still-growing startup list does not immediately reallocate after the GC.
+
+/// Aggregate backing-storage telemetry collected while live lists are swept.
+///
+/// Lengths and capacities describe physical storage after GC compaction.  A
+/// retained prefix is logically absent but still occupies `payload` and
+/// `order` storage until it becomes large enough to compact.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ListStorageStats {
+    /// Live list identities with allocated backing storage.
+    pub allocated_lists: usize,
+    /// Physical [`Value`] slots in positional and associative storage.
+    pub payload_len: usize,
+    /// Allocated [`Value`] capacity in positional and associative storage.
+    pub payload_capacity: usize,
+    /// Physical unified-order entries.
+    pub order_len: usize,
+    /// Allocated unified-order capacity.
+    pub order_capacity: usize,
+    /// Logically removed prefix entries deliberately retained after this GC.
+    pub prefix_retained: usize,
+    /// Lists whose lazy prefix was materialized by this GC.
+    pub compacted_lists: usize,
+    /// Logically removed entries physically released by this GC.
+    pub compacted_prefix_entries: usize,
+    /// Backing vectors whose gross excess capacity was released.
+    pub shrunk_vectors: usize,
+    /// Capacity bytes returned by successful vector shrinks.
+    pub reclaimed_capacity_bytes: usize,
+    /// Eligible vectors retained because their backing storage is shared COW.
+    pub shared_shrink_candidates: usize,
+    /// Retained associative lookup indexes.
+    pub associative_indexes: usize,
+    /// Entries across retained associative lookup indexes.
+    pub associative_index_len: usize,
+    /// Hash-table capacity across retained associative lookup indexes.
+    pub associative_index_capacity: usize,
+    /// Index counts in capacity/length bins: `<1.125`, `<1.25`, `<1.5`,
+    /// `<2.0`, and `>=2.0`.
+    pub associative_index_ratio_bins: [usize; 5],
+    /// Associative indexes whose excess bucket capacity was released.
+    pub shrunk_associative_indexes: usize,
+    /// Hash-table capacity slots released from associative indexes.
+    pub reclaimed_associative_index_capacity: usize,
+    /// Entry-storage bytes represented by released association-index capacity.
+    ///
+    /// This excludes the standard library hash table's private control-byte
+    /// allocation, so it is a conservative measure of allocator bytes freed.
+    pub reclaimed_associative_index_bytes: usize,
+    /// Transient positional-remove indexes observed before dropping unique ones.
+    pub positional_remove_indexes: usize,
+    /// Semantic-key entries across positional-remove indexes.
+    pub positional_remove_key_len: usize,
+    /// Hash-table capacity across positional-remove indexes.
+    pub positional_remove_key_capacity: usize,
+    /// Stored source positions across positional-remove indexes.
+    pub positional_remove_position_len: usize,
+    /// Position-vector capacity across positional-remove indexes.
+    pub positional_remove_position_capacity: usize,
+    /// Fenwick bookkeeping length across positional-remove indexes.
+    pub positional_remove_removed_len: usize,
+    /// Fenwick bookkeeping capacity across positional-remove indexes.
+    pub positional_remove_removed_capacity: usize,
+    /// Unique transient positional-remove indexes released by this GC.
+    pub dropped_positional_remove_indexes: usize,
+    /// Derived-index reclamation candidates skipped to preserve shared COW.
+    pub shared_derived_index_candidates: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PositionalRemoveIndex {
+    positions: HashMap<SemanticKey, Vec<usize>>,
+    removed: Vec<usize>,
+}
+
+impl PositionalRemoveIndex {
+    fn removed_before(&self, original: usize) -> usize {
+        let mut cursor = original;
+        let mut total = 0;
+        while cursor > 0 {
+            total += self.removed[cursor];
+            cursor &= cursor - 1;
+        }
+        total
+    }
+
+    fn mark_removed(&mut self, original: usize) {
+        let mut cursor = original + 1;
+        while cursor < self.removed.len() {
+            self.removed[cursor] += 1;
+            cursor += cursor & cursor.wrapping_neg();
+        }
+    }
 }
 
 impl std::ops::Deref for DmList {
@@ -422,8 +904,10 @@ impl std::ops::Deref for DmList {
 
 impl std::ops::DerefMut for DmList {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.storage
-            .get_or_insert_with(|| Box::new(DmListStorage::default()))
+        Arc::make_mut(
+            self.storage
+                .get_or_insert_with(|| Arc::new(DmListStorage::default())),
+        )
     }
 }
 
@@ -493,6 +977,208 @@ fn semantic_key(value: &Value) -> Option<SemanticKey> {
 
 impl DmList {
     const ASSOCIATIVE_INDEX_THRESHOLD: usize = 8;
+    const POSITIONAL_REMOVE_INDEX_THRESHOLD: usize = 64;
+
+    fn should_compact_prefix_for_gc(&self) -> bool {
+        let head = self.prefix_head;
+        if head < GC_LIST_PREFIX_MIN_ENTRIES {
+            return false;
+        }
+        let prefix_bytes = head.saturating_mul(
+            std::mem::size_of::<Value>().saturating_add(std::mem::size_of::<ListOrder>()),
+        );
+        head.saturating_mul(GC_LIST_PREFIX_RATIO_DENOMINATOR) >= self.positional.len()
+            || prefix_bytes >= GC_LIST_PREFIX_MIN_BYTES
+    }
+
+    fn compact_and_measure_for_gc(&mut self, aggregate: &mut ListStorageStats) {
+        let compacted_prefix = self
+            .should_compact_prefix_for_gc()
+            .then_some(self.prefix_head);
+        if let Some(prefix) = compacted_prefix {
+            // A list identity can share storage with a shallow COW copy.  Do
+            // not clone its dead prefix merely to drain it: construct this
+            // identity directly from the logical suffix while leaving the
+            // other identity untouched.
+            if self
+                .storage
+                .as_ref()
+                .is_some_and(|storage| Arc::strong_count(storage) > 1)
+            {
+                let source = self
+                    .storage
+                    .as_deref()
+                    .expect("a non-zero prefix has allocated storage");
+                debug_assert!(source.associative.is_empty());
+                let positional = source.positional[prefix..].to_vec();
+                let order = (0..positional.len()).map(ListOrder::positional).collect();
+                self.storage = Some(Arc::new(DmListStorage {
+                    positional,
+                    associative: Vec::new(),
+                    order,
+                    associative_index: None,
+                    positional_remove_index: None,
+                    prefix_head: 0,
+                }));
+            } else {
+                self.materialize_prefix();
+            }
+            aggregate.compacted_lists = aggregate.compacted_lists.saturating_add(1);
+            aggregate.compacted_prefix_entries =
+                aggregate.compacted_prefix_entries.saturating_add(prefix);
+        }
+
+        // Capacity slack is independent of lazy-prefix compaction. Most
+        // Boot203 candidates had no retained prefix at all, so inspect every
+        // live allocated list during the sweep we already perform. Never call
+        // Arc::make_mut here: cloning a shared COW payload merely to trim its
+        // capacity would multiply live memory and break the sharing win.
+        if let Some(storage) = self.storage.as_mut() {
+            let shrink_candidates = [
+                gc_vector_shrink_target(&storage.positional).is_some(),
+                gc_vector_shrink_target(&storage.associative).is_some(),
+                gc_vector_shrink_target(&storage.order).is_some(),
+            ]
+            .into_iter()
+            .filter(|candidate| *candidate)
+            .count();
+            if shrink_candidates > 0 && Arc::strong_count(storage) > 1 {
+                aggregate.shared_shrink_candidates = aggregate
+                    .shared_shrink_candidates
+                    .saturating_add(shrink_candidates);
+            } else if shrink_candidates > 0 {
+                let storage = Arc::get_mut(storage)
+                    .expect("a uniquely owned list storage must be mutably accessible");
+                for reclaimed in [
+                    gc_shrink_vector(&mut storage.positional),
+                    gc_shrink_vector(&mut storage.associative),
+                    gc_shrink_vector(&mut storage.order),
+                ] {
+                    aggregate.shrunk_vectors = aggregate
+                        .shrunk_vectors
+                        .saturating_add(usize::from(reclaimed > 0));
+                    aggregate.reclaimed_capacity_bytes =
+                        aggregate.reclaimed_capacity_bytes.saturating_add(reclaimed);
+                }
+            }
+
+            let positional_index_present = storage.positional_remove_index.is_some();
+            if let Some(index) = storage.positional_remove_index.as_deref() {
+                aggregate.positional_remove_indexes =
+                    aggregate.positional_remove_indexes.saturating_add(1);
+                aggregate.positional_remove_key_len = aggregate
+                    .positional_remove_key_len
+                    .saturating_add(index.positions.len());
+                aggregate.positional_remove_key_capacity = aggregate
+                    .positional_remove_key_capacity
+                    .saturating_add(index.positions.capacity());
+                for positions in index.positions.values() {
+                    aggregate.positional_remove_position_len = aggregate
+                        .positional_remove_position_len
+                        .saturating_add(positions.len());
+                    aggregate.positional_remove_position_capacity = aggregate
+                        .positional_remove_position_capacity
+                        .saturating_add(positions.capacity());
+                }
+                aggregate.positional_remove_removed_len = aggregate
+                    .positional_remove_removed_len
+                    .saturating_add(index.removed.len());
+                aggregate.positional_remove_removed_capacity = aggregate
+                    .positional_remove_removed_capacity
+                    .saturating_add(index.removed.capacity());
+            }
+
+            let associative_shrink_candidate =
+                storage.associative_index.as_deref().is_some_and(|index| {
+                    gc_index_shrink_target(index.len(), index.capacity()).is_some()
+                });
+            if Arc::strong_count(storage) > 1 {
+                aggregate.shared_derived_index_candidates = aggregate
+                    .shared_derived_index_candidates
+                    .saturating_add(usize::from(positional_index_present))
+                    .saturating_add(usize::from(associative_shrink_candidate));
+            } else {
+                let storage = Arc::get_mut(storage)
+                    .expect("a uniquely owned list storage must be mutably accessible");
+                if let Some(index) = &mut storage.associative_index
+                    && let Some(target) = gc_index_shrink_target(index.len(), index.capacity())
+                {
+                    let before = index.capacity();
+                    index.shrink_to(target);
+                    let reclaimed = before.saturating_sub(index.capacity());
+                    aggregate.shrunk_associative_indexes = aggregate
+                        .shrunk_associative_indexes
+                        .saturating_add(usize::from(reclaimed > 0));
+                    aggregate.reclaimed_associative_index_capacity = aggregate
+                        .reclaimed_associative_index_capacity
+                        .saturating_add(reclaimed);
+                    aggregate.reclaimed_associative_index_bytes =
+                        aggregate.reclaimed_associative_index_bytes.saturating_add(
+                            reclaimed.saturating_mul(std::mem::size_of::<(SemanticKey, usize)>()),
+                        );
+                }
+                if storage.positional_remove_index.take().is_some() {
+                    aggregate.dropped_positional_remove_indexes = aggregate
+                        .dropped_positional_remove_indexes
+                        .saturating_add(1);
+                }
+            }
+        }
+
+        let Some(storage) = self.storage.as_deref() else {
+            return;
+        };
+        aggregate.allocated_lists = aggregate.allocated_lists.saturating_add(1);
+        aggregate.payload_len = aggregate
+            .payload_len
+            .saturating_add(storage.positional.len())
+            .saturating_add(storage.associative.len().saturating_mul(2));
+        aggregate.payload_capacity = aggregate
+            .payload_capacity
+            .saturating_add(storage.positional.capacity())
+            .saturating_add(storage.associative.capacity().saturating_mul(2));
+        aggregate.order_len = aggregate.order_len.saturating_add(storage.order.len());
+        aggregate.order_capacity = aggregate
+            .order_capacity
+            .saturating_add(storage.order.capacity());
+        aggregate.prefix_retained = aggregate
+            .prefix_retained
+            .saturating_add(storage.prefix_head);
+        if let Some(index) = storage.associative_index.as_deref() {
+            aggregate.associative_indexes = aggregate.associative_indexes.saturating_add(1);
+            let ratio_bin = gc_index_ratio_bin(index.len(), index.capacity());
+            aggregate.associative_index_ratio_bins[ratio_bin] =
+                aggregate.associative_index_ratio_bins[ratio_bin].saturating_add(1);
+            aggregate.associative_index_len =
+                aggregate.associative_index_len.saturating_add(index.len());
+            aggregate.associative_index_capacity = aggregate
+                .associative_index_capacity
+                .saturating_add(index.capacity());
+        }
+    }
+
+    fn materialize_prefix(&mut self) {
+        let head = self.prefix_head;
+        if head == 0 {
+            return;
+        }
+        let storage = &mut **self;
+        storage.positional.drain(..head);
+        storage.order.drain(..head);
+        for entry in &mut storage.order {
+            let index = entry
+                .positional_index()
+                .expect("lazy list prefix is only used for positional lists");
+            *entry = ListOrder::positional(index - head);
+        }
+        storage.prefix_head = 0;
+    }
+
+    fn invalidate_positional_remove_index(&mut self) {
+        if let Some(storage) = &mut self.storage {
+            Arc::make_mut(storage).positional_remove_index = None;
+        }
+    }
 
     fn rebuild_associative_index(&mut self) {
         if self.associative.len() < Self::ASSOCIATIVE_INDEX_THRESHOLD {
@@ -528,13 +1214,13 @@ impl DmList {
     /// Returns the number of values and associative keys in iteration order.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.order.len()
+        self.order.len() - self.prefix_head
     }
 
     /// Returns the number of entries without an associative value.
     #[must_use]
     pub fn positional_len(&self) -> usize {
-        self.positional.len()
+        self.positional.len() - self.prefix_head
     }
 
     /// Returns the number of associative entries.
@@ -546,15 +1232,16 @@ impl DmList {
     /// Returns whether there are no positional or associative entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.order.is_empty()
+        self.len() == 0
     }
 
     /// Appends a positional value and returns its 1-based index.
     pub fn add(&mut self, value: Value) -> usize {
+        self.invalidate_positional_remove_index();
         let position = self.positional.len();
         self.order.push(ListOrder::positional(position));
         self.positional.push(value);
-        self.order.len()
+        self.len()
     }
 
     /// Reads a 1-based positional entry.
@@ -563,7 +1250,7 @@ impl DmList {
     ///
     /// Returns a precise index error for zero or an index beyond `len`.
     pub fn get(&self, index: usize) -> Result<&Value, ValueError> {
-        let zero_based = checked_index(index, self.order.len())?;
+        let zero_based = checked_index(index, self.len())? + self.prefix_head;
         let entry = self.order[zero_based];
         Ok(if let Some(position) = entry.positional_index() {
             &self.positional[position]
@@ -581,10 +1268,11 @@ impl DmList {
     ///
     /// Returns a precise index error for zero or an index beyond `len`.
     pub fn set(&mut self, index: usize, value: Value) -> Result<Value, ValueError> {
-        let zero_based = checked_index(index, self.order.len())?;
+        let zero_based = checked_index(index, self.len())? + self.prefix_head;
         let Some(position) = self.order[zero_based].positional_index() else {
             return Err(ValueError::AssociativeIndexAssignment { index });
         };
+        self.invalidate_positional_remove_index();
         Ok(std::mem::replace(&mut self.positional[position], value))
     }
 
@@ -594,6 +1282,8 @@ impl DmList {
     ///
     /// Returns a precise index error for zero or an index beyond `len`.
     pub fn remove(&mut self, index: usize) -> Result<Value, ValueError> {
+        self.materialize_prefix();
+        self.invalidate_positional_remove_index();
         let zero_based = checked_index(index, self.order.len())?;
         let entry = self.order.remove(zero_based);
         if let Some(position) = entry.positional_index() {
@@ -636,7 +1326,9 @@ impl DmList {
     ///
     /// Returns an index error when `index` is zero or greater than `len + 1`.
     pub fn insert(&mut self, index: usize, value: Value) -> Result<usize, ValueError> {
+        self.materialize_prefix();
         checked_boundary(index, self.order.len())?;
+        self.invalidate_positional_remove_index();
         let position = self.positional.len();
         self.positional.push(value);
         self.order
@@ -654,13 +1346,14 @@ impl DmList {
     /// [`ValueError::CorruptListStorage`] if an associative order entry lost
     /// its value.
     pub fn copy_range(&self, start: usize, end: usize) -> Result<Self, ValueError> {
-        checked_boundary(start, self.order.len())?;
-        checked_boundary(end, self.order.len())?;
+        checked_boundary(start, self.len())?;
+        checked_boundary(end, self.len())?;
         let mut copy = Self::default();
         if end <= start {
             return Ok(copy);
         }
-        for entry in &self.order[start - 1..end - 1] {
+        let offset = self.prefix_head;
+        for entry in &self.order[offset + start - 1..offset + end - 1] {
             if let Some(position) = entry.positional_index() {
                 copy.add(self.positional[position].clone());
             } else {
@@ -684,15 +1377,103 @@ impl DmList {
     ///
     /// Returns an index error for boundaries outside `1..=len + 1`.
     pub fn cut_range(&mut self, start: usize, end: usize) -> Result<usize, ValueError> {
-        checked_boundary(start, self.order.len())?;
-        checked_boundary(end, self.order.len())?;
+        let logical_len = self.len();
+        checked_boundary(start, logical_len)?;
+        checked_boundary(end, logical_len)?;
         if end <= start {
             return Ok(0);
         }
         let count = end - start;
-        for _ in 0..count {
-            self.remove(start)?;
+
+        // `Cut()` is a very common list-clearing idiom in DM. Release the
+        // lazily allocated backing store in one operation instead of repeatedly
+        // shifting its three parallel vectors.
+        if start == 1 && end == logical_len + 1 {
+            self.storage = None;
+            return Ok(count);
         }
+
+        if start == 1
+            && self.associative.is_empty()
+            && (self.prefix_head > 0
+                || self
+                    .order
+                    .iter()
+                    .enumerate()
+                    .all(|(index, entry)| entry.positional_index() == Some(index)))
+        {
+            self.invalidate_positional_remove_index();
+            self.prefix_head += count;
+            return Ok(count);
+        }
+
+        self.materialize_prefix();
+
+        self.invalidate_positional_remove_index();
+
+        let storage = Arc::make_mut(
+            self.storage
+                .as_mut()
+                .ok_or(ValueError::CorruptListStorage)?,
+        );
+        let removed = storage.order.drain(start - 1..end - 1);
+        let mut remove_positional = vec![false; storage.positional.len()];
+        let mut remove_associative = vec![false; storage.associative.len()];
+        for entry in removed {
+            if let Some(index) = entry.positional_index() {
+                *remove_positional
+                    .get_mut(index)
+                    .ok_or(ValueError::CorruptListStorage)? = true;
+            } else {
+                let index = entry
+                    .associative_index()
+                    .ok_or(ValueError::CorruptListStorage)?;
+                *remove_associative
+                    .get_mut(index)
+                    .ok_or(ValueError::CorruptListStorage)? = true;
+            }
+        }
+
+        let mut positional_remap = vec![usize::MAX; storage.positional.len()];
+        let mut next = 0;
+        for (old, removed) in remove_positional.iter().copied().enumerate() {
+            if !removed {
+                positional_remap[old] = next;
+                next += 1;
+            }
+        }
+        storage.positional = std::mem::take(&mut storage.positional)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, value)| (!remove_positional[index]).then_some(value))
+            .collect();
+
+        let mut associative_remap = vec![usize::MAX; storage.associative.len()];
+        next = 0;
+        for (old, removed) in remove_associative.iter().copied().enumerate() {
+            if !removed {
+                associative_remap[old] = next;
+                next += 1;
+            }
+        }
+        storage.associative = std::mem::take(&mut storage.associative)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, value)| (!remove_associative[index]).then_some(value))
+            .collect();
+
+        for entry in &mut storage.order {
+            *entry = if let Some(index) = entry.positional_index() {
+                ListOrder::positional(positional_remap[index])
+            } else {
+                ListOrder::associative(
+                    associative_remap[entry
+                        .associative_index()
+                        .ok_or(ValueError::CorruptListStorage)?],
+                )
+            };
+        }
+        self.rebuild_associative_index();
         Ok(count)
     }
 
@@ -708,8 +1489,8 @@ impl DmList {
         start: usize,
         end: usize,
     ) -> Result<usize, ValueError> {
-        checked_boundary(start, self.order.len())?;
-        checked_boundary(end, self.order.len())?;
+        checked_boundary(start, self.len())?;
+        checked_boundary(end, self.len())?;
         if end <= start {
             return Ok(0);
         }
@@ -724,11 +1505,196 @@ impl DmList {
     /// Removes the last occurrence equal to `value`, matching BYOND list
     /// subtraction/`Remove()` ordering.
     pub fn remove_last(&mut self, value: &Value) -> Option<Value> {
+        self.materialize_prefix();
+        if self.positional_remove_index.is_none()
+            && self.associative.is_empty()
+            && self.positional.len() >= Self::POSITIONAL_REMOVE_INDEX_THRESHOLD
+            && self.order.iter().enumerate().all(|(index, entry)| {
+                entry.positional_index() == Some(index)
+                    && semantic_key(&self.positional[index]).is_some()
+            })
+        {
+            let mut positions: HashMap<SemanticKey, Vec<usize>> = HashMap::new();
+            for (index, value) in self.positional.iter().enumerate() {
+                positions
+                    .entry(semantic_key(value)?)
+                    .or_default()
+                    .push(index);
+            }
+            self.positional_remove_index = Some(Box::new(PositionalRemoveIndex {
+                positions,
+                removed: vec![0; self.positional.len() + 1],
+            }));
+        }
+
+        if let (Some(key), Some(index)) =
+            (semantic_key(value), self.positional_remove_index.as_mut())
+        {
+            let original = index.positions.get_mut(&key)?.pop()?;
+            let current = original - index.removed_before(original);
+            index.mark_removed(original);
+            self.order.pop();
+            return Some(self.positional.remove(current));
+        }
+
         let index = (1..=self.len()).rev().find(|index| {
             self.get(*index)
                 .is_ok_and(|candidate| candidate.semantic_eq(value))
         })?;
         self.remove(index).ok()
+    }
+
+    /// Removes the last matching occurrence for every entry in `values`.
+    ///
+    /// This is the bulk form of repeated [`Self::remove_last`]. It preserves
+    /// BYOND's multiset subtraction semantics while compacting positional,
+    /// associative, and unified-order storage once instead of shifting them
+    /// once per right-hand entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValueError::CorruptListStorage`] if an order entry no longer
+    /// refers to a live positional or associative value.
+    pub fn subtract_entries(&mut self, values: &[Value]) -> Result<usize, ValueError> {
+        if values.is_empty() || self.len() == 0 {
+            return Ok(0);
+        }
+
+        let mut keyed_quotas = HashMap::<SemanticKey, usize>::new();
+        let mut fallback_quotas = Vec::<(Value, usize)>::new();
+        for value in values {
+            if let Some(key) = semantic_key(value) {
+                *keyed_quotas.entry(key).or_default() += 1;
+            } else if let Some((_, count)) = fallback_quotas
+                .iter_mut()
+                .find(|(candidate, _)| candidate.semantic_eq(value))
+            {
+                *count += 1;
+            } else {
+                fallback_quotas.push((value.clone(), 1));
+            }
+        }
+
+        let mut remove_order = vec![false; self.order.len()];
+        let mut removed = 0;
+        for order_index in (self.prefix_head..self.order.len()).rev() {
+            let entry = self.order[order_index];
+            let candidate = if let Some(index) = entry.positional_index() {
+                self.positional
+                    .get(index)
+                    .ok_or(ValueError::CorruptListStorage)?
+            } else {
+                let index = entry
+                    .associative_index()
+                    .ok_or(ValueError::CorruptListStorage)?;
+                &self
+                    .associative
+                    .get(index)
+                    .ok_or(ValueError::CorruptListStorage)?
+                    .0
+            };
+            let matches = if let Some(key) = semantic_key(candidate) {
+                keyed_quotas.get_mut(&key).is_some_and(|count| {
+                    if *count == 0 {
+                        false
+                    } else {
+                        *count -= 1;
+                        true
+                    }
+                })
+            } else {
+                fallback_quotas
+                    .iter_mut()
+                    .find(|(value, count)| *count > 0 && candidate.semantic_eq(value))
+                    .is_some_and(|(_, count)| {
+                        *count -= 1;
+                        true
+                    })
+            };
+            if matches {
+                remove_order[order_index] = true;
+                removed += 1;
+            }
+        }
+        if removed == 0 {
+            return Ok(0);
+        }
+
+        self.invalidate_positional_remove_index();
+        let storage = Arc::make_mut(
+            self.storage
+                .as_mut()
+                .ok_or(ValueError::CorruptListStorage)?,
+        );
+        let mut remove_positional = vec![false; storage.positional.len()];
+        let mut remove_associative = vec![false; storage.associative.len()];
+        for (order_index, entry) in storage.order.iter().copied().enumerate() {
+            if order_index >= storage.prefix_head && !remove_order[order_index] {
+                continue;
+            }
+            if let Some(index) = entry.positional_index() {
+                *remove_positional
+                    .get_mut(index)
+                    .ok_or(ValueError::CorruptListStorage)? = true;
+            } else {
+                let index = entry
+                    .associative_index()
+                    .ok_or(ValueError::CorruptListStorage)?;
+                *remove_associative
+                    .get_mut(index)
+                    .ok_or(ValueError::CorruptListStorage)? = true;
+            }
+        }
+
+        let mut positional_remap = vec![usize::MAX; storage.positional.len()];
+        let mut next = 0;
+        for (old, remove) in remove_positional.iter().copied().enumerate() {
+            if !remove {
+                positional_remap[old] = next;
+                next += 1;
+            }
+        }
+        storage.positional = std::mem::take(&mut storage.positional)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, value)| (!remove_positional[index]).then_some(value))
+            .collect();
+
+        let mut associative_remap = vec![usize::MAX; storage.associative.len()];
+        next = 0;
+        for (old, remove) in remove_associative.iter().copied().enumerate() {
+            if !remove {
+                associative_remap[old] = next;
+                next += 1;
+            }
+        }
+        storage.associative = std::mem::take(&mut storage.associative)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, value)| (!remove_associative[index]).then_some(value))
+            .collect();
+
+        storage.order = std::mem::take(&mut storage.order)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(order_index, entry)| {
+                (order_index >= storage.prefix_head && !remove_order[order_index]).then(|| {
+                    if let Some(index) = entry.positional_index() {
+                        ListOrder::positional(positional_remap[index])
+                    } else {
+                        ListOrder::associative(
+                            associative_remap[entry
+                                .associative_index()
+                                .expect("validated associative order entry")],
+                        )
+                    }
+                })
+            })
+            .collect();
+        storage.prefix_head = 0;
+        storage.positional_remove_index = None;
+        self.rebuild_associative_index();
+        Ok(removed)
     }
 
     /// Swaps two 1-based iteration positions while keeping associative values
@@ -738,8 +1704,10 @@ impl DmList {
     ///
     /// Returns an index error when either position is outside the list.
     pub fn swap(&mut self, first: usize, second: usize) -> Result<(), ValueError> {
+        self.materialize_prefix();
         let first = checked_index(first, self.order.len())?;
         let second = checked_index(second, self.order.len())?;
+        self.invalidate_positional_remove_index();
         self.order.swap(first, second);
         Ok(())
     }
@@ -787,6 +1755,8 @@ impl DmList {
     /// Replacing a key retains its deterministic insertion position and
     /// returns the old value. New keys return `None`.
     pub fn set_key(&mut self, key: Value, value: Value) -> Option<Value> {
+        self.materialize_prefix();
+        self.invalidate_positional_remove_index();
         let indexed_key = semantic_key(&key);
         let existing = match (&self.associative_index, indexed_key.as_ref()) {
             (Some(index), Some(key)) => index.get(key).copied(),
@@ -838,6 +1808,8 @@ impl DmList {
 
     /// Removes an associative key and returns its value.
     pub fn remove_key(&mut self, key: &Value) -> Option<Value> {
+        self.materialize_prefix();
+        self.invalidate_positional_remove_index();
         let index = self
             .associative
             .iter()
@@ -862,14 +1834,17 @@ impl DmList {
     /// Iterates positional entries in ascending 1-based index order.
     #[must_use]
     pub fn positions(&self) -> impl ExactSizeIterator<Item = (usize, &Value)> {
-        self.order.iter().enumerate().map(|(index, entry)| {
-            let value = if let Some(position) = entry.positional_index() {
-                &self.positional[position]
-            } else {
-                &self.associative[entry.associative_index().expect("valid list order")].0
-            };
-            (index + 1, value)
-        })
+        self.order[self.prefix_head..]
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let value = if let Some(position) = entry.positional_index() {
+                    &self.positional[position]
+                } else {
+                    &self.associative[entry.associative_index().expect("valid list order")].0
+                };
+                (index + 1, value)
+            })
     }
 
     /// Iterates associative entries in stable key-insertion order.
@@ -968,6 +1943,21 @@ struct Slot<T> {
 
 const ARENA_CHUNK_SLOTS: usize = 16 * 1024;
 
+/// Constant-time slot-allocation telemetry for a value arena.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ArenaStats {
+    /// Slots currently containing a live value.
+    pub live: usize,
+    /// Slots that have been initialized at least once.
+    pub slots: usize,
+    /// Reusable vacant slots.
+    pub free: usize,
+    /// Individually allocated fixed-size slot chunks.
+    pub chunks: usize,
+    /// Slot capacity reserved across all chunks.
+    pub reserved: usize,
+}
+
 struct Arena<T> {
     chunks: Vec<Vec<Slot<T>>>,
     slot_len: usize,
@@ -987,6 +1977,16 @@ impl<T> Default for Arena<T> {
 }
 
 impl<T> Arena<T> {
+    fn stats(&self) -> ArenaStats {
+        ArenaStats {
+            live: self.live,
+            slots: self.slot_len,
+            free: self.free.len(),
+            chunks: self.chunks.len(),
+            reserved: self.chunks.len().saturating_mul(ARENA_CHUNK_SLOTS),
+        }
+    }
+
     fn slot(&self, index: usize) -> Option<&Slot<T>> {
         let chunk = index / ARENA_CHUNK_SLOTS;
         let offset = index % ARENA_CHUNK_SLOTS;
@@ -1091,14 +2091,24 @@ impl<T> Arena<T> {
         self.slot_len
     }
 
-    fn sweep_unmarked(&mut self, marked: &[bool]) -> usize {
+    fn sweep_unmarked_with(
+        &mut self,
+        marked: &[bool],
+        mut visit_retained: impl FnMut(&mut T),
+    ) -> usize {
         debug_assert_eq!(marked.len(), self.slot_len);
         let mut reclaimed = 0;
         for index in 0..self.slot_len {
+            if marked[index] {
+                if let Some(value) = self.slot_mut(index).and_then(|slot| slot.value.as_mut()) {
+                    visit_retained(value);
+                }
+                continue;
+            }
             let Some(slot) = self.slot(index) else {
                 continue;
             };
-            if marked[index] || slot.value.is_none() {
+            if slot.value.is_none() {
                 continue;
             }
             let generation = slot.generation;
@@ -1118,6 +2128,23 @@ pub struct ValueHeap {
     lists: Arena<DmList>,
 }
 
+/// Results and storage telemetry from one combined datum/list collection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HeapCollectionStats {
+    /// Unreachable datum identities reclaimed by this collection.
+    pub reclaimed_datums: usize,
+    /// Unreachable list identities reclaimed by this collection.
+    pub reclaimed_lists: usize,
+    /// Live list backing storage measured during the existing sweep pass.
+    pub list_storage: ListStorageStats,
+    /// Live datum backing storage measured during the existing sweep pass.
+    pub datum_storage: DatumStorageStats,
+    /// Datum arena allocation state after sweeping.
+    pub datum_arena: ArenaStats,
+    /// List arena allocation state after sweeping.
+    pub list_arena: ArenaStats,
+}
+
 impl ValueHeap {
     /// Creates an empty heap.
     #[must_use]
@@ -1135,6 +2162,18 @@ impl ValueHeap {
     #[must_use]
     pub fn live_list_count(&self) -> usize {
         self.lists.len()
+    }
+
+    /// Returns constant-time datum arena allocation telemetry.
+    #[must_use]
+    pub fn datum_arena_stats(&self) -> ArenaStats {
+        self.datums.stats()
+    }
+
+    /// Returns constant-time list arena allocation telemetry.
+    #[must_use]
+    pub fn list_arena_stats(&self) -> ArenaStats {
+        self.lists.stats()
     }
 
     /// Reclaims every list that is unreachable from live datum fields or the
@@ -1247,6 +2286,17 @@ impl ValueHeap {
         datum_roots: &[DatumId],
         list_roots: &[ListId],
     ) -> (usize, usize) {
+        let stats = self.collect_unreachable_values_from_ids_with_stats(datum_roots, list_roots);
+        (stats.reclaimed_datums, stats.reclaimed_lists)
+    }
+
+    /// Reclaims unreachable identities and reports storage observed during the
+    /// same sweep, avoiding a second full heap walk for diagnostics.
+    pub fn collect_unreachable_values_from_ids_with_stats(
+        &mut self,
+        datum_roots: &[DatumId],
+        list_roots: &[ListId],
+    ) -> HeapCollectionStats {
         #[derive(Clone, Copy)]
         enum Pending {
             Datum(DatumId),
@@ -1373,9 +2423,23 @@ impl ValueHeap {
             }
         }
 
-        let reclaimed_lists = self.lists.sweep_unmarked(&marked_lists);
-        let reclaimed_datums = self.datums.sweep_unmarked(&marked_datums);
-        (reclaimed_datums, reclaimed_lists)
+        let mut list_storage = ListStorageStats::default();
+        let reclaimed_lists = self.lists.sweep_unmarked_with(&marked_lists, |list| {
+            list.compact_and_measure_for_gc(&mut list_storage);
+        });
+        let mut datum_storage = DatumStorageStats::default();
+        let mut field_indexes = FieldIndexInterner::default();
+        let reclaimed_datums = self.datums.sweep_unmarked_with(&marked_datums, |datum| {
+            datum.compact_and_measure_for_gc(&mut datum_storage, &mut field_indexes);
+        });
+        HeapCollectionStats {
+            reclaimed_datums,
+            reclaimed_lists,
+            list_storage,
+            datum_storage,
+            datum_arena: self.datums.stats(),
+            list_arena: self.lists.stats(),
+        }
     }
 
     /// Allocates an empty mutable list.
@@ -1435,6 +2499,7 @@ impl ValueHeap {
         let (index, generation) = self.datums.insert(Datum {
             type_path,
             fields: Vec::new(),
+            field_index: None,
         });
         DatumId { index, generation }
     }
@@ -1453,6 +2518,7 @@ impl ValueHeap {
         let mut datum = Datum {
             type_path,
             fields: Vec::new(),
+            field_index: None,
         };
         for layer in defaults {
             datum.apply_defaults(layer);
@@ -1614,6 +2680,14 @@ mod tests {
         FieldName::parse(value).unwrap()
     }
 
+    fn index_number(index: usize) -> Value {
+        Value::number(f32::from(u16::try_from(index).unwrap()))
+    }
+
+    fn index_f32(index: usize) -> f32 {
+        f32::from(u16::try_from(index).unwrap())
+    }
+
     #[test]
     fn type_paths_are_canonical_and_validated() {
         let path = TypePath::parse("/obj/item/tool").unwrap();
@@ -1686,6 +2760,183 @@ mod tests {
             Err(ValueError::MissingField(name))
         );
         assert_eq!(heap.datum(datum).unwrap().field_len(), 1);
+    }
+
+    #[test]
+    fn datum_field_index_appears_exactly_at_threshold_without_changing_order() {
+        assert_eq!(
+            std::mem::size_of::<Datum>(),
+            std::mem::size_of::<TypePath>()
+                + std::mem::size_of::<Vec<(FieldName, Value)>>()
+                + std::mem::size_of::<Option<Box<HashMap<FieldName, usize>>>>(),
+        );
+        assert_eq!(
+            std::mem::size_of::<Option<Box<HashMap<FieldName, usize>>>>(),
+            std::mem::size_of::<usize>(),
+        );
+
+        let mut heap = ValueHeap::new();
+        let datum = heap.allocate_datum(TypePath::parse("/datum/indexed").unwrap());
+
+        for index in 0..DATUM_FIELD_INDEX_THRESHOLD - 1 {
+            heap.set_datum_field(
+                datum,
+                field(&format!("field_{index:02}")),
+                index_number(index),
+            )
+            .unwrap();
+        }
+        assert!(heap.datum(datum).unwrap().field_index.is_none());
+
+        let last = DATUM_FIELD_INDEX_THRESHOLD - 1;
+        heap.set_datum_field(
+            datum,
+            field(&format!("field_{last:02}")),
+            index_number(last),
+        )
+        .unwrap();
+        let record = heap.datum(datum).unwrap();
+        assert_eq!(
+            record.field_index.as_ref().unwrap().len(),
+            record.field_len()
+        );
+        for index in 0..DATUM_FIELD_INDEX_THRESHOLD {
+            assert_eq!(
+                record
+                    .field(&field(&format!("field_{index:02}")))
+                    .unwrap()
+                    .as_number(),
+                Some(index_f32(index))
+            );
+        }
+        let names: Vec<String> = record
+            .fields()
+            .map(|(name, _)| name.as_str().to_owned())
+            .collect();
+        let expected: Vec<String> = (0..DATUM_FIELD_INDEX_THRESHOLD)
+            .map(|index| format!("field_{index:02}"))
+            .collect();
+        assert_eq!(names, expected);
+
+        let updated_name = field("field_00");
+        assert_eq!(
+            heap.set_datum_field(datum, updated_name.clone(), Value::number(100.0))
+                .unwrap()
+                .unwrap()
+                .as_number(),
+            Some(0.0)
+        );
+        let record = heap.datum(datum).unwrap();
+        assert_eq!(
+            record.field(&updated_name).unwrap().as_number(),
+            Some(100.0)
+        );
+        assert_eq!(record.fields().next().unwrap().0, &updated_name);
+        assert_eq!(
+            record.field(&field("absent")),
+            Err(ValueError::MissingField(field("absent")))
+        );
+    }
+
+    #[test]
+    fn datum_field_index_reindexes_after_delete_and_drops_below_threshold() {
+        let mut heap = ValueHeap::new();
+        let datum = heap.allocate_datum(TypePath::parse("/datum/indexed").unwrap());
+        let field_count = DATUM_FIELD_INDEX_THRESHOLD + 3;
+        for index in 0..field_count {
+            heap.set_datum_field(
+                datum,
+                field(&format!("field_{index:02}")),
+                index_number(index),
+            )
+            .unwrap();
+        }
+
+        let deleted = field("field_01");
+        assert_eq!(
+            heap.delete_datum_field(datum, &deleted)
+                .unwrap()
+                .unwrap()
+                .as_number(),
+            Some(1.0)
+        );
+        let record = heap.datum(datum).unwrap();
+        let field_index = record.field_index.as_ref().unwrap();
+        assert_eq!(field_index.len(), field_count - 1);
+        for (position, (name, value)) in record.fields().enumerate() {
+            assert_eq!(field_index.get(name), Some(&position));
+            assert_eq!(record.field(name).unwrap(), value);
+        }
+        assert_eq!(
+            record.field(&deleted),
+            Err(ValueError::MissingField(deleted))
+        );
+
+        for index in [0, 2, 3] {
+            heap.delete_datum_field(datum, &field(&format!("field_{index:02}")))
+                .unwrap();
+        }
+        let record = heap.datum(datum).unwrap();
+        assert_eq!(record.field_len(), DATUM_FIELD_INDEX_THRESHOLD - 1);
+        assert!(record.field_index.is_none());
+        for (name, value) in record.fields() {
+            assert_eq!(record.field(name).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn indexed_datum_defaults_and_clones_preserve_layer_and_value_semantics() {
+        let mut parent = DatumDefaults::new(TypePath::parse("/datum").unwrap());
+        for index in 0..DATUM_FIELD_INDEX_THRESHOLD - 4 {
+            parent.set(field(&format!("field_{index:02}")), index_number(index));
+        }
+        let mut child = DatumDefaults::new(TypePath::parse("/datum/child").unwrap());
+        child.set(field("field_03"), Value::number(303.0));
+        for index in DATUM_FIELD_INDEX_THRESHOLD - 4..DATUM_FIELD_INDEX_THRESHOLD + 2 {
+            child.set(field(&format!("field_{index:02}")), index_number(index));
+        }
+
+        let mut heap = ValueHeap::new();
+        let datum = heap.allocate_datum_with_defaults(
+            TypePath::parse("/datum/child/example").unwrap(),
+            &[parent, child],
+        );
+        let record = heap.datum(datum).unwrap();
+        assert_eq!(record.field_len(), DATUM_FIELD_INDEX_THRESHOLD + 2);
+        assert!(record.field_index.is_some());
+        assert_eq!(
+            record.field(&field("field_03")).unwrap().as_number(),
+            Some(303.0)
+        );
+        let expected_names: Vec<String> = (0..DATUM_FIELD_INDEX_THRESHOLD + 2)
+            .map(|index| format!("field_{index:02}"))
+            .collect();
+        assert_eq!(
+            record
+                .fields()
+                .map(|(name, _)| name.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            expected_names
+        );
+
+        let mut cloned = record.clone();
+        assert_eq!(cloned, *record);
+        assert!(cloned.field_index.is_some());
+        assert_eq!(
+            cloned
+                .set_field(field("field_03"), Value::number(404.0))
+                .unwrap()
+                .as_number(),
+            Some(303.0)
+        );
+        assert_eq!(
+            cloned.field(&field("field_03")).unwrap().as_number(),
+            Some(404.0)
+        );
+        assert_eq!(
+            record.field(&field("field_03")).unwrap().as_number(),
+            Some(303.0)
+        );
     }
 
     #[test]
@@ -1922,6 +3173,106 @@ mod tests {
     }
 
     #[test]
+    fn cut_range_removes_mixed_entries_and_preserves_all_remaining_mappings() {
+        let mut list = DmList::default();
+        list.add(text("p0"));
+        list.set_key(text("k0"), text("v0"));
+        list.add(text("p1"));
+        list.set_key(text("k1"), text("v1"));
+        list.add(text("p2"));
+        list.set_key(text("k2"), text("v2"));
+        list.add(text("p3"));
+        list.set_key(text("k3"), text("v3"));
+        assert_eq!(list.cut_range(3, 7), Ok(4));
+        assert_eq!(list.len(), 4);
+        assert_eq!(list.positional_len(), 2);
+        assert_eq!(list.associative_len(), 2);
+        for (index, expected) in ["p0", "k0", "p3", "k3"].iter().enumerate() {
+            assert!(list.get(index + 1).unwrap().semantic_eq(&text(expected)));
+        }
+        assert!(list.get_key(&text("k0")).unwrap().semantic_eq(&text("v0")));
+        assert!(list.get_key(&text("k3")).unwrap().semantic_eq(&text("v3")));
+        assert!(matches!(
+            list.get_key(&text("k1")),
+            Err(ValueError::MissingKey)
+        ));
+        assert!(list.associative_index.is_none());
+
+        assert_eq!(list.cut_range(1, 2), Ok(1));
+        assert_eq!(list.cut_range(3, 4), Ok(1));
+        assert!(list.get(1).unwrap().semantic_eq(&text("k0")));
+        assert!(list.get(2).unwrap().semantic_eq(&text("p3")));
+        assert!(list.get_key(&text("k0")).unwrap().semantic_eq(&text("v0")));
+    }
+
+    #[test]
+    fn whole_list_cut_releases_lazy_storage_and_empty_ranges_do_not_mutate() {
+        let mut list = DmList::default();
+        for index in 0..32 {
+            list.add(Value::number(index as f32));
+            list.set_key(
+                Value::text(format!("key-{index}")),
+                Value::number((index + 100) as f32),
+            );
+        }
+        assert_eq!(list.cut_range(10, 10), Ok(0));
+        assert_eq!(list.len(), 64);
+        assert_eq!(list.cut_range(1, 65), Ok(64));
+        assert!(list.is_empty());
+        assert!(list.storage.is_none());
+        assert_eq!(list.positional_len(), 0);
+        assert_eq!(list.associative_len(), 0);
+
+        list.add(text("reused"));
+        assert!(list.get(1).unwrap().semantic_eq(&text("reused")));
+    }
+
+    #[test]
+    fn indexed_repeated_remove_last_preserves_duplicates_order_and_mutation_semantics() {
+        let mut list = DmList::default();
+        for index in 0..128 {
+            list.add(Value::number(index as f32));
+        }
+        list.add(Value::number(7.0));
+
+        assert_eq!(
+            list.remove_last(&Value::number(7.0)).unwrap().as_number(),
+            Some(7.0)
+        );
+        assert!(list.positional_remove_index.is_some());
+        assert_eq!(list.len(), 128);
+        assert_eq!(list.get(8).unwrap().as_number(), Some(7.0));
+
+        for index in (0..128).step_by(2) {
+            assert_eq!(
+                list.remove_last(&Value::number(index as f32))
+                    .unwrap()
+                    .as_number(),
+                Some(index as f32)
+            );
+        }
+        assert_eq!(list.len(), 64);
+        for (position, expected) in (1..128).step_by(2).enumerate() {
+            assert_eq!(
+                list.get(position + 1).unwrap().as_number(),
+                Some(expected as f32)
+            );
+        }
+        assert!(list.remove_last(&Value::number(200.0)).is_none());
+
+        list.add(text("tail"));
+        assert!(list.positional_remove_index.is_none());
+        assert!(
+            list.remove_last(&text("tail"))
+                .unwrap()
+                .semantic_eq(&text("tail"))
+        );
+        list.swap(1, 2).unwrap();
+        assert_eq!(list.get(1).unwrap().as_number(), Some(3.0));
+        assert_eq!(list.get(2).unwrap().as_number(), Some(1.0));
+    }
+
+    #[test]
     fn associative_updates_preserve_deterministic_insertion_order() {
         let mut list = DmList::default();
         assert!(list.set_key(text("first"), Value::number(1.0)).is_none());
@@ -1980,6 +3331,10 @@ mod tests {
 
         let copy = heap.copy_list(original).unwrap();
         assert_ne!(copy, original);
+        assert!(Arc::ptr_eq(
+            heap.list(original).unwrap().storage.as_ref().unwrap(),
+            heap.list(copy).unwrap().storage.as_ref().unwrap(),
+        ));
         assert!(
             heap.list(copy)
                 .unwrap()
@@ -1988,6 +3343,10 @@ mod tests {
                 .semantic_eq(&Value::List(child))
         );
         heap.list_mut(copy).unwrap().add(text("copy only"));
+        assert!(!Arc::ptr_eq(
+            heap.list(original).unwrap().storage.as_ref().unwrap(),
+            heap.list(copy).unwrap().storage.as_ref().unwrap(),
+        ));
         assert_eq!(heap.list(original).unwrap().len(), 2);
         assert_eq!(heap.list(copy).unwrap().len(), 3);
     }
@@ -2082,6 +3441,1048 @@ mod tests {
     }
 
     #[test]
+    fn repeated_prefix_cuts_preserve_logical_indexing_and_copy_ranges() {
+        let mut list = DmList::default();
+        for value in 0..10_000 {
+            list.add(Value::number(value as f32));
+        }
+        for expected in 0..9_900 {
+            assert_eq!(list.get(1).unwrap(), &Value::number(expected as f32));
+            assert_eq!(list.cut_range(1, 2), Ok(1));
+        }
+        assert_eq!(list.len(), 100);
+        assert_eq!(list.positional_len(), 100);
+        assert_eq!(list.get(1).unwrap(), &Value::number(9_900.0));
+        assert_eq!(list.get(100).unwrap(), &Value::number(9_999.0));
+        let copy = list.copy_range(2, 5).unwrap();
+        assert_eq!(copy.len(), 3);
+        assert_eq!(copy.get(1).unwrap(), &Value::number(9_901.0));
+        assert_eq!(copy.get(3).unwrap(), &Value::number(9_903.0));
+    }
+
+    #[test]
+    fn mutations_after_lazy_prefix_cut_materialize_without_changing_semantics() {
+        let mut list = DmList::default();
+        for value in 1..=8 {
+            list.add(Value::number(value as f32));
+        }
+        list.cut_range(1, 4).unwrap();
+        list.set(1, Value::number(50.0)).unwrap();
+        list.insert(2, Value::number(60.0)).unwrap();
+        list.swap(1, 3).unwrap();
+        list.set_key(text("key"), text("value"));
+        assert_eq!(list.len(), 7);
+        assert_eq!(list.get(1).unwrap(), &Value::number(5.0));
+        assert_eq!(list.get(2).unwrap(), &Value::number(60.0));
+        assert_eq!(list.get(3).unwrap(), &Value::number(50.0));
+        assert_eq!(list.get_key(&text("key")).unwrap(), &text("value"));
+        assert_eq!(list.remove(1).unwrap(), Value::number(5.0));
+        assert_eq!(list.get(1).unwrap(), &Value::number(60.0));
+    }
+
+    #[test]
+    fn cloned_list_storage_detaches_before_advancing_lazy_prefix() {
+        let mut original = DmList::default();
+        for value in 1..=4 {
+            original.add(Value::number(value as f32));
+        }
+        let snapshot = original.clone();
+        original.cut_range(1, 3).unwrap();
+        assert_eq!(original.len(), 2);
+        assert_eq!(original.get(1).unwrap(), &Value::number(3.0));
+        assert_eq!(snapshot.len(), 4);
+        assert_eq!(snapshot.get(1).unwrap(), &Value::number(1.0));
+    }
+
+    #[test]
+    fn gc_compaction_releases_removed_arc_payloads() {
+        let mut heap = ValueHeap::new();
+        let queue = heap.allocate_list();
+        let payload: Arc<str> = Arc::from("retained payload");
+        for _ in 0..2_048 {
+            heap.list_mut(queue)
+                .unwrap()
+                .add(Value::Text(Arc::clone(&payload)));
+        }
+        heap.list_mut(queue).unwrap().cut_range(1, 1_025).unwrap();
+        assert_eq!(
+            Arc::strong_count(&payload),
+            2_049,
+            "a lazy cut must not add hot-path destruction work"
+        );
+
+        let stats = heap.collect_unreachable_values_from_ids_with_stats(&[], &[queue]);
+        assert_eq!(stats.list_storage.compacted_lists, 1);
+        assert_eq!(stats.list_storage.compacted_prefix_entries, 1_024);
+        assert_eq!(stats.list_storage.prefix_retained, 0);
+        assert_eq!(
+            Arc::strong_count(&payload),
+            1_025,
+            "GC compaction must drop Values retained only by the dead prefix"
+        );
+    }
+
+    #[test]
+    fn gc_prefix_compaction_preserves_cow_source_order_and_associations() {
+        let mut heap = ValueHeap::new();
+        let source = heap.allocate_list();
+        for value in 1..=4_096 {
+            heap.list_mut(source)
+                .unwrap()
+                .add(Value::number(value as f32));
+        }
+        let queue = heap.copy_list(source).unwrap();
+        heap.list_mut(queue).unwrap().cut_range(1, 2_049).unwrap();
+
+        let stats = heap.collect_unreachable_values_from_ids_with_stats(&[], &[source, queue]);
+        assert_eq!(stats.list_storage.compacted_lists, 1);
+        assert_eq!(heap.list(source).unwrap().len(), 4_096);
+        assert_eq!(heap.list(source).unwrap().get(1), Ok(&Value::number(1.0)));
+
+        let queue = heap.list_mut(queue).unwrap();
+        queue.set_key(text("key"), text("associated"));
+        queue.add(text("tail"));
+        assert_eq!(queue.len(), 2_050);
+        assert_eq!(queue.get(1), Ok(&Value::number(2_049.0)));
+        assert_eq!(queue.get(2_048), Ok(&Value::number(4_096.0)));
+        assert_eq!(queue.get(2_049), Ok(&text("key")));
+        assert_eq!(queue.get(2_050), Ok(&text("tail")));
+        assert_eq!(queue.get_key(&text("key")), Ok(&text("associated")));
+    }
+
+    #[test]
+    fn gc_prefix_compaction_detaches_shared_lazy_storage() {
+        let mut queue = DmList::default();
+        for value in 1..=4_096 {
+            queue.add(Value::number(value as f32));
+        }
+        queue.cut_range(1, 2_049).unwrap();
+        let source = queue.clone();
+        let shared_storage = Arc::as_ptr(source.storage.as_ref().unwrap());
+        let source_capacity = source.positional.capacity();
+        assert_eq!(Arc::as_ptr(queue.storage.as_ref().unwrap()), shared_storage);
+
+        let mut stats = ListStorageStats::default();
+        queue.compact_and_measure_for_gc(&mut stats);
+        assert_eq!(stats.compacted_lists, 1);
+        assert_eq!(queue.prefix_head, 0);
+        assert_eq!(queue.len(), 2_048);
+        assert_eq!(queue.get(1), Ok(&Value::number(2_049.0)));
+        assert_ne!(Arc::as_ptr(queue.storage.as_ref().unwrap()), shared_storage);
+
+        assert_eq!(source.prefix_head, 2_048);
+        assert_eq!(source.len(), 2_048);
+        assert_eq!(source.positional.capacity(), source_capacity);
+        assert_eq!(
+            Arc::as_ptr(source.storage.as_ref().unwrap()),
+            shared_storage
+        );
+        assert_eq!(source.get(1), Ok(&Value::number(2_049.0)));
+    }
+
+    #[test]
+    fn gc_does_not_churn_small_lazy_prefixes() {
+        let mut heap = ValueHeap::new();
+        let queue = heap.allocate_list();
+        for value in 0..14_000 {
+            heap.list_mut(queue)
+                .unwrap()
+                .add(Value::number(value as f32));
+        }
+        heap.list_mut(queue).unwrap().cut_range(1, 33).unwrap();
+        let storage_before = Arc::as_ptr(heap.list(queue).unwrap().storage.as_ref().unwrap());
+        let capacity_before = heap.list(queue).unwrap().positional.capacity();
+
+        let stats = heap.collect_unreachable_values_from_ids_with_stats(&[], &[queue]);
+        let list = heap.list(queue).unwrap();
+        assert_eq!(stats.list_storage.compacted_lists, 0);
+        assert_eq!(stats.list_storage.prefix_retained, 32);
+        assert_eq!(list.prefix_head, 32);
+        assert_eq!(list.positional.capacity(), capacity_before);
+        assert_eq!(Arc::as_ptr(list.storage.as_ref().unwrap()), storage_before);
+    }
+
+    #[test]
+    fn gc_compacts_representative_93k_queue_capacity() {
+        let mut heap = ValueHeap::new();
+        let queue = heap.allocate_list();
+        for value in 0..93_000 {
+            heap.list_mut(queue)
+                .unwrap()
+                .add(Value::number(value as f32));
+        }
+        heap.list_mut(queue).unwrap().cut_range(1, 90_001).unwrap();
+        let before_capacity_bytes = {
+            let list = heap.list(queue).unwrap();
+            list.positional
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Value>())
+                .saturating_add(
+                    list.order
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<ListOrder>()),
+                )
+        };
+        let started = std::time::Instant::now();
+        let stats = heap.collect_unreachable_values_from_ids_with_stats(&[], &[queue]);
+        let elapsed = started.elapsed();
+        let list = heap.list(queue).unwrap();
+        let after_capacity_bytes = list
+            .positional
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Value>())
+            .saturating_add(
+                list.order
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ListOrder>()),
+            );
+        eprintln!(
+            "93k GC queue compaction: capacity_bytes={before_capacity_bytes}->{after_capacity_bytes} elapsed_us={}",
+            elapsed.as_micros()
+        );
+        assert_eq!(list.len(), 3_000);
+        assert_eq!(list.get(1), Ok(&Value::number(90_000.0)));
+        assert_eq!(stats.list_storage.compacted_prefix_entries, 90_000);
+        assert_eq!(stats.list_storage.shrunk_vectors, 2);
+        assert!(after_capacity_bytes < before_capacity_bytes / 10);
+    }
+
+    #[test]
+    fn gc_reclaims_boot_scale_tail_slack_with_growth_headroom() {
+        let mut heap = ValueHeap::new();
+        let list = heap.allocate_list();
+        for value in 0..93_000 {
+            heap.list_mut(list)
+                .unwrap()
+                .add(Value::number(value as f32));
+        }
+        // Model a long-lived startup vector that peaked above its final live
+        // length. This is the aggregate shape reported immediately before the
+        // Boot203 Lighting OOM (roughly 1.5x capacity).
+        {
+            let list = heap.list_mut(list).unwrap();
+            list.positional.truncate(87_000);
+            list.order.truncate(87_000);
+        }
+        let before_capacity_bytes = {
+            let list = heap.list(list).unwrap();
+            list.positional
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Value>())
+                .saturating_add(
+                    list.order
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<ListOrder>()),
+                )
+        };
+
+        let started = std::time::Instant::now();
+        let stats = heap.collect_unreachable_values_from_ids_with_stats(&[], &[list]);
+        let elapsed = started.elapsed();
+        let list = heap.list(list).unwrap();
+        let after_capacity_bytes = list
+            .positional
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Value>())
+            .saturating_add(
+                list.order
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ListOrder>()),
+            );
+        eprintln!(
+            "93k tail-slack GC: capacity_bytes={before_capacity_bytes}->{after_capacity_bytes} reclaimed={} elapsed_us={}",
+            stats.list_storage.reclaimed_capacity_bytes,
+            elapsed.as_micros(),
+        );
+
+        assert_eq!(stats.list_storage.shrunk_vectors, 2);
+        assert_eq!(
+            before_capacity_bytes.saturating_sub(after_capacity_bytes),
+            stats.list_storage.reclaimed_capacity_bytes,
+        );
+        assert!(stats.list_storage.reclaimed_capacity_bytes >= 512 * 1_024);
+        assert!(list.positional.capacity() > list.positional.len());
+        assert!(list.order.capacity() > list.order.len());
+        assert_eq!(list.get(1), Ok(&Value::number(0.0)));
+        assert_eq!(list.get(87_000), Ok(&Value::number(86_999.0)));
+    }
+
+    #[test]
+    #[ignore = "local release memory benchmark"]
+    fn gc_millions_small_vector_release_benchmark() {
+        const SAMPLE: usize = 100_000;
+        let mut heap = ValueHeap::new();
+        let mut datum_roots = Vec::with_capacity(SAMPLE);
+        let mut positional_roots = Vec::with_capacity(SAMPLE);
+        let mut associative_roots = Vec::with_capacity(SAMPLE);
+        let datum_field = field("value");
+        for _ in 0..SAMPLE {
+            let positional = heap.allocate_list();
+            heap.list_mut(positional).unwrap().add(Value::Null);
+            positional_roots.push(positional);
+
+            let associative = heap.allocate_list();
+            heap.list_mut(associative)
+                .unwrap()
+                .set_key(Value::Null, Value::Null);
+            associative_roots.push(associative);
+
+            let datum = heap.allocate_datum(TypePath::parse("/datum/small_vector").unwrap());
+            heap.set_datum_field(datum, datum_field.clone(), Value::Null)
+                .unwrap();
+            datum_roots.push(datum);
+        }
+
+        let started = std::time::Instant::now();
+        let mut list_roots = positional_roots.clone();
+        list_roots.extend_from_slice(&associative_roots);
+        let stats = heap.collect_unreachable_values_from_ids_with_stats(&datum_roots, &list_roots);
+        let elapsed = started.elapsed();
+        let positional_bytes = positional_roots
+            .iter()
+            .map(|list| {
+                let list = heap.list(*list).unwrap();
+                (4usize.saturating_sub(list.positional.capacity()))
+                    .saturating_mul(std::mem::size_of::<Value>())
+            })
+            .sum::<usize>();
+        let associative_bytes = associative_roots
+            .iter()
+            .map(|list| {
+                let list = heap.list(*list).unwrap();
+                (4usize.saturating_sub(list.associative.capacity()))
+                    .saturating_mul(std::mem::size_of::<(Value, Value)>())
+            })
+            .sum::<usize>();
+        let datum_bytes = datum_roots
+            .iter()
+            .map(|datum| {
+                let datum = heap.datum(*datum).unwrap();
+                (4usize.saturating_sub(datum.fields.capacity()))
+                    .saturating_mul(std::mem::size_of::<(FieldName, Value)>())
+            })
+            .sum::<usize>();
+        eprintln!(
+            "small-vector GC sample={SAMPLE} positional_bytes={positional_bytes} associative_bytes={associative_bytes} datum_bytes={datum_bytes} total_reported={} elapsed_ms={} extrapolated_boot_positional_mib={} extrapolated_boot_datum_mib={}",
+            stats
+                .list_storage
+                .reclaimed_capacity_bytes
+                .saturating_add(stats.datum_storage.reclaimed_capacity_bytes),
+            elapsed.as_millis(),
+            positional_bytes
+                .saturating_mul(1_923_680)
+                .saturating_div(SAMPLE)
+                .saturating_div(1024 * 1024),
+            datum_bytes
+                .saturating_mul(1_522_931)
+                .saturating_div(SAMPLE)
+                .saturating_div(1024 * 1024),
+        );
+        assert_eq!(stats.list_storage.shrunk_vectors, SAMPLE * 2);
+        assert_eq!(stats.datum_storage.shrunk_field_vectors, SAMPLE);
+        assert_eq!(
+            stats.list_storage.reclaimed_capacity_bytes,
+            positional_bytes.saturating_add(associative_bytes),
+        );
+        assert_eq!(stats.datum_storage.reclaimed_capacity_bytes, datum_bytes);
+    }
+
+    #[test]
+    #[ignore = "local release index-capacity benchmark"]
+    fn gc_distributed_hash_index_release_benchmark() {
+        const SAMPLE: usize = 10_000;
+        const FIELD_LAYOUTS: usize = 100;
+        const LOOKUP_ROUNDS: usize = 50;
+        let field_names = (0..64)
+            .map(|index| field(&format!("field_{index:02}")))
+            .collect::<Vec<_>>();
+        let list_keys = (0..64)
+            .map(|index| text(&format!("key-{index:02}")))
+            .collect::<Vec<_>>();
+        let mut heap = ValueHeap::new();
+        let mut datum_roots = Vec::with_capacity(SAMPLE);
+        let mut list_roots = Vec::with_capacity(SAMPLE);
+        let mut datum_capacity_before = 0usize;
+        let mut list_capacity_before = 0usize;
+
+        for sample_index in 0..SAMPLE {
+            let datum = heap.allocate_datum(TypePath::parse("/datum/index_benchmark").unwrap());
+            for (index, name) in field_names[..31].iter().enumerate() {
+                heap.set_datum_field(datum, name.clone(), Value::number(index as f32))
+                    .unwrap();
+            }
+            heap.set_datum_field(
+                datum,
+                field(&format!("layout_{}", sample_index % FIELD_LAYOUTS)),
+                Value::number(31.0),
+            )
+            .unwrap();
+            for (index, name) in field_names[32..].iter().enumerate() {
+                heap.set_datum_field(datum, name.clone(), Value::number((index + 32) as f32))
+                    .unwrap();
+            }
+            {
+                let datum = heap.datum_mut(datum).unwrap();
+                datum.fields.truncate(32);
+                Arc::make_mut(datum.field_index.as_mut().unwrap())
+                    .retain(|_, position| *position < 32);
+                datum_capacity_before = datum_capacity_before
+                    .saturating_add(datum.field_index.as_ref().unwrap().capacity());
+            }
+            datum_roots.push(datum);
+
+            let list = heap.allocate_list();
+            for (index, key) in list_keys.iter().enumerate() {
+                heap.list_mut(list)
+                    .unwrap()
+                    .set_key(key.clone(), Value::number(index as f32));
+            }
+            {
+                let list = heap.list_mut(list).unwrap();
+                list.associative.truncate(32);
+                list.order.truncate(32);
+                list.associative_index
+                    .as_mut()
+                    .unwrap()
+                    .retain(|_, position| *position < 32);
+                list_capacity_before = list_capacity_before
+                    .saturating_add(list.associative_index.as_ref().unwrap().capacity());
+            }
+            list_roots.push(list);
+        }
+
+        let measure_lookups = |heap: &ValueHeap| {
+            let started = std::time::Instant::now();
+            let mut hits = 0usize;
+            for round in 0..LOOKUP_ROUNDS {
+                let field_name = &field_names[round % 31];
+                let list_key = &list_keys[round % 32];
+                for datum in &datum_roots {
+                    hits = hits.saturating_add(usize::from(
+                        heap.datum(*datum).unwrap().field(field_name).is_ok(),
+                    ));
+                }
+                for list in &list_roots {
+                    hits = hits.saturating_add(usize::from(
+                        heap.list(*list).unwrap().get_key(list_key).is_ok(),
+                    ));
+                }
+            }
+            std::hint::black_box(hits);
+            started.elapsed()
+        };
+        let lookup_before = measure_lookups(&heap);
+        let started = std::time::Instant::now();
+        let stats = heap.collect_unreachable_values_from_ids_with_stats(&datum_roots, &list_roots);
+        let gc_elapsed = started.elapsed();
+        let lookup_after = measure_lookups(&heap);
+        let repeat_started = std::time::Instant::now();
+        let repeat_stats =
+            heap.collect_unreachable_values_from_ids_with_stats(&datum_roots, &list_roots);
+        let repeat_gc_elapsed = repeat_started.elapsed();
+        let datum_capacity_after = datum_roots
+            .iter()
+            .map(|datum| {
+                heap.datum(*datum)
+                    .unwrap()
+                    .field_index
+                    .as_ref()
+                    .unwrap()
+                    .capacity()
+            })
+            .sum::<usize>();
+        let list_capacity_after = list_roots
+            .iter()
+            .map(|list| {
+                heap.list(*list)
+                    .unwrap()
+                    .associative_index
+                    .as_ref()
+                    .unwrap()
+                    .capacity()
+            })
+            .sum::<usize>();
+
+        eprintln!(
+            "distributed-index GC sample={SAMPLE} field_layouts={FIELD_LAYOUTS} datum_slots={datum_capacity_before}->{datum_capacity_after} datum_shrink_bytes_reclaimed={} datum_indexes_deduplicated={} datum_dedupe_bytes_reclaimed={} datum_physical_indexes={} first_fingerprints={} first_pointer_hits={} first_exact_compares={} repeat_fingerprints={} repeat_pointer_hits={} repeat_exact_compares={} list_slots={list_capacity_before}->{list_capacity_after} list_entry_bytes_reclaimed={} first_gc_ms={} repeat_gc_ms={} lookups={} lookup_before_ms={} lookup_after_ms={}",
+            stats.datum_storage.reclaimed_field_index_bytes,
+            stats.datum_storage.deduplicated_field_indexes,
+            stats.datum_storage.deduplicated_field_index_bytes,
+            stats.datum_storage.physical_field_indexes,
+            stats.datum_storage.field_index_fingerprints_computed,
+            stats.datum_storage.field_index_pointer_cache_hits,
+            stats.datum_storage.field_index_exact_layout_comparisons,
+            repeat_stats.datum_storage.field_index_fingerprints_computed,
+            repeat_stats.datum_storage.field_index_pointer_cache_hits,
+            repeat_stats
+                .datum_storage
+                .field_index_exact_layout_comparisons,
+            stats.list_storage.reclaimed_associative_index_bytes,
+            gc_elapsed.as_millis(),
+            repeat_gc_elapsed.as_millis(),
+            SAMPLE * LOOKUP_ROUNDS * 2,
+            lookup_before.as_millis(),
+            lookup_after.as_millis(),
+        );
+        assert_eq!(
+            datum_capacity_before.saturating_sub(datum_capacity_after),
+            stats.datum_storage.reclaimed_field_index_capacity,
+        );
+        assert_eq!(
+            list_capacity_before.saturating_sub(list_capacity_after),
+            stats.list_storage.reclaimed_associative_index_capacity,
+        );
+        assert_eq!(stats.datum_storage.shrunk_field_indexes, SAMPLE);
+        assert_eq!(
+            stats.datum_storage.deduplicated_field_indexes,
+            SAMPLE - FIELD_LAYOUTS,
+        );
+        assert_eq!(stats.datum_storage.physical_field_indexes, FIELD_LAYOUTS,);
+        assert_eq!(
+            stats.datum_storage.field_index_fingerprints_computed,
+            SAMPLE,
+        );
+        assert_eq!(stats.datum_storage.field_index_pointer_cache_hits, 0);
+        assert_eq!(
+            stats.datum_storage.field_index_exact_layout_comparisons,
+            SAMPLE - FIELD_LAYOUTS,
+        );
+        assert_eq!(repeat_stats.datum_storage.deduplicated_field_indexes, 0);
+        assert_eq!(
+            repeat_stats.datum_storage.physical_field_indexes,
+            FIELD_LAYOUTS,
+        );
+        assert_eq!(
+            repeat_stats.datum_storage.field_index_fingerprints_computed,
+            FIELD_LAYOUTS,
+        );
+        assert_eq!(
+            repeat_stats.datum_storage.field_index_pointer_cache_hits,
+            SAMPLE - FIELD_LAYOUTS,
+        );
+        assert_eq!(
+            repeat_stats
+                .datum_storage
+                .field_index_exact_layout_comparisons,
+            0,
+        );
+        assert_eq!(stats.list_storage.shrunk_associative_indexes, SAMPLE);
+        assert!(datum_capacity_after >= SAMPLE * 40);
+        assert!(list_capacity_after >= SAMPLE * 40);
+    }
+
+    #[test]
+    fn gc_capacity_reclamation_preserves_associations_and_hot_index() {
+        let mut heap = ValueHeap::new();
+        let list = heap.allocate_list();
+        for index in 0..2_048 {
+            heap.list_mut(list).unwrap().set_key(
+                text(&format!("key-{index:04}")),
+                Value::number(index as f32),
+            );
+        }
+        {
+            let list = heap.list_mut(list).unwrap();
+            list.associative.truncate(1_024);
+            list.order.truncate(1_024);
+            list.associative_index
+                .as_mut()
+                .unwrap()
+                .retain(|_, position| *position < 1_024);
+        }
+
+        let stats = heap.collect_unreachable_values_from_ids_with_stats(&[], &[list]);
+        let list = heap.list(list).unwrap();
+        assert!(stats.list_storage.shrunk_vectors >= 1);
+        assert_eq!(stats.list_storage.associative_indexes, 1);
+        assert_eq!(stats.list_storage.shrunk_associative_indexes, 1);
+        assert!(stats.list_storage.reclaimed_associative_index_capacity > 0);
+        assert!(
+            list.associative_index.is_some(),
+            "the hot index stays built"
+        );
+        assert_eq!(list.len(), 1_024);
+        assert_eq!(list.get_key(&text("key-0000")), Ok(&Value::number(0.0)),);
+        assert_eq!(list.get_key(&text("key-1023")), Ok(&Value::number(1_023.0)),);
+        assert_eq!(list.get_key(&text("key-1024")), Err(ValueError::MissingKey),);
+    }
+
+    #[test]
+    fn gc_reclaims_distributed_association_index_slack_below_old_floor() {
+        let mut heap = ValueHeap::new();
+        let list = heap.allocate_list();
+        for index in 0..64 {
+            heap.list_mut(list).unwrap().set_key(
+                text(&format!("key-{index:02}")),
+                Value::number(index as f32),
+            );
+        }
+        {
+            let list = heap.list_mut(list).unwrap();
+            list.associative.truncate(52);
+            list.order.truncate(52);
+            list.associative_index
+                .as_mut()
+                .unwrap()
+                .retain(|_, position| *position < 52);
+        }
+        let before = heap
+            .list(list)
+            .unwrap()
+            .associative_index
+            .as_ref()
+            .unwrap()
+            .capacity();
+        assert!(before.saturating_sub(52) < 128);
+
+        let stats = heap.collect_unreachable_values_from_ids_with_stats(&[], &[list]);
+        let list_record = heap.list(list).unwrap();
+        let after = list_record.associative_index.as_ref().unwrap().capacity();
+        let reclaimed = before.saturating_sub(after);
+        assert!(reclaimed >= 8);
+        assert_eq!(stats.list_storage.shrunk_associative_indexes, 1);
+        assert_eq!(
+            stats.list_storage.reclaimed_associative_index_capacity,
+            reclaimed,
+        );
+        assert_eq!(
+            stats.list_storage.reclaimed_associative_index_bytes,
+            reclaimed.saturating_mul(std::mem::size_of::<(SemanticKey, usize)>()),
+        );
+        assert!(after >= 56, "the compacted index retains 6.25% headroom");
+        assert_eq!(
+            list_record.get_key(&text("key-51")),
+            Ok(&Value::number(51.0)),
+        );
+
+        let retained_capacity = after;
+        for index in 64..68 {
+            heap.list_mut(list).unwrap().set_key(
+                text(&format!("key-{index:02}")),
+                Value::number(index as f32),
+            );
+        }
+        assert_eq!(
+            heap.list(list)
+                .unwrap()
+                .associative_index
+                .as_ref()
+                .unwrap()
+                .capacity(),
+            retained_capacity,
+            "6.25% immediate growth must not reallocate the index",
+        );
+    }
+
+    #[test]
+    fn gc_drops_unique_rebuildable_positional_remove_index() {
+        let mut heap = ValueHeap::new();
+        let list = heap.allocate_list();
+        for index in 0..256 {
+            heap.list_mut(list)
+                .unwrap()
+                .add(Value::number(index as f32));
+        }
+        assert_eq!(
+            heap.list_mut(list)
+                .unwrap()
+                .remove_last(&Value::number(255.0)),
+            Some(Value::number(255.0)),
+        );
+        assert!(heap.list(list).unwrap().positional_remove_index.is_some());
+
+        let stats = heap.collect_unreachable_values_from_ids_with_stats(&[], &[list]);
+        assert_eq!(stats.list_storage.positional_remove_indexes, 1);
+        assert_eq!(stats.list_storage.dropped_positional_remove_indexes, 1);
+        assert!(stats.list_storage.positional_remove_key_len > 0);
+        assert!(stats.list_storage.positional_remove_position_len > 0);
+        assert!(stats.list_storage.positional_remove_removed_len > 0);
+        assert!(heap.list(list).unwrap().positional_remove_index.is_none());
+
+        assert_eq!(
+            heap.list_mut(list)
+                .unwrap()
+                .remove_last(&Value::number(254.0)),
+            Some(Value::number(254.0)),
+            "the transient index must rebuild without changing semantics",
+        );
+        assert!(heap.list(list).unwrap().positional_remove_index.is_some());
+    }
+
+    #[test]
+    fn gc_does_not_detach_shared_cow_storage_to_reclaim_capacity_or_indexes() {
+        let mut heap = ValueHeap::new();
+        let source = heap.allocate_list();
+        for index in 0..8_192 {
+            heap.list_mut(source)
+                .unwrap()
+                .add(Value::number(index as f32));
+        }
+        {
+            let source = heap.list_mut(source).unwrap();
+            source.positional.truncate(4_096);
+            source.order.truncate(4_096);
+            assert_eq!(
+                source.remove_last(&Value::number(4_095.0)),
+                Some(Value::number(4_095.0)),
+            );
+        }
+        let copy = heap.copy_list(source).unwrap();
+        let pointer = Arc::as_ptr(heap.list(source).unwrap().storage.as_ref().unwrap());
+        let positional_capacity = heap.list(source).unwrap().positional.capacity();
+
+        let stats = heap.collect_unreachable_values_from_ids_with_stats(&[], &[source, copy]);
+        let source_list = heap.list(source).unwrap();
+        let copy_list = heap.list(copy).unwrap();
+        assert_eq!(stats.list_storage.shrunk_vectors, 0);
+        assert_eq!(stats.list_storage.reclaimed_capacity_bytes, 0);
+        assert!(stats.list_storage.shared_shrink_candidates >= 2);
+        assert!(stats.list_storage.shared_derived_index_candidates >= 2);
+        assert_eq!(Arc::as_ptr(source_list.storage.as_ref().unwrap()), pointer);
+        assert_eq!(Arc::as_ptr(copy_list.storage.as_ref().unwrap()), pointer);
+        assert_eq!(source_list.positional.capacity(), positional_capacity);
+        assert!(source_list.positional_remove_index.is_some());
+        assert!(copy_list.positional_remove_index.is_some());
+        assert_eq!(source_list.get(1), copy_list.get(1));
+        assert_eq!(
+            source_list.get(source_list.len()),
+            copy_list.get(copy_list.len())
+        );
+    }
+
+    #[test]
+    fn gc_does_not_churn_sub_page_capacity_slack() {
+        let mut heap = ValueHeap::new();
+        let list = heap.allocate_list();
+        for index in 0..4 {
+            heap.list_mut(list)
+                .unwrap()
+                .add(Value::number(index as f32));
+        }
+        {
+            let list = heap.list_mut(list).unwrap();
+            list.positional.truncate(2);
+            list.order.truncate(2);
+        }
+        let pointer = Arc::as_ptr(heap.list(list).unwrap().storage.as_ref().unwrap());
+        let capacity = heap.list(list).unwrap().positional.capacity();
+
+        let stats = heap.collect_unreachable_values_from_ids_with_stats(&[], &[list]);
+        let list = heap.list(list).unwrap();
+        assert_eq!(stats.list_storage.shrunk_vectors, 0);
+        assert_eq!(Arc::as_ptr(list.storage.as_ref().unwrap()), pointer);
+        assert_eq!(list.positional.capacity(), capacity);
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn gc_reclaims_datum_field_slack_without_dropping_hot_index() {
+        let mut heap = ValueHeap::new();
+        let datum = heap.allocate_datum(TypePath::parse("/datum/gc_slack").unwrap());
+        for index in 0..4_096 {
+            heap.set_datum_field(
+                datum,
+                field(&format!("field_{index:04}")),
+                Value::number(index as f32),
+            )
+            .unwrap();
+        }
+        {
+            let datum = heap.datum_mut(datum).unwrap();
+            datum.fields.truncate(2_048);
+            Arc::make_mut(datum.field_index.as_mut().unwrap())
+                .retain(|_, position| *position < 2_048);
+        }
+        let before = heap.datum(datum).unwrap().fields.capacity();
+
+        let stats = heap.collect_unreachable_values_from_ids_with_stats(&[datum], &[]);
+        let datum = heap.datum(datum).unwrap();
+        assert_eq!(stats.datum_storage.shrunk_field_vectors, 1);
+        assert!(stats.datum_storage.reclaimed_capacity_bytes > 0);
+        assert_eq!(stats.datum_storage.field_indexes, 1);
+        assert_eq!(stats.datum_storage.shrunk_field_indexes, 1);
+        assert!(stats.datum_storage.reclaimed_field_index_capacity > 0);
+        assert!(datum.fields.capacity() < before);
+        assert!(
+            datum.field_index.is_some(),
+            "hot field reads remain indexed"
+        );
+        assert_eq!(datum.field(&field("field_0000")), Ok(&Value::number(0.0)),);
+        assert_eq!(
+            datum.field(&field("field_2047")),
+            Ok(&Value::number(2_047.0)),
+        );
+        assert_eq!(
+            datum.field(&field("field_2048")),
+            Err(ValueError::MissingField(field("field_2048"))),
+        );
+    }
+
+    #[test]
+    fn gc_shares_identical_field_layout_indexes_and_detaches_only_for_layout_changes() {
+        let mut heap = ValueHeap::new();
+        let left = heap.allocate_datum(TypePath::parse("/datum/layout_left").unwrap());
+        let right = heap.allocate_datum(TypePath::parse("/datum/layout_right").unwrap());
+        for index in 0..64 {
+            let name = field(&format!("field_{index:02}"));
+            heap.set_datum_field(left, name.clone(), Value::number(index as f32))
+                .unwrap();
+            heap.set_datum_field(right, name, Value::number((index + 1) as f32))
+                .unwrap();
+        }
+        assert!(!Arc::ptr_eq(
+            heap.datum(left).unwrap().field_index.as_ref().unwrap(),
+            heap.datum(right).unwrap().field_index.as_ref().unwrap(),
+        ));
+
+        let stats = heap.collect_unreachable_values_from_ids_with_stats(&[left, right], &[]);
+        let shared = Arc::clone(heap.datum(left).unwrap().field_index.as_ref().unwrap());
+        assert!(Arc::ptr_eq(
+            &shared,
+            heap.datum(right).unwrap().field_index.as_ref().unwrap(),
+        ));
+        assert_eq!(stats.datum_storage.field_indexes, 2);
+        assert_eq!(stats.datum_storage.physical_field_indexes, 1);
+        assert_eq!(stats.datum_storage.deduplicated_field_indexes, 1);
+        assert_eq!(stats.datum_storage.field_index_fingerprints_computed, 2);
+        assert_eq!(stats.datum_storage.field_index_pointer_cache_hits, 0);
+        assert_eq!(stats.datum_storage.field_index_exact_layout_comparisons, 1);
+        assert!(stats.datum_storage.deduplicated_field_index_bytes > 0);
+        assert_eq!(
+            heap.datum(left).unwrap().field(&field("field_07")),
+            Ok(&Value::number(7.0)),
+        );
+        assert_eq!(
+            heap.datum(right).unwrap().field(&field("field_07")),
+            Ok(&Value::number(8.0)),
+        );
+
+        // Updating an existing value does not mutate the layout index, so the
+        // shared O(1) cache stays shared.
+        heap.set_datum_field(left, field("field_07"), Value::number(700.0))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &shared,
+            heap.datum(left).unwrap().field_index.as_ref().unwrap(),
+        ));
+
+        // Adding a new field changes one layout and therefore detaches only
+        // that datum's index through Arc::make_mut.
+        heap.set_datum_field(left, field("dynamic_field"), Value::number(1.0))
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            heap.datum(left).unwrap().field_index.as_ref().unwrap(),
+            heap.datum(right).unwrap().field_index.as_ref().unwrap(),
+        ));
+        assert_eq!(
+            heap.datum(left).unwrap().field(&field("dynamic_field")),
+            Ok(&Value::number(1.0)),
+        );
+        assert_eq!(
+            heap.datum(right).unwrap().field(&field("dynamic_field")),
+            Err(ValueError::MissingField(field("dynamic_field"))),
+        );
+
+        // Returning the detached datum to the old layout lets the next GC
+        // merge it back into the canonical shared index. A later collection
+        // fingerprints that physical Arc once and resolves the other logical
+        // datum through the pointer cache without comparing every field.
+        drop(shared);
+        assert_eq!(
+            heap.delete_datum_field(left, &field("dynamic_field"))
+                .unwrap(),
+            Some(Value::number(1.0)),
+        );
+        let merged = heap.collect_unreachable_values_from_ids_with_stats(&[left, right], &[]);
+        assert!(Arc::ptr_eq(
+            heap.datum(left).unwrap().field_index.as_ref().unwrap(),
+            heap.datum(right).unwrap().field_index.as_ref().unwrap(),
+        ));
+        assert_eq!(merged.datum_storage.deduplicated_field_indexes, 1);
+        assert_eq!(merged.datum_storage.field_index_fingerprints_computed, 2);
+        assert_eq!(merged.datum_storage.field_index_pointer_cache_hits, 0);
+        assert_eq!(merged.datum_storage.field_index_exact_layout_comparisons, 1,);
+
+        let repeated = heap.collect_unreachable_values_from_ids_with_stats(&[left, right], &[]);
+        assert_eq!(repeated.datum_storage.deduplicated_field_indexes, 0);
+        assert_eq!(repeated.datum_storage.field_index_fingerprints_computed, 1);
+        assert_eq!(repeated.datum_storage.field_index_pointer_cache_hits, 1);
+        assert_eq!(
+            repeated.datum_storage.field_index_exact_layout_comparisons,
+            0,
+        );
+    }
+
+    #[test]
+    fn gc_field_index_sharing_never_merges_different_field_orders() {
+        let mut heap = ValueHeap::new();
+        let left = heap.allocate_datum(TypePath::parse("/datum/layout_order_left").unwrap());
+        let right = heap.allocate_datum(TypePath::parse("/datum/layout_order_right").unwrap());
+        let names = (0..16)
+            .map(|index| field(&format!("field_{index:02}")))
+            .collect::<Vec<_>>();
+        for (index, name) in names.iter().enumerate() {
+            heap.set_datum_field(left, name.clone(), Value::number(index as f32))
+                .unwrap();
+        }
+        for (index, name) in names.iter().rev().enumerate() {
+            heap.set_datum_field(right, name.clone(), Value::number(index as f32))
+                .unwrap();
+        }
+
+        let stats = heap.collect_unreachable_values_from_ids_with_stats(&[left, right], &[]);
+        assert!(!Arc::ptr_eq(
+            heap.datum(left).unwrap().field_index.as_ref().unwrap(),
+            heap.datum(right).unwrap().field_index.as_ref().unwrap(),
+        ));
+        assert_eq!(stats.datum_storage.physical_field_indexes, 2);
+        assert_eq!(stats.datum_storage.deduplicated_field_indexes, 0);
+        assert_eq!(
+            heap.datum(left).unwrap().fields().next().unwrap().0,
+            &names[0],
+        );
+        assert_eq!(
+            heap.datum(right).unwrap().fields().next().unwrap().0,
+            &names[15],
+        );
+    }
+
+    #[test]
+    fn gc_reclaims_distributed_field_index_slack_below_old_floor() {
+        let mut heap = ValueHeap::new();
+        let datum = heap.allocate_datum(TypePath::parse("/datum/gc_index_slack").unwrap());
+        for index in 0..64 {
+            heap.set_datum_field(
+                datum,
+                field(&format!("field_{index:02}")),
+                Value::number(index as f32),
+            )
+            .unwrap();
+        }
+        {
+            let datum = heap.datum_mut(datum).unwrap();
+            datum.fields.truncate(52);
+            Arc::make_mut(datum.field_index.as_mut().unwrap()).retain(|_, position| *position < 52);
+        }
+        let before = heap
+            .datum(datum)
+            .unwrap()
+            .field_index
+            .as_ref()
+            .unwrap()
+            .capacity();
+        assert!(before.saturating_sub(52) < 128);
+
+        let stats = heap.collect_unreachable_values_from_ids_with_stats(&[datum], &[]);
+        let datum_record = heap.datum(datum).unwrap();
+        let after = datum_record.field_index.as_ref().unwrap().capacity();
+        let reclaimed = before.saturating_sub(after);
+        assert!(reclaimed >= 8);
+        assert_eq!(stats.datum_storage.shrunk_field_indexes, 1);
+        assert_eq!(
+            stats.datum_storage.reclaimed_field_index_capacity,
+            reclaimed,
+        );
+        assert_eq!(
+            stats.datum_storage.reclaimed_field_index_bytes,
+            reclaimed.saturating_mul(std::mem::size_of::<(FieldName, usize)>()),
+        );
+        assert!(after >= 56, "the compacted index retains 6.25% headroom");
+        assert_eq!(
+            datum_record.field(&field("field_51")),
+            Ok(&Value::number(51.0)),
+        );
+
+        let retained_capacity = after;
+        for index in 64..68 {
+            heap.set_datum_field(
+                datum,
+                field(&format!("field_{index:02}")),
+                Value::number(index as f32),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            heap.datum(datum)
+                .unwrap()
+                .field_index
+                .as_ref()
+                .unwrap()
+                .capacity(),
+            retained_capacity,
+            "6.25% immediate growth must not reallocate the index",
+        );
+    }
+
+    #[test]
+    fn bulk_subtraction_removes_last_multiset_occurrences_in_one_compaction() {
+        let mut list = DmList::default();
+        for value in ["a", "b", "a", "a", "c"] {
+            list.add(text(value));
+        }
+        let snapshot = list.clone();
+        assert_eq!(
+            list.subtract_entries(&[text("a"), text("b"), text("a")]),
+            Ok(3)
+        );
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.get(1).unwrap(), &text("a"));
+        assert_eq!(list.get(2).unwrap(), &text("c"));
+        assert_eq!(snapshot.len(), 5, "COW source remains unchanged");
+        assert_eq!(snapshot.get(4).unwrap(), &text("a"));
+
+        let shared = list.clone();
+        assert_eq!(list.subtract_entries(&[text("missing")]), Ok(0));
+        assert!(Arc::ptr_eq(
+            list.storage.as_ref().unwrap(),
+            shared.storage.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn bulk_subtraction_preserves_mixed_associations_and_fallback_equality() {
+        let mut list = DmList::default();
+        list.add(text("x"));
+        list.set_key(text("key"), text("associated"));
+        list.add(text("key"));
+        let modified = Value::ModifiedTypePath(Arc::new(ModifiedTypePath::new(
+            TypePath::parse("/obj/item").unwrap(),
+            vec![(field("amount"), Value::number(3.0))],
+        )));
+        list.add(modified.clone());
+        list.set_key(text("keep"), text("value"));
+
+        assert_eq!(
+            list.subtract_entries(&[text("key"), modified.clone()]),
+            Ok(2)
+        );
+        assert_eq!(list.len(), 3);
+        assert_eq!(list.get(1).unwrap(), &text("x"));
+        assert_eq!(list.get(2).unwrap(), &text("key"));
+        assert_eq!(list.get(3).unwrap(), &text("keep"));
+        assert_eq!(list.get_key(&text("key")).unwrap(), &text("associated"));
+        assert_eq!(list.get_key(&text("keep")).unwrap(), &text("value"));
+    }
+
+    #[test]
+    fn bulk_subtraction_compacts_a_lazy_prefix_and_self_snapshot_exactly() {
+        let mut list = DmList::default();
+        for value in 0..128 {
+            list.add(Value::number(value as f32));
+        }
+        list.cut_range(1, 65).unwrap();
+        let rhs = list
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(list.subtract_entries(&rhs), Ok(64));
+        assert!(list.is_empty());
+        assert_eq!(list.prefix_head, 0);
+        list.add(text("reused"));
+        assert_eq!(list.get(1).unwrap(), &text("reused"));
+    }
+
+    #[test]
     fn live_heap_counts_track_allocation_reuse_and_destruction() {
         let mut heap = ValueHeap::new();
         let list = heap.allocate_list();
@@ -2095,6 +4496,51 @@ mod tests {
         let reused = heap.allocate_list();
         assert_ne!(reused, list);
         assert_eq!(heap.live_list_count(), 1);
+    }
+
+    #[test]
+    fn arena_stats_track_chunks_free_slots_and_reuse_in_constant_time() {
+        let mut heap = ValueHeap::new();
+        let datum = heap.allocate_datum(TypePath::parse("/datum/example").unwrap());
+        assert_eq!(
+            heap.datum_arena_stats(),
+            ArenaStats {
+                live: 1,
+                slots: 1,
+                free: 0,
+                chunks: 1,
+                reserved: ARENA_CHUNK_SLOTS,
+            }
+        );
+
+        let lists = (0..=ARENA_CHUNK_SLOTS)
+            .map(|_| heap.allocate_list())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            heap.list_arena_stats(),
+            ArenaStats {
+                live: ARENA_CHUNK_SLOTS + 1,
+                slots: ARENA_CHUNK_SLOTS + 1,
+                free: 0,
+                chunks: 2,
+                reserved: ARENA_CHUNK_SLOTS * 2,
+            }
+        );
+        heap.destroy_list(lists[0]).unwrap();
+        assert_eq!(heap.list_arena_stats().free, 1);
+        let replacement = heap.allocate_list();
+        assert_eq!(replacement.index(), lists[0].index());
+        let reused = heap.list_arena_stats();
+        assert_eq!(reused.live, ARENA_CHUNK_SLOTS + 1);
+        assert_eq!(reused.slots, ARENA_CHUNK_SLOTS + 1);
+        assert_eq!(reused.free, 0);
+        assert_eq!(reused.chunks, 2);
+
+        heap.destroy_datum(datum).unwrap();
+        let datum_stats = heap.datum_arena_stats();
+        assert_eq!(datum_stats.live, 0);
+        assert_eq!(datum_stats.slots, 1);
+        assert_eq!(datum_stats.free, 1);
     }
 
     #[test]

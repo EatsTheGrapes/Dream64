@@ -47,6 +47,8 @@ const INIT_PROFILER: &str = "/datum/controller/subsystem/init_profiler/proc/Init
 const BECOME_AREA_SENSITIVE: &str = "/atom/movable/proc/become_area_sensitive";
 const DCS_GET_ID: &str = "/datum/controller/subsystem/processing/dcs/proc/GetIdFromArguments";
 const DCS_GET_ELEMENT: &str = "/datum/controller/subsystem/processing/dcs/proc/GetElement";
+const ADD_ELEMENT: &str = "/datum/proc/_AddElement";
+const DECAL_SMOOTH_REACT: &str = "/datum/element/decal/proc/smooth_react";
 
 fn main() -> ExitCode {
     std::thread::Builder::new()
@@ -120,6 +122,8 @@ fn run() -> Result<(), String> {
         BECOME_AREA_SENSITIVE,
         DCS_GET_ID,
         DCS_GET_ELEMENT,
+        ADD_ELEMENT,
+        DECAL_SMOOTH_REACT,
     ]
     .map(|path| effective_target(&procedures, path))
     .into_iter()
@@ -182,6 +186,12 @@ fn run() -> Result<(), String> {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| format!("failed to allocate blood-pack fixture: {error}"))?;
+    let neon_carpet_fixture = runtime
+        .allocate_datum(
+            &dm_value::TypePath::parse("/turf/open/floor/carpet/neon/simple/blue/nodots")
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| format!("failed to allocate neon-carpet fixture: {error}"))?;
     let world = runtime
         .canonical_world()
         .ok_or("canonical /world datum is missing")?;
@@ -225,14 +235,25 @@ fn run() -> Result<(), String> {
     {
         return Err("goldgrub is missing inherited important_recursive_contents metadata".into());
     }
-    let containing_turf = state.heap_mut().allocate_datum(
-        dm_value::TypePath::parse("/turf/open/floor").map_err(|error| error.to_string())?,
-    );
+    // Model the map allocator for the containing turf. A bare heap datum is
+    // intentionally only valid for the sparse nested fixtures below; turfs
+    // require their inherited atom fields (including
+    // `important_recursive_contents`) to be materialized before the real
+    // area-sensitive procedure writes them.
+    let containing_turf = state
+        .allocate_compact_map_datum(
+            dm_value::TypePath::parse("/turf/open/floor").map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| format!("failed to allocate containing turf fixture: {error}"))?;
     for (name, value) in [
         ("x", Value::number(8.0)),
         ("y", Value::number(9.0)),
         ("z", Value::number(1.0)),
         ("loc", Value::Null),
+        // `become_area_sensitive` appends to this inherited atom list. The
+        // compact map datum retains sparse defaults, so make the catalog's
+        // verified null default concrete for this direct heap-field path.
+        ("important_recursive_contents", Value::Null),
     ] {
         state
             .heap_mut()
@@ -309,6 +330,12 @@ fn run() -> Result<(), String> {
         &mut state,
     )?;
     let dcs = global_datum(&state, "SSdcs")?;
+    verify_neon_decal_smoothing(
+        &mut executable,
+        &procedures,
+        &mut state,
+        neon_carpet_fixture,
+    )?;
     let knife_arguments = processable_arguments(&mut state, "knife")?;
     let saw_arguments = processable_arguments(&mut state, "saw")?;
     let knife_id = invoke_with_args(
@@ -648,6 +675,134 @@ fn processable_arguments(
     list.set_key(Value::text("table_required"), Value::number(1.0));
     list.set_key(Value::text("screentip_verb"), Value::text("Slice"));
     Ok(list_id)
+}
+
+fn verify_neon_decal_smoothing(
+    executable: &mut ExecutableProcedures,
+    procedures: &ProcedureRegistry,
+    state: &mut ExecutionState,
+    neon_carpet: DatumId,
+) -> Result<(), String> {
+    let arguments = state.heap_mut().allocate_list();
+    {
+        let arguments = state
+            .heap_mut()
+            .list_mut(arguments)
+            .map_err(|error| error.to_string())?;
+        for value in [
+            Value::TypePath(
+                dm_value::TypePath::parse("/datum/element/decal")
+                    .map_err(|error| error.to_string())?,
+            ),
+            Value::file("icons/turf/floors/carpet_neon_simple.dmi"),
+            Value::text("light-nodots"),
+            Value::number(2.0),
+            Value::Null,
+            Value::Null,
+            Value::number(255.0),
+            Value::text("#0000ff"),
+            Value::number(255.0),
+        ] {
+            arguments.add(value);
+        }
+    }
+    invoke_with_args(
+        executable,
+        procedures,
+        ADD_ELEMENT,
+        neon_carpet,
+        &[Value::List(arguments)],
+        state,
+    )?;
+
+    let decal_type =
+        dm_value::TypePath::parse("/datum/element/decal").map_err(|error| error.to_string())?;
+    let initial_decal = state
+        .heap()
+        .datums()
+        .find_map(|(id, datum)| {
+            (datum.type_path() == &decal_type
+                && datum
+                    .field(&field("smoothing").ok()?)
+                    .ok()
+                    .and_then(Value::as_number)
+                    == Some(255.0))
+            .then_some(id)
+        })
+        .ok_or("real decal Attach did not create the initial bespoke element")?;
+    let initial_pic = match state
+        .heap()
+        .datum_field(initial_decal, &field("pic")?)
+        .map_err(|error| error.to_string())?
+    {
+        Value::Datum(pic) => *pic,
+        value => return Err(format!("initial decal pic is not an appearance: {value}")),
+    };
+    let initial_icon = state
+        .heap()
+        .datum_field(initial_pic, &field("icon")?)
+        .map_err(|error| error.to_string())?;
+    if initial_icon != &Value::file("icons/turf/floors/carpet_neon_simple.dmi") {
+        return Err(format!(
+            "typed mutable-appearance copy lost the decal icon before smoothing: {initial_icon}"
+        ));
+    }
+
+    state
+        .heap_mut()
+        .set_datum_field(
+            neon_carpet,
+            field("smoothing_junction")?,
+            Value::number(3.0),
+        )
+        .map_err(|error| error.to_string())?;
+    invoke_with_args(
+        executable,
+        procedures,
+        DECAL_SMOOTH_REACT,
+        initial_decal,
+        &[Value::Datum(neon_carpet)],
+        state,
+    )?;
+
+    let replacement = state
+        .heap()
+        .datums()
+        .find_map(|(id, datum)| {
+            (datum.type_path() == &decal_type
+                && datum
+                    .field(&field("smoothing").ok()?)
+                    .ok()
+                    .and_then(Value::as_number)
+                    == Some(3.0))
+            .then_some(id)
+        })
+        .ok_or("smooth_react did not attach the replacement bespoke decal")?;
+    let replacement_pic = match state
+        .heap()
+        .datum_field(replacement, &field("pic")?)
+        .map_err(|error| error.to_string())?
+    {
+        Value::Datum(pic) => *pic,
+        value => {
+            return Err(format!(
+                "replacement decal pic is not an appearance: {value}"
+            ));
+        }
+    };
+    let replacement_icon = state
+        .heap()
+        .datum_field(replacement_pic, &field("icon")?)
+        .map_err(|error| error.to_string())?;
+    if replacement_icon != &Value::file("icons/turf/floors/carpet_neon_simple.dmi") {
+        return Err(format!(
+            "smooth_react replacement lost the copied icon: {replacement_icon}"
+        ));
+    }
+    eprintln!(
+        "early-assets-smoke: real neon decal smooth_react passed initial={initial_decal:?} replacement={replacement:?}"
+    );
+    Ok(())
 }
 
 fn dcs_cached_element(

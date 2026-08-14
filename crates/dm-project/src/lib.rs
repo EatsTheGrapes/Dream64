@@ -30,6 +30,29 @@ pub struct Project {
 }
 
 impl Project {
+    /// Encodes the complete preprocessed project into the portable payload
+    /// used by Dream64 compiled executable artifacts.
+    ///
+    /// The payload contains source/resource bytes and preprocessor mappings,
+    /// but no filesystem timestamps or process-local state.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn encode_compiled_artifact(&self) -> Vec<u8> {
+        encode_cached_project(self)
+    }
+
+    /// Decodes one complete preprocessed-project artifact payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload is corrupt, truncated, or contains
+    /// internally inconsistent file/include identities.
+    #[doc(hidden)]
+    pub fn decode_compiled_artifact(bytes: &[u8]) -> Result<Self, String> {
+        decode_cached_project(bytes)
+            .ok_or_else(|| "compiled project payload is invalid or truncated".to_owned())
+    }
+
     /// Loads a `.dme` and recursively discovers quoted source includes.
     ///
     /// Quoted includes are searched relative to the including file first and
@@ -44,6 +67,38 @@ impl Project {
     /// directory.
     pub fn load(root_file: impl AsRef<Path>) -> Result<Self, ProjectError> {
         Loader::new(root_file.as_ref())?.load()
+    }
+
+    /// Returns a deterministic identity for the complete discovered project.
+    ///
+    /// The identity covers the canonical root identity and, in first-discovery
+    /// include order, every normalized relative path, [`FileKind`], and raw
+    /// file byte. File timestamps, permissions, and allocation metadata are
+    /// deliberately excluded. Consequently this is suitable for deciding
+    /// whether a compiled cache artifact belongs to this exact project input.
+    ///
+    /// This checksum is a cache identity, not a cryptographic security or
+    /// authenticity mechanism. Untrusted artifacts still require independent
+    /// validation before use.
+    #[must_use]
+    pub fn content_fingerprint(&self) -> ProjectContentFingerprint {
+        let mut context = md5::Context::new();
+        context.consume(b"DREAM64-PROJECT-CONTENT\0\x01");
+        let root = self
+            .files
+            .first()
+            .map_or(self.root_directory.as_path(), |file| file.path.as_path());
+        fingerprint_bytes(&mut context, normalized_identity_path(root).as_bytes());
+        fingerprint_u64(&mut context, self.files.len() as u64);
+        for file in &self.files {
+            fingerprint_bytes(
+                &mut context,
+                normalized_identity_path(&file.relative_path).as_bytes(),
+            );
+            context.consume([file.kind.identity_tag()]);
+            fingerprint_bytes(&mut context, &file.contents);
+        }
+        ProjectContentFingerprint(context.compute().0)
     }
 
     /// Loads a project through a persistent preprocessing cache.
@@ -93,16 +148,69 @@ impl Project {
             return Ok((project, true));
         }
         let project = Self::load(&canonical_root)?;
-        if let Some(parent) = cache_file.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let encoded = encode_cached_project(&project);
-        if fs::write(cache_file, &encoded).is_ok()
-            && let Some(manifest) = CacheManifest::from_project(&project, encoded.len() as u64)
-        {
-            let _ = fs::write(manifest_file, encode_cache_manifest(&manifest));
-        }
+        write_cached_project_best_effort(&project, cache_file, &manifest_file);
         Ok((project, false))
+    }
+
+    /// Loads a cached project only when its current raw filesystem bytes match
+    /// the cached content exactly.
+    ///
+    /// Unlike [`Self::load_cached`], a metadata-valid candidate is verified by
+    /// rereading every discovered input and recomputing its content identity.
+    /// This is intended for persistent executable caches where a same-size
+    /// edit with a restored timestamp must still invalidate compiled code. It
+    /// performs no lexing, parsing, or object-tree construction on a hit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same project discovery and source errors as [`Self::load`]
+    /// when the exact-byte check requires a fresh load.
+    pub fn load_cached_exact(
+        root_file: impl AsRef<Path>,
+        cache_file: impl AsRef<Path>,
+    ) -> Result<(Self, bool), ProjectError> {
+        let root_file = root_file.as_ref();
+        let cache_file = cache_file.as_ref();
+        let (project, metadata_hit) = Self::load_cached(root_file, cache_file)?;
+        if metadata_hit
+            && project
+                .current_filesystem_content_fingerprint()
+                .is_ok_and(|current| current == project.content_fingerprint())
+        {
+            return Ok((project, true));
+        }
+        if !metadata_hit {
+            return Ok((project, false));
+        }
+
+        let canonical_root = fs::canonicalize(root_file).map_err(|source| ProjectError::Io {
+            path: root_file.to_path_buf(),
+            source,
+        })?;
+        let project = Self::load(&canonical_root)?;
+        let manifest_file = cache_manifest_path(cache_file);
+        write_cached_project_best_effort(&project, cache_file, &manifest_file);
+        Ok((project, false))
+    }
+
+    fn current_filesystem_content_fingerprint(&self) -> io::Result<ProjectContentFingerprint> {
+        let mut context = md5::Context::new();
+        context.consume(b"DREAM64-PROJECT-CONTENT\0\x01");
+        let root = self
+            .files
+            .first()
+            .map_or(self.root_directory.as_path(), |file| file.path.as_path());
+        fingerprint_bytes(&mut context, normalized_identity_path(root).as_bytes());
+        fingerprint_u64(&mut context, self.files.len() as u64);
+        for file in &self.files {
+            fingerprint_bytes(
+                &mut context,
+                normalized_identity_path(&file.relative_path).as_bytes(),
+            );
+            context.consume([file.kind.identity_tag()]);
+            fingerprint_bytes(&mut context, &fs::read(&file.path)?);
+        }
+        Ok(ProjectContentFingerprint(context.compute().0))
     }
 
     /// Retrieves a file by its stable project-local identity.
@@ -193,6 +301,60 @@ impl Project {
     }
 }
 
+/// Compact deterministic identity of all compiler-visible project inputs.
+///
+/// The 128-bit checksum is intentionally an efficient cache key, not a
+/// security primitive. See [`Project::content_fingerprint`].
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct ProjectContentFingerprint([u8; 16]);
+
+impl ProjectContentFingerprint {
+    /// Returns the compact checksum bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    /// Returns the lowercase hexadecimal cache-key spelling.
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        format!("{self}")
+    }
+}
+
+impl fmt::Debug for ProjectContentFingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for ProjectContentFingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+fn fingerprint_u64(context: &mut md5::Context, value: u64) {
+    context.consume(value.to_le_bytes());
+}
+
+fn fingerprint_bytes(context: &mut md5::Context, bytes: &[u8]) {
+    fingerprint_u64(context, bytes.len() as u64);
+    context.consume(bytes);
+}
+
+fn normalized_identity_path(path: &Path) -> String {
+    let portable = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        portable.to_lowercase()
+    } else {
+        portable
+    }
+}
+
 const PROJECT_CACHE_MAGIC: &[u8] = b"DREAM64-PROJECT-CACHE\0\x01";
 const PROJECT_CACHE_MANIFEST_MAGIC: &[u8] = b"DREAM64-PROJECT-MANIFEST\0\x01";
 
@@ -241,6 +403,18 @@ fn cache_manifest_path(cache_file: &Path) -> PathBuf {
     let mut name = cache_file.file_name().unwrap_or_default().to_os_string();
     name.push(".manifest");
     cache_file.with_file_name(name)
+}
+
+fn write_cached_project_best_effort(project: &Project, cache_file: &Path, manifest_file: &Path) {
+    if let Some(parent) = cache_file.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let encoded = encode_cached_project(project);
+    if fs::write(cache_file, &encoded).is_ok()
+        && let Some(manifest) = CacheManifest::from_project(project, encoded.len() as u64)
+    {
+        let _ = fs::write(manifest_file, encode_cache_manifest(&manifest));
+    }
 }
 
 fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
@@ -704,6 +878,16 @@ pub enum FileKind {
 }
 
 impl FileKind {
+    const fn identity_tag(self) -> u8 {
+        match self {
+            Self::Environment => 0,
+            Self::Source => 1,
+            Self::Map => 2,
+            Self::Interface => 3,
+            Self::Resource => 4,
+        }
+    }
+
     fn from_path(path: &Path) -> Self {
         match path
             .extension()
@@ -2990,7 +3174,7 @@ mod tests {
 
     use dm_core::SourceSpan;
 
-    use super::{IncludeTarget, PragmaSeverity, Project, ProjectError};
+    use super::{FileKind, IncludeTarget, PragmaSeverity, Project, ProjectError};
 
     struct ScratchDirectory(PathBuf);
 
@@ -3064,6 +3248,176 @@ mod tests {
                 .unwrap()
                 .contains("value = 2")
         );
+    }
+
+    #[test]
+    fn exact_cache_rejects_same_size_change_with_restored_timestamp() {
+        let scratch = ScratchDirectory::new();
+        let environment = scratch.path().join("world.dme");
+        let included = scratch.path().join("types.dm");
+        let cache = scratch.path().join("cache/project.bin");
+        fs::write(&environment, "#include \"types.dm\"\n").expect("environment should be written");
+        fs::write(&included, "/datum/alpha\n").expect("include should be written");
+
+        let (_, cold_hit) = Project::load_cached_exact(&environment, &cache)
+            .expect("cold exact load should succeed");
+        assert!(!cold_hit);
+        let (warm, warm_hit) = Project::load_cached_exact(&environment, &cache)
+            .expect("warm exact load should succeed");
+        assert!(warm_hit);
+        let original_fingerprint = warm.content_fingerprint();
+        let original_metadata = fs::metadata(&included).expect("include metadata should exist");
+        let original_modified = original_metadata.modified().expect("mtime should exist");
+
+        fs::write(&included, "/datum/bravo\n").expect("same-size include should change");
+        fs::File::options()
+            .write(true)
+            .open(&included)
+            .expect("changed include should open")
+            .set_times(fs::FileTimes::new().set_modified(original_modified))
+            .expect("original timestamp should be restored");
+        let changed_metadata = fs::metadata(&included).expect("changed metadata should exist");
+        assert_eq!(changed_metadata.len(), original_metadata.len());
+        assert_eq!(changed_metadata.modified().unwrap(), original_modified);
+
+        // The ordinary metadata cache accepts this adversarial edit. Restore
+        // that stale candidate, then prove the exact loader catches the bytes.
+        let (_, metadata_hit) =
+            Project::load_cached(&environment, &cache).expect("metadata load should succeed");
+        assert!(metadata_hit);
+        let (changed, exact_hit) =
+            Project::load_cached_exact(&environment, &cache).expect("exact load should rebuild");
+        assert!(!exact_hit);
+        assert_ne!(changed.content_fingerprint(), original_fingerprint);
+        assert!(changed.files[1].text().unwrap().contains("bravo"));
+    }
+
+    #[test]
+    fn compiled_artifact_project_payload_round_trips_without_filesystem_metadata() {
+        let scratch = ScratchDirectory::new();
+        let environment = scratch.path().join("world.dme");
+        let included = scratch.path().join("types.dm");
+        fs::write(
+            &environment,
+            "#define PROJECT_VALUE 7\n#include \"types.dm\"\n",
+        )
+        .expect("environment should be written");
+        fs::write(&included, "/datum/example\n\tvar/value = PROJECT_VALUE\n")
+            .expect("include should be written");
+        let project = Project::load(&environment).expect("project should load");
+
+        let encoded = project.encode_compiled_artifact();
+        assert_eq!(encoded, project.encode_compiled_artifact());
+        let decoded = Project::decode_compiled_artifact(&encoded).expect("payload should decode");
+        assert_eq!(decoded.content_fingerprint(), project.content_fingerprint());
+        assert_eq!(decoded.files.len(), project.files.len());
+        assert_eq!(decoded.includes, project.includes);
+        assert_eq!(decoded.diagnostic_pragmas, project.diagnostic_pragmas);
+        assert_eq!(decoded.object_macro("PROJECT_VALUE"), Some("7"));
+        assert!(
+            decoded
+                .files
+                .iter()
+                .zip(&project.files)
+                .all(|(left, right)| {
+                    left.id == right.id
+                        && left.path == right.path
+                        && left.relative_path == right.relative_path
+                        && left.kind == right.kind
+                        && left.contents == right.contents
+                        && left.compiler_text().ok() == right.compiler_text().ok()
+                })
+        );
+
+        let mut bad_header = encoded.clone();
+        bad_header[0] ^= 0xff;
+        assert!(Project::decode_compiled_artifact(&bad_header).is_err());
+        assert!(Project::decode_compiled_artifact(&encoded[..encoded.len() - 1]).is_err());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(Project::decode_compiled_artifact(&trailing).is_err());
+    }
+
+    #[test]
+    fn content_fingerprint_uses_bytes_not_filesystem_timestamps() {
+        let scratch = ScratchDirectory::new();
+        let environment = scratch.path().join("world.dme");
+        let included = scratch.path().join("types.dm");
+        fs::write(&environment, "#include \"types.dm\"\n").expect("environment should be written");
+        fs::write(&included, "/datum/alpha\n").expect("include should be written");
+
+        let first = Project::load(&environment)
+            .expect("project should load")
+            .content_fingerprint();
+        let changed_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&included)
+            .expect("include should open")
+            .set_times(fs::FileTimes::new().set_modified(changed_time))
+            .expect("mtime should change");
+        let metadata_only = Project::load(&environment)
+            .expect("project should reload")
+            .content_fingerprint();
+        assert_eq!(metadata_only, first);
+
+        fs::write(&included, "/datum/bravo\n").expect("same-length content should change");
+        fs::File::options()
+            .write(true)
+            .open(&included)
+            .expect("include should open")
+            .set_times(fs::FileTimes::new().set_modified(changed_time))
+            .expect("mtime should be restored");
+        let changed_bytes = Project::load(&environment)
+            .expect("changed project should load")
+            .content_fingerprint();
+        assert_ne!(changed_bytes, first);
+    }
+
+    #[test]
+    fn content_fingerprint_covers_root_order_path_kind_and_content_deterministically() {
+        let scratch = ScratchDirectory::new();
+        let environment = scratch.path().join("world.dme");
+        fs::write(
+            &environment,
+            "#include \"first.dm\"\n#include \"second.dm\"\n",
+        )
+        .expect("environment should be written");
+        fs::write(scratch.path().join("first.dm"), "/datum/first\n")
+            .expect("first include should be written");
+        fs::write(scratch.path().join("second.dm"), "/datum/second\n")
+            .expect("second include should be written");
+
+        let baseline = Project::load(&environment).expect("project should load");
+        let expected = baseline.content_fingerprint();
+        assert_eq!(expected.as_bytes().len(), 16);
+        assert_eq!(expected.to_hex().len(), 32);
+        assert_eq!(
+            Project::load(&environment)
+                .expect("deterministic reload should succeed")
+                .content_fingerprint(),
+            expected,
+        );
+
+        let mut reordered = Project::load(&environment).expect("project should load");
+        reordered.files.swap(1, 2);
+        assert_ne!(reordered.content_fingerprint(), expected);
+
+        let mut changed_path = Project::load(&environment).expect("project should load");
+        changed_path.files[1].relative_path = PathBuf::from("renamed.dm");
+        assert_ne!(changed_path.content_fingerprint(), expected);
+
+        let mut changed_kind = Project::load(&environment).expect("project should load");
+        changed_kind.files[1].kind = FileKind::Resource;
+        assert_ne!(changed_kind.content_fingerprint(), expected);
+
+        let mut changed_content = Project::load(&environment).expect("project should load");
+        changed_content.files[1].contents[0] ^= 1;
+        assert_ne!(changed_content.content_fingerprint(), expected);
+
+        let mut changed_root = Project::load(&environment).expect("project should load");
+        changed_root.files[0].path = scratch.path().join("other-world.dme");
+        assert_ne!(changed_root.content_fingerprint(), expected);
     }
 
     #[test]

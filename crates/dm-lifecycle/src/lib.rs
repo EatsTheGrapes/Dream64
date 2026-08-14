@@ -2,7 +2,11 @@
 
 #![cfg_attr(not(test), deny(missing_docs))]
 
+/// Versioned, self-validating storage for compiled Dream64 payloads.
+pub mod artifact;
+
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use dm_compiler::Compilation;
 use dm_core::{FileId, SourceSpan};
@@ -147,9 +151,9 @@ pub enum LifecycleResolution {
     /// No implementation exists in the effective inheritance chain.
     Absent,
     /// An exact effective implementation and source were resolved.
-    Resolved(LifecycleTarget),
+    Resolved(Arc<LifecycleTarget>),
     /// A procedure was present but its target metadata was incomplete.
-    Unsupported(LifecycleTargetIssue),
+    Unsupported(Arc<LifecycleTargetIssue>),
 }
 
 /// All four effective lifecycle entry points for one type.
@@ -304,6 +308,7 @@ impl LifecycleIndex {
             })
             .collect::<Vec<_>>();
         types.sort_by(|left, right| left.path.cmp(&right.path));
+        share_resolved_lifecycle_targets(&mut types);
         let by_node = types
             .iter()
             .enumerate()
@@ -397,6 +402,7 @@ impl LifecycleIndex {
                 targets,
             });
         }
+        share_resolved_lifecycle_targets(&mut types);
         let by_node = types
             .iter()
             .enumerate()
@@ -461,9 +467,9 @@ pub struct GlobalInitialization {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MapPlacementContext {
     /// Map path supplied by the caller.
-    pub map_path: String,
+    pub map_path: Arc<str>,
     /// Cell key that supplied the initializer template.
-    pub key: String,
+    pub key: Arc<str>,
     /// Expanded stable world coordinate.
     pub coordinate: WorldCoordinate,
     /// Source range of the initializer in the map key definition.
@@ -478,7 +484,7 @@ pub struct PlannedAtom {
     /// Index into [`LifecycleIndex::types`].
     pub type_index: usize,
     /// Canonical type path.
-    pub type_path: String,
+    pub type_path: Arc<str>,
     /// World atom category inferred by the map planner.
     pub category: AtomCategory,
     /// Ordered, lossless map variable assignments for this atom placement.
@@ -486,7 +492,7 @@ pub struct PlannedAtom {
     /// The values remain unevaluated until map initialization execution. Each
     /// assignment retains its target and value source spans, along with its raw
     /// source text, through [`MapVariableAssignment`].
-    pub variables: Vec<MapVariableAssignment>,
+    pub variables: Arc<[MapVariableAssignment]>,
     /// Exact map placement source and coordinate context.
     pub placement: MapPlacementContext,
 }
@@ -714,12 +720,50 @@ impl PrecompiledLifecycle {
 
 /// Selects and symbolically links the exact world/map lifecycle roots without
 /// constructing a runtime image or allocating map atoms.
+///
+/// # Errors
+///
+/// Returns a lowering error when a required eager lifecycle body cannot be
+/// represented by the VM.
 pub fn precompile_lifecycle_for_world(
     compilation: &Compilation,
     procedures: &ProcedureRegistry,
     index: &LifecycleIndex,
     world: &WorldPlan,
 ) -> Result<PrecompiledLifecycle, dm_vm::CompileError> {
+    let targets = lifecycle_targets_for_world(index, world);
+    let executable = procedures
+        .compile_vm_all_symbolic_with_eager_roots(compilation, targets.iter().copied())?;
+    Ok(precompiled_lifecycle_from_executable(
+        compilation,
+        procedures,
+        &targets,
+        executable,
+    ))
+}
+
+/// Selects the exact world/map lifecycle roots and closure while reusing an
+/// already linked executable module.
+///
+/// This is the artifact-backed counterpart to
+/// [`precompile_lifecycle_for_world`]. It performs no linking or lowering;
+/// the caller-supplied executable is moved directly into the boot state.
+#[must_use]
+pub fn precompile_lifecycle_for_world_with_executable(
+    compilation: &Compilation,
+    procedures: &ProcedureRegistry,
+    index: &LifecycleIndex,
+    world: &WorldPlan,
+    executable: dm_semantics::ExecutableProcedures,
+) -> PrecompiledLifecycle {
+    let targets = lifecycle_targets_for_world(index, world);
+    precompiled_lifecycle_from_executable(compilation, procedures, &targets, executable)
+}
+
+fn lifecycle_targets_for_world(
+    index: &LifecycleIndex,
+    world: &WorldPlan,
+) -> BTreeSet<ProcedureImplementationId> {
     let mut targets = BTreeSet::new();
     if let Some(world_type) = index.find_path("/world") {
         for kind in [LifecycleKind::Genesis, LifecycleKind::New] {
@@ -756,17 +800,25 @@ pub fn precompile_lifecycle_for_world(
             }
         }
     }
+    targets
+}
+
+fn precompiled_lifecycle_from_executable(
+    compilation: &Compilation,
+    procedures: &ProcedureRegistry,
+    targets: &BTreeSet<ProcedureImplementationId>,
+    executable: dm_semantics::ExecutableProcedures,
+) -> PrecompiledLifecycle {
     let target_count = targets.len();
     let (reachable, closure) =
         procedures.implementation_closure_with_stats(compilation, targets.iter().copied());
-    let executable = procedures.compile_vm_all_symbolic_with_eager_roots(compilation, targets)?;
-    Ok(PrecompiledLifecycle {
+    PrecompiledLifecycle {
         executable,
         persistent_state: None,
         targets: target_count,
         reachable_bodies: reachable.len(),
         closure,
-    })
+    }
 }
 
 impl Default for SchedulerDrainLimits {
@@ -802,6 +854,12 @@ pub struct SchedulerDrain {
     pub rounds: usize,
     /// Number of tasks which ran to completion.
     pub completed_tasks: usize,
+    /// Number of persistent scheduled threads terminated by an isolated
+    /// runtime error during this drain.
+    ///
+    /// Startup drains remain fail-fast and therefore never report failures in
+    /// this field.
+    pub failed_tasks: usize,
     /// Tasks still pending when draining stopped.
     pub pending_tasks: usize,
     /// Why draining stopped.
@@ -1458,7 +1516,7 @@ fn execute_initialization_plan_with_executable(
                     .and_then(|datum| *datum)
                     .ok_or_else(|| InitializationExecutionError::MissingMapDatum {
                         atom_index,
-                        path: plan.map_atoms[atom_index].type_path.clone(),
+                        path: plan.map_atoms[atom_index].type_path.to_string(),
                     })?,
                 EventSubject::Globals => continue,
             };
@@ -1663,38 +1721,86 @@ pub fn advance_persistent_scheduler(
         .persistent_state
         .take()
         .expect("persistent scheduler requires completed precompiled lifecycle execution");
+    let result = drain_persistent_scheduler(precompiled.executable.module(), &mut state, limits);
+    precompiled.persistent_state = Some(state);
+    Ok(result)
+}
+
+fn drain_persistent_scheduler(
+    module: &dm_vm::Module,
+    state: &mut dm_vm::ExecutionState,
+    limits: SchedulerDrainLimits,
+) -> SchedulerDrain {
     let start_tick = state.scheduler_tick();
-    let mut result =
-        drain_startup_scheduler(precompiled.executable.module(), &mut state, limits, None);
-    if let Ok(drain) = &mut result
-        && drain.termination == SchedulerDrainTermination::TickLimit
-    {
-        let boundary = start_tick.saturating_add(limits.max_ticks);
-        let advance = boundary.saturating_sub(state.scheduler_tick());
-        match advance_scheduler(
-            precompiled.executable.module(),
-            advance,
-            ExecutionLimits::default(),
-            &mut state,
-        )
-        .map_err(InitializationExecutionError::Scheduler)
-        {
+    let tick_limit = start_tick.saturating_add(limits.max_ticks);
+    let mut drain = SchedulerDrain {
+        final_tick: start_tick,
+        ..SchedulerDrain::default()
+    };
+
+    while state.scheduled_task_count() != 0 {
+        if drain.rounds >= limits.max_rounds {
+            drain.termination = SchedulerDrainTermination::RoundLimit;
+            break;
+        }
+        let next_tick = state
+            .next_scheduled_tick()
+            .expect("a non-empty scheduler has an earliest task");
+        if next_tick > tick_limit {
+            drain.termination = SchedulerDrainTermination::TickLimit;
+            break;
+        }
+        let advance = next_tick.saturating_sub(state.scheduler_tick());
+        drain.rounds = drain.rounds.saturating_add(1);
+        match advance_scheduler(module, advance, ExecutionLimits::default(), state) {
             Ok(completed) => {
-                drain.rounds = drain.rounds.saturating_add(1);
                 drain.completed_tasks = drain.completed_tasks.saturating_add(completed.len());
                 drop(completed);
                 state.release_host_value_roots();
-                drain.final_tick = state.scheduler_tick();
-                drain.pending_tasks = state.scheduled_task_count();
-                if drain.pending_tasks == 0 {
-                    drain.termination = SchedulerDrainTermination::StableIdle;
-                }
             }
-            Err(error) => result = Err(error),
+            Err(error) => {
+                // `advance_scheduler` drops only the failing continuation and
+                // restores every later due task to scheduler state. Match the
+                // server scheduler's thread isolation here: report the full
+                // source-mapped failure, then keep draining the other work.
+                drain.failed_tasks = drain.failed_tasks.saturating_add(1);
+                state.release_host_value_roots();
+                eprintln!(
+                    "server-runtime: isolated scheduled thread failure (continuing): {error}"
+                );
+            }
         }
+        drain.final_tick = state.scheduler_tick();
     }
-    precompiled.persistent_state = Some(state);
-    result
+
+    // A persistent server owns a clock even when no DM continuation is
+    // pending. Advance an otherwise idle/between-task slice to its bounded
+    // tick boundary. RoundLimit is the exception: same-tick work must retain
+    // its tick and source order for the next host slice.
+    if drain.termination != SchedulerDrainTermination::RoundLimit
+        && state.scheduler_tick() < tick_limit
+    {
+        drain.rounds = drain.rounds.saturating_add(1);
+        let completed = advance_scheduler(
+            module,
+            tick_limit.saturating_sub(state.scheduler_tick()),
+            ExecutionLimits::default(),
+            state,
+        )
+        .expect("no scheduled task is due before the validated persistent tick boundary");
+        drain.completed_tasks = drain.completed_tasks.saturating_add(completed.len());
+        drop(completed);
+        state.release_host_value_roots();
+        drain.final_tick = state.scheduler_tick();
+    }
+
+    drain.pending_tasks = state.scheduled_task_count();
+    if drain.pending_tasks == 0 {
+        drain.termination = SchedulerDrainTermination::StableIdle;
+    } else if drain.termination != SchedulerDrainTermination::RoundLimit {
+        drain.termination = SchedulerDrainTermination::TickLimit;
+    }
+    drain
 }
 
 fn readiness_probe_matches(state: &dm_vm::ExecutionState, probe: &HeadlessReadinessProbe) -> bool {
@@ -1851,7 +1957,7 @@ fn apply_dynamic_map_overrides(
         let Some(datum) = bindings.get(atom_index).and_then(|datum| *datum) else {
             continue;
         };
-        for assignment in &atom.variables {
+        for assignment in atom.variables.iter() {
             if !is_dynamic_map_assignment(allocation, atom, assignment) {
                 continue;
             }
@@ -1893,7 +1999,7 @@ fn is_dynamic_map_assignment(
     allocation.work_items().iter().any(|item| {
         matches!(item.kind, WorldAllocationWorkKind::DynamicOverride(_))
             && item.coordinate == atom.placement.coordinate
-            && item.initializer_path.as_deref() == Some(atom.type_path.as_str())
+            && item.initializer_path.as_deref() == Some(atom.type_path.as_ref())
             && item.field.as_deref() == Some(assignment.name.as_str())
             && item.raw_value.as_deref() == Some(assignment.value.raw.as_str())
     })
@@ -1952,7 +2058,7 @@ fn map_datum_bindings(
                 runtime
                     .heap()
                     .datum(datum)
-                    .is_ok_and(|record| record.type_path().as_str() == atom.type_path)
+                    .is_ok_and(|record| record.type_path().as_str() == atom.type_path.as_ref())
             });
             if matches_type {
                 *position += 1;
@@ -1998,12 +2104,52 @@ fn initialization_diagnostics(
     diagnostics
 }
 
+struct SharedMapInitializer {
+    type_path: Arc<str>,
+    variables: Arc<[MapVariableAssignment]>,
+}
+
+struct SharedMapTemplate {
+    key: Arc<str>,
+    initializers: Vec<SharedMapInitializer>,
+}
+
 fn plan_map_atoms(
     index: &LifecycleIndex,
     world: &WorldPlan,
     map_path: &str,
     diagnostics: &mut Vec<LifecycleDiagnostic>,
 ) -> Vec<PlannedAtom> {
+    let shared_map_path = Arc::<str>::from(map_path);
+    let mut shared_type_paths = BTreeMap::<&str, Arc<str>>::new();
+    let shared_templates = world
+        .templates()
+        .iter()
+        .map(|(key, template)| {
+            let initializers = template
+                .initializers
+                .iter()
+                .map(|initializer| {
+                    let type_path = Arc::clone(
+                        shared_type_paths
+                            .entry(initializer.path.as_str())
+                            .or_insert_with(|| Arc::from(initializer.path.as_str())),
+                    );
+                    SharedMapInitializer {
+                        type_path,
+                        variables: Arc::from(initializer.variables.clone()),
+                    }
+                })
+                .collect();
+            (
+                key.as_str(),
+                SharedMapTemplate {
+                    key: Arc::from(key.as_str()),
+                    initializers,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut map_atoms = Vec::new();
     for cell in world.cells() {
         let Some(template) = world.template(&cell.key) else {
@@ -2017,7 +2163,10 @@ fn plan_map_atoms(
             });
             continue;
         };
-        for initializer in &template.initializers {
+        let shared_template = shared_templates
+            .get(cell.key.as_str())
+            .expect("retained world templates have shared lifecycle metadata");
+        for (initializer_index, initializer) in template.initializers.iter().enumerate() {
             let (node, category) = match initializer.resolution {
                 InitializerResolution::Resolved { node, category } => (node, category),
                 InitializerResolution::Unknown | InitializerResolution::NonType { .. } => {
@@ -2049,14 +2198,15 @@ fn plan_map_atoms(
                 });
                 continue;
             };
+            let shared_initializer = &shared_template.initializers[initializer_index];
             map_atoms.push(PlannedAtom {
                 type_index,
-                type_path: initializer.path.clone(),
+                type_path: Arc::clone(&shared_initializer.type_path),
                 category,
-                variables: initializer.variables.clone(),
+                variables: Arc::clone(&shared_initializer.variables),
                 placement: MapPlacementContext {
-                    map_path: map_path.to_owned(),
-                    key: cell.key.clone(),
+                    map_path: Arc::clone(&shared_map_path),
+                    key: Arc::clone(&shared_template.key),
                     coordinate: cell.coordinate,
                     initializer_span: initializer.span,
                     block_span: cell.block_span,
@@ -2099,11 +2249,11 @@ fn resolve_target(
     let mut visited = BTreeSet::new();
     while let Some(node) = current {
         if !visited.insert(node) {
-            return LifecycleResolution::Unsupported(LifecycleTargetIssue {
+            return LifecycleResolution::Unsupported(Arc::new(LifecycleTargetIssue {
                 kind: LifecycleTargetIssueKind::MissingEffectiveTarget,
                 message: "type inheritance cycle prevents lifecycle resolution".to_owned(),
                 procedure_path: None,
-            });
+            }));
         }
         if let Some(procedure) = direct.get(&(node, kind)) {
             return resolved_procedure(compilation, registry, type_node, procedure);
@@ -2121,43 +2271,43 @@ fn resolved_procedure(
 ) -> LifecycleResolution {
     let procedure_path = procedure.path.to_string();
     let Some(target_id) = procedure.effective_target else {
-        return LifecycleResolution::Unsupported(LifecycleTargetIssue {
+        return LifecycleResolution::Unsupported(Arc::new(LifecycleTargetIssue {
             kind: LifecycleTargetIssueKind::MissingEffectiveTarget,
             message: format!("{procedure_path} has no effective implementation"),
             procedure_path: Some(procedure_path),
-        });
+        }));
     };
     let Some(target) = registry.implementation(target_id) else {
-        return LifecycleResolution::Unsupported(LifecycleTargetIssue {
+        return LifecycleResolution::Unsupported(Arc::new(LifecycleTargetIssue {
             kind: LifecycleTargetIssueKind::MissingImplementation,
             message: format!("effective implementation for {procedure_path} is absent"),
             procedure_path: Some(procedure_path),
-        });
+        }));
     };
     if compilation
         .syntax(target.file_id)
         .and_then(|syntax| syntax.definitions.get(target.definition_index))
         .is_none()
     {
-        return LifecycleResolution::Unsupported(LifecycleTargetIssue {
+        return LifecycleResolution::Unsupported(Arc::new(LifecycleTargetIssue {
             kind: LifecycleTargetIssueKind::MissingSourceDefinition,
             message: format!("source definition for {procedure_path} is absent"),
             procedure_path: Some(procedure_path),
-        });
+        }));
     }
     let Some(file) = compilation.project().file(target.file_id) else {
-        return LifecycleResolution::Unsupported(LifecycleTargetIssue {
+        return LifecycleResolution::Unsupported(Arc::new(LifecycleTargetIssue {
             kind: LifecycleTargetIssueKind::MissingSourceDefinition,
             message: format!("source file for {procedure_path} is absent"),
             procedure_path: Some(procedure_path),
-        });
+        }));
     };
     let declaring_node = procedure.owner_type.unwrap_or(requested_type);
     let declaring_type = compilation
         .code_tree()
         .node(declaring_node)
         .map_or_else(|| "<unknown>".to_owned(), |node| node.path.to_string());
-    LifecycleResolution::Resolved(LifecycleTarget {
+    LifecycleResolution::Resolved(Arc::new(LifecycleTarget {
         procedure: procedure.id,
         implementation: target.id,
         procedure_path,
@@ -2171,7 +2321,30 @@ fn resolved_procedure(
                 .unwrap_or(target.span),
             ordinal: target.ordinal,
         },
-    })
+    }))
+}
+
+fn share_resolved_lifecycle_targets(types: &mut [TypeLifecycle]) {
+    let mut shared = BTreeMap::<(ProcedureImplementationId, bool), Arc<LifecycleTarget>>::new();
+    for lifecycle in types {
+        for resolution in [
+            &mut lifecycle.targets.genesis,
+            &mut lifecycle.targets.new_target,
+            &mut lifecycle.targets.initialize,
+            &mut lifecycle.targets.late_initialize,
+            &mut lifecycle.targets.destroy,
+        ] {
+            let LifecycleResolution::Resolved(target) = resolution else {
+                continue;
+            };
+            let key = (target.implementation, target.inherited);
+            if let Some(existing) = shared.get(&key) {
+                *target = Arc::clone(existing);
+            } else {
+                shared.insert(key, Arc::clone(target));
+            }
+        }
+    }
 }
 
 fn collect_target_diagnostics(
@@ -2273,6 +2446,7 @@ fn has_target(index: &LifecycleIndex, type_index: usize, kind: LifecycleKind) ->
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use dm_compiler::{Compilation, CompilerDatabase};
@@ -2331,18 +2505,29 @@ mod tests {
 
     #[test]
     fn resolves_inherited_and_overridden_effective_targets() {
+        assert!(
+            std::mem::size_of::<LifecycleResolution>() <= 2 * std::mem::size_of::<usize>(),
+            "every type retains five lifecycle resolution slots, so payloads must remain indirect"
+        );
         let (_fixture, _compilation, _runtime, index) = index(
-            "/datum/base\n\tproc/New()\n\tproc/Initialize()\n\tproc/Destroy()\n/datum/base/child\n\tInitialize()\n\tproc/LateInitialize()\n",
+            "/datum/base\n\tproc/New()\n\tproc/Initialize()\n\tproc/Destroy()\n/datum/base/child\n\tInitialize()\n\tproc/LateInitialize()\n/datum/base/sibling\n",
         );
         let child = index
             .find_path("/datum/base/child")
             .expect("child lifecycle should exist");
+        let sibling = index
+            .find_path("/datum/base/sibling")
+            .expect("sibling lifecycle should exist");
 
         let LifecycleResolution::Resolved(new_target) = &child.targets.new_target else {
             panic!("New should resolve");
         };
         assert!(new_target.inherited);
         assert_eq!(new_target.declaring_type, "/datum/base");
+        let LifecycleResolution::Resolved(sibling_new) = &sibling.targets.new_target else {
+            panic!("sibling New should resolve");
+        };
+        assert!(Arc::ptr_eq(new_target, sibling_new));
         let LifecycleResolution::Resolved(initialize) = &child.targets.initialize else {
             panic!("Initialize should resolve");
         };
@@ -2496,7 +2681,7 @@ mod tests {
             plan.map_atoms[0].placement.coordinate,
             WorldCoordinate { x: 5, y: 7, z: 2 }
         );
-        assert_eq!(plan.map_atoms[0].placement.map_path, "test.dmm");
+        assert_eq!(plan.map_atoms[0].placement.map_path.as_ref(), "test.dmm");
         assert_eq!(plan.map_atoms[0].variables.len(), 2);
         assert_eq!(plan.map_atoms[0].variables[0].name, "name");
         assert_eq!(plan.map_atoms[0].variables[0].value.raw, "\"crate\"");
@@ -2529,6 +2714,52 @@ mod tests {
             3
         );
         assert!(plan.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn repeated_map_template_rows_share_immutable_planning_metadata() {
+        let source = concat!(
+            "/world/New()\n",
+            "/area/test\n",
+            "/turf/test\n",
+            "/obj/test\n\tInitialize()\n",
+        );
+        let (_fixture, compilation, runtime, index) = index(source);
+        let map = parse(concat!(
+            "\"a\" = (/obj/test{name = \"crate\"; dir = 4}, /turf/test, /area/test)\n",
+            "(1,1,1) = {\"\naaa\n\"}\n",
+        ))
+        .expect("map should parse");
+        let world = build_plan(&map, &compilation);
+        let plan = build_initialization_plan(&runtime, &index, &world, "shared-map-path.dmm");
+
+        assert_eq!(plan.map_atoms.len(), 9);
+        let first = &plan.map_atoms[0];
+        let second = &plan.map_atoms[3];
+        let third = &plan.map_atoms[6];
+        assert_ne!(first.placement.coordinate, second.placement.coordinate);
+        assert_ne!(second.placement.coordinate, third.placement.coordinate);
+        assert!(Arc::ptr_eq(
+            &first.placement.map_path,
+            &second.placement.map_path,
+        ));
+        assert!(Arc::ptr_eq(
+            &second.placement.map_path,
+            &third.placement.map_path,
+        ));
+        assert!(Arc::ptr_eq(&first.placement.key, &second.placement.key));
+        assert!(Arc::ptr_eq(&second.placement.key, &third.placement.key));
+        assert!(Arc::ptr_eq(&first.type_path, &second.type_path));
+        assert!(Arc::ptr_eq(&second.type_path, &third.type_path));
+        assert!(Arc::ptr_eq(&first.variables, &second.variables));
+        assert!(Arc::ptr_eq(&second.variables, &third.variables));
+        assert_eq!(first.variables.len(), 2);
+        assert_eq!(first.variables[0].span, second.variables[0].span);
+        assert_eq!(
+            second.variables[1].value.span,
+            third.variables[1].value.span
+        );
+        assert_eq!(first, &plan.clone().map_atoms[0]);
     }
 
     #[test]
@@ -3053,6 +3284,327 @@ mod tests {
         assert_eq!(
             final_slice.termination,
             SchedulerDrainTermination::StableIdle
+        );
+    }
+
+    #[test]
+    fn persistent_idle_slices_keep_the_server_clock_advancing() {
+        let source = concat!(
+            "var/global/ready = 0\n",
+            "/world/New()\n\tglobal.ready = 1\n",
+            "/area/test\n/turf/test\n",
+        );
+        let (_fixture, compilation) = Fixture::compile(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .unwrap();
+        let world = build_plan(&map, &compilation);
+        let compile_index = LifecycleIndex::build_compile_only(&compilation, &procedures);
+        let mut precompiled =
+            precompile_lifecycle_for_world(&compilation, &procedures, &compile_index, &world)
+                .unwrap();
+        let mut runtime = RuntimeImage::from_compilation(&compilation).unwrap();
+        let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
+        let plan = build_initialization_plan(&runtime, &index, &world, "test.dmm");
+        let allocation = allocate_world(&world, &mut runtime).unwrap();
+        let readiness = HeadlessReadinessProbe {
+            qualified_storage: None,
+            global: FieldName::parse("ready").unwrap(),
+            fields: vec![],
+            expected: Value::number(1.0),
+        };
+        let execution = execute_initialization_plan_with_precompiled(
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+            SchedulerDrainLimits::default(),
+            Some(&readiness),
+            &mut precompiled,
+        )
+        .unwrap();
+        assert_eq!(
+            execution.scheduler.termination,
+            SchedulerDrainTermination::HeadlessReady
+        );
+        assert_eq!(execution.scheduler.pending_tasks, 0);
+
+        let first = advance_persistent_scheduler(
+            &mut precompiled,
+            &mut runtime,
+            SchedulerDrainLimits {
+                max_ticks: 1,
+                max_rounds: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(first.termination, SchedulerDrainTermination::StableIdle);
+        assert_eq!(first.final_tick, 1);
+        assert_eq!(first.pending_tasks, 0);
+
+        let second = advance_persistent_scheduler(
+            &mut precompiled,
+            &mut runtime,
+            SchedulerDrainLimits {
+                max_ticks: 3,
+                max_rounds: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(second.termination, SchedulerDrainTermination::StableIdle);
+        assert_eq!(second.final_tick, 4);
+        let state = precompiled.persistent_state.as_ref().unwrap();
+        let Value::Datum(world) = state.global(&FieldName::parse("world").unwrap()).unwrap() else {
+            panic!("persistent state should retain the world singleton");
+        };
+        assert_eq!(
+            state
+                .heap()
+                .datum_field(*world, &FieldName::parse("time").unwrap()),
+            Ok(&Value::number(4.0)),
+        );
+    }
+
+    #[test]
+    fn infinite_native_walk_does_not_block_readiness_or_persistent_idle_slices() {
+        let source = concat!(
+            "var/global/ready = 0\n",
+            "var/global/walker\n",
+            "/world/New()\n",
+            "\tglobal.walker = new /obj/walker\n",
+            "\twalk(global.walker, EAST, 1)\n",
+            "\tglobal.ready = 1\n",
+            "/obj/walker\n",
+            "/area/test\n/turf/test\n",
+        );
+        let (_fixture, compilation) = Fixture::compile(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .unwrap();
+        let world = build_plan(&map, &compilation);
+        let compile_index = LifecycleIndex::build_compile_only(&compilation, &procedures);
+        let mut precompiled =
+            precompile_lifecycle_for_world(&compilation, &procedures, &compile_index, &world)
+                .unwrap();
+        let mut runtime = RuntimeImage::from_compilation(&compilation).unwrap();
+        let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
+        let plan = build_initialization_plan(&runtime, &index, &world, "test.dmm");
+        let allocation = allocate_world(&world, &mut runtime).unwrap();
+        let readiness = HeadlessReadinessProbe {
+            qualified_storage: None,
+            global: FieldName::parse("ready").unwrap(),
+            fields: vec![],
+            expected: Value::number(1.0),
+        };
+        let execution = execute_initialization_plan_with_precompiled(
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+            SchedulerDrainLimits::default(),
+            Some(&readiness),
+            &mut precompiled,
+        )
+        .expect("a perpetual engine walk must not prevent startup readiness");
+        assert_eq!(
+            execution.scheduler.termination,
+            SchedulerDrainTermination::HeadlessReady,
+        );
+        assert_eq!(execution.scheduler.pending_tasks, 0);
+        assert_eq!(
+            precompiled
+                .persistent_state
+                .as_ref()
+                .unwrap()
+                .next_scheduled_tick(),
+            Some(1),
+        );
+
+        for expected_tick in 1..=3 {
+            let slice = advance_persistent_scheduler(
+                &mut precompiled,
+                &mut runtime,
+                SchedulerDrainLimits {
+                    max_ticks: 1,
+                    max_rounds: 10,
+                },
+            )
+            .expect("persistent walk ticks should remain bounded and non-blocking");
+            assert_eq!(slice.termination, SchedulerDrainTermination::StableIdle);
+            assert_eq!(slice.pending_tasks, 0);
+            assert_eq!(slice.final_tick, expected_tick);
+            assert_eq!(
+                precompiled
+                    .persistent_state
+                    .as_ref()
+                    .unwrap()
+                    .next_scheduled_tick(),
+                Some(expected_tick + 1),
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_scheduler_isolates_a_failed_thread_and_runs_later_due_work() {
+        let source = concat!(
+            "var/global/ready = 0\n",
+            "var/global/trace = \"\"\n",
+            "/proc/fail_later()\n\tCRASH(\"isolated\")\n",
+            "/proc/finish_later()\n\tglobal.trace += \"L\"\n",
+            "/world/New()\n",
+            "\tglobal.ready = 1\n",
+            "\tspawn(1) fail_later()\n",
+            "\tspawn(1) finish_later()\n",
+            "/area/test\n/turf/test\n",
+        );
+        let (_fixture, compilation) = Fixture::compile(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .unwrap();
+        let world = build_plan(&map, &compilation);
+        let compile_index = LifecycleIndex::build_compile_only(&compilation, &procedures);
+        let mut precompiled =
+            precompile_lifecycle_for_world(&compilation, &procedures, &compile_index, &world)
+                .unwrap();
+        let mut runtime = RuntimeImage::from_compilation(&compilation).unwrap();
+        let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
+        let plan = build_initialization_plan(&runtime, &index, &world, "test.dmm");
+        let allocation = allocate_world(&world, &mut runtime).unwrap();
+        let readiness = HeadlessReadinessProbe {
+            qualified_storage: None,
+            global: FieldName::parse("ready").unwrap(),
+            fields: vec![],
+            expected: Value::number(1.0),
+        };
+        let execution = execute_initialization_plan_with_precompiled(
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+            SchedulerDrainLimits::default(),
+            Some(&readiness),
+            &mut precompiled,
+        )
+        .unwrap();
+        assert_eq!(
+            execution.scheduler.termination,
+            SchedulerDrainTermination::HeadlessReady
+        );
+        assert_eq!(execution.scheduler.pending_tasks, 2);
+
+        let slice = advance_persistent_scheduler(
+            &mut precompiled,
+            &mut runtime,
+            SchedulerDrainLimits {
+                max_ticks: 1,
+                max_rounds: 10,
+            },
+        )
+        .expect("one failed scheduled thread must not stop the server");
+        assert_eq!(slice.failed_tasks, 1);
+        assert_eq!(slice.completed_tasks, 1);
+        assert_eq!(slice.pending_tasks, 0);
+        assert_eq!(slice.final_tick, 1);
+        assert_eq!(slice.termination, SchedulerDrainTermination::StableIdle);
+        assert_eq!(
+            precompiled
+                .persistent_state
+                .as_ref()
+                .and_then(|state| state.global(&FieldName::parse("trace").unwrap())),
+            Some(&Value::text("L")),
+        );
+    }
+
+    #[test]
+    fn persistent_round_limit_preserves_same_tick_work_for_the_next_slice() {
+        let source = concat!(
+            "var/global/ready = 0\n",
+            "var/global/runs = 0\n",
+            "/proc/run_again()\n",
+            "\tglobal.runs += 1\n",
+            "\tif(global.runs < 3)\n",
+            "\t\tspawn(0) run_again()\n",
+            "/world/New()\n",
+            "\tglobal.ready = 1\n",
+            "\tspawn(0) run_again()\n",
+            "/area/test\n/turf/test\n",
+        );
+        let (_fixture, compilation) = Fixture::compile(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .unwrap();
+        let world = build_plan(&map, &compilation);
+        let compile_index = LifecycleIndex::build_compile_only(&compilation, &procedures);
+        let mut precompiled =
+            precompile_lifecycle_for_world(&compilation, &procedures, &compile_index, &world)
+                .unwrap();
+        let mut runtime = RuntimeImage::from_compilation(&compilation).unwrap();
+        let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
+        let plan = build_initialization_plan(&runtime, &index, &world, "test.dmm");
+        let allocation = allocate_world(&world, &mut runtime).unwrap();
+        let readiness = HeadlessReadinessProbe {
+            qualified_storage: None,
+            global: FieldName::parse("ready").unwrap(),
+            fields: vec![],
+            expected: Value::number(1.0),
+        };
+        execute_initialization_plan_with_precompiled(
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+            SchedulerDrainLimits::default(),
+            Some(&readiness),
+            &mut precompiled,
+        )
+        .unwrap();
+
+        let bounded = advance_persistent_scheduler(
+            &mut precompiled,
+            &mut runtime,
+            SchedulerDrainLimits {
+                max_ticks: 1,
+                max_rounds: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(bounded.termination, SchedulerDrainTermination::RoundLimit);
+        assert_eq!(bounded.final_tick, 0);
+        assert_eq!(bounded.rounds, 2);
+        assert_eq!(bounded.completed_tasks, 2);
+        assert_eq!(bounded.pending_tasks, 1);
+
+        let resumed = advance_persistent_scheduler(
+            &mut precompiled,
+            &mut runtime,
+            SchedulerDrainLimits {
+                max_ticks: 1,
+                max_rounds: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(resumed.termination, SchedulerDrainTermination::StableIdle);
+        assert_eq!(resumed.final_tick, 1);
+        assert_eq!(resumed.completed_tasks, 1);
+        assert_eq!(resumed.pending_tasks, 0);
+        assert_eq!(
+            precompiled
+                .persistent_state
+                .as_ref()
+                .and_then(|state| state.global(&FieldName::parse("runs").unwrap())),
+            Some(&Value::number(3.0)),
         );
     }
 

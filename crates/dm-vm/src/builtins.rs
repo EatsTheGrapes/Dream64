@@ -26,7 +26,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dm_value::{DatumId, FieldName, ListId, TypePath, Value};
 
-use super::{CompoundAssignmentOperator, ExecutionState, compare_values};
+use super::{
+    CompoundAssignmentOperator, ExecutionState, NativeWalk, NativeWalkKind, compare_values,
+};
 
 pub(super) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
     Some(match name {
@@ -56,12 +58,17 @@ pub(super) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
         "image" => (0, 7),
         "qdel" | "typecacheof" | "icon" => (0, 5),
         "view" => (0, 2),
+        "orange" => (1, 2),
         "oview" | "viewers" | "oviewers" | "hearers" | "ohearers" => (0, 2),
         "step" => (2, 3),
         "step_towards" => (2, 2),
         "step_to" | "get_step_to" | "get_step_away" => (2, 3),
         "step_away" => (2, 3),
         "step_rand" | "get_step_rand" => (1, 2),
+        "walk" => (2, 4),
+        "walk_towards" => (2, 4),
+        "walk_to" | "walk_away" => (2, 5),
+        "walk_rand" => (1, 3),
         "bounds_dist" => (2, 2),
         "winshow" => (2, 3),
         "winclone" => (3, 3),
@@ -102,6 +109,8 @@ pub(super) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
         "_dream64_world_get_config" => (1, 2),
         "_dream64_world_set_config" => (3, 3),
         "_dream64_world_open_port" => (2, 2),
+        "_dream64_generator_rand" => (1, 1),
+        "_dream64_icon_swap_color" => (3, 3),
         _ => return None,
     })
 }
@@ -254,6 +263,7 @@ pub(super) fn execute_standard_builtin_with_usr(
             resource_datum_builtin("/generator", &["type", "a", "b", "rand"], arguments, state)
         }
         "time2text" => time2text_builtin(arguments, state),
+        "orange" => orange_builtin(arguments, state, usr),
         "view" => spatial_query(arguments, state, usr, false, false),
         "oview" => spatial_query(arguments, state, usr, false, true),
         "viewers" | "hearers" => spatial_query(arguments, state, usr, true, false),
@@ -266,6 +276,9 @@ pub(super) fn execute_standard_builtin_with_usr(
         "get_step_away" => get_step_away_builtin(arguments, state),
         "step_rand" => step_rand_builtin(arguments, state),
         "get_step_rand" => get_step_rand_builtin(arguments, state),
+        "walk" | "walk_towards" | "walk_to" | "walk_away" | "walk_rand" => {
+            start_native_walk(name, arguments, state)
+        }
         "bounds_dist" => bounds_dist_builtin(arguments, state),
         "shell" => Ok(Value::Null),
         "file" => match &arguments[0] {
@@ -298,6 +311,8 @@ pub(super) fn execute_standard_builtin_with_usr(
             state,
         ),
         "icon_states" => icon_states_builtin(arguments, state),
+        "_dream64_generator_rand" => generator_rand_builtin(arguments, state),
+        "_dream64_icon_swap_color" => icon_swap_color_builtin(arguments, state),
         _ => Err(format!("unknown native DM builtin {name:?}")),
     }
 }
@@ -1099,7 +1114,7 @@ fn read_dmi_metadata(path: &std::path::Path) -> Result<DmiMetadata, String> {
 }
 
 fn icon_states_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
-    let resource = match arguments.first().cloned().unwrap_or(Value::Null) {
+    let mut resource = match arguments.first().cloned().unwrap_or(Value::Null) {
         Value::Datum(datum) => super::datum_field_or_initial(
             state,
             datum,
@@ -1108,7 +1123,21 @@ fn icon_states_builtin(arguments: &[Value], state: &mut ExecutionState) -> Resul
         .map_err(|error| error.to_string())?,
         value => value,
     };
-    let requested = strict_text(&resource, state, "icon_states resource")?;
+    if let Value::Datum(_) = resource {
+        resource = icon_backing_resource(&resource, state, 0)?;
+    }
+    let requested = match resource {
+        Value::File(path) => path.to_string(),
+        Value::Text(path) => path.to_string(),
+        Value::Null => {
+            return Err("icon_states resource requires text, received null".to_owned());
+        }
+        value => {
+            return Err(format!(
+                "icon_states resource requires text, received {value}"
+            ));
+        }
+    };
     let resolved = relaxed_resolved_file_path(
         &[Value::text(requested.clone())],
         state,
@@ -1738,6 +1767,207 @@ fn resource_datum_builtin(
             .map_err(|error| error.to_string())?;
     }
     Ok(Value::Datum(datum))
+}
+
+fn generator_field(
+    generator: DatumId,
+    name: &str,
+    state: &ExecutionState,
+) -> Result<Value, String> {
+    super::datum_field_or_initial(
+        state,
+        generator,
+        &FieldName::parse(name).expect("generator field is valid"),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn generator_distribution_sample(
+    low: f32,
+    high: f32,
+    distribution: i32,
+    state: &mut ExecutionState,
+) -> f32 {
+    let (low, high) = if low <= high {
+        (low, high)
+    } else {
+        (high, low)
+    };
+    if low == high {
+        return low;
+    }
+    let unit = super::deterministic_unit(&mut state.random_state);
+    let factor = match distribution {
+        1 => {
+            // OpenDream models NORMAL_RAND with a normal distribution whose
+            // finite interval spans six standard deviations, then clamps the
+            // rare tails. Box-Muller keeps that contract deterministic here.
+            let second = super::deterministic_unit(&mut state.random_state);
+            let normal = (-2.0 * unit.max(f32::MIN_POSITIVE).ln()).sqrt()
+                * (std::f32::consts::TAU * second).cos();
+            return ((low + high) * 0.5 + normal * (high - low) / 6.0).clamp(low, high);
+        }
+        2 => unit.sqrt(),
+        3 => unit.cbrt(),
+        _ => unit,
+    };
+    low + factor * (high - low)
+}
+
+fn generator_vector_components(value: &Value, state: &ExecutionState) -> [f32; 3] {
+    match value {
+        Value::Datum(datum) => super::vector_components(*datum, state.heap()).unwrap_or([0.0; 3]),
+        Value::List(list) => {
+            let Ok(list) = state.heap().list(*list) else {
+                return [0.0; 3];
+            };
+            std::array::from_fn(|index| {
+                list.get(index + 1)
+                    .ok()
+                    .and_then(Value::as_number)
+                    .unwrap_or(0.0)
+            })
+        }
+        _ => [0.0; 3],
+    }
+}
+
+fn generator_rand_builtin(
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    let Value::Datum(generator) = arguments[0] else {
+        return Err("generator.Rand requires a /generator receiver".to_owned());
+    };
+    let path = state
+        .heap()
+        .datum(generator)
+        .map_err(|error| error.to_string())?
+        .type_path();
+    if path.as_str() != "/generator" && !path.as_str().starts_with("/generator/") {
+        return Err("generator.Rand requires a /generator receiver".to_owned());
+    }
+
+    let kind = generator_field(generator, "type", state)?;
+    let kind = value_text(&kind)
+        .ok_or_else(|| format!("invalid generator type {kind}"))?
+        .to_owned();
+    let low = generator_field(generator, "a", state).unwrap_or(Value::number(0.0));
+    let high = generator_field(generator, "b", state).unwrap_or(Value::number(1.0));
+    let distribution = generator_field(generator, "rand", state)
+        .ok()
+        .and_then(|value| value.as_number())
+        .unwrap_or(0.0) as i32;
+
+    match kind.as_str() {
+        "num" => {
+            let low = low.as_number().unwrap_or(0.0);
+            let high = high.as_number().unwrap_or(1.0);
+            Ok(Value::number(generator_distribution_sample(
+                low,
+                high,
+                distribution,
+                state,
+            )))
+        }
+        "vector" | "box" => {
+            let low = generator_vector_components(&low, state);
+            let high = generator_vector_components(&high, state);
+            let values = if kind == "vector" {
+                let factor = generator_distribution_sample(0.0, 1.0, distribution, state);
+                std::array::from_fn(|index| low[index] + (high[index] - low[index]) * factor)
+            } else {
+                std::array::from_fn(|index| {
+                    generator_distribution_sample(low[index], high[index], distribution, state)
+                })
+            };
+            super::allocate_vector(values, state.heap_mut()).map(Value::Datum)
+        }
+        "circle" | "sphere" => {
+            let low = low.as_number().unwrap_or(0.0);
+            let high = high.as_number().unwrap_or(1.0);
+            let radius = generator_distribution_sample(low, high, distribution, state);
+            let theta = super::deterministic_unit(&mut state.random_state) * std::f32::consts::TAU;
+            let values = if kind == "circle" {
+                [theta.cos() * radius, theta.sin() * radius, 0.0]
+            } else {
+                let phi = super::deterministic_unit(&mut state.random_state) * std::f32::consts::PI;
+                [
+                    theta.cos() * phi.sin() * radius,
+                    theta.sin() * phi.sin() * radius,
+                    phi.cos() * radius,
+                ]
+            };
+            super::allocate_vector(values, state.heap_mut()).map(Value::Datum)
+        }
+        "square" | "cube" => {
+            let low = generator_vector_components(&low, state).map(f32::abs);
+            let high = generator_vector_components(&high, state).map(f32::abs);
+            let mut values = std::array::from_fn(|index| {
+                generator_distribution_sample(-high[index], high[index], distribution, state)
+            });
+            if values[0].abs() < low[0] {
+                let sign = if super::deterministic_unit(&mut state.random_state) < 0.5 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                values[1] =
+                    sign * generator_distribution_sample(low[1], high[1], distribution, state);
+            }
+            if kind == "cube" && values[1].abs() < low[1] {
+                let sign = if super::deterministic_unit(&mut state.random_state) < 0.5 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                values[2] =
+                    sign * generator_distribution_sample(low[2], high[2], distribution, state);
+            } else if kind == "square" {
+                values[2] = 0.0;
+            }
+            super::allocate_vector(values, state.heap_mut()).map(Value::Datum)
+        }
+        "color" => {
+            let low_text = value_text(&low).unwrap_or("#000000");
+            let high_text = value_text(&high).unwrap_or("#ffffff");
+            let low = parse_hex_color(low_text)
+                .ok_or_else(|| format!("invalid generator color {low_text:?}"))?;
+            let high = parse_hex_color(high_text)
+                .ok_or_else(|| format!("invalid generator color {high_text:?}"))?;
+            let factor = generator_distribution_sample(0.0, 1.0, distribution, state);
+            let alpha = low.len() == 4 || high.len() == 4;
+            let component = |values: &[u8], index: usize, default: u8| {
+                f32::from(values.get(index).copied().unwrap_or(default))
+            };
+            let components = (0..usize::from(3 + u8::from(alpha)))
+                .map(|index| {
+                    let left = component(&low, index, 255);
+                    let right = component(&high, index, 255);
+                    (left + (right - left) * factor).round().clamp(0.0, 255.0) as u8
+                })
+                .collect::<Vec<_>>();
+            let mut output = String::from("#");
+            for component in components {
+                write!(output, "{component:02x}").expect("writing to a string cannot fail");
+            }
+            Ok(Value::text(output))
+        }
+        _ => Err(format!("invalid generator type {kind:?}")),
+    }
+}
+
+fn icon_swap_color_builtin(
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    let Value::Datum(icon) = arguments[0] else {
+        return Err("icon.SwapColor requires an /icon receiver".to_owned());
+    };
+    if !super::is_icon_datum(icon, state.heap()) {
+        return Err("icon.SwapColor requires an /icon receiver".to_owned());
+    }
+    super::execute_icon_method(icon, "SwapColor", &arguments[1..], state.heap_mut())
 }
 
 /// Constructs BYOND's mutable `/icon` value.
@@ -3149,7 +3379,7 @@ pub(super) fn is_appearance_source(path: &TypePath) -> bool {
             .any(|root| path == root || path.starts_with(&format!("{root}/")))
 }
 
-fn copy_image_appearance(
+pub(super) fn copy_image_appearance(
     source: &Value,
     destination: DatumId,
     state: &mut ExecutionState,
@@ -3692,11 +3922,15 @@ fn text2num(arguments: &[Value], _state: &ExecutionState) -> Result<Value, Strin
 }
 
 fn text2path(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
-    let text = strict_text(&arguments[0], state, "text2path")?;
+    // BYOND 516 returns null for every non-text input, including an already
+    // resolved type path. Only the textual spelling participates in lookup.
+    let Value::Text(text) = &arguments[0] else {
+        return Ok(Value::Null);
+    };
     Ok(state
         .type_paths
         .iter()
-        .find(|path| path.as_str() == text)
+        .find(|path| path.as_str() == text.as_ref())
         .cloned()
         .map_or(Value::Null, Value::TypePath))
 }
@@ -4241,7 +4475,7 @@ fn splicetext(
     )))
 }
 
-fn datum_coordinates(state: &ExecutionState, value: &Value) -> Option<(f32, f32, f32)> {
+pub(super) fn datum_coordinates(state: &ExecutionState, value: &Value) -> Option<(f32, f32, f32)> {
     let Value::Datum(original) = value else {
         return None;
     };
@@ -4260,19 +4494,397 @@ fn datum_coordinates(state: &ExecutionState, value: &Value) -> Option<(f32, f32,
             coordinate_source = current;
             break;
         }
-        let Ok(Value::Datum(parent)) = datum.field(&loc) else {
+        let Ok(Value::Datum(parent)) = super::datum_field_or_initial(state, current, &loc) else {
             break;
         };
-        current = *parent;
+        current = parent;
     }
-    let datum = state.heap.datum(coordinate_source).ok()?;
     let coordinate = |name: &str| {
-        datum
-            .field(&FieldName::parse(name).expect("coordinate name is valid"))
-            .ok()?
-            .as_number()
+        super::datum_field_or_initial(
+            state,
+            coordinate_source,
+            &FieldName::parse(name).expect("coordinate name is valid"),
+        )
+        .ok()?
+        .as_number()
     };
     Some((coordinate("x")?, coordinate("y")?, coordinate("z")?))
+}
+
+/// Adds one turf followed by its direct movable contents, matching the cell
+/// ordering used by BYOND/OpenDream's view enumeration. Inventory descendants
+/// are not members of the surrounding turf cell and therefore remain hidden.
+fn append_spatial_cell(
+    state: &ExecutionState,
+    turf: DatumId,
+    expected_coordinate: (i32, i32, i32),
+    seen: &mut HashSet<DatumId>,
+    output: &mut Vec<DatumId>,
+) {
+    let Some((x, y, z)) = datum_coordinates(state, &Value::Datum(turf)) else {
+        return;
+    };
+    let (expected_x, expected_y, expected_z) = expected_coordinate;
+    if (x, y, z) != (expected_x as f32, expected_y as f32, expected_z as f32)
+        || !state
+            .heap
+            .datum(turf)
+            .is_ok_and(|datum| super::is_turf_type_path(datum.type_path()))
+        || !seen.insert(turf)
+    {
+        return;
+    }
+    output.push(turf);
+
+    let contents = FieldName::parse("contents").expect("built-in contents field");
+    let members = state
+        .heap
+        .datum_field(turf, &contents)
+        .ok()
+        .and_then(|value| match value {
+            Value::List(list) => state.heap.list(*list).ok(),
+            _ => None,
+        })
+        .map(|list| {
+            list.positions()
+                .filter_map(|(_, value)| match value {
+                    Value::Datum(member) => Some(*member),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for member in members {
+        let Ok(datum) = state.heap.datum(member) else {
+            continue;
+        };
+        let path = datum.type_path().as_str();
+        if (path == "/area" || path.starts_with("/area/")) || !seen.insert(member) {
+            continue;
+        }
+        output.push(member);
+    }
+}
+
+fn spiral_order_key(delta_x: i32, delta_y: i32, distance_x: i32, distance_y: i32) -> (u32, u64) {
+    let radius = delta_x.unsigned_abs().max(delta_y.unsigned_abs());
+    if radius == 0 {
+        return (0, 0);
+    }
+    let radius_i32 = i32::try_from(radius).expect("coordinate delta radius fits i32");
+    let vertical_radius = radius_i32.min(distance_y);
+    let left_count = if radius_i32 <= distance_x {
+        u64::from(vertical_radius.unsigned_abs()) * 2 + 1
+    } else {
+        0
+    };
+    if radius_i32 <= distance_x && delta_x == -radius_i32 {
+        return (
+            radius,
+            u64::from((delta_y + vertical_radius).unsigned_abs()),
+        );
+    }
+
+    let interior_low = (-radius_i32 + 1).max(-distance_x);
+    let interior_high = (radius_i32 - 1).min(distance_x);
+    let interior_count = if radius_i32 <= distance_y && interior_low <= interior_high {
+        u64::from((interior_high - interior_low + 1).unsigned_abs()) * 2
+    } else {
+        0
+    };
+    if radius_i32 <= distance_y
+        && (delta_y == -radius_i32 || delta_y == radius_i32)
+        && delta_x >= interior_low
+        && delta_x <= interior_high
+    {
+        let top = u64::from(delta_y == radius_i32);
+        return (
+            radius,
+            left_count + u64::from((delta_x - interior_low).unsigned_abs()) * 2 + top,
+        );
+    }
+
+    (
+        radius,
+        left_count + interior_count + u64::from((delta_y + vertical_radius).unsigned_abs()),
+    )
+}
+
+fn indexed_spatial_candidates(
+    state: &ExecutionState,
+    center_x: f32,
+    center_y: f32,
+    center_z: f32,
+    distance_x: f32,
+    distance_y: f32,
+) -> Vec<DatumId> {
+    let integral_coordinate = |value: f32| -> Option<i32> {
+        (value.is_finite()
+            && value.fract() == 0.0
+            && value >= i32::MIN as f32
+            && value <= i32::MAX as f32)
+            .then(|| value as i32)
+    };
+    let (Some(center_x), Some(center_y), Some(center_z)) = (
+        integral_coordinate(center_x),
+        integral_coordinate(center_y),
+        integral_coordinate(center_z),
+    ) else {
+        return Vec::new();
+    };
+    let distance_x = distance_x.min(i32::MAX as f32) as i32;
+    let distance_y = distance_y.min(i32::MAX as f32) as i32;
+    let low_x = center_x.saturating_sub(distance_x);
+    let high_x = center_x.saturating_add(distance_x);
+    let low_y = center_y.saturating_sub(distance_y);
+    let high_y = center_y.saturating_add(distance_y);
+
+    let axis_len = |low: i32, high: i32| {
+        u128::try_from(i64::from(high) - i64::from(low) + 1)
+            .expect("ordered i32 bounds have a positive span")
+    };
+    let area = axis_len(low_x, high_x).saturating_mul(axis_len(low_y, high_y));
+    let direct_limit = (state.world_turfs.len() as u128)
+        .saturating_mul(2)
+        .max(4_096);
+    let ordered_turfs = if area <= direct_limit {
+        let mut turfs = Vec::new();
+        if let Some(turf) = state.turf_at(center_x, center_y, center_z) {
+            turfs.push(((center_x, center_y), turf));
+        }
+        for radius in 1..=distance_x.max(distance_y) {
+            let vertical_radius = radius.min(distance_y);
+            if radius <= distance_x {
+                let x = center_x.saturating_sub(radius);
+                for delta_y in -vertical_radius..=vertical_radius {
+                    if let Some(turf) = state.turf_at(x, center_y.saturating_add(delta_y), center_z)
+                    {
+                        turfs.push(((x, center_y.saturating_add(delta_y)), turf));
+                    }
+                }
+            }
+            if radius <= distance_y {
+                let low_delta_x = (-radius + 1).max(-distance_x);
+                let high_delta_x = (radius - 1).min(distance_x);
+                for delta_x in low_delta_x..=high_delta_x {
+                    let x = center_x.saturating_add(delta_x);
+                    for delta_y in [-radius, radius] {
+                        if let Some(turf) =
+                            state.turf_at(x, center_y.saturating_add(delta_y), center_z)
+                        {
+                            turfs.push(((x, center_y.saturating_add(delta_y)), turf));
+                        }
+                    }
+                }
+            }
+            if radius <= distance_x {
+                let x = center_x.saturating_add(radius);
+                for delta_y in -vertical_radius..=vertical_radius {
+                    if let Some(turf) = state.turf_at(x, center_y.saturating_add(delta_y), center_z)
+                    {
+                        turfs.push(((x, center_y.saturating_add(delta_y)), turf));
+                    }
+                }
+            }
+        }
+        turfs
+    } else {
+        let mut turfs = state
+            .world_turfs
+            .iter()
+            .filter_map(|((x, y, z), turf)| {
+                (*z == center_z && *x >= low_x && *x <= high_x && *y >= low_y && *y <= high_y)
+                    .then_some(((*x, *y), *turf))
+            })
+            .collect::<Vec<_>>();
+        turfs.sort_unstable_by_key(|((x, y), _)| {
+            spiral_order_key(*x - center_x, *y - center_y, distance_x, distance_y)
+        });
+        turfs
+    };
+
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    for ((x, y), turf) in ordered_turfs {
+        append_spatial_cell(state, turf, (x, y, center_z), &mut seen, &mut candidates);
+    }
+    candidates
+}
+
+fn append_orange_candidate(
+    state: &mut ExecutionState,
+    output: ListId,
+    candidate: DatumId,
+    center: &Value,
+    loc: &FieldName,
+) -> Result<(), String> {
+    let datum = state
+        .heap
+        .datum(candidate)
+        .map_err(|error| error.to_string())?;
+    if !super::is_atom_type_path(datum.type_path()) || Value::Datum(candidate).semantic_eq(center) {
+        return Ok(());
+    }
+    let candidate_loc =
+        super::datum_field_or_initial(state, candidate, loc).map_err(|error| error.to_string())?;
+    if candidate_loc.semantic_eq(center) {
+        return Ok(());
+    }
+    state
+        .heap
+        .list_mut(output)
+        .map_err(|error| error.to_string())?
+        .add(Value::Datum(candidate));
+    Ok(())
+}
+
+/// Native form of BYOND's `orange()` using the same indexed cell order as
+/// `range()`, but filtering directly into the result. The semantic builtin's
+/// historical DM body materialized an intermediate range list and then kept
+/// every atom except the center and atoms whose direct `loc` was the center.
+fn orange_builtin(
+    arguments: &[Value],
+    state: &mut ExecutionState,
+    usr: &Value,
+) -> Result<Value, String> {
+    let output = state.heap.allocate_list();
+    let Some(first) = arguments.first() else {
+        return Err("orange requires one or two arguments".to_owned());
+    };
+    let second = arguments.get(1).unwrap_or(usr);
+    let (distance, center) = if let Some(distance) = first.as_number() {
+        (Some(distance), second)
+    } else {
+        (second.as_number(), first)
+    };
+    let Some(distance) = distance else {
+        return Ok(Value::List(output));
+    };
+    if !distance.is_finite() || distance < 0.0 {
+        return Ok(Value::List(output));
+    }
+    let Some((center_x, center_y, center_z)) = datum_coordinates(state, center) else {
+        return Ok(Value::List(output));
+    };
+    let distance = distance.floor();
+    let loc = FieldName::parse("loc").expect("built-in loc field");
+
+    if state.world_turfs.is_empty() {
+        // Geometry-free fixtures retain range()'s historical arena scan and
+        // direct coordinate fields. Production worlds never enter this path.
+        let x = FieldName::parse("x").expect("built-in coordinate field");
+        let y = FieldName::parse("y").expect("built-in coordinate field");
+        let z = FieldName::parse("z").expect("built-in coordinate field");
+        let candidates = state
+            .heap
+            .datums()
+            .filter_map(|(candidate, datum)| {
+                let path = datum.type_path().as_str();
+                if path == "/area" || path.starts_with("/area/") {
+                    return None;
+                }
+                let candidate_x = datum.field(&x).ok()?.as_number()?;
+                let candidate_y = datum.field(&y).ok()?.as_number()?;
+                let candidate_z = datum.field(&z).ok()?.as_number()?;
+                (candidate_z.total_cmp(&center_z).is_eq()
+                    && (candidate_x - center_x).abs() <= distance
+                    && (candidate_y - center_y).abs() <= distance)
+                    .then_some(candidate)
+            })
+            .collect::<Vec<_>>();
+        for candidate in candidates {
+            append_orange_candidate(state, output, candidate, center, &loc)?;
+        }
+        return Ok(Value::List(output));
+    }
+
+    let integral_coordinate = |value: f32| -> Option<i32> {
+        (value.is_finite()
+            && value.fract() == 0.0
+            && value >= i32::MIN as f32
+            && value <= i32::MAX as f32)
+            .then(|| value as i32)
+    };
+    let (Some(center_x), Some(center_y), Some(center_z)) = (
+        integral_coordinate(center_x),
+        integral_coordinate(center_y),
+        integral_coordinate(center_z),
+    ) else {
+        return Ok(Value::List(output));
+    };
+    let distance = distance.min(i32::MAX as f32) as i32;
+    let low_x = center_x.saturating_sub(distance);
+    let high_x = center_x.saturating_add(distance);
+    let low_y = center_y.saturating_sub(distance);
+    let high_y = center_y.saturating_add(distance);
+    let axis_len = |low: i32, high: i32| {
+        u128::try_from(i64::from(high) - i64::from(low) + 1)
+            .expect("ordered i32 bounds have a positive span")
+    };
+    let area = axis_len(low_x, high_x).saturating_mul(axis_len(low_y, high_y));
+    let direct_limit = (state.world_turfs.len() as u128)
+        .saturating_mul(2)
+        .max(4_096);
+    let mut tiles = if area <= direct_limit {
+        let mut tiles = Vec::new();
+        for x in low_x..=high_x {
+            for y in low_y..=high_y {
+                if let Some(turf) = state.turf_at(x, y, center_z) {
+                    tiles.push(((x, y, center_z), turf));
+                }
+            }
+        }
+        tiles
+    } else {
+        state
+            .world_turfs
+            .iter()
+            .filter(|((x, y, z), _)| {
+                *z == center_z && *x >= low_x && *x <= high_x && *y >= low_y && *y <= high_y
+            })
+            .map(|(coordinate, turf)| (*coordinate, *turf))
+            .collect::<Vec<_>>()
+    };
+    let center_coordinate = (center_x, center_y, center_z);
+    if let Some(index) = tiles
+        .iter()
+        .position(|(coordinate, _)| *coordinate == center_coordinate)
+    {
+        let center_tile = tiles.remove(index);
+        tiles.insert(0, center_tile);
+    }
+
+    let contents = FieldName::parse("contents").expect("built-in contents field");
+    let mut seen_areas = HashSet::new();
+    for (coordinate, turf) in tiles {
+        append_orange_candidate(state, output, turf, center, &loc)?;
+        if let Some(area) = state.world_areas.get(&coordinate).copied()
+            && seen_areas.insert(area)
+        {
+            append_orange_candidate(state, output, area, center, &loc)?;
+        }
+        let members = state
+            .heap
+            .datum_field(turf, &contents)
+            .ok()
+            .and_then(|value| match value {
+                Value::List(list) => state.heap.list(*list).ok(),
+                _ => None,
+            })
+            .map(|list| {
+                list.positions()
+                    .filter_map(|(_, value)| match value {
+                        Value::Datum(member) => Some(*member),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for member in members {
+            append_orange_candidate(state, output, member, center, &loc)?;
+        }
+    }
+    Ok(Value::List(output))
 }
 
 fn spatial_query(
@@ -4348,10 +4960,17 @@ fn spatial_query(
     if !distance_x.is_finite() || distance_x < 0.0 || !distance_y.is_finite() || distance_y < 0.0 {
         return Ok(Value::List(output));
     }
-    let matching = state
-        .heap
-        .datums()
-        .filter_map(|(id, datum)| {
+    let candidates = if state.world_turfs.is_empty() {
+        // Lightweight standalone fixtures may supply coordinate-bearing atoms
+        // without constructing canonical world geometry.
+        state.heap.datums().map(|(id, _)| id).collect::<Vec<_>>()
+    } else {
+        indexed_spatial_candidates(state, center_x, center_y, center_z, distance_x, distance_y)
+    };
+    let matching = candidates
+        .into_iter()
+        .filter_map(|id| {
+            let datum = state.heap.datum(id).ok()?;
             let path = datum.type_path().as_str();
             if path == "/area" || path.starts_with("/area/") {
                 return None;
@@ -4549,6 +5168,179 @@ fn get_step_rand_builtin(arguments: &[Value], state: &mut ExecutionState) -> Res
     )
 }
 
+fn walk_movable(value: &Value, state: &ExecutionState) -> Option<DatumId> {
+    let Value::Datum(datum) = value else {
+        return None;
+    };
+    let path = state.heap().datum(*datum).ok()?.type_path();
+    let movable = TypePath::parse("/atom/movable").expect("movable path is valid");
+    is_subtype(state, path, &movable).then_some(*datum)
+}
+
+fn walk_target(value: Option<&Value>, state: &ExecutionState) -> Option<DatumId> {
+    let Value::Datum(datum) = value? else {
+        return None;
+    };
+    let path = state.heap().datum(*datum).ok()?.type_path();
+    let atom = TypePath::parse("/atom").expect("atom path is valid");
+    is_subtype(state, path, &atom).then_some(*datum)
+}
+
+fn walk_lag(value: Option<&Value>) -> u64 {
+    value
+        .and_then(Value::as_number)
+        .filter(|lag| lag.is_finite() && *lag > 0.0)
+        .map_or(1, |lag| lag.trunc() as u64)
+        .max(1)
+}
+
+fn start_native_walk(
+    name: &str,
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    let Some(movable) = arguments
+        .first()
+        .and_then(|value| walk_movable(value, state))
+    else {
+        return Ok(Value::Null);
+    };
+
+    let (kind, lag) = match name {
+        "walk" => {
+            let direction = arguments.get(1).and_then(Value::as_number).unwrap_or(0.0) as i16;
+            if direction == 0 {
+                state.native_walks.remove(&movable);
+                return Ok(Value::Null);
+            }
+            (
+                NativeWalkKind::Direction(direction),
+                walk_lag(arguments.get(2)),
+            )
+        }
+        "walk_rand" => (NativeWalkKind::Random, walk_lag(arguments.get(1))),
+        "walk_towards" => {
+            let Some(target) = walk_target(arguments.get(1), state) else {
+                state.native_walks.remove(&movable);
+                return Ok(Value::Null);
+            };
+            (NativeWalkKind::Towards(target), walk_lag(arguments.get(2)))
+        }
+        "walk_to" => {
+            let Some(target) = walk_target(arguments.get(1), state) else {
+                state.native_walks.remove(&movable);
+                return Ok(Value::Null);
+            };
+            (
+                NativeWalkKind::To {
+                    target,
+                    minimum: arguments.get(2).and_then(Value::as_number).unwrap_or(0.0),
+                },
+                walk_lag(arguments.get(3)),
+            )
+        }
+        "walk_away" => {
+            let Some(target) = walk_target(arguments.get(1), state) else {
+                state.native_walks.remove(&movable);
+                return Ok(Value::Null);
+            };
+            (
+                NativeWalkKind::Away {
+                    target,
+                    maximum: arguments.get(2).and_then(Value::as_number).unwrap_or(5.0),
+                },
+                walk_lag(arguments.get(3)),
+            )
+        }
+        _ => return Err(format!("unknown native walk procedure {name:?}")),
+    };
+
+    let sequence = state.scheduler_sequence;
+    state.scheduler_sequence = state.scheduler_sequence.saturating_add(1);
+    state.native_walks.insert(
+        movable,
+        NativeWalk {
+            due_tick: state.scheduler_tick.saturating_add(lag),
+            sequence,
+            lag,
+            kind,
+        },
+    );
+    Ok(Value::Null)
+}
+
+fn native_walk_step(movable: DatumId, kind: &NativeWalkKind, state: &mut ExecutionState) -> bool {
+    if state.heap().datum(movable).is_err() {
+        return false;
+    }
+    let movable = Value::Datum(movable);
+    match *kind {
+        NativeWalkKind::Direction(direction) => {
+            step_builtin(&[movable, Value::number(f32::from(direction))], state).is_ok()
+        }
+        NativeWalkKind::Random => step_rand_builtin(&[movable], state).is_ok(),
+        NativeWalkKind::Towards(target) => {
+            state.heap().datum(target).is_ok()
+                && step_towards_builtin(&[movable, Value::Datum(target)], state).is_ok()
+        }
+        NativeWalkKind::To { target, minimum } => {
+            if state.heap().datum(target).is_err() {
+                return false;
+            }
+            let arguments = [movable, Value::Datum(target), Value::number(minimum)];
+            if within_minimum_distance(&arguments, state) {
+                return false;
+            }
+            step_to_builtin(&arguments, state).is_ok()
+        }
+        NativeWalkKind::Away { target, maximum } => {
+            if state.heap().datum(target).is_err() {
+                return false;
+            }
+            let arguments = [movable, Value::Datum(target), Value::number(maximum)];
+            if maximum > 0.0
+                && let (Some(source), Some(target)) = (
+                    datum_coordinates(state, &arguments[0]),
+                    datum_coordinates(state, &arguments[1]),
+                )
+                && (source.0 - target.0)
+                    .abs()
+                    .max((source.1 - target.1).abs())
+                    .max((source.2 - target.2).abs())
+                    > maximum
+            {
+                return false;
+            }
+            step_away_builtin(&arguments, state).is_ok()
+        }
+    }
+}
+
+pub(super) fn advance_native_walks(state: &mut ExecutionState) {
+    let now = state.scheduler_tick;
+    let mut due = state
+        .native_walks
+        .iter()
+        .filter(|(_, walk)| walk.due_tick <= now)
+        .map(|(movable, walk)| (*movable, walk.due_tick, walk.sequence))
+        .collect::<Vec<_>>();
+    due.sort_unstable_by_key(|(_, due_tick, sequence)| (*due_tick, *sequence));
+
+    for (movable, _, _) in due {
+        let Some(mut walk) = state.native_walks.remove(&movable) else {
+            continue;
+        };
+        let mut active = true;
+        while active && walk.due_tick <= now {
+            active = native_walk_step(movable, &walk.kind, state);
+            walk.due_tick = walk.due_tick.saturating_add(walk.lag);
+        }
+        if active {
+            state.native_walks.insert(movable, walk);
+        }
+    }
+}
+
 fn bounds_dist_builtin(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
     let Some(left) = datum_coordinates(state, &arguments[0]) else {
         return Ok(Value::number(f32::INFINITY));
@@ -4589,6 +5381,13 @@ pub(super) fn synchronize_moved_atom_contents(
     let contents = FieldName::parse("contents").expect("built-in contents field");
     let loc = FieldName::parse("loc").expect("built-in loc field");
     let enclosing_area = |state: &ExecutionState, turf: DatumId| {
+        if !state
+            .heap
+            .datum(turf)
+            .is_ok_and(|datum| super::is_turf_type_path(datum.type_path()))
+        {
+            return None;
+        }
         state
             .heap
             .datum_field(turf, &loc)
@@ -4910,13 +5709,16 @@ pub(super) fn execute_list_binary_operator(
             if state.is_associative_list(left) {
                 state.mark_associative_list(result);
             }
-            for entry in operator_rhs_entries(right, state)? {
-                state
-                    .heap
-                    .list_mut(result)
-                    .map_err(|error| error.to_string())?
-                    .remove_last(&entry.key);
-            }
+            let keys = operator_rhs_entries(right, state)?
+                .into_iter()
+                .map(|entry| entry.key)
+                .collect::<Vec<_>>();
+            state
+                .heap
+                .list_mut(result)
+                .map_err(|error| error.to_string())?
+                .subtract_entries(&keys)
+                .map_err(|error| error.to_string())?;
             Ok(Value::List(result))
         }
         "|" => {
@@ -5012,13 +5814,16 @@ pub(super) fn execute_list_compound_operator(
             }
         }
         CompoundAssignmentOperator::Subtract => {
-            for entry in operator_rhs_entries(right, state)? {
-                state
-                    .heap
-                    .list_mut(left)
-                    .map_err(|error| error.to_string())?
-                    .remove_last(&entry.key);
-            }
+            let keys = operator_rhs_entries(right, state)?
+                .into_iter()
+                .map(|entry| entry.key)
+                .collect::<Vec<_>>();
+            state
+                .heap
+                .list_mut(left)
+                .map_err(|error| error.to_string())?
+                .subtract_entries(&keys)
+                .map_err(|error| error.to_string())?;
         }
         CompoundAssignmentOperator::BitOr => {
             for entry in operator_rhs_entries(right, state)? {
@@ -5991,7 +6796,25 @@ fn text2file(arguments: &[Value], state: &ExecutionState) -> Result<Value, Strin
 }
 
 fn fcopy(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
-    let source = relaxed_resolved_file_path(arguments, state, "fcopy source")?;
+    let mut source = arguments
+        .first()
+        .cloned()
+        .ok_or_else(|| "fcopy source requires text, received null".to_owned())?;
+    if let Value::Datum(_) = source {
+        source = icon_backing_resource(&source, state, 0)?;
+    }
+    let source = match source {
+        Value::Text(_) | Value::File(_) => {
+            relaxed_resolved_file_path(&[source], state, "fcopy source")?
+        }
+        Value::Null => return Err("fcopy source requires text, received null".to_owned()),
+        value => {
+            return Err(format!(
+                "fcopy source requires text, received {}",
+                runtime_text(&value, state, "fcopy source")?
+            ));
+        }
+    };
     let Some(destination) = prepare_write_file_path(&arguments[1..], state, "fcopy destination")?
     else {
         return Ok(Value::number(0.0));
@@ -6144,7 +6967,14 @@ fn parse_hex_color(text: &str) -> Option<Vec<u8>> {
 }
 
 fn rgb2num_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
-    let text = strict_text(&arguments[0], state, "rgb2num")?;
+    // BYOND applies rgb2num's documented default white color when the color
+    // argument is null. OpenDream's conformance fixture explicitly verifies
+    // rgb2num(null) == rgb2num("#fff").
+    let text = if arguments[0] == Value::Null {
+        "#FFFFFF".to_owned()
+    } else {
+        strict_text(&arguments[0], state, "rgb2num")?
+    };
     let components =
         parse_hex_color(&text).ok_or_else(|| format!("rgb2num invalid color {text:?}"))?;
     let space = arguments.get(1).and_then(Value::as_number).unwrap_or(0.0);
@@ -6529,6 +7359,29 @@ mod color_text_file_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn rgb2num_treats_null_as_default_white_like_byond_and_opendream() {
+        let mut state = ExecutionState::new();
+        let Value::List(parts) = rgb2num_builtin(&[Value::Null], &mut state).unwrap() else {
+            panic!("rgb2num must return a list")
+        };
+        let parts = state.heap.list(parts).unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts.get(1), Ok(&Value::number(255.0)));
+        assert_eq!(parts.get(2), Ok(&Value::number(255.0)));
+        assert_eq!(parts.get(3), Ok(&Value::number(255.0)));
+
+        let Value::List(parts) =
+            rgb2num_builtin(&[Value::Null, Value::number(2.0)], &mut state).unwrap()
+        else {
+            panic!("rgb2num must return a list")
+        };
+        let parts = state.heap.list(parts).unwrap();
+        assert_eq!(parts.get(1), Ok(&Value::number(0.0)));
+        assert_eq!(parts.get(2), Ok(&Value::number(0.0)));
+        assert_eq!(parts.get(3), Ok(&Value::number(100.0)));
     }
 
     #[test]
@@ -7395,6 +8248,29 @@ mod color_text_file_tests {
     }
 
     #[test]
+    fn text2path_returns_null_for_non_text_and_resolves_valid_text_like_byond_516() {
+        let mut state = ExecutionState::new();
+        let path = TypePath::parse("/datum/reagent/toxin/carpotoxin").unwrap();
+        state.set_type_paths([path.clone()]);
+        assert_eq!(
+            text2path(&[Value::TypePath(path.clone())], &state),
+            Ok(Value::Null),
+        );
+        assert_eq!(text2path(&[Value::Null], &state), Ok(Value::Null));
+        assert_eq!(text2path(&[Value::number(5.0)], &state), Ok(Value::Null));
+        let datum = state.heap_mut().allocate_datum(path.clone());
+        assert_eq!(text2path(&[Value::Datum(datum)], &state), Ok(Value::Null));
+        assert_eq!(
+            text2path(&[Value::text(path.as_str())], &state),
+            Ok(Value::TypePath(path)),
+        );
+        assert_eq!(
+            text2path(&[Value::text("/datum/not_real")], &state),
+            Ok(Value::Null),
+        );
+    }
+
+    #[test]
     fn rust_g_cellular_noise_is_bounded_row_major_and_binary() {
         let library = Value::text("rust_g");
         let function = Value::text("cnoise_generate");
@@ -7807,6 +8683,56 @@ mod spatial_tests {
         id
     }
 
+    fn place_world_turf(state: &mut ExecutionState, x: i32, y: i32) -> DatumId {
+        let turf = place(state, "/turf/open", x as f32, y as f32);
+        state
+            .ensure_contents(turf)
+            .expect("indexed fixture turf contents should materialize");
+        state.world_turfs.insert((x, y, 1), turf);
+        turf
+    }
+
+    fn spatial_result(
+        state: &mut ExecutionState,
+        arguments: &[Value],
+        mobs_only: bool,
+        exclude_center: bool,
+    ) -> Vec<DatumId> {
+        let Value::List(result) =
+            spatial_query(arguments, state, &Value::Null, mobs_only, exclude_center).unwrap()
+        else {
+            panic!("spatial query must return a list")
+        };
+        state
+            .heap
+            .list(result)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| match value {
+                Value::Datum(datum) => *datum,
+                value => panic!("spatial query returned non-datum {value}"),
+            })
+            .collect()
+    }
+
+    fn orange_result(state: &mut ExecutionState, arguments: &[Value], usr: &Value) -> Vec<DatumId> {
+        let Value::List(result) =
+            execute_standard_builtin_with_usr("orange", arguments, state, usr).unwrap()
+        else {
+            panic!("orange must return a list")
+        };
+        state
+            .heap
+            .list(result)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| match value {
+                Value::Datum(datum) => *datum,
+                value => panic!("orange returned non-datum {value}"),
+            })
+            .collect()
+    }
+
     #[test]
     fn view_families_filter_distance_center_and_mob_type() {
         let mut state = ExecutionState::new();
@@ -7901,6 +8827,315 @@ mod spatial_tests {
             panic!()
         };
         assert!(state.heap.list(no_usr).unwrap().is_empty());
+    }
+
+    #[test]
+    fn indexed_view_bounds_direct_contents_filters_and_excludes_nested_inventory() {
+        let mut state = ExecutionState::new();
+        let center = place_world_turf(&mut state, 5, 5);
+        let near = place_world_turf(&mut state, 6, 5);
+        let far = place_world_turf(&mut state, 8, 5);
+        let area = state
+            .heap
+            .allocate_datum(TypePath::parse("/area/station").unwrap());
+        state.world_areas.insert((6, 5, 1), area);
+
+        let container = state
+            .heap
+            .allocate_datum(TypePath::parse("/obj/structure/closet").unwrap());
+        move_movable_to_turf(&mut state, container, near).unwrap();
+        state.ensure_contents(container).unwrap();
+        let nested_mob = state
+            .heap
+            .allocate_datum(TypePath::parse("/mob/living/nested").unwrap());
+        move_movable_to_atom(&mut state, nested_mob, container).unwrap();
+        let direct_object = state
+            .heap
+            .allocate_datum(TypePath::parse("/obj/item/direct").unwrap());
+        move_movable_to_turf(&mut state, direct_object, near).unwrap();
+        let center_mob = state
+            .heap
+            .allocate_datum(TypePath::parse("/mob/living/center").unwrap());
+        move_movable_to_turf(&mut state, center_mob, center).unwrap();
+
+        // A coordinate-bearing atom that is not a member of any bounded
+        // turf must not leak in merely because it occupies a heap slot.
+        let unrelated = place(&mut state, "/obj/item/unrelated", 6.0, 5.0);
+        let far_mob = state
+            .heap
+            .allocate_datum(TypePath::parse("/mob/living/far").unwrap());
+        move_movable_to_turf(&mut state, far_mob, far).unwrap();
+
+        // Corrupt duplicate contents entries are tolerated without returning
+        // the same atom twice.
+        let near_contents = state.ensure_contents(near).unwrap();
+        state
+            .heap
+            .list_mut(near_contents)
+            .unwrap()
+            .add(Value::Datum(container));
+
+        let arguments = [Value::number(1.0), Value::Datum(center)];
+        assert_eq!(
+            spatial_result(&mut state, &arguments, false, false),
+            vec![center, center_mob, near, container, direct_object]
+        );
+        assert_eq!(
+            spatial_result(&mut state, &arguments, true, false),
+            vec![center_mob]
+        );
+        assert_eq!(
+            spatial_result(&mut state, &arguments, false, true),
+            vec![near, container, direct_object]
+        );
+        assert_eq!(
+            spatial_result(&mut state, &arguments, true, true),
+            Vec::<DatumId>::new()
+        );
+
+        for absent in [far, area, nested_mob, unrelated, far_mob] {
+            assert!(!spatial_result(&mut state, &arguments, false, false).contains(&absent));
+        }
+    }
+
+    #[test]
+    fn indexed_view_uses_center_then_concentric_spiral_and_contents_order() {
+        let mut state = ExecutionState::new();
+        let southwest = place_world_turf(&mut state, 4, 4);
+        let west = place_world_turf(&mut state, 4, 5);
+        let northwest = place_world_turf(&mut state, 4, 6);
+        let south = place_world_turf(&mut state, 5, 4);
+        let center = place_world_turf(&mut state, 5, 5);
+        let north = place_world_turf(&mut state, 5, 6);
+        let southeast = place_world_turf(&mut state, 6, 4);
+        let east = place_world_turf(&mut state, 6, 5);
+        let northeast = place_world_turf(&mut state, 6, 6);
+        let first = state
+            .heap
+            .allocate_datum(TypePath::parse("/obj/item/first").unwrap());
+        let second = state
+            .heap
+            .allocate_datum(TypePath::parse("/obj/item/second").unwrap());
+        move_movable_to_turf(&mut state, first, center).unwrap();
+        move_movable_to_turf(&mut state, second, center).unwrap();
+
+        assert_eq!(
+            spatial_result(
+                &mut state,
+                &[Value::number(1.0), Value::Datum(center)],
+                false,
+                false,
+            ),
+            vec![
+                center, first, second, southwest, west, northwest, south, north, southeast, east,
+                northeast,
+            ]
+        );
+    }
+
+    #[test]
+    fn indexed_view_respects_rectangular_text_bounds_and_stale_members() {
+        let mut state = ExecutionState::new();
+        let center = place_world_turf(&mut state, 5, 5);
+        let vertical = place_world_turf(&mut state, 5, 6);
+        let horizontal = place_world_turf(&mut state, 6, 5);
+        let stale = state
+            .heap
+            .allocate_datum(TypePath::parse("/obj/item/stale").unwrap());
+        move_movable_to_turf(&mut state, stale, vertical).unwrap();
+        state.heap.destroy_datum(stale).unwrap();
+
+        assert_eq!(
+            spatial_result(
+                &mut state,
+                &[Value::text("1x3"), Value::Datum(center)],
+                false,
+                false,
+            ),
+            vec![center, vertical]
+        );
+        assert!(
+            !spatial_result(
+                &mut state,
+                &[Value::text("1x3"), Value::Datum(center)],
+                false,
+                false,
+            )
+            .contains(&horizontal)
+        );
+    }
+
+    #[test]
+    fn indexed_view_uses_non_turf_centers_and_live_direct_membership() {
+        let mut state = ExecutionState::new();
+        let old_turf = place_world_turf(&mut state, 10, 10);
+        let new_turf = place_world_turf(&mut state, 11, 10);
+        let center = state
+            .heap
+            .allocate_datum(TypePath::parse("/mob/living/center").unwrap());
+        move_movable_to_turf(&mut state, center, old_turf).unwrap();
+        state.ensure_contents(center).unwrap();
+        let inventory = state
+            .heap
+            .allocate_datum(TypePath::parse("/obj/item/inventory").unwrap());
+        move_movable_to_atom(&mut state, inventory, center).unwrap();
+        let moving = state
+            .heap
+            .allocate_datum(TypePath::parse("/obj/item/moving").unwrap());
+        move_movable_to_turf(&mut state, moving, old_turf).unwrap();
+        move_movable_to_turf(&mut state, moving, new_turf).unwrap();
+
+        let centered = [Value::number(0.0), Value::Datum(center)];
+        assert_eq!(
+            spatial_result(&mut state, &centered, false, false),
+            vec![old_turf, center]
+        );
+        assert!(spatial_result(&mut state, &centered, false, true).is_empty());
+        assert!(!spatial_result(&mut state, &centered, false, false).contains(&inventory));
+        assert!(!spatial_result(&mut state, &centered, false, false).contains(&moving));
+
+        assert_eq!(
+            spatial_result(
+                &mut state,
+                &[Value::number(0.0), Value::Datum(new_turf)],
+                false,
+                false,
+            ),
+            vec![new_turf, moving]
+        );
+    }
+
+    #[test]
+    fn orange_compiles_to_one_native_standard_builtin_instruction() {
+        use dm_syntax::parse;
+
+        let syntax = parse("/proc/run(center)\n\treturn orange(3, center)\n").unwrap();
+        let module = crate::compile_module(&syntax.definitions).unwrap();
+        let entry = module.procedure_id("/proc/run").unwrap();
+        let program = module.procedure(entry).unwrap();
+        assert!(program.instructions.iter().any(|instruction| matches!(
+            instruction,
+            crate::Instruction::StandardBuiltin {
+                name,
+                argument_count: 2,
+                ..
+            } if name == "orange"
+        )));
+        assert!(!program.instructions.iter().any(|instruction| matches!(
+            instruction,
+            crate::Instruction::Call { .. } | crate::Instruction::CallDynamic { .. }
+        )));
+    }
+
+    #[test]
+    fn indexed_orange_preserves_range_order_and_direct_loc_exclusions() {
+        let mut state = ExecutionState::new();
+        let center = place_world_turf(&mut state, 5, 5);
+        let west = place_world_turf(&mut state, 4, 5);
+        let center_area = state
+            .heap
+            .allocate_datum(TypePath::parse("/area/center").unwrap());
+        let west_area = state
+            .heap
+            .allocate_datum(TypePath::parse("/area/west").unwrap());
+        let loc = FieldName::parse("loc").unwrap();
+        for area in [center_area, west_area] {
+            state
+                .heap
+                .set_datum_field(area, loc.clone(), Value::Null)
+                .unwrap();
+        }
+        state.world_areas.insert((5, 5, 1), center_area);
+        state.world_areas.insert((4, 5, 1), west_area);
+
+        let center_object = state
+            .heap
+            .allocate_datum(TypePath::parse("/obj/item/center").unwrap());
+        move_movable_to_turf(&mut state, center_object, center).unwrap();
+        let west_object = state
+            .heap
+            .allocate_datum(TypePath::parse("/obj/item/west").unwrap());
+        move_movable_to_turf(&mut state, west_object, west).unwrap();
+
+        // Same coordinates are insufficient: indexed orange must never inspect
+        // or return an unrelated atom outside the turf membership graph.
+        let unrelated = place(&mut state, "/obj/item/unrelated", 4.0, 5.0);
+        state
+            .heap
+            .set_datum_field(unrelated, loc.clone(), Value::Null)
+            .unwrap();
+
+        let before_lists = state.heap.live_list_count();
+        assert_eq!(
+            orange_result(
+                &mut state,
+                &[Value::number(1.0), Value::Datum(center)],
+                &Value::Null,
+            ),
+            vec![center_area, west, west_area, west_object]
+        );
+        assert_eq!(
+            state.heap.live_list_count(),
+            before_lists + 1,
+            "native orange should allocate only its output list"
+        );
+        assert!(
+            !orange_result(
+                &mut state,
+                &[Value::number(1.0), Value::Datum(center)],
+                &Value::Null,
+            )
+            .contains(&unrelated)
+        );
+        assert_eq!(
+            orange_result(&mut state, &[Value::number(0.0)], &Value::Datum(center)),
+            vec![center_area],
+            "the omitted second argument defaults to usr"
+        );
+        assert_eq!(
+            orange_result(
+                &mut state,
+                &[Value::Datum(center), Value::number(1.0)],
+                &Value::Null,
+            ),
+            vec![center_area, west, west_area, west_object],
+            "orange accepts center and distance in reversed order"
+        );
+    }
+
+    #[test]
+    fn synthetic_orange_fallback_filters_non_atoms_center_and_direct_children() {
+        let mut state = ExecutionState::new();
+        let center = place(&mut state, "/turf/open", 3.0, 3.0);
+        let loc = FieldName::parse("loc").unwrap();
+        state
+            .heap
+            .set_datum_field(center, loc.clone(), Value::Null)
+            .unwrap();
+        let neighbor = place(&mut state, "/obj/item/neighbor", 4.0, 3.0);
+        state
+            .heap
+            .set_datum_field(neighbor, loc.clone(), Value::Null)
+            .unwrap();
+        let direct_child = place(&mut state, "/obj/item/child", 3.0, 3.0);
+        state
+            .heap
+            .set_datum_field(direct_child, loc.clone(), Value::Datum(center))
+            .unwrap();
+        let non_atom = place(&mut state, "/datum/coordinates", 4.0, 3.0);
+        state
+            .heap
+            .set_datum_field(non_atom, loc, Value::Null)
+            .unwrap();
+
+        assert_eq!(
+            orange_result(
+                &mut state,
+                &[Value::number(1.0), Value::Datum(center)],
+                &Value::Null,
+            ),
+            vec![neighbor]
+        );
     }
 
     #[test]

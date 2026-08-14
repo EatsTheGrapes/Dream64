@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::io::{Cursor, Read};
 
 use dm_core::{FileId, SourceSpan};
 use dm_lexer::{SpannedToken, TokenKind, lex};
@@ -254,6 +255,280 @@ pub struct CodeTree {
 }
 
 impl CodeTree {
+    /// Encodes this completed tree into Dream64's portable compiled-artifact
+    /// representation.
+    ///
+    /// The encoding stores stable semantic identities rather than Rust memory
+    /// layout. Derived path indexes are rebuilt by the decoder.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn encode_compiled_artifact(&self) -> Vec<u8> {
+        let mut output = CODE_TREE_ARTIFACT_MAGIC.to_vec();
+        artifact_write_len(&mut output, self.nodes.len());
+        for node in &self.nodes {
+            artifact_write_u32(&mut output, node.id.0);
+            artifact_write_path(&mut output, &node.path);
+            output.push(match node.kind {
+                NodeKind::Type => 0,
+                NodeKind::Procedure => 1,
+                NodeKind::Verb => 2,
+                NodeKind::Variable => 3,
+            });
+            artifact_write_optional_u32(&mut output, node.parent_type.map(|id| id.0));
+            artifact_write_optional_u32(&mut output, node.owner_type.map(|id| id.0));
+            artifact_write_optional_u32(&mut output, node.inherited_member.map(|id| id.0));
+            artifact_write_len(&mut output, node.child_types.len());
+            for child in &node.child_types {
+                artifact_write_u32(&mut output, child.0);
+            }
+            artifact_write_len(&mut output, node.declarations.len());
+            for declaration in &node.declarations {
+                artifact_write_u32(&mut output, declaration.0);
+            }
+            output.push(u8::from(node.standard));
+        }
+
+        artifact_write_len(&mut output, self.declarations.len());
+        for declaration in &self.declarations {
+            artifact_write_u32(&mut output, declaration.id.0);
+            artifact_write_u32(&mut output, declaration.node.0);
+            artifact_write_u32(
+                &mut output,
+                u32::try_from(declaration.file_id.index())
+                    .expect("project file identity is already bounded by u32"),
+            );
+            artifact_write_len(&mut output, declaration.definition_index);
+            artifact_write_len(&mut output, declaration.ordinal);
+            output.push(artifact_definition_kind(declaration.kind));
+            artifact_write_span(&mut output, declaration.span);
+        }
+
+        artifact_write_len(&mut output, self.inheritance_diagnostics.len());
+        for diagnostic in &self.inheritance_diagnostics {
+            output.push(match diagnostic.kind {
+                InheritanceDiagnosticKind::NonConstantParentType => 0,
+                InheritanceDiagnosticKind::UnknownParentType => 1,
+                InheritanceDiagnosticKind::ParentTargetNotType => 2,
+                InheritanceDiagnosticKind::InheritanceCycle => 3,
+            });
+            artifact_write_path(&mut output, &diagnostic.owner);
+            match &diagnostic.target {
+                Some(target) => {
+                    output.push(1);
+                    artifact_write_path(&mut output, target);
+                }
+                None => output.push(0),
+            }
+            artifact_write_optional_u32(
+                &mut output,
+                diagnostic.declaration.map(|declaration| declaration.0),
+            );
+            artifact_write_u32(
+                &mut output,
+                u32::try_from(diagnostic.file_id.index())
+                    .expect("project file identity is already bounded by u32"),
+            );
+            artifact_write_span(&mut output, diagnostic.span);
+            artifact_write_len(&mut output, diagnostic.declaration_ordinal);
+        }
+        output
+    }
+
+    /// Decodes and validates one portable compiled-artifact tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns a descriptive error for a corrupt, truncated, oversized, or
+    /// internally inconsistent tree payload.
+    #[doc(hidden)]
+    pub fn decode_compiled_artifact(bytes: &[u8]) -> Result<Self, String> {
+        let mut input = Cursor::new(bytes);
+        let mut magic = vec![0; CODE_TREE_ARTIFACT_MAGIC.len()];
+        input
+            .read_exact(&mut magic)
+            .map_err(|_| "compiled code tree is truncated before its header".to_owned())?;
+        if magic != CODE_TREE_ARTIFACT_MAGIC {
+            return Err("compiled code tree has an unsupported header".to_owned());
+        }
+
+        let node_count = artifact_read_len(&mut input, "node count")?;
+        let mut nodes = Vec::with_capacity(node_count);
+        for expected_index in 0..node_count {
+            let id = NodeId(artifact_read_u32(&mut input, "node identity")?);
+            if id.index() != expected_index {
+                return Err(format!(
+                    "compiled code tree node identity {} is out of sequence at {expected_index}",
+                    id.index()
+                ));
+            }
+            let path = artifact_read_path(&mut input)?;
+            let kind = match artifact_read_byte(&mut input, "node kind")? {
+                0 => NodeKind::Type,
+                1 => NodeKind::Procedure,
+                2 => NodeKind::Verb,
+                3 => NodeKind::Variable,
+                tag => return Err(format!("compiled code tree has unknown node kind {tag}")),
+            };
+            let parent_type = artifact_read_optional_u32(&mut input, "parent type")?.map(NodeId);
+            let owner_type = artifact_read_optional_u32(&mut input, "owner type")?.map(NodeId);
+            let inherited_member =
+                artifact_read_optional_u32(&mut input, "inherited member")?.map(NodeId);
+            let child_count = artifact_read_len(&mut input, "child count")?;
+            let mut child_types = Vec::with_capacity(child_count);
+            for _ in 0..child_count {
+                child_types.push(NodeId(artifact_read_u32(&mut input, "child identity")?));
+            }
+            let declaration_count = artifact_read_len(&mut input, "declaration count")?;
+            let mut declarations = Vec::with_capacity(declaration_count);
+            for _ in 0..declaration_count {
+                declarations.push(DeclarationId(artifact_read_u32(
+                    &mut input,
+                    "declaration identity",
+                )?));
+            }
+            let standard = match artifact_read_byte(&mut input, "standard flag")? {
+                0 => false,
+                1 => true,
+                tag => return Err(format!("compiled code tree has invalid boolean tag {tag}")),
+            };
+            nodes.push(CodeNode {
+                id,
+                path,
+                kind,
+                parent_type,
+                owner_type,
+                inherited_member,
+                child_types,
+                declarations,
+                standard,
+            });
+        }
+
+        let declaration_count = artifact_read_len(&mut input, "tree declaration count")?;
+        let mut declarations = Vec::with_capacity(declaration_count);
+        for expected_index in 0..declaration_count {
+            let id = DeclarationId(artifact_read_u32(&mut input, "tree declaration identity")?);
+            if id.index() != expected_index {
+                return Err(format!(
+                    "compiled tree declaration identity {} is out of sequence at {expected_index}",
+                    id.index()
+                ));
+            }
+            let node = NodeId(artifact_read_u32(&mut input, "declaration node")?);
+            let file_id = FileId::from_index(artifact_read_u32(
+                &mut input,
+                "declaration file identity",
+            )? as usize);
+            let definition_index = artifact_read_len(&mut input, "definition index")?;
+            let ordinal = artifact_read_len(&mut input, "declaration ordinal")?;
+            let kind = artifact_read_definition_kind(&mut input)?;
+            let span = artifact_read_span(&mut input)?;
+            declarations.push(TreeDeclaration {
+                id,
+                node,
+                file_id,
+                definition_index,
+                ordinal,
+                kind,
+                span,
+            });
+        }
+
+        let diagnostic_count = artifact_read_len(&mut input, "inheritance diagnostic count")?;
+        let mut inheritance_diagnostics = Vec::with_capacity(diagnostic_count);
+        for _ in 0..diagnostic_count {
+            let kind = match artifact_read_byte(&mut input, "inheritance diagnostic kind")? {
+                0 => InheritanceDiagnosticKind::NonConstantParentType,
+                1 => InheritanceDiagnosticKind::UnknownParentType,
+                2 => InheritanceDiagnosticKind::ParentTargetNotType,
+                3 => InheritanceDiagnosticKind::InheritanceCycle,
+                tag => {
+                    return Err(format!(
+                        "compiled code tree has unknown inheritance diagnostic kind {tag}"
+                    ));
+                }
+            };
+            let owner = artifact_read_path(&mut input)?;
+            let target = match artifact_read_byte(&mut input, "diagnostic target tag")? {
+                0 => None,
+                1 => Some(artifact_read_path(&mut input)?),
+                tag => return Err(format!("compiled code tree has invalid option tag {tag}")),
+            };
+            let declaration = artifact_read_optional_u32(&mut input, "diagnostic declaration")?
+                .map(DeclarationId);
+            let file_id = FileId::from_index(artifact_read_u32(
+                &mut input,
+                "diagnostic file identity",
+            )? as usize);
+            let span = artifact_read_span(&mut input)?;
+            let declaration_ordinal = artifact_read_len(&mut input, "diagnostic ordinal")?;
+            inheritance_diagnostics.push(InheritanceDiagnostic {
+                kind,
+                owner,
+                target,
+                declaration,
+                file_id,
+                span,
+                declaration_ordinal,
+            });
+        }
+
+        if input.position() != bytes.len() as u64 {
+            return Err("compiled code tree contains trailing bytes".to_owned());
+        }
+        for node in &nodes {
+            for reference in [node.parent_type, node.owner_type, node.inherited_member]
+                .into_iter()
+                .flatten()
+                .chain(node.child_types.iter().copied())
+            {
+                if reference.index() >= nodes.len() {
+                    return Err(format!(
+                        "compiled code tree node {} references missing node {}",
+                        node.id.index(),
+                        reference.index()
+                    ));
+                }
+            }
+            if node
+                .declarations
+                .iter()
+                .any(|declaration| declaration.index() >= declarations.len())
+            {
+                return Err(format!(
+                    "compiled code tree node {} references a missing declaration",
+                    node.id.index()
+                ));
+            }
+        }
+        if declarations
+            .iter()
+            .any(|declaration| declaration.node.index() >= nodes.len())
+            || inheritance_diagnostics.iter().any(|diagnostic| {
+                diagnostic
+                    .declaration
+                    .is_some_and(|declaration| declaration.index() >= declarations.len())
+            })
+        {
+            return Err("compiled code tree contains an out-of-range identity".to_owned());
+        }
+        let mut paths = BTreeMap::new();
+        for node in &nodes {
+            if paths.insert(node.path.clone(), node.id).is_some() {
+                return Err(format!(
+                    "compiled code tree contains duplicate path {}",
+                    node.path
+                ));
+            }
+        }
+        Ok(Self {
+            nodes,
+            declarations,
+            paths,
+            inheritance_diagnostics,
+        })
+    }
+
     /// Returns every node in stable canonical path order.
     #[must_use]
     pub fn nodes(&self) -> &[CodeNode] {
@@ -357,6 +632,157 @@ impl CodeTree {
     #[must_use]
     pub fn inheritance_diagnostics(&self) -> &[InheritanceDiagnostic] {
         &self.inheritance_diagnostics
+    }
+}
+
+const CODE_TREE_ARTIFACT_MAGIC: &[u8] = b"DREAM64-CODE-TREE\0\x01";
+const MAX_ARTIFACT_ITEMS: usize = 16_777_216;
+const MAX_ARTIFACT_STRING_BYTES: usize = 268_435_456;
+
+fn artifact_write_u32(output: &mut Vec<u8>, value: u32) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn artifact_write_len(output: &mut Vec<u8>, value: usize) {
+    output.extend_from_slice(&(value as u64).to_le_bytes());
+}
+
+fn artifact_write_string(output: &mut Vec<u8>, value: &str) {
+    artifact_write_len(output, value.len());
+    output.extend_from_slice(value.as_bytes());
+}
+
+fn artifact_write_path(output: &mut Vec<u8>, path: &CodePath) {
+    artifact_write_len(output, path.0.len());
+    for segment in &path.0 {
+        artifact_write_string(output, segment);
+    }
+}
+
+fn artifact_write_optional_u32(output: &mut Vec<u8>, value: Option<u32>) {
+    match value {
+        Some(value) => {
+            output.push(1);
+            artifact_write_u32(output, value);
+        }
+        None => output.push(0),
+    }
+}
+
+fn artifact_write_span(output: &mut Vec<u8>, span: SourceSpan) {
+    artifact_write_len(output, span.start);
+    artifact_write_len(output, span.end);
+}
+
+const fn artifact_definition_kind(kind: DefinitionKind) -> u8 {
+    match kind {
+        DefinitionKind::Type => 0,
+        DefinitionKind::Procedure => 1,
+        DefinitionKind::ProcedureOverride => 2,
+        DefinitionKind::Verb => 3,
+        DefinitionKind::Variable => 4,
+        DefinitionKind::VariableOverride => 5,
+    }
+}
+
+fn artifact_read_byte(input: &mut Cursor<&[u8]>, what: &str) -> Result<u8, String> {
+    let mut byte = [0];
+    input
+        .read_exact(&mut byte)
+        .map_err(|_| format!("compiled code tree is truncated while reading {what}"))?;
+    Ok(byte[0])
+}
+
+fn artifact_read_u32(input: &mut Cursor<&[u8]>, what: &str) -> Result<u32, String> {
+    let mut bytes = [0; 4];
+    input
+        .read_exact(&mut bytes)
+        .map_err(|_| format!("compiled code tree is truncated while reading {what}"))?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn artifact_read_len(input: &mut Cursor<&[u8]>, what: &str) -> Result<usize, String> {
+    let mut bytes = [0; 8];
+    input
+        .read_exact(&mut bytes)
+        .map_err(|_| format!("compiled code tree is truncated while reading {what}"))?;
+    let value = usize::try_from(u64::from_le_bytes(bytes))
+        .map_err(|_| format!("compiled code tree {what} exceeds this platform"))?;
+    if value > MAX_ARTIFACT_ITEMS {
+        return Err(format!(
+            "compiled code tree {what} exceeds the limit of {MAX_ARTIFACT_ITEMS}"
+        ));
+    }
+    Ok(value)
+}
+
+fn artifact_read_string(input: &mut Cursor<&[u8]>) -> Result<String, String> {
+    let mut length_bytes = [0; 8];
+    input
+        .read_exact(&mut length_bytes)
+        .map_err(|_| "compiled code tree is truncated while reading a string length".to_owned())?;
+    let length = usize::try_from(u64::from_le_bytes(length_bytes))
+        .map_err(|_| "compiled code tree string length exceeds this platform".to_owned())?;
+    if length > MAX_ARTIFACT_STRING_BYTES {
+        return Err(format!(
+            "compiled code tree string exceeds the byte limit of {MAX_ARTIFACT_STRING_BYTES}"
+        ));
+    }
+    let mut bytes = vec![0; length];
+    input
+        .read_exact(&mut bytes)
+        .map_err(|_| "compiled code tree is truncated while reading a string".to_owned())?;
+    String::from_utf8(bytes)
+        .map_err(|_| "compiled code tree contains a non-UTF-8 string".to_owned())
+}
+
+fn artifact_read_path(input: &mut Cursor<&[u8]>) -> Result<CodePath, String> {
+    let segment_count = artifact_read_len(input, "path segment count")?;
+    if segment_count == 0 {
+        return Err("compiled code tree contains an empty path".to_owned());
+    }
+    let mut segments = Vec::with_capacity(segment_count);
+    for _ in 0..segment_count {
+        let segment = artifact_read_string(input)?;
+        if segment.is_empty() {
+            return Err("compiled code tree contains an empty path segment".to_owned());
+        }
+        segments.push(segment);
+    }
+    Ok(CodePath(segments))
+}
+
+fn artifact_read_optional_u32(
+    input: &mut Cursor<&[u8]>,
+    what: &str,
+) -> Result<Option<u32>, String> {
+    match artifact_read_byte(input, what)? {
+        0 => Ok(None),
+        1 => artifact_read_u32(input, what).map(Some),
+        tag => Err(format!("compiled code tree has invalid option tag {tag}")),
+    }
+}
+
+fn artifact_read_span(input: &mut Cursor<&[u8]>) -> Result<SourceSpan, String> {
+    let start = artifact_read_len(input, "source span start")?;
+    let end = artifact_read_len(input, "source span end")?;
+    if start > end {
+        return Err("compiled code tree contains an inverted source span".to_owned());
+    }
+    Ok(SourceSpan::new(start, end))
+}
+
+fn artifact_read_definition_kind(input: &mut Cursor<&[u8]>) -> Result<DefinitionKind, String> {
+    match artifact_read_byte(input, "definition kind")? {
+        0 => Ok(DefinitionKind::Type),
+        1 => Ok(DefinitionKind::Procedure),
+        2 => Ok(DefinitionKind::ProcedureOverride),
+        3 => Ok(DefinitionKind::Verb),
+        4 => Ok(DefinitionKind::Variable),
+        5 => Ok(DefinitionKind::VariableOverride),
+        tag => Err(format!(
+            "compiled code tree has unknown definition kind {tag}"
+        )),
     }
 }
 
@@ -1086,9 +1512,37 @@ mod tests {
     use dm_syntax::{DefinitionKind, parse};
 
     use super::{
-        DefinitionUnit, DiagnosticKind, DiagnosticSeverity, InheritanceDiagnosticKind, NodeKind,
-        SyntaxUnit, build, build_definitions,
+        CodeTree, DefinitionUnit, DiagnosticKind, DiagnosticSeverity, InheritanceDiagnosticKind,
+        NodeKind, SyntaxUnit, build, build_definitions,
     };
+
+    #[test]
+    fn compiled_artifact_code_tree_round_trips_deterministically_and_rejects_damage() {
+        let syntax = parse(
+            "/datum/base\n\tvar/value = 1\n\tproc/run()\n\t\treturn value\n/datum/child\n\tparent_type = /datum/base\n\trun()\n\t\treturn ..()\n",
+        )
+        .expect("fixture should parse");
+        let output = build(&[SyntaxUnit {
+            file_id: FileId::from_index(0),
+            syntax: &syntax,
+        }]);
+        assert!(output.diagnostics.is_empty());
+
+        let encoded = output.tree.encode_compiled_artifact();
+        assert_eq!(encoded, output.tree.encode_compiled_artifact());
+        assert_eq!(
+            CodeTree::decode_compiled_artifact(&encoded).expect("tree should decode"),
+            output.tree
+        );
+
+        let mut bad_header = encoded.clone();
+        bad_header[0] ^= 0xff;
+        assert!(CodeTree::decode_compiled_artifact(&bad_header).is_err());
+        assert!(CodeTree::decode_compiled_artifact(&encoded[..encoded.len() - 1]).is_err());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(CodeTree::decode_compiled_artifact(&trailing).is_err());
+    }
 
     #[test]
     fn assigns_node_ids_by_canonical_path_not_file_visit_order() {

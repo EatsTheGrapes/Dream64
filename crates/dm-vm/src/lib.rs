@@ -3,17 +3,23 @@
 #![cfg_attr(not(test), deny(missing_docs))]
 
 mod builtins;
+mod module_codec;
 
+pub use module_codec::ModuleCodecError;
+
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use builtins::{
-    execute_external_call, execute_list_binary_operator, execute_list_compound_operator,
-    execute_list_method, execute_output, execute_regex_method, execute_standard_builtin,
-    execute_standard_builtin_with_usr, is_regex_datum, is_subtype, standard_builtin_arity,
+    advance_native_walks, execute_external_call, execute_list_binary_operator,
+    execute_list_compound_operator, execute_list_method, execute_output, execute_regex_method,
+    execute_standard_builtin, execute_standard_builtin_with_usr, is_regex_datum, is_subtype,
+    standard_builtin_arity,
 };
 
 use dm_core::{DmNumberBits, SourceSpan};
@@ -53,7 +59,7 @@ pub enum Instruction {
     /// Pushes a numeric constant.
     PushNumber(DmNumberBits),
     /// Pushes a text constant.
-    PushText(String),
+    PushText(Arc<str>),
     /// Pushes a first-class BYOND file/resource constant.
     PushFile(String),
     /// Pushes a canonical absolute DM type path.
@@ -199,6 +205,12 @@ pub enum Instruction {
         /// Whether each candidate has a preceding numeric weight on the stack.
         weighted: Vec<bool>,
     },
+    /// Selects from the runtime argument vector produced by `arglist(...)`.
+    ///
+    /// Unlike a single ordinary list candidate, this first expands the outer
+    /// argument list. If expansion yields one list, ordinary `pick(list)`
+    /// semantics then select from that nested list.
+    PickExpandedArguments,
     /// Evaluates BYOND's percentage chance predicate deterministically.
     Prob,
     /// Rounds a number using BYOND's legacy one-argument floor form or its
@@ -270,6 +282,14 @@ pub enum Instruction {
     MakeListEntries(Vec<ListEntryKind>),
     /// Builds a BYOND `/alist`, whose constructor entries are key/value pairs.
     MakeAssociativeListEntries(Vec<ListEntryKind>),
+    /// Implements `local ||= list()` without materializing branch bytecode.
+    LogicalOrEmptyListLocal(u16),
+    /// Implements `global ||= list()` without materializing branch bytecode.
+    LogicalOrEmptyListGlobal(FieldName),
+    /// Pops a captured receiver and implements `receiver.field ||= list()`.
+    LogicalOrEmptyListField(FieldName),
+    /// Pops a captured key and receiver and implements `receiver[key] ||= list()`.
+    LogicalOrEmptyListIndex,
     /// Pops a numeric 1-based index and a list handle, then pushes the entry.
     IndexList,
     /// Pops a value, index/key, and list handle and updates that list.
@@ -510,6 +530,10 @@ pub enum Instruction {
     /// The stack holds the receiver (or null for a global procedure), the
     /// procedure name, then the positional arguments.
     CallDynamic {
+        /// Compile-time text selector for ordinary `receiver.method()` calls.
+        /// A runtime `call(receiver, selector)()` leaves this unset and pushes
+        /// its selector after the receiver instead.
+        static_selector: Option<String>,
         /// Number of positional values supplied by the caller.
         argument_count: u16,
         /// Optional BYOND keyword attached to each source argument.
@@ -677,7 +701,8 @@ pub struct Program {
 /// A deterministic table of compiled procedures and their canonical paths.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Module {
-    procedures: Vec<Program>,
+    identity: ModuleIdentity,
+    procedures: Vec<Arc<Program>>,
     paths: Vec<String>,
     names: HashMap<String, ProcedureId>,
     /// Latest implementation for each canonical path with reopening suffixes removed.
@@ -685,6 +710,26 @@ pub struct Module {
     deferred: Arc<HashMap<ProcedureId, DeferredProcedure>>,
     procedure_types: Vec<TypePath>,
     initializer_call_names: Option<InitializerCallNameIndex>,
+}
+
+static NEXT_MODULE_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug)]
+struct ModuleIdentity(u64);
+
+// Module identity is an execution-cache namespace, not part of portable
+// bytecode semantics. Independently compiled equivalent modules must retain
+// their historical structural equality.
+impl PartialEq for ModuleIdentity {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ModuleIdentity {}
+
+fn next_module_identity() -> ModuleIdentity {
+    ModuleIdentity(NEXT_MODULE_IDENTITY.fetch_add(1, Ordering::Relaxed))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -702,6 +747,21 @@ struct DeferredProcedure {
     global_types: Arc<BTreeMap<String, TypePath>>,
     preflight_error: Option<CompileError>,
     compiled: Arc<OnceLock<Result<Program, CompileError>>>,
+}
+
+impl DeferredProcedure {
+    fn compile(&self) -> Result<Program, CompileError> {
+        if let Some(error) = &self.preflight_error {
+            return Err(error.clone());
+        }
+        compile_procedure_with_resolver_and_fields(
+            self.definition.as_ref(),
+            self.targets.as_ref(),
+            self.src_fields.as_ref(),
+            self.global_fields.as_ref(),
+            self.global_types.as_ref(),
+        )
+    }
 }
 
 /// An initializer expression linked as an entry point in a VM module.
@@ -764,18 +824,7 @@ impl Module {
             }
             return deferred
                 .compiled
-                .get_or_init(|| {
-                    if let Some(error) = &deferred.preflight_error {
-                        return Err(error.clone());
-                    }
-                    compile_procedure_with_resolver_and_fields(
-                        deferred.definition.as_ref(),
-                        deferred.targets.as_ref(),
-                        deferred.src_fields.as_ref(),
-                        deferred.global_fields.as_ref(),
-                        deferred.global_types.as_ref(),
-                    )
-                })
+                .get_or_init(|| deferred.compile())
                 .as_ref()
                 .map_err(|error| error.message.clone())
                 .inspect(|_| {
@@ -794,6 +843,7 @@ impl Module {
         }
         self.procedures
             .get(procedure.index())
+            .map(Arc::as_ref)
             .ok_or_else(|| format!("invalid procedure {}", procedure.index()))
     }
 
@@ -839,6 +889,164 @@ impl Module {
             .values()
             .filter(|procedure| procedure.compiled.get().is_some())
             .count()
+    }
+
+    /// Compiles every deferred body and returns a module containing only eager
+    /// procedure programs.
+    ///
+    /// Deferred bodies are visited in stable procedure identity order. Known
+    /// preflight failures are reported before any remaining body is lowered,
+    /// and all successfully lowered programs are installed only after every
+    /// body succeeds. Clones of this module therefore retain their original
+    /// lazy state and do not observe partial materialization through shared
+    /// deferred caches.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first deferred preflight or lowering failure in stable
+    /// procedure identity order, annotated with its canonical procedure path.
+    pub fn into_fully_eager(mut self) -> Result<Self, CompileError> {
+        if self.deferred.is_empty() {
+            return Ok(self);
+        }
+
+        let mut deferred_ids = self.deferred.keys().copied().collect::<Vec<_>>();
+        deferred_ids.sort_unstable_by_key(|procedure| procedure.index());
+
+        for procedure in &deferred_ids {
+            let deferred = self
+                .deferred
+                .get(procedure)
+                .expect("deferred identity came from this module");
+            if let Some(error) = &deferred.preflight_error {
+                let path = self
+                    .paths
+                    .get(procedure.index())
+                    .map_or("<missing procedure>", String::as_str);
+                return Err(compile_error(format!("{path}: {}", error.message)));
+            }
+        }
+
+        let mut compiled = Vec::with_capacity(deferred_ids.len());
+        for procedure in deferred_ids {
+            let path = self
+                .paths
+                .get(procedure.index())
+                .map_or("<missing procedure>", String::as_str);
+            let deferred = self
+                .deferred
+                .get(&procedure)
+                .expect("deferred identity came from this module");
+            let program = match deferred.compiled.get() {
+                Some(result) => result.clone(),
+                None => deferred.compile(),
+            }
+            .map_err(|error| compile_error(format!("{path}: {}", error.message)))?;
+            if self.procedures.get(procedure.index()).is_none() {
+                return Err(compile_error(format!(
+                    "{path}: invalid deferred procedure identity {}",
+                    procedure.index()
+                )));
+            }
+            compiled.push((procedure, program));
+        }
+
+        for (procedure, program) in compiled {
+            self.procedures[procedure.index()] = Arc::new(program);
+        }
+        self.deferred = Arc::new(HashMap::new());
+        Ok(self)
+    }
+
+    /// Attempts every deferred body in stable procedure identity order while
+    /// retaining only a bounded diagnostic sample.
+    ///
+    /// Successful bodies are installed even when independent bodies fail, and
+    /// only failed bodies remain deferred. This makes a single artifact-build
+    /// pass expose multiple incompatibilities without changing ordinary lazy
+    /// dispatch or [`Self::into_fully_eager`]'s first-error contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bounded leading diagnostics, total failure count, and
+    /// successful materialization count when any deferred body fails.
+    pub fn materialize_fully_eager_bounded(
+        &mut self,
+        diagnostic_limit: usize,
+    ) -> Result<(), FullyEagerCompileErrors> {
+        if self.deferred.is_empty() {
+            return Ok(());
+        }
+
+        let mut deferred_ids = self.deferred.keys().copied().collect::<Vec<_>>();
+        deferred_ids.sort_unstable_by_key(|procedure| procedure.index());
+
+        let mut successful = Vec::with_capacity(deferred_ids.len());
+        let mut failed = Vec::new();
+        let mut diagnostics = Vec::with_capacity(diagnostic_limit.min(deferred_ids.len()));
+        let mut total_failures = 0usize;
+
+        for procedure in deferred_ids {
+            let path = self
+                .paths
+                .get(procedure.index())
+                .map_or("<missing procedure>", String::as_str);
+            let result = if self.procedures.get(procedure.index()).is_none() {
+                Err(compile_error(format!(
+                    "invalid deferred procedure identity {}",
+                    procedure.index()
+                )))
+            } else {
+                let deferred = self
+                    .deferred
+                    .get(&procedure)
+                    .expect("deferred identity came from this module");
+                match deferred.compiled.get() {
+                    Some(result) => result.clone(),
+                    None => deferred.compile(),
+                }
+            };
+
+            match result {
+                Ok(program) => successful.push((procedure, program)),
+                Err(error) => {
+                    total_failures += 1;
+                    failed.push(procedure);
+                    if diagnostics.len() < diagnostic_limit {
+                        diagnostics.push(compile_error(format!("{path}: {}", error.message)));
+                    }
+                }
+            }
+        }
+
+        let successful_procedures = successful.len();
+        for (procedure, program) in successful {
+            self.procedures[procedure.index()] = Arc::new(program);
+        }
+
+        if total_failures == 0 {
+            self.deferred = Arc::new(HashMap::new());
+            return Ok(());
+        }
+
+        self.deferred = Arc::new(
+            failed
+                .into_iter()
+                .map(|procedure| {
+                    let deferred = self
+                        .deferred
+                        .get(&procedure)
+                        .expect("failed deferred identity came from this module")
+                        .clone();
+                    (procedure, deferred)
+                })
+                .collect(),
+        );
+        Err(FullyEagerCompileErrors {
+            diagnostics,
+            total_failures,
+            successful_procedures,
+        })
     }
 
     /// Number of times the module name table was scanned to construct the
@@ -946,6 +1154,59 @@ impl fmt::Display for CompileError {
 
 impl std::error::Error for CompileError {}
 
+/// Bounded diagnostics from one complete deferred-procedure materialization.
+///
+/// The total failure count is retained even when the diagnostic sample is
+/// capped. Successfully lowered procedures are installed before this error is
+/// returned, allowing callers that keep the module to inspect or execute the
+/// valid portion without compiling it a second time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FullyEagerCompileErrors {
+    diagnostics: Vec<CompileError>,
+    total_failures: usize,
+    successful_procedures: usize,
+}
+
+impl FullyEagerCompileErrors {
+    /// First failures in stable procedure identity order, bounded by the
+    /// caller-provided diagnostic limit.
+    #[must_use]
+    pub fn diagnostics(&self) -> &[CompileError] {
+        &self.diagnostics
+    }
+
+    /// Total number of deferred procedures that failed, including diagnostics
+    /// omitted by the caller-provided limit.
+    #[must_use]
+    pub const fn total_failures(&self) -> usize {
+        self.total_failures
+    }
+
+    /// Deferred procedures that lowered and were installed successfully during
+    /// the same complete pass.
+    #[must_use]
+    pub const fn successful_procedures(&self) -> usize {
+        self.successful_procedures
+    }
+}
+
+impl fmt::Display for FullyEagerCompileErrors {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let shown = self.diagnostics.len();
+        write!(
+            formatter,
+            "{} deferred procedures failed eager compilation; {} compiled successfully; showing first {} failures",
+            self.total_failures, self.successful_procedures, shown
+        )?;
+        for diagnostic in &self.diagnostics {
+            write!(formatter, "\n- {}", diagnostic.message)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for FullyEagerCompileErrors {}
+
 /// Failure while executing portable bytecode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeError {
@@ -1031,6 +1292,7 @@ pub fn compile_initializer(
     procedures: Option<&Module>,
 ) -> Result<InitializerProgram, CompileError> {
     let mut module = procedures.cloned().unwrap_or_else(|| Module {
+        identity: next_module_identity(),
         procedures: Vec::new(),
         paths: Vec::new(),
         names: HashMap::new(),
@@ -1099,7 +1361,7 @@ pub fn compile_initializer_into_module(
         instructions,
     };
     let entry = ProcedureId::from_index(module.procedures.len())?;
-    module.procedures.push(program);
+    module.procedures.push(Arc::new(program));
     module.paths.push("<initializer>".to_owned());
     module
         .dynamic_names
@@ -1169,9 +1431,11 @@ pub fn compile_module_with_global_fields(
                 global_fields,
                 &BTreeMap::new(),
             )
+            .map(Arc::new)
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Module {
+        identity: next_module_identity(),
         procedures,
         dynamic_names: dynamic_name_index(&paths)?,
         paths,
@@ -1258,10 +1522,12 @@ pub fn compile_module_specs_with_global_types(
                 &spec.global_fields,
                 global_types,
             )
+            .map(Arc::new)
             .map_err(|error| compile_error(format!("{}: {}", spec.path, error.message)))
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Module {
+        identity: next_module_identity(),
         procedures,
         dynamic_names: dynamic_name_index(&paths)?,
         paths,
@@ -1330,7 +1596,7 @@ pub fn compile_module_specs_selective_with_errors(
     for (index, (spec, global_types)) in specs.iter().zip(global_types).enumerate() {
         let targets = resolved_spec_targets(spec, &call_index)?;
         if eager_indices.contains(&index) {
-            procedures.push(
+            procedures.push(Arc::new(
                 compile_procedure_with_resolver_and_fields(
                     spec.definition,
                     &targets,
@@ -1339,17 +1605,17 @@ pub fn compile_module_specs_selective_with_errors(
                     global_types,
                 )
                 .map_err(|error| compile_error(format!("{}: {}", spec.path, error.message)))?,
-            );
+            ));
         } else {
             let procedure = ProcedureId::from_index(index)?;
-            procedures.push(Program {
+            procedures.push(Arc::new(Program {
                 wait_for: true,
                 parameter_count: 0,
                 parameter_names: Vec::new(),
                 local_count: 0,
                 instructions: Vec::new(),
                 source_spans: Vec::new(),
-            });
+            }));
             deferred.insert(
                 procedure,
                 DeferredProcedure {
@@ -1365,6 +1631,7 @@ pub fn compile_module_specs_selective_with_errors(
         }
     }
     Ok(Module {
+        identity: next_module_identity(),
         procedures,
         dynamic_names: dynamic_name_index(&paths)?,
         paths,
@@ -1399,14 +1666,22 @@ struct SpecCallIndex {
 }
 
 fn dynamic_name_index(paths: &[String]) -> Result<HashMap<String, ProcedureId>, CompileError> {
-    paths
-        .iter()
-        .enumerate()
-        .map(|(position, path)| {
-            let base_path = path.split_once('@').map_or(path.as_str(), |(base, _)| base);
-            Ok((base_path.to_owned(), ProcedureId::from_index(position)?))
-        })
-        .collect()
+    let mut index = HashMap::new();
+    for (position, path) in paths.iter().enumerate() {
+        let (base_path, suffix) = path
+            .split_once('@')
+            .map_or((path.as_str(), None), |(base, suffix)| (base, Some(suffix)));
+        let procedure = ProcedureId::from_index(position)?;
+        if matches!(suffix, Some("dream64_builtin" | "dream64_native")) {
+            // Engine declarations are fallback surfaces. A real project body
+            // at the same canonical path retains BYOND override precedence
+            // for dynamic calls, even though generated specs are appended.
+            index.entry(base_path.to_owned()).or_insert(procedure);
+        } else {
+            index.insert(base_path.to_owned(), procedure);
+        }
+    }
+    Ok(index)
 }
 
 impl SpecCallIndex {
@@ -1416,9 +1691,18 @@ impl SpecCallIndex {
             let Some((_, _)) = path.rsplit_once("/proc/") else {
                 continue;
             };
-            let base_path = path.split_once('@').map_or(path.as_str(), |(base, _)| base);
+            let (base_path, suffix) = path
+                .split_once('@')
+                .map_or((path.as_str(), None), |(base, suffix)| (base, Some(suffix)));
             // Match the old reverse scan: the last spec for a base path wins.
-            latest_by_base_path.insert(base_path.to_owned(), ProcedureId::from_index(position)?);
+            let procedure = ProcedureId::from_index(position)?;
+            if matches!(suffix, Some("dream64_builtin" | "dream64_native")) {
+                latest_by_base_path
+                    .entry(base_path.to_owned())
+                    .or_insert(procedure);
+            } else {
+                latest_by_base_path.insert(base_path.to_owned(), procedure);
+            }
         }
         Ok(Self {
             latest_by_base_path,
@@ -1665,11 +1949,14 @@ fn join_delimited_physical_lines(lines: &[SourceLine]) -> Vec<SourceLine> {
 }
 
 fn delimiter_delta(tokens: &[SpannedToken]) -> isize {
-    tokens.iter().fold(0isize, |depth, token| match token.kind {
-        TokenKind::Punctuation('(' | '[') => depth + 1,
-        TokenKind::Punctuation(')' | ']') => depth - 1,
-        _ => depth,
-    })
+    tokens
+        .iter()
+        .fold(0isize, |depth, token| match &token.kind {
+            TokenKind::Punctuation('(' | '[') => depth + 1,
+            TokenKind::Operator(operator) if operator == "?[" => depth + 1,
+            TokenKind::Punctuation(')' | ']') => depth - 1,
+            _ => depth,
+        })
 }
 
 /// Expands DM's macro-style statement separators and compact brace bodies.
@@ -1719,8 +2006,12 @@ fn split_top_level_semicolon_statements(lines: &[SourceLine]) -> Vec<SourceLine>
             result.push(logical_line);
         };
         for token in &line.tokens {
-            match token.kind {
+            match &token.kind {
                 TokenKind::Punctuation('(' | '[') => {
+                    grouping_depth += 1;
+                    statement.push(token.clone());
+                }
+                TokenKind::Operator(operator) if operator == "?[" => {
                     grouping_depth += 1;
                     statement.push(token.clone());
                 }
@@ -2255,8 +2546,8 @@ fn compile_block_inner(
                     instructions.len() - first_instruction,
                 ));
             }
-            TokenKind::Identifier(_) | TokenKind::Operator(_)
-                if top_level_assignment(&line.tokens).is_some() =>
+            TokenKind::Identifier(keyword) | TokenKind::Operator(keyword)
+                if keyword != "spawn" && top_level_assignment(&line.tokens).is_some() =>
             {
                 let first_instruction = instructions.len();
                 compile_assignment_statement(&line.tokens, locals, instructions, procedures)?;
@@ -2671,7 +2962,7 @@ fn compile_crash_statement(
     }
     let expression = &rest[1..rest.len() - 1];
     if expression.is_empty() {
-        instructions.push(Instruction::PushText("CRASH".to_owned()));
+        instructions.push(Instruction::PushText(Arc::from("CRASH")));
     } else {
         compile_expression(expression, locals, instructions, procedures)?;
     }
@@ -2958,12 +3249,13 @@ fn compile_assignment_statement(
             }
             instructions.push(Instruction::PushNumber(DmNumberBits::from_f32(1.0)));
             compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
-            if operator != "=" {
-                return Err(compile_error(
-                    "pointer dereference only supports direct assignment",
+            if operator == "=" {
+                instructions.push(Instruction::SetListIndex);
+            } else {
+                instructions.push(Instruction::CompoundListIndex(
+                    compound_list_index_operator(operator)?,
                 ));
             }
-            instructions.push(Instruction::SetListIndex);
         }
         _ => return Err(compile_error("assignment target is not writable")),
     }
@@ -4591,13 +4883,19 @@ fn compile_try(
         Instruction::EndTry,
         catch_line.span,
     );
-    let end_jump = instructions.len();
-    push_instruction(
-        instructions,
-        source_spans,
-        Instruction::Jump(usize::MAX),
-        catch_line.span,
-    );
+    // A terminating protected body cannot reach the catch-skipping branch.
+    // Omitting that dead instruction also keeps a try/catch whose two arms
+    // terminate from pointing one past the complete procedure.
+    let end_jump = try_falls_through.then(|| {
+        let jump = instructions.len();
+        push_instruction(
+            instructions,
+            source_spans,
+            Instruction::Jump(usize::MAX),
+            catch_line.span,
+        );
+        jump
+    });
     let catch_target = instructions.len();
     instructions[handler_instruction] = Instruction::BeginTry {
         catch: catch_target,
@@ -4613,7 +4911,9 @@ fn compile_try(
     // try/catch pair.
     if catch_indentation.is_none_or(|indentation| indentation <= block_indentation) {
         let end_target = instructions.len();
-        patch_jump(instructions, end_jump, end_target)?;
+        if let Some(end_jump) = end_jump {
+            patch_jump(instructions, end_jump, end_target)?;
+        }
         return Ok((catch_child_index, true));
     }
     let catch_indentation = catch_indentation.expect("indentation was checked");
@@ -4633,7 +4933,9 @@ fn compile_try(
     )?;
     locals.names = saved_names;
     let end_target = instructions.len();
-    patch_jump(instructions, end_jump, end_target)?;
+    if let Some(end_jump) = end_jump {
+        patch_jump(instructions, end_jump, end_target)?;
+    }
     Ok((next_line, try_falls_through || catch_falls_through))
 }
 
@@ -4764,13 +5066,20 @@ fn compile_if(
     }
 
     let else_line = &lines[after_then];
-    let end_jump = instructions.len();
-    push_instruction(
-        instructions,
-        source_spans,
-        Instruction::Jump(usize::MAX),
-        else_line.span,
-    );
+    // Only a live then arm needs to skip over the else body. Emitting this
+    // branch after a terminating `return`, `throw`, or loop-control statement
+    // leaves unreachable bytecode whose target can be the program boundary
+    // when the else arm terminates too.
+    let end_jump = then_falls_through.then(|| {
+        let jump = instructions.len();
+        push_instruction(
+            instructions,
+            source_spans,
+            Instruction::Jump(usize::MAX),
+            else_line.span,
+        );
+        jump
+    });
     let else_target = instructions.len();
     patch_jump(instructions, false_jump, else_target)?;
     let (after_else, else_falls_through) = if is_else_if(else_line) {
@@ -4828,7 +5137,9 @@ fn compile_if(
         )?
     };
     let end_target = instructions.len();
-    patch_jump(instructions, end_jump, end_target)?;
+    if let Some(end_jump) = end_jump {
+        patch_jump(instructions, end_jump, end_target)?;
+    }
     Ok((after_else, then_falls_through || else_falls_through))
 }
 
@@ -5756,6 +6067,10 @@ enum Expression {
         when_true: Box<Self>,
         when_false: Box<Self>,
     },
+    LogicalOrAssignment {
+        target: Box<Self>,
+        value: Box<Self>,
+    },
     Assignment {
         target: Box<Self>,
         operator: String,
@@ -5808,6 +6123,7 @@ fn dm_builtin_numeric_constant(identifier: &str) -> Option<f32> {
         | "PROFILE_START"
         | "PROFILE_REFRESH"
         | "FILTER_COLOR_RGB"
+        | "UNIFORM_RAND"
         | "ICON_ADD" => Some(0.0),
         "FLOAT_LAYER" => Some(-1.0),
         "TRUE"
@@ -5836,6 +6152,7 @@ fn dm_builtin_numeric_constant(identifier: &str) -> Option<f32> {
         "CONTROL_FREAK_MACROS" => Some(2.0),
         "JSON_PRETTY_PRINT" => Some(1.0),
         "BLEND_ADD"
+        | "LINEAR_RAND"
         | "MASK_SWAP"
         | "FILTER_UNDERLAY"
         | "FILTER_COLOR_HSL"
@@ -5853,8 +6170,8 @@ fn dm_builtin_numeric_constant(identifier: &str) -> Option<f32> {
         | "PROFILE_CLEAR"
         | "PROFILE_RESTART"
         | "ICON_MULTIPLY" => Some(2.0),
-        "BLEND_SUBTRACT" | "FILTER_COLOR_HCY" | "OBJ_LAYER" | "CUBIC_EASING" | "COLORSPACE_HCY"
-        | "MOUSE_DRAG_POINTER" | "SYNC_STEPS" | "ICON_OVERLAY" => Some(3.0),
+        "BLEND_SUBTRACT" | "SQUARE_RAND" | "FILTER_COLOR_HCY" | "OBJ_LAYER" | "CUBIC_EASING"
+        | "COLORSPACE_HCY" | "MOUSE_DRAG_POINTER" | "SYNC_STEPS" | "ICON_OVERLAY" => Some(3.0),
         "BLEND_MULTIPLY" | "LONG_GLIDE" | "EAST" | "MATRIX_INVERT" | "MOB_LAYER"
         | "BOUNCE_EASING" | "ANIMATION_PARALLEL" | "VIS_INHERIT_DIR" | "MOUSE_DROP_POINTER"
         | "SEE_MOBS" | "SEEMOBS" | "PROFILE_AVERAGE" => Some(4.0),
@@ -5968,15 +6285,9 @@ impl<'a> ExpressionParser<'a> {
         self.index += 1;
         let value = self.parse_assignment()?;
         if operator == "||=" {
-            let assignment = Expression::Assignment {
-                target: Box::new(target.clone()),
-                operator: "=".to_owned(),
+            return Ok(Expression::LogicalOrAssignment {
+                target: Box::new(target),
                 value: Box::new(value),
-            };
-            return Ok(Expression::Conditional {
-                condition: Box::new(target.clone()),
-                when_true: Box::new(target),
-                when_false: Box::new(assignment),
             });
         }
         if operator == "&&=" {
@@ -6311,18 +6622,14 @@ impl<'a> ExpressionParser<'a> {
 
     /// Inside the true arm of `?:`, an attached `:name` is ambiguous with the
     /// ternary separator (`condition ? value:null`). It can only be dynamic
-    /// member access when another top-level colon remains to terminate the
-    /// conditional (`condition ? datum:field : fallback`).
+    /// member access when another colon remains to terminate the conditional
+    /// (`condition ? datum:field : fallback`). That delimiter can be outside
+    /// grouping which began before the member, as in a macro-expanded
+    /// `condition ? list[(inner ? value : value:type)] : fallback`.
     fn conditional_true_arm_has_later_colon(&self) -> bool {
-        let mut depth = 0_u32;
         for token in self.tokens.iter().skip(self.index + 2) {
-            match &token.kind {
-                TokenKind::Punctuation('(' | '[' | '{') => depth += 1,
-                TokenKind::Punctuation(')' | ']' | '}') if depth == 0 => break,
-                TokenKind::Punctuation(')' | ']' | '}') => depth -= 1,
-                TokenKind::Punctuation(',') if depth == 0 => break,
-                TokenKind::Operator(operator) if operator == ":" && depth == 0 => return true,
-                _ => {}
+            if matches!(&token.kind, TokenKind::Operator(operator) if operator == ":") {
+                return true;
             }
         }
         false
@@ -7573,7 +7880,7 @@ fn emit_associative_list_key(
     // is a named/text key even when a local, field, or global with the same
     // spelling exists. Dynamic keys use an explicit expression instead.
     if let Expression::Local(name) = key {
-        instructions.push(Instruction::PushText(name.clone()));
+        instructions.push(Instruction::PushText(Arc::from(name.as_str())));
         return Ok(());
     }
     emit_expression(key, locals, instructions, procedures)
@@ -7638,7 +7945,9 @@ fn emit_expression(
         }
         Expression::Null => instructions.push(Instruction::PushNull),
         Expression::Number(number) => instructions.push(Instruction::PushNumber(*number)),
-        Expression::Text(text) => instructions.push(Instruction::PushText(text.clone())),
+        Expression::Text(text) => {
+            instructions.push(Instruction::PushText(Arc::from(text.as_str())))
+        }
         Expression::File(path) => instructions.push(Instruction::PushFile(path.clone())),
         Expression::TypePath(path) => instructions.push(Instruction::PushTypePath(path.clone())),
         Expression::ModifiedTypePath { base, overrides } => {
@@ -7840,6 +8149,16 @@ fn emit_expression(
             });
         }
         Expression::Pick { entries } => {
+            if let [(None, Expression::ArgList(value))] = entries.as_slice() {
+                emit_expression(value, locals, instructions, procedures)?;
+                instructions.push(Instruction::ExpandArgumentLists {
+                    argument_count: 1,
+                    argument_names: vec![None],
+                    expanded_indices: vec![0],
+                });
+                instructions.push(Instruction::PickExpandedArguments);
+                return Ok(());
+            }
             let mut weighted = Vec::with_capacity(entries.len());
             for (weight, candidate) in entries {
                 weighted.push(weight.is_some());
@@ -8197,9 +8516,15 @@ fn emit_expression(
             null_receiver_is_global,
         } => {
             emit_expression(target, locals, instructions, procedures)?;
-            emit_expression(procedure, locals, instructions, procedures)?;
+            let static_selector = if let Expression::Text(selector) = procedure.as_ref() {
+                Some(selector.clone())
+            } else {
+                emit_expression(procedure, locals, instructions, procedures)?;
+                None
+            };
             let argument_count = emit_call_arguments(arguments, locals, instructions, procedures)?;
             instructions.push(Instruction::CallDynamic {
+                static_selector,
                 argument_count,
                 argument_names: arguments
                     .iter()
@@ -8220,9 +8545,15 @@ fn emit_expression(
             instructions.push(Instruction::Duplicate);
             let null_jump = instructions.len();
             instructions.push(Instruction::JumpIfNull(usize::MAX));
-            emit_expression(procedure, locals, instructions, procedures)?;
+            let static_selector = if let Expression::Text(selector) = procedure.as_ref() {
+                Some(selector.clone())
+            } else {
+                emit_expression(procedure, locals, instructions, procedures)?;
+                None
+            };
             let argument_count = emit_call_arguments(arguments, locals, instructions, procedures)?;
             instructions.push(Instruction::CallDynamic {
+                static_selector,
                 argument_count,
                 argument_names: arguments
                     .iter()
@@ -8403,6 +8734,26 @@ fn emit_expression(
             let end_target = instructions.len();
             patch_jump(instructions, end_jump, end_target)?;
         }
+        Expression::LogicalOrAssignment { target, value } => {
+            if !matches!(value.as_ref(), Expression::List(entries) if entries.is_empty())
+                || !emit_logical_or_empty_list_assignment(target, locals, instructions, procedures)?
+            {
+                // Keep every non-empty RHS on the general logical-assignment
+                // lowering. The superinstructions below are deliberately
+                // exact to the overwhelmingly common empty-list constructor.
+                emit_expression(target, locals, instructions, procedures)?;
+                let false_jump = instructions.len();
+                instructions.push(Instruction::JumpIfFalse(usize::MAX));
+                emit_expression(target, locals, instructions, procedures)?;
+                let end_jump = instructions.len();
+                instructions.push(Instruction::Jump(usize::MAX));
+                let false_target = instructions.len();
+                patch_jump(instructions, false_jump, false_target)?;
+                emit_assignment_expression(target, "=", value, locals, instructions, procedures)?;
+                let end_target = instructions.len();
+                patch_jump(instructions, end_jump, end_target)?;
+            }
+        }
         Expression::Assignment {
             target,
             operator,
@@ -8410,6 +8761,50 @@ fn emit_expression(
         } => emit_assignment_expression(target, operator, value, locals, instructions, procedures)?,
     }
     Ok(())
+}
+
+fn emit_logical_or_empty_list_assignment(
+    target: &Expression,
+    locals: &LocalTable<'_>,
+    instructions: &mut Vec<Instruction>,
+    procedures: &HashMap<String, ProcedureId>,
+) -> Result<bool, CompileError> {
+    match target {
+        Expression::Local(name) => {
+            if let Some(slot) = locals.get(name) {
+                instructions.push(Instruction::LogicalOrEmptyListLocal(slot));
+            } else if let Some(field) = locals.src_field(name) {
+                instructions.push(Instruction::LoadSrc);
+                instructions.push(Instruction::LogicalOrEmptyListField(field.clone()));
+            } else if let Some(global) = locals.global_field(name) {
+                instructions.push(Instruction::LogicalOrEmptyListGlobal(global.clone()));
+            } else {
+                return Err(compile_error(format!("unknown local {name:?}")));
+            }
+        }
+        Expression::GlobalField(name) if name.as_str() != "vars" => {
+            instructions.push(Instruction::LogicalOrEmptyListGlobal(name.clone()));
+        }
+        Expression::Field { receiver, name } if name.as_str() != "vars" => {
+            if let Some(storage) = locals.receiver_static(receiver.as_ref(), name).or_else(|| {
+                matches!(receiver.as_ref(), Expression::Src)
+                    .then(|| locals.global_field(name.as_str()))
+                    .flatten()
+            }) {
+                instructions.push(Instruction::LogicalOrEmptyListGlobal(storage.clone()));
+            } else {
+                emit_expression(receiver, locals, instructions, procedures)?;
+                instructions.push(Instruction::LogicalOrEmptyListField(name.clone()));
+            }
+        }
+        Expression::Index { list, index } => {
+            emit_expression(list, locals, instructions, procedures)?;
+            emit_expression(index, locals, instructions, procedures)?;
+            instructions.push(Instruction::LogicalOrEmptyListIndex);
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 fn emit_mutation_expression(
@@ -8840,7 +9235,8 @@ fn bind_initializer_expression(
             bind_initializer_expression(when_true, bindings)?;
             bind_initializer_expression(when_false, bindings)?;
         }
-        Expression::Assignment { target, value, .. } => {
+        Expression::LogicalOrAssignment { target, value }
+        | Expression::Assignment { target, value, .. } => {
             bind_initializer_expression(target, bindings)?;
             bind_initializer_expression(value, bindings)?;
         }
@@ -8944,6 +9340,9 @@ fn build_type_intervals(
     intervals
 }
 
+const MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES: usize = 524_288;
+const MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE: usize = 8;
+
 /// Mutable heap state shared by executions in one runtime world.
 ///
 /// Values contain only stable logical handles. All mutable list and datum
@@ -8964,21 +9363,49 @@ pub struct ExecutionState {
     shared_fields: Arc<BTreeMap<TypePath, BTreeMap<FieldName, FieldName>>>,
     instance_initializers: Arc<BTreeMap<TypePath, Vec<InstanceInitializer>>>,
     initial_prototypes: BTreeMap<TypePath, DatumId>,
+    initial_prototypes_initializing: HashSet<TypePath>,
     instance_initializer_module: Option<Arc<Module>>,
     globals: BTreeMap<FieldName, Value>,
     initial_globals: BTreeMap<FieldName, Value>,
     type_paths: Arc<std::collections::BTreeSet<TypePath>>,
     type_parents: Arc<BTreeMap<TypePath, Option<TypePath>>>,
     type_intervals: Arc<BTreeMap<TypePath, (u32, u32)>>,
+    // Runtime type metadata and a compiled module's procedure table are immutable
+    // while DM executes. Receiver dispatch can therefore retain both successful
+    // and failed parent-chain resolutions. The cache is cleared only by the host
+    // APIs that replace the type-parent catalog.
+    dynamic_receiver_targets: HashMap<(u64, TypePath), HashMap<String, Option<ProcedureId>>>,
     initial_values: Arc<BTreeMap<TypePath, BTreeMap<FieldName, Value>>>,
-    // Engine-created turfs keep immutable effective defaults in
-    // `initial_values` and materialize only per-cell state and overrides.
+    // The initial-value catalog is immutable but can contain millions of
+    // scalar values. Derive the only heap handles it can retain when the
+    // catalog is installed, so every collection need only append this compact
+    // deduplicated snapshot instead of walking the complete catalog.
+    initial_value_datum_roots: Arc<[DatumId]>,
+    initial_value_list_roots: Arc<[ListId]>,
+    // Sparse datum reads repeatedly resolve the same effective default while
+    // the immutable catalogs remain unchanged. Cache owned answers (including
+    // misses) without changing the borrowed public catalog API.
+    effective_initial_value_cache: RefCell<HashMap<TypePath, HashMap<FieldName, Option<Value>>>>,
+    effective_initial_value_cache_entries: Cell<usize>,
+    // Type-scoped `initial()` reads are immutable after the runtime metadata is
+    // installed. Cache their final value separately because a null catalog
+    // entry can still require an inherited runtime initializer/prototype.
+    initial_field_value_cache: HashMap<TypePath, HashMap<FieldName, Value>>,
+    initial_field_value_cache_entries: usize,
+    // Engine-created map cells whose identities are owned by the world keep
+    // immutable effective defaults in `initial_values` and remain explicit GC
+    // roots. Ordinary runtime datums use the same sparse field representation
+    // but are rooted only by the normal DM object graph.
     compact_default_datums: HashSet<DatumId>,
     project_root: Option<Arc<PathBuf>>,
     random_state: u64,
     scheduler_tick: u64,
     scheduler_sequence: u64,
     scheduled_spawns: Vec<ScheduledSpawn>,
+    // Native walking procedures run independently of DM continuations and do
+    // not keep the startup scheduler drain open. A later call for the same
+    // movable replaces the prior walk immediately.
+    native_walks: HashMap<DatumId, NativeWalk>,
     // Due tasks are moved here while one scheduler dispatch is running. They
     // must remain visible to list GC until each continuation becomes active;
     // otherwise a collection in an earlier same-tick task can reclaim values
@@ -8987,6 +9414,8 @@ pub struct ExecutionState {
     // Wall-clock origin for the scheduler tick currently dispatching DM work.
     // Standalone execution leaves this disabled.
     scheduler_tick_started: Option<Instant>,
+    // Optional production sampler spanning every scheduler slice of SSatoms.
+    atoms_profile: Option<AtomsProfile>,
     // Datums whose BYOND `Del()` hook is currently executing. This prevents a
     // reentrant `del(src)` from dispatching the same hook indefinitely.
     deleting_datums: HashSet<DatumId>,
@@ -9042,21 +9471,31 @@ impl ExecutionState {
             shared_fields: Arc::new(BTreeMap::new()),
             instance_initializers: Arc::new(BTreeMap::new()),
             initial_prototypes: BTreeMap::new(),
+            initial_prototypes_initializing: HashSet::new(),
             instance_initializer_module: None,
             globals: BTreeMap::new(),
             initial_globals: BTreeMap::new(),
             type_paths: Arc::new(std::collections::BTreeSet::new()),
             type_parents: Arc::new(BTreeMap::new()),
             type_intervals: Arc::new(BTreeMap::new()),
+            dynamic_receiver_targets: HashMap::new(),
             initial_values: Arc::new(BTreeMap::new()),
+            initial_value_datum_roots: Arc::default(),
+            initial_value_list_roots: Arc::default(),
+            effective_initial_value_cache: RefCell::new(HashMap::new()),
+            effective_initial_value_cache_entries: Cell::new(0),
+            initial_field_value_cache: HashMap::new(),
+            initial_field_value_cache_entries: 0,
             compact_default_datums: HashSet::new(),
             project_root: None,
             random_state: 0,
             scheduler_tick: 0,
             scheduler_sequence: 0,
             scheduled_spawns: Vec::new(),
+            native_walks: HashMap::new(),
             scheduler_inflight: Vec::new(),
             scheduler_tick_started: None,
+            atoms_profile: None,
             deleting_datums: HashSet::new(),
             last_animation_target: None,
             environment_overrides: BTreeMap::new(),
@@ -9768,6 +10207,7 @@ impl ExecutionState {
     /// Replaces the canonical type catalog used by `typesof()`.
     pub fn set_type_paths(&mut self, paths: impl IntoIterator<Item = TypePath>) {
         self.type_paths = Arc::new(paths.into_iter().collect());
+        self.clear_effective_initial_value_cache();
     }
 
     /// Replaces the canonical type catalog used by `typesof()` with a shared
@@ -9777,6 +10217,7 @@ impl ExecutionState {
     /// tree for every dynamically evaluated initializer.
     pub fn set_shared_type_paths(&mut self, paths: Arc<std::collections::BTreeSet<TypePath>>) {
         self.type_paths = paths;
+        self.clear_effective_initial_value_cache();
     }
 
     /// Iterates the canonical type catalog in lexical path order.
@@ -9788,12 +10229,16 @@ impl ExecutionState {
     pub fn set_type_parents(&mut self, parents: BTreeMap<TypePath, Option<TypePath>>) {
         self.type_intervals = Arc::new(build_type_intervals(&parents));
         self.type_parents = Arc::new(parents);
+        self.dynamic_receiver_targets.clear();
+        self.clear_effective_initial_value_cache();
     }
 
     /// Replaces the runtime type-parent catalog with shared immutable metadata.
     pub fn set_shared_type_parents(&mut self, parents: Arc<BTreeMap<TypePath, Option<TypePath>>>) {
         self.type_intervals = Arc::new(build_type_intervals(&parents));
         self.type_parents = parents;
+        self.dynamic_receiver_targets.clear();
+        self.clear_effective_initial_value_cache();
     }
 
     fn subtype_interval(&self, path: &TypePath) -> Option<(u32, u32)> {
@@ -9803,6 +10248,8 @@ impl ExecutionState {
     /// Replaces effective compile-time initial field values for every runtime type.
     pub fn set_initial_values(&mut self, values: BTreeMap<TypePath, BTreeMap<FieldName, Value>>) {
         self.initial_values = Arc::new(values);
+        self.rebuild_initial_value_roots();
+        self.clear_effective_initial_value_cache();
     }
 
     /// Replaces effective initial values with shared immutable metadata.
@@ -9811,6 +10258,24 @@ impl ExecutionState {
         values: Arc<BTreeMap<TypePath, BTreeMap<FieldName, Value>>>,
     ) {
         self.initial_values = values;
+        self.rebuild_initial_value_roots();
+        self.clear_effective_initial_value_cache();
+    }
+
+    fn rebuild_initial_value_roots(&mut self) {
+        let mut datum_roots = Vec::new();
+        let mut list_roots = Vec::new();
+        extend_heap_root_ids(
+            &mut datum_roots,
+            &mut list_roots,
+            self.initial_values.values().flat_map(BTreeMap::values),
+        );
+        datum_roots.sort_unstable();
+        datum_roots.dedup();
+        list_roots.sort_unstable();
+        list_roots.dedup();
+        self.initial_value_datum_roots = Arc::from(datum_roots);
+        self.initial_value_list_roots = Arc::from(list_roots);
     }
 
     /// Installs inherited reflection names for owner-qualified shared fields.
@@ -9829,6 +10294,7 @@ impl ExecutionState {
     ) {
         self.instance_initializers = initializers;
         self.instance_initializer_module = module;
+        self.clear_initial_field_value_cache();
     }
 
     /// Replaces runtime-new initializer metadata and returns the previous catalog.
@@ -9836,7 +10302,9 @@ impl ExecutionState {
         &mut self,
         initializers: Arc<BTreeMap<TypePath, Vec<InstanceInitializer>>>,
     ) -> Arc<BTreeMap<TypePath, Vec<InstanceInitializer>>> {
-        std::mem::replace(&mut self.instance_initializers, initializers)
+        let previous = std::mem::replace(&mut self.instance_initializers, initializers);
+        self.clear_initial_field_value_cache();
+        previous
     }
 
     /// Sets the project root used by BYOND filesystem procedures such as `fexists()`.
@@ -9867,6 +10335,58 @@ impl ExecutionState {
         None
     }
 
+    fn inherited_initial_values(&self, path: &TypePath) -> BTreeMap<FieldName, Value> {
+        let mut hierarchy = Vec::new();
+        let mut current = Some(path);
+        while let Some(path) = current {
+            hierarchy.push(path);
+            current = self.type_parent(path);
+        }
+        let mut values = BTreeMap::new();
+        for path in hierarchy.into_iter().rev() {
+            if let Some(direct) = self.initial_values.get(path) {
+                values.extend(direct.clone());
+            }
+        }
+        values
+    }
+
+    fn clear_effective_initial_value_cache(&mut self) {
+        self.effective_initial_value_cache.get_mut().clear();
+        self.effective_initial_value_cache_entries.set(0);
+        self.clear_initial_field_value_cache();
+    }
+
+    fn clear_initial_field_value_cache(&mut self) {
+        self.initial_field_value_cache.clear();
+        self.initial_field_value_cache_entries = 0;
+    }
+
+    fn effective_initial_value(&self, path: &TypePath, field: &FieldName) -> Option<Value> {
+        let cache = self.effective_initial_value_cache.borrow();
+        if let Some(value) = cache.get(path).and_then(|fields| fields.get(field)) {
+            return value.clone();
+        }
+        drop(cache);
+
+        let value = self
+            .initial_value(path, field)
+            .or_else(|| engine_root_initial_value(self, path, field))
+            .cloned()
+            .or_else(|| engine_builtin_initial_value(path, field));
+        let entry_count = self.effective_initial_value_cache_entries.get();
+        if entry_count < MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES {
+            let mut cache = self.effective_initial_value_cache.borrow_mut();
+            let fields = cache.entry(path.clone()).or_default();
+            if fields.len() < MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE {
+                fields.insert(field.clone(), value.clone());
+                self.effective_initial_value_cache_entries
+                    .set(entry_count + 1);
+            }
+        }
+        value
+    }
+
     /// Seeds effective project and engine defaults on a datum allocated by a
     /// native constructor (`image()`, `icon()`, `sound()`, and peers). Native
     /// constructors historically allocated raw heap datums, bypassing the
@@ -9877,9 +10397,7 @@ impl ExecutionState {
         path: &TypePath,
     ) -> Result<(), String> {
         let mut defaults = engine_builtin_initial_fields(path);
-        if let Some(project) = self.initial_values.get(path) {
-            defaults.extend(project.clone());
-        }
+        defaults.extend(self.inherited_initial_values(path));
         for (field, value) in defaults {
             if self.heap.datum_field(datum, &field).is_err() {
                 self.heap
@@ -9927,13 +10445,16 @@ impl ExecutionState {
     /// Returns the earliest tick at which pending scheduler work is due.
     #[must_use]
     pub fn next_scheduled_tick(&self) -> Option<u64> {
-        self.scheduled_spawns.iter().map(|task| task.due_tick).min()
+        self.scheduled_spawns
+            .iter()
+            .map(|task| task.due_tick)
+            .chain(self.native_walks.values().map(|walk| walk.due_tick))
+            .min()
     }
 
     fn maybe_collect_unreachable_lists(&mut self, active_frames: &[CallFrame]) {
-        const MINIMUM_COLLECTION_INTERVAL: usize = 65_536;
         if self.next_list_collection == 0 {
-            self.next_list_collection = MINIMUM_COLLECTION_INTERVAL;
+            self.next_list_collection = MINIMUM_HEAP_COLLECTION_GROWTH;
         }
         let before_lists = self.heap.live_list_count();
         let before_datums = self.heap.live_datum_count();
@@ -9941,6 +10462,7 @@ impl ExecutionState {
         if before < self.next_list_collection {
             return;
         }
+        let collection_started = Instant::now();
 
         let mut datum_roots = Vec::new();
         let mut list_roots = Vec::new();
@@ -9950,11 +10472,8 @@ impl ExecutionState {
             &mut list_roots,
             self.initial_globals.values(),
         );
-        extend_heap_root_ids(
-            &mut datum_roots,
-            &mut list_roots,
-            self.initial_values.values().flat_map(BTreeMap::values),
-        );
+        datum_roots.extend_from_slice(&self.initial_value_datum_roots);
+        list_roots.extend_from_slice(&self.initial_value_list_roots);
         extend_heap_root_ids(
             &mut datum_roots,
             &mut list_roots,
@@ -9990,6 +10509,8 @@ impl ExecutionState {
         datum_roots.extend(self.world_turfs.values().copied());
         datum_roots.extend(self.world_areas.values().copied());
         datum_roots.extend(self.default_world_area);
+        datum_roots.extend(self.native_walks.keys().copied());
+        datum_roots.extend(self.native_walks.values().filter_map(NativeWalk::target));
         list_roots.extend(self.global_vars_proxy);
         for (datum, list) in self
             .datum_vars_by_datum
@@ -10039,9 +10560,11 @@ impl ExecutionState {
             }
         }
 
-        let (reclaimed_datums, reclaimed_lists) = self
+        let collection = self
             .heap
-            .collect_unreachable_values_from_ids(&datum_roots, &list_roots);
+            .collect_unreachable_values_from_ids_with_stats(&datum_roots, &list_roots);
+        let reclaimed_datums = collection.reclaimed_datums;
+        let reclaimed_lists = collection.reclaimed_lists;
         let heap = &self.heap;
         self.associative_lists
             .retain(|list| heap.list(*list).is_ok());
@@ -10058,6 +10581,12 @@ impl ExecutionState {
             .retain(|list, datum| heap.list(*list).is_ok() && heap.datum(*datum).is_ok());
         self.compact_default_datums
             .retain(|datum| heap.datum(*datum).is_ok());
+        self.native_walks.retain(|movable, walk| {
+            heap.datum(*movable).is_ok()
+                && walk
+                    .target()
+                    .is_none_or(|target| heap.datum(target).is_ok())
+        });
         if self
             .global_vars_proxy
             .is_some_and(|list| heap.list(list).is_err())
@@ -10068,20 +10597,108 @@ impl ExecutionState {
         let after_lists = self.heap.live_list_count();
         let after_datums = self.heap.live_datum_count();
         let after = after_lists.saturating_add(after_datums);
-        // Large production worlds retain well over a million live identities.
-        // Waiting for another 50% growth can require close to a gigabyte of
-        // transient datum/list storage before the next pass. Bound growth to
-        // 5% (or the existing minimum interval) so collection runs before the
-        // Windows commit limit becomes the trigger.
-        self.next_list_collection =
-            after.saturating_add(after.saturating_div(40).max(MINIMUM_COLLECTION_INTERVAL));
+        let reclaimed = reclaimed_datums.saturating_add(reclaimed_lists);
+        let growth = adaptive_heap_collection_growth(after, reclaimed);
+        self.next_list_collection = after.saturating_add(growth);
         if boot_trace_enabled() || boot_dashboard_enabled() {
+            let elapsed_ms = collection_started.elapsed().as_millis();
+            let lists = collection.list_storage;
+            let datum_storage = collection.datum_storage;
+            let datums = collection.datum_arena;
+            let list_arena = collection.list_arena;
             eprintln!(
-                "boot-vm: heap-gc datums_before={before_datums} datums_after={after_datums} datums_reclaimed={reclaimed_datums} lists_before={before_lists} lists_after={after_lists} lists_reclaimed={reclaimed_lists} next={}",
-                self.next_list_collection
+                "boot-vm: heap-gc datums_before={before_datums} datums_after={after_datums} datums_reclaimed={reclaimed_datums} lists_before={before_lists} lists_after={after_lists} lists_reclaimed={reclaimed_lists} growth={growth} next={} elapsed_ms={elapsed_ms} list_storage_allocated={} list_payload_len={} list_payload_cap={} list_order_len={} list_order_cap={} list_prefix_retained={} list_prefix_compacted={} list_prefix_entries_compacted={} list_vectors_shrunk={} list_capacity_bytes_reclaimed={} list_shared_shrink_candidates={} list_assoc_indexes={} list_assoc_index_len={} list_assoc_index_cap={} list_assoc_index_ratio_bins={:?} list_assoc_indexes_shrunk={} list_assoc_index_cap_reclaimed={} list_assoc_index_bytes_reclaimed={} list_remove_indexes={} list_remove_key_len={} list_remove_key_cap={} list_remove_position_len={} list_remove_position_cap={} list_remove_removed_len={} list_remove_removed_cap={} list_remove_indexes_dropped={} list_shared_derived_candidates={} datum_field_len={} datum_field_cap={} datum_field_vectors_shrunk={} datum_capacity_bytes_reclaimed={} datum_field_indexes={} datum_field_index_len={} datum_field_index_cap={} datum_field_index_ratio_bins={:?} datum_field_indexes_shrunk={} datum_field_index_cap_reclaimed={} datum_field_index_bytes_reclaimed={} datum_field_indexes_deduplicated={} datum_field_index_dedupe_bytes_reclaimed={} datum_field_physical_indexes={} datum_field_physical_index_len={} datum_field_physical_index_cap={} datum_field_index_fingerprint_collisions={} datum_field_index_fingerprints_computed={} datum_field_index_pointer_cache_hits={} datum_field_index_exact_layout_comparisons={} datum_arena_live={} datum_arena_slots={} datum_arena_free={} datum_arena_chunks={} datum_arena_reserved={} list_arena_live={} list_arena_slots={} list_arena_free={} list_arena_chunks={} list_arena_reserved={}",
+                self.next_list_collection,
+                lists.allocated_lists,
+                lists.payload_len,
+                lists.payload_capacity,
+                lists.order_len,
+                lists.order_capacity,
+                lists.prefix_retained,
+                lists.compacted_lists,
+                lists.compacted_prefix_entries,
+                lists.shrunk_vectors,
+                lists.reclaimed_capacity_bytes,
+                lists.shared_shrink_candidates,
+                lists.associative_indexes,
+                lists.associative_index_len,
+                lists.associative_index_capacity,
+                lists.associative_index_ratio_bins,
+                lists.shrunk_associative_indexes,
+                lists.reclaimed_associative_index_capacity,
+                lists.reclaimed_associative_index_bytes,
+                lists.positional_remove_indexes,
+                lists.positional_remove_key_len,
+                lists.positional_remove_key_capacity,
+                lists.positional_remove_position_len,
+                lists.positional_remove_position_capacity,
+                lists.positional_remove_removed_len,
+                lists.positional_remove_removed_capacity,
+                lists.dropped_positional_remove_indexes,
+                lists.shared_derived_index_candidates,
+                datum_storage.field_len,
+                datum_storage.field_capacity,
+                datum_storage.shrunk_field_vectors,
+                datum_storage.reclaimed_capacity_bytes,
+                datum_storage.field_indexes,
+                datum_storage.field_index_len,
+                datum_storage.field_index_capacity,
+                datum_storage.field_index_ratio_bins,
+                datum_storage.shrunk_field_indexes,
+                datum_storage.reclaimed_field_index_capacity,
+                datum_storage.reclaimed_field_index_bytes,
+                datum_storage.deduplicated_field_indexes,
+                datum_storage.deduplicated_field_index_bytes,
+                datum_storage.physical_field_indexes,
+                datum_storage.physical_field_index_len,
+                datum_storage.physical_field_index_capacity,
+                datum_storage.field_index_fingerprint_collisions,
+                datum_storage.field_index_fingerprints_computed,
+                datum_storage.field_index_pointer_cache_hits,
+                datum_storage.field_index_exact_layout_comparisons,
+                datums.live,
+                datums.slots,
+                datums.free,
+                datums.chunks,
+                datums.reserved,
+                list_arena.live,
+                list_arena.slots,
+                list_arena.free,
+                list_arena.chunks,
+                list_arena.reserved,
             );
         }
     }
+}
+
+const MINIMUM_HEAP_COLLECTION_GROWTH: usize = 65_536;
+// Keep the low-yield window bounded tightly enough for production hosts with
+// small Windows commit limits. Boot194 exhausted commit after this window
+// expanded to 836,706 live identities, before the next reachability pass.
+const MAXIMUM_LOW_YIELD_COLLECTION_GROWTH: usize = 262_144;
+const MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH: usize = 262_144;
+const MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH: usize = 262_144;
+
+/// Chooses how many additional heap identities may be allocated before the
+/// next full reachability pass.
+///
+/// A large, mostly-live production heap is expensive to rescan and receives a
+/// 25% growth window after a pass that reclaimed at most 5% of the identities
+/// it visited. More productive passes tighten the window because they indicate
+/// that transient allocation pressure is building. Absolute caps bound both
+/// transient garbage and the live-object growth between collections.
+fn adaptive_heap_collection_growth(live: usize, reclaimed: usize) -> usize {
+    let visited = live.saturating_add(reclaimed);
+    let (growth_divisor, maximum_growth) = if reclaimed <= visited.saturating_div(20) {
+        (4, MAXIMUM_LOW_YIELD_COLLECTION_GROWTH)
+    } else if reclaimed <= visited.saturating_div(5) {
+        (10, MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH)
+    } else {
+        (40, MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH)
+    };
+    live.saturating_div(growth_divisor)
+        .max(MINIMUM_HEAP_COLLECTION_GROWTH)
+        .min(maximum_growth)
 }
 
 fn extend_heap_root_ids<'a>(
@@ -10178,6 +10795,25 @@ struct CallFrame {
     boot_trace_started: Option<Instant>,
     boot_trace_heap: Option<(usize, usize, usize)>,
     boot_trace_step: u64,
+    atoms_profile_entry_counted: bool,
+    atoms_profile_root: bool,
+}
+
+#[derive(Debug)]
+struct AtomsProfile {
+    started: Instant,
+    last_snapshot: Instant,
+    startup_root: Option<String>,
+    total_instructions: u64,
+    samples: HashMap<AtomsProfileProcedure, u64>,
+    frame_entries: HashMap<AtomsProfileProcedure, u64>,
+    paths: HashMap<AtomsProfileProcedure, String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct AtomsProfileProcedure {
+    module_identity: u64,
+    procedure: ProcedureId,
 }
 
 #[derive(Clone, Debug)]
@@ -10196,15 +10832,134 @@ struct ScheduledSpawn {
     frames: Vec<CallFrame>,
 }
 
+#[derive(Clone, Debug)]
+struct NativeWalk {
+    due_tick: u64,
+    sequence: u64,
+    lag: u64,
+    kind: NativeWalkKind,
+}
+
+impl NativeWalk {
+    fn target(&self) -> Option<DatumId> {
+        match self.kind {
+            NativeWalkKind::Direction(_) | NativeWalkKind::Random => None,
+            NativeWalkKind::Towards(target)
+            | NativeWalkKind::To { target, .. }
+            | NativeWalkKind::Away { target, .. } => Some(target),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum NativeWalkKind {
+    Direction(i16),
+    Random,
+    Towards(DatumId),
+    To { target: DatumId, minimum: f32 },
+    Away { target: DatumId, maximum: f32 },
+}
+
 enum FrameRunOutcome {
     Complete(Value),
-    Yielded { frames: Vec<CallFrame>, delay: u64 },
+    Yielded { frames: Vec<CallFrame>, delay: f32 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StepBudgetBehavior {
     Error,
     YieldScheduledContinuation,
+}
+
+#[derive(Clone, Debug)]
+enum SimpleIterationValue {
+    Null,
+    Number(DmNumberBits),
+    Text(String),
+    File(String),
+    TypePath(TypePath),
+    Local(u16),
+}
+
+#[derive(Clone, Debug)]
+struct SimpleIterationFieldAssignment {
+    list_slot: u16,
+    index_slot: u16,
+    item_slot: u16,
+    value: SimpleIterationValue,
+    field: FieldName,
+    store_instruction: usize,
+    exit_instruction: usize,
+}
+
+fn simple_iteration_field_assignment(
+    program: &Program,
+    prepare: usize,
+) -> Option<SimpleIterationFieldAssignment> {
+    let tail = program.instructions.get(prepare + 1..prepare + 21)?;
+    let [
+        Instruction::StoreLocal(list_slot),
+        Instruction::PushNumber(one),
+        Instruction::StoreLocal(index_slot),
+        Instruction::LoadLocal(condition_index),
+        Instruction::LoadLocal(condition_list),
+        Instruction::ListLength,
+        Instruction::LessEqual,
+        Instruction::JumpIfFalse(exit_instruction),
+        Instruction::LoadLocal(iteration_list),
+        Instruction::LoadLocal(iteration_index),
+        Instruction::IndexList,
+        Instruction::StoreLocal(item_slot),
+        Instruction::LoadLocal(receiver_slot),
+        value,
+        Instruction::StoreField(field),
+        Instruction::LoadLocal(increment_index),
+        Instruction::PushNumber(increment),
+        Instruction::Add,
+        Instruction::StoreLocal(stored_index),
+        Instruction::Jump(condition_target),
+    ] = tail
+    else {
+        return None;
+    };
+    let condition = prepare + 4;
+    let exit = prepare + 21;
+    if one.to_f32() != 1.0
+        || increment.to_f32() != 1.0
+        || condition_index != index_slot
+        || condition_list != list_slot
+        || iteration_list != list_slot
+        || iteration_index != index_slot
+        || receiver_slot != item_slot
+        || increment_index != index_slot
+        || stored_index != index_slot
+        || *condition_target != condition
+        || *exit_instruction != exit
+    {
+        return None;
+    }
+    let value = match value {
+        Instruction::PushNull => SimpleIterationValue::Null,
+        Instruction::PushNumber(value) => SimpleIterationValue::Number(*value),
+        Instruction::PushText(value) => SimpleIterationValue::Text(value.to_string()),
+        Instruction::PushFile(value) => SimpleIterationValue::File(value.clone()),
+        Instruction::PushTypePath(value) => SimpleIterationValue::TypePath(value.clone()),
+        Instruction::LoadLocal(slot)
+            if slot != item_slot && slot != list_slot && slot != index_slot =>
+        {
+            SimpleIterationValue::Local(*slot)
+        }
+        _ => return None,
+    };
+    Some(SimpleIterationFieldAssignment {
+        list_slot: *list_slot,
+        index_slot: *index_slot,
+        item_slot: *item_slot,
+        value,
+        field: field.clone(),
+        store_instruction: prepare + 15,
+        exit_instruction: exit,
+    })
 }
 
 fn materialize_callee_chain(
@@ -10295,7 +11050,8 @@ pub fn execute_in_context(
 ) -> Result<Value, RuntimeError> {
     let entry = ProcedureId(0);
     let module = Module {
-        procedures: vec![program.clone()],
+        identity: next_module_identity(),
+        procedures: vec![Arc::new(program.clone())],
         paths: vec!["<standalone>".to_owned()],
         names: HashMap::new(),
         dynamic_names: HashMap::new(),
@@ -10342,7 +11098,8 @@ pub fn execute_with_limits_in_state(
 ) -> Result<Value, RuntimeError> {
     let entry = ProcedureId(0);
     let module = Module {
-        procedures: vec![program.clone()],
+        identity: next_module_identity(),
+        procedures: vec![Arc::new(program.clone())],
         paths: vec!["<standalone>".to_owned()],
         names: HashMap::new(),
         dynamic_names: HashMap::new(),
@@ -10519,6 +11276,7 @@ pub fn advance_scheduler(
 ) -> Result<Vec<Value>, RuntimeError> {
     state.scheduler_tick = state.scheduler_tick.saturating_add(ticks);
     advance_headless_world_clock(state, ticks);
+    advance_native_walks(state);
     state
         .scheduled_spawns
         .sort_by_key(|spawn| (spawn.due_tick, spawn.sequence));
@@ -10584,16 +11342,16 @@ fn account_scheduler_tick_usage(state: &mut ExecutionState) {
     set_world_numeric_field(state, "tick_usage", usage);
 }
 
-fn schedule_frames(state: &mut ExecutionState, frames: Vec<CallFrame>, delay: u64) {
+fn schedule_frames(state: &mut ExecutionState, frames: Vec<CallFrame>, delay: f32) {
     let sequence = state.scheduler_sequence;
     state.scheduler_sequence = state.scheduler_sequence.saturating_add(1);
     let tick_lag = world_numeric_field(state, "tick_lag")
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(1.0);
-    let delay_ticks = if delay == 0 {
-        0
+    let delay_ticks = if delay.is_finite() && delay > 0.0 {
+        ((f64::from(delay) / f64::from(tick_lag)).floor() as u64).max(1)
     } else {
-        ((delay as f64) / f64::from(tick_lag)).ceil() as u64
+        0
     };
     state.scheduled_spawns.push(ScheduledSpawn {
         due_tick: state.scheduler_tick.saturating_add(delay_ticks),
@@ -10645,6 +11403,116 @@ fn advance_headless_world_clock(state: &mut ExecutionState, ticks: u64) {
     set_world_numeric_field(state, "timeofday", timeofday);
 }
 
+const CANONICAL_TYPE2PARENT_SOURCE: &str = "/proc/type2parent(child)\n\
+\tvar/string_type = \"[child]\"\n\
+\tvar/last_slash = findlasttext(string_type, \"/\")\n\
+\tif(last_slash == 1)\n\
+\t\tswitch(child)\n\
+\t\t\tif(/datum)\n\
+\t\t\t\treturn null\n\
+\t\t\tif(/obj, /mob)\n\
+\t\t\t\treturn /atom/movable\n\
+\t\t\tif(/area, /turf)\n\
+\t\t\t\treturn /atom\n\
+\t\t\telse\n\
+\t\t\t\treturn /datum\n\
+\treturn text2path(copytext(string_type, 1, last_slash))\n";
+
+fn canonical_type2parent_program(program: &Program) -> bool {
+    static CANONICAL: OnceLock<Program> = OnceLock::new();
+    let canonical = CANONICAL.get_or_init(|| {
+        let syntax = dm_syntax::parse(CANONICAL_TYPE2PARENT_SOURCE)
+            .expect("canonical type2parent source is valid");
+        compile_procedure(
+            syntax
+                .definitions
+                .first()
+                .expect("canonical type2parent definition exists"),
+        )
+        .expect("canonical type2parent procedure compiles")
+    });
+    program.wait_for == canonical.wait_for
+        && program.parameter_count == canonical.parameter_count
+        && program.parameter_names == canonical.parameter_names
+        && program.local_count == canonical.local_count
+        && program.instructions == canonical.instructions
+}
+
+fn canonical_type2parent(path: &TypePath) -> Option<TypePath> {
+    let path = path.as_str();
+    match path {
+        "/datum" => None,
+        "/obj" | "/mob" => TypePath::parse("/atom/movable").ok(),
+        "/area" | "/turf" => TypePath::parse("/atom").ok(),
+        _ => path.rfind('/').and_then(|slash| {
+            if slash == 0 {
+                TypePath::parse("/datum").ok()
+            } else {
+                TypePath::parse(&path[..slash]).ok()
+            }
+        }),
+    }
+}
+
+fn canonical_static_native_builtin(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+) -> Option<&'static str> {
+    fn matches_canonical(
+        program: &Program,
+        source: &str,
+        canonical: &'static OnceLock<Program>,
+    ) -> bool {
+        let canonical = canonical.get_or_init(|| {
+            let syntax = dm_syntax::parse(source).expect("canonical native builtin should parse");
+            compile_procedure(
+                syntax
+                    .definitions
+                    .first()
+                    .expect("canonical native builtin definition exists"),
+            )
+            .expect("canonical native builtin should compile")
+        });
+        program.wait_for == canonical.wait_for
+            && program.parameter_count == canonical.parameter_count
+            && program.parameter_names == canonical.parameter_names
+            && program.local_count == canonical.local_count
+            && program.instructions == canonical.instructions
+    }
+
+    static IS_TEXT: OnceLock<Program> = OnceLock::new();
+    static MIN: OnceLock<Program> = OnceLock::new();
+    static MAX: OnceLock<Program> = OnceLock::new();
+    let path = module.procedure_path(procedure)?;
+    let (name, source, canonical) = match path {
+        "/proc/istext@dream64_builtin" => (
+            "istext",
+            "/proc/istext(value)\n\treturn !isnull(value) && !isnum(value) && !ispath(value) && !islist(value) && !istype(value)\n",
+            &IS_TEXT,
+        ),
+        "/proc/min@dream64_builtin" => (
+            "min",
+            "/proc/min(...)\n\tvar/list/values = args\n\tif(length(args) == 1 && islist(args[1]))\n\t\tvalues = args[1]\n\tif(!length(values))\n\t\treturn null\n\tvar/result = values[1]\n\tfor(var/value in values)\n\t\tif(value < result)\n\t\t\tresult = value\n\treturn result\n",
+            &MIN,
+        ),
+        "/proc/max@dream64_builtin" => (
+            "max",
+            "/proc/max(...)\n\tvar/list/values = args\n\tif(length(args) == 1 && islist(args[1]))\n\t\tvalues = args[1]\n\tif(!length(values))\n\t\treturn null\n\tvar/result = values[1]\n\tfor(var/value in values)\n\t\tif(value > result)\n\t\t\tresult = value\n\treturn result\n",
+            &MAX,
+        ),
+        _ => return None,
+    };
+    matches_canonical(program, source, canonical).then_some(name)
+}
+
+fn canonical_istext(value: &Value) -> Value {
+    Value::number(f32::from(!matches!(
+        value,
+        Value::Null | Value::Number(_) | Value::TypePath(_) | Value::Datum(_) | Value::List(_)
+    )))
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_frames(
     module: &Module,
@@ -10659,6 +11527,11 @@ fn run_frames(
     let mut instruction_batch = Instant::now();
     let mut slow_batch_report = Instant::now();
     let mut prior_instruction: Option<(Instant, ProcedureId, usize)> = None;
+    // A frame retains only its stable procedure identity so scheduled continuations
+    // remain self-contained. Cache the immutable program for the currently executing
+    // identity within one dispatch, resolving again only after a call/return switches
+    // procedures or when a continuation starts a new dispatch.
+    let mut active_program: Option<(ProcedureId, &Program)> = None;
     loop {
         if boot_trace_enabled()
             && let Some((started, prior_procedure, prior_index)) = prior_instruction.take()
@@ -10677,10 +11550,66 @@ fn run_frames(
         let frame_index = frames.len() - 1;
         let procedure = frames[frame_index].procedure;
         let instruction_index = frames[frame_index].instruction;
-        let program = module
-            .resolve_procedure(procedure)
-            .map_err(|message| execution_error(module, &frames, message))?;
-        let Some(instruction) = program.instructions.get(instruction_index).cloned() else {
+        let program = match active_program {
+            Some((active_procedure, program)) if active_procedure == procedure => program,
+            _ => {
+                let program = module
+                    .resolve_procedure(procedure)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                active_program = Some((procedure, program));
+                program
+            }
+        };
+        if instruction_index == 0 && !frames[frame_index].atoms_profile_entry_counted {
+            frames[frame_index].atoms_profile_entry_counted = true;
+            let procedure_path = module.procedure_path(procedure);
+            let is_atoms_root = procedure_path.is_some_and(is_atoms_initialize_path);
+            let startup_root = procedure_path
+                .filter(|path| is_subsystem_initialize_path(path) && startup_profile_enabled());
+            if state.atoms_profile.is_none()
+                && ((is_atoms_root && atoms_profile_enabled()) || startup_root.is_some())
+            {
+                let started = Instant::now();
+                // Keep DREAM64_PROFILE_ATOMS byte-for-byte compatible when both
+                // samplers are enabled. Every other subsystem uses its canonical
+                // Initialize path to identify independent snapshots.
+                let startup_root = (!is_atoms_root || !atoms_profile_enabled())
+                    .then(|| startup_root.map(ToOwned::to_owned))
+                    .flatten();
+                state.atoms_profile = Some(AtomsProfile {
+                    started,
+                    last_snapshot: started,
+                    startup_root: startup_root.clone(),
+                    total_instructions: 0,
+                    samples: HashMap::new(),
+                    frame_entries: HashMap::new(),
+                    paths: HashMap::new(),
+                });
+                frames[frame_index].atoms_profile_root = true;
+                if let Some(root) = startup_root {
+                    eprintln!("boot-vm: startup-profile-begin subsystem={root}");
+                } else {
+                    eprintln!(
+                        "boot-vm: atoms-profile-begin procedure={}",
+                        procedure_path.unwrap_or("<missing>")
+                    );
+                }
+            }
+            if let Some(profile) = &mut state.atoms_profile {
+                let key = AtomsProfileProcedure {
+                    module_identity: module.identity.0,
+                    procedure,
+                };
+                profile.paths.entry(key).or_insert_with(|| {
+                    module
+                        .procedure_path(procedure)
+                        .unwrap_or("<missing>")
+                        .to_owned()
+                });
+                *profile.frame_entries.entry(key).or_default() += 1;
+            }
+        }
+        let Some(instruction) = program.instructions.get(instruction_index) else {
             return Err(execution_error(
                 module,
                 &frames,
@@ -10702,7 +11631,7 @@ fn run_frames(
                     );
                 }
                 state.maybe_collect_unreachable_lists(&frames);
-                return Ok(FrameRunOutcome::Yielded { frames, delay: 0 });
+                return Ok(FrameRunOutcome::Yielded { frames, delay: 0.0 });
             }
             return Err(execution_error(
                 module,
@@ -10712,8 +11641,33 @@ fn run_frames(
         }
         remaining_steps -= 1;
         executed_steps += 1;
+        if let Some(profile) = &mut state.atoms_profile {
+            profile.total_instructions = profile.total_instructions.saturating_add(1);
+        }
         if executed_steps.is_multiple_of(4_096) {
             account_scheduler_tick_usage(state);
+            if let Some(profile) = &mut state.atoms_profile {
+                let key = AtomsProfileProcedure {
+                    module_identity: module.identity.0,
+                    procedure,
+                };
+                profile.paths.entry(key).or_insert_with(|| {
+                    module
+                        .procedure_path(procedure)
+                        .unwrap_or("<missing>")
+                        .to_owned()
+                });
+                *profile.samples.entry(key).or_default() += 1;
+                if let Some(lines) = atoms_profile_snapshot_lines_if_due(
+                    profile,
+                    Instant::now(),
+                    Duration::from_secs(60),
+                ) {
+                    for line in lines {
+                        eprintln!("{line}");
+                    }
+                }
+            }
             if boot_dashboard_enabled() {
                 let batch_elapsed = instruction_batch.elapsed();
                 if batch_elapsed.as_millis() >= 250 && slow_batch_report.elapsed().as_secs() >= 30 {
@@ -10758,12 +11712,18 @@ fn run_frames(
         match instruction {
             Instruction::PushNull => frames[frame_index].stack.push(Value::Null),
             Instruction::PushNumber(number) => {
-                frames[frame_index].stack.push(Value::Number(number));
+                frames[frame_index].stack.push(Value::Number(*number));
             }
-            Instruction::PushText(text) => frames[frame_index].stack.push(Value::text(text)),
-            Instruction::PushFile(path) => frames[frame_index].stack.push(Value::file(path)),
+            Instruction::PushText(text) => frames[frame_index]
+                .stack
+                .push(Value::Text(Arc::clone(text))),
+            Instruction::PushFile(path) => {
+                frames[frame_index].stack.push(Value::file(path.as_str()))
+            }
             Instruction::PushTypePath(path) => {
-                frames[frame_index].stack.push(Value::TypePath(path));
+                frames[frame_index]
+                    .stack
+                    .push(Value::TypePath(path.clone()));
             }
             Instruction::MakeModifiedTypePath { fields } => {
                 let stack = &mut frames[frame_index].stack;
@@ -10794,7 +11754,7 @@ fn run_frames(
                 argument_names,
                 expanded_indices,
             } => {
-                let count = usize::from(argument_count);
+                let count = usize::from(*argument_count);
                 if count > frames[frame_index].stack.len() {
                     return Err(execution_error(module, &frames, "bytecode stack underflow"));
                 }
@@ -10872,11 +11832,11 @@ fn run_frames(
                 argument_count,
                 argument_names,
             } => {
-                let expanded_argument_names = (argument_count == EXPANDED_ARGUMENT_COUNT)
+                let expanded_argument_names = (*argument_count == EXPANDED_ARGUMENT_COUNT)
                     .then(|| frames[frame_index].pending_argument_names.take())
                     .flatten();
                 let count_result =
-                    runtime_argument_count(&mut frames[frame_index].stack, argument_count);
+                    runtime_argument_count(&mut frames[frame_index].stack, *argument_count);
                 let count =
                     count_result.map_err(|message| execution_error(module, &frames, message))?;
                 let stack = &mut frames[frame_index].stack;
@@ -11011,10 +11971,10 @@ fn run_frames(
                 frames[frame_index].stack.push(allocated);
             }
             Instruction::AllocateCurrentDatum { argument_count } => {
-                let expanded_argument_names = (argument_count == EXPANDED_ARGUMENT_COUNT)
+                let expanded_argument_names = (*argument_count == EXPANDED_ARGUMENT_COUNT)
                     .then(|| frames[frame_index].pending_argument_names.take())
                     .flatten();
-                let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
+                let count = runtime_argument_count(&mut frames[frame_index].stack, *argument_count)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 if frames[frame_index].stack.len() < count {
                     return Err(execution_error(module, &frames, "bytecode stack underflow"));
@@ -11086,7 +12046,7 @@ fn run_frames(
                 frames[frame_index].stack.push(Value::Datum(datum));
             }
             Instruction::MakeRegex { argument_count } => {
-                let count = usize::from(argument_count);
+                let count = usize::from(*argument_count);
                 if !(1..=2).contains(&count) || frames[frame_index].stack.len() < count {
                     return Err(execution_error(
                         module,
@@ -11148,7 +12108,7 @@ fn run_frames(
                 frames[frame_index].stack.push(Value::Datum(datum));
             }
             Instruction::MakeMutableAppearance { argument_count } => {
-                let count = usize::from(argument_count);
+                let count = usize::from(*argument_count);
                 if frames[frame_index].stack.len() < count {
                     return Err(execution_error(
                         module,
@@ -11164,7 +12124,7 @@ fn run_frames(
                 stack.push(Value::Datum(datum));
             }
             Instruction::MakeMatrix { argument_count } => {
-                let count = usize::from(argument_count);
+                let count = usize::from(*argument_count);
                 if frames[frame_index].stack.len() < count {
                     return Err(execution_error(
                         module,
@@ -11181,7 +12141,7 @@ fn run_frames(
                 frames[frame_index].stack.push(Value::Datum(datum));
             }
             Instruction::MakeVector { argument_count } => {
-                let count = usize::from(argument_count);
+                let count = usize::from(*argument_count);
                 if frames[frame_index].stack.len() < count {
                     return Err(execution_error(
                         module,
@@ -11202,7 +12162,7 @@ fn run_frames(
                 exact,
                 character_indices,
             } => {
-                let count = usize::from(argument_count);
+                let count = usize::from(*argument_count);
                 if !(3..=5).contains(&count) || frames[frame_index].stack.len() < count {
                     return Err(execution_error(
                         module,
@@ -11222,12 +12182,12 @@ fn run_frames(
                         state,
                         regex,
                         &arguments,
-                        character_indices,
+                        *character_indices,
                         &frame_context(&frames[frame_index]),
                     )
                     .map_err(|message| execution_error(module, &frames, message))?
                 } else {
-                    replace_text_builtin(&arguments, exact, character_indices, &state.heap)
+                    replace_text_builtin(&arguments, *exact, *character_indices, &state.heap)
                         .map_err(|message| execution_error(module, &frames, message))?
                 };
                 frames[frame_index].stack.push(value);
@@ -11236,7 +12196,7 @@ fn run_frames(
                 argument_count,
                 character_indices,
             } => {
-                let count = usize::from(argument_count);
+                let count = usize::from(*argument_count);
                 if !(1..=3).contains(&count) || frames[frame_index].stack.len() < count {
                     return Err(execution_error(
                         module,
@@ -11248,7 +12208,7 @@ fn run_frames(
                     let stack = &mut frames[frame_index].stack;
                     stack.split_off(stack.len() - count)
                 };
-                let value = copy_text_builtin(&arguments, character_indices, &state.heap)
+                let value = copy_text_builtin(&arguments, *character_indices, &state.heap)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 frames[frame_index].stack.push(Value::text(value));
             }
@@ -11257,7 +12217,7 @@ fn run_frames(
                 argument_count,
                 argument_names,
             } => {
-                let count = usize::from(argument_count);
+                let count = usize::from(*argument_count);
                 if count > frames[frame_index].stack.len() {
                     return Err(execution_error(module, &frames, "bytecode stack underflow"));
                 }
@@ -11289,7 +12249,7 @@ fn run_frames(
                 name,
                 argument_count,
             } => {
-                let count = usize::from(argument_count);
+                let count = usize::from(*argument_count);
                 if count > frames[frame_index].stack.len() {
                     return Err(execution_error(module, &frames, "bytecode stack underflow"));
                 }
@@ -11435,7 +12395,7 @@ fn run_frames(
                 frames[frame_index].stack.push(value);
             }
             Instruction::ExternalCall { argument_count } => {
-                let count = usize::from(argument_count) + 2;
+                let count = usize::from(*argument_count) + 2;
                 if count > frames[frame_index].stack.len() {
                     return Err(execution_error(
                         module,
@@ -11577,11 +12537,6 @@ fn run_frames(
                         format!("sleep delay must be numeric, received {delay}"),
                     )
                 })?;
-                let delay = if delay.is_finite() && delay > 0.0 {
-                    (delay.floor() as u64).max(1)
-                } else {
-                    0
-                };
                 frames[frame_index].stack.push(Value::Null);
                 frames[frame_index].instruction += 1;
                 if let Some(detach_at) = frames.iter().rposition(|frame| {
@@ -11640,14 +12595,14 @@ fn run_frames(
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let source = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
-                let direction = direction_towards_builtin(&source, &target, &state.heap)
+                let direction = direction_towards_builtin(&source, &target, state)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let value = get_step_builtin(&source, &direction, state)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 frames[frame_index].stack.push(value);
             }
             Instruction::Range { argument_count } => {
-                let count = usize::from(argument_count);
+                let count = usize::from(*argument_count);
                 if !(1..=2).contains(&count) || frames[frame_index].stack.len() < count {
                     return Err(execution_error(
                         module,
@@ -11664,7 +12619,7 @@ fn run_frames(
                 frames[frame_index].stack.push(value);
             }
             Instruction::Block { argument_count } => {
-                let count = usize::from(argument_count);
+                let count = usize::from(*argument_count);
                 if !(count == 2 || (3..=6).contains(&count))
                     || frames[frame_index].stack.len() < count
                 {
@@ -11683,7 +12638,7 @@ fn run_frames(
                 frames[frame_index].stack.push(value);
             }
             Instruction::TypesOf { argument_count } => {
-                let count = usize::from(argument_count);
+                let count = usize::from(*argument_count);
                 if count == 0 || frames[frame_index].stack.len() < count {
                     return Err(execution_error(
                         module,
@@ -11756,7 +12711,7 @@ fn run_frames(
                 frames[frame_index].stack.push(Value::List(list));
             }
             Instruction::Rand { argument_count } => {
-                let count = usize::from(argument_count);
+                let count = usize::from(*argument_count);
                 if count > 2 || frames[frame_index].stack.len() < count {
                     return Err(execution_error(
                         module,
@@ -11771,7 +12726,7 @@ fn run_frames(
                 frames[frame_index].stack.push(Value::number(value));
             }
             Instruction::Roll { argument_count } => {
-                let count = usize::from(argument_count);
+                let count = usize::from(*argument_count);
                 if !(1..=2).contains(&count) || frames[frame_index].stack.len() < count {
                     return Err(execution_error(
                         module,
@@ -11805,6 +12760,25 @@ fn run_frames(
                     .map_err(|message| execution_error(module, &frames, message))?;
                 frames[frame_index].stack.push(value);
             }
+            Instruction::PickExpandedArguments => {
+                frames[frame_index].pending_argument_names = None;
+                let count =
+                    runtime_argument_count(&mut frames[frame_index].stack, EXPANDED_ARGUMENT_COUNT)
+                        .map_err(|message| execution_error(module, &frames, message))?;
+                if count > frames[frame_index].stack.len() {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "invalid expanded pick builtin stack",
+                    ));
+                }
+                let stack_length = frames[frame_index].stack.len();
+                let values = frames[frame_index].stack.split_off(stack_length - count);
+                let weighted = vec![false; count];
+                let value = pick_value(&values, &weighted, &state.heap, &mut state.random_state)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].stack.push(value);
+            }
             Instruction::Prob => {
                 let chance = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
@@ -11822,7 +12796,7 @@ fn run_frames(
                     .push(Value::number(f32::from(result)));
             }
             Instruction::Round { argument_count } => {
-                let count = usize::from(argument_count);
+                let count = usize::from(*argument_count);
                 if !(1..=2).contains(&count) || frames[frame_index].stack.len() < count {
                     return Err(execution_error(
                         module,
@@ -11840,7 +12814,8 @@ fn run_frames(
                 kind,
                 argument_count,
             } => {
-                let count = usize::from(argument_count);
+                let kind = *kind;
+                let count = usize::from(*argument_count);
                 let valid_count = match kind {
                     TypePredicateKind::IsType | TypePredicateKind::IsPath => {
                         (1..=2).contains(&count)
@@ -11868,7 +12843,7 @@ fn run_frames(
                     .push(Value::number(f32::from(result)));
             }
             Instruction::MakeList(item_count) => {
-                let count = usize::from(item_count);
+                let count = usize::from(*item_count);
                 let stack_length = frames[frame_index].stack.len();
                 if count > stack_length {
                     return Err(execution_error(module, &frames, "bytecode stack underflow"));
@@ -11885,7 +12860,7 @@ fn run_frames(
                 frames[frame_index].stack.push(Value::List(list));
             }
             Instruction::MakeArray(dimension_count) => {
-                let count = usize::from(dimension_count);
+                let count = usize::from(*dimension_count);
                 if frames[frame_index].stack.len() < count {
                     return Err(execution_error(module, &frames, "bytecode stack underflow"));
                 }
@@ -12003,6 +12978,111 @@ fn run_frames(
                 }
                 state.mark_associative_list(list);
                 frames[frame_index].stack.push(Value::List(list));
+            }
+            Instruction::LogicalOrEmptyListLocal(slot) => {
+                let slot = *slot;
+                let Some(mut current) = frames[frame_index].locals.get(usize::from(slot)).cloned()
+                else {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        format!("invalid local slot {slot}"),
+                    ));
+                };
+                if let Value::List(list) = current
+                    && state.reference_lists.contains(&list)
+                {
+                    current = state
+                        .heap
+                        .list(list)
+                        .and_then(|values| values.get(1))
+                        .cloned()
+                        .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                }
+                let value = if runtime_truthy(&state.heap, &current)
+                    .map_err(|message| execution_error(module, &frames, message))?
+                {
+                    current
+                } else {
+                    let value = Value::List(state.heap.allocate_list());
+                    let Some(local) = frames[frame_index].locals.get_mut(usize::from(slot)) else {
+                        return Err(execution_error(
+                            module,
+                            &frames,
+                            format!("invalid local slot {slot}"),
+                        ));
+                    };
+                    if let Value::List(list) = local
+                        && state.reference_lists.contains(list)
+                    {
+                        state
+                            .heap
+                            .list_mut(*list)
+                            .and_then(|values| values.set(1, value.clone()))
+                            .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                    } else {
+                        *local = value.clone();
+                    }
+                    let parameter = usize::from(slot);
+                    if parameter < declared_argument_count(program) {
+                        frames[frame_index].arguments[parameter] = value.clone();
+                        if let Some(args) = frames[frame_index].args_list {
+                            state
+                                .heap
+                                .list_mut(args)
+                                .and_then(|values| values.set(parameter + 1, value.clone()))
+                                .map_err(|error| {
+                                    execution_error(module, &frames, error.to_string())
+                                })?;
+                        }
+                    }
+                    if frames[frame_index].static_locals.contains(&slot) {
+                        let path = module
+                            .procedure_path(frames[frame_index].procedure)
+                            .unwrap_or("<unknown procedure>")
+                            .to_owned();
+                        state
+                            .procedure_static_locals
+                            .insert((path, slot), value.clone());
+                    }
+                    value
+                };
+                frames[frame_index].stack.push(value);
+            }
+            Instruction::LogicalOrEmptyListGlobal(name) => {
+                let Some(current) = state.global(name).cloned() else {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        format!("runtime global {name:?} is absent"),
+                    ));
+                };
+                let value = if runtime_truthy(&state.heap, &current)
+                    .map_err(|message| execution_error(module, &frames, message))?
+                {
+                    current
+                } else {
+                    let value = Value::List(state.heap.allocate_list());
+                    state.set_global(name.clone(), value.clone());
+                    value
+                };
+                frames[frame_index].stack.push(value);
+            }
+            Instruction::LogicalOrEmptyListField(name) => {
+                let receiver = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let value = logical_or_empty_list_field(state, receiver, name)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].stack.push(value);
+            }
+            Instruction::LogicalOrEmptyListIndex => {
+                let key = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let receiver = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let value = logical_or_empty_list_index(state, receiver, key)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].stack.push(value);
             }
             Instruction::IndexList => {
                 let key = match pop(&mut frames[frame_index].stack) {
@@ -12222,6 +13302,7 @@ fn run_frames(
             }
             Instruction::CompoundListIndex(operator)
             | Instruction::CompoundListIndexKeep(operator) => {
+                let operator = *operator;
                 let keep = matches!(instruction, Instruction::CompoundListIndexKeep(_));
                 let right = match pop(&mut frames[frame_index].stack) {
                     Ok(value) => value,
@@ -12413,6 +13494,72 @@ fn run_frames(
                     // loop machinery simply executes zero iterations.
                     _ => Value::List(state.heap.allocate_list()),
                 };
+                if let (Value::List(snapshot), Some(assignment)) = (
+                    &iterable,
+                    simple_iteration_field_assignment(program, instruction_index),
+                ) {
+                    let item_is_pointer = frames[frame_index]
+                        .locals
+                        .get(usize::from(assignment.item_slot))
+                        .is_some_and(|value| {
+                            matches!(value, Value::List(list) if state.reference_lists.contains(list))
+                        });
+                    let value = match &assignment.value {
+                        SimpleIterationValue::Null => Some(Value::Null),
+                        SimpleIterationValue::Number(value) => Some(Value::Number(*value)),
+                        SimpleIterationValue::Text(value) => Some(Value::text(value.as_str())),
+                        SimpleIterationValue::File(value) => Some(Value::file(value.as_str())),
+                        SimpleIterationValue::TypePath(value) => {
+                            Some(Value::TypePath(value.clone()))
+                        }
+                        SimpleIterationValue::Local(slot) => frames[frame_index]
+                            .locals
+                            .get(usize::from(*slot))
+                            .cloned()
+                            .and_then(|value| match value {
+                                Value::List(list) if state.reference_lists.contains(&list) => state
+                                    .heap
+                                    .list(list)
+                                    .ok()
+                                    .and_then(|values| values.get(1).ok())
+                                    .cloned(),
+                                value => Some(value),
+                            }),
+                    };
+                    let datums = state.heap.list(*snapshot).ok().and_then(|values| {
+                        values
+                            .positions()
+                            .map(|(_, value)| match value {
+                                Value::Datum(datum) if state.heap.datum(*datum).is_ok() => {
+                                    Some(*datum)
+                                }
+                                _ => None,
+                            })
+                            .collect::<Option<Vec<_>>>()
+                    });
+                    if !item_is_pointer && let (Some(value), Some(datums)) = (value, datums) {
+                        frames[frame_index].locals[usize::from(assignment.list_slot)] =
+                            iterable.clone();
+                        for (index, datum) in datums.iter().copied().enumerate() {
+                            frames[frame_index].locals[usize::from(assignment.index_slot)] =
+                                Value::number((index + 1) as f32);
+                            frames[frame_index].locals[usize::from(assignment.item_slot)] =
+                                Value::Datum(datum);
+                            frames[frame_index].instruction = assignment.store_instruction;
+                            assign_datum_or_shared_field(
+                                state,
+                                datum,
+                                assignment.field.clone(),
+                                value.clone(),
+                            )
+                            .map_err(|message| execution_error(module, &frames, message))?;
+                        }
+                        frames[frame_index].locals[usize::from(assignment.index_slot)] =
+                            Value::number((datums.len() + 1) as f32);
+                        frames[frame_index].instruction = assignment.exit_instruction;
+                        continue;
+                    }
+                }
                 frames[frame_index].stack.push(iterable);
             }
             Instruction::IterationTypeFilter(target) => {
@@ -12479,7 +13626,7 @@ fn run_frames(
                             .overrides()
                             .iter()
                             .rev()
-                            .find(|(field, _)| field == &name)
+                            .find(|(field, _)| field == name)
                             .map(|(_, value)| value.clone())
                             .or_else(|| state.initial_value(path.base(), &name).cloned())
                             .unwrap_or(Value::Null),
@@ -12706,7 +13853,7 @@ fn run_frames(
                 };
                 frames[frame_index].stack.push(value);
             }
-            Instruction::StoreField(ref name) | Instruction::StoreFieldKeep(ref name) => {
+            Instruction::StoreField(name) | Instruction::StoreFieldKeep(name) => {
                 let keep = matches!(instruction, Instruction::StoreFieldKeep(_));
                 let value = match pop(&mut frames[frame_index].stack) {
                     Ok(value) => value,
@@ -12851,13 +13998,7 @@ fn run_frames(
                                 .map(|(field, value)| (field.clone(), value.clone())),
                         );
                     }
-                    if let Some(values) = state.initial_values.get(&runtime_type) {
-                        initial.extend(
-                            values
-                                .iter()
-                                .map(|(field, value)| (field.clone(), value.clone())),
-                        );
-                    }
+                    initial.extend(state.inherited_initial_values(&runtime_type));
                     let initial = initial.into_iter().collect::<Vec<_>>();
                     let instance = state
                         .heap
@@ -12922,13 +14063,14 @@ fn run_frames(
                             .unwrap_or("<unknown>")
                     );
                 }
-                state.set_global(name, value);
+                state.set_global(name.clone(), value);
             }
             Instruction::MutateLocal {
                 slot,
                 delta,
                 prefix,
             } => {
+                let (slot, delta, prefix) = (*slot, *delta, *prefix);
                 let Some(current) = frames[frame_index].locals.get(usize::from(slot)).cloned()
                 else {
                     return Err(execution_error(
@@ -12947,13 +14089,15 @@ fn run_frames(
                 delta,
                 prefix,
             } => {
+                let (delta, prefix) = (*delta, *prefix);
                 let current = state.global(&name).cloned().unwrap_or(Value::Null);
                 let (result, updated) = mutate_scalar_value(current, delta, prefix)
                     .map_err(|message| execution_error(module, &frames, message))?;
-                state.set_global(name, updated);
+                state.set_global(name.clone(), updated);
                 frames[frame_index].stack.push(result);
             }
             Instruction::MutateResult { delta, prefix } => {
+                let (delta, prefix) = (*delta, *prefix);
                 let current = frames[frame_index].result.clone();
                 let (result, updated) = mutate_scalar_value(current, delta, prefix)
                     .map_err(|message| execution_error(module, &frames, message))?;
@@ -12965,6 +14109,7 @@ fn run_frames(
                 delta,
                 prefix,
             } => {
+                let (delta, prefix) = (*delta, *prefix);
                 let receiver = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let current = match &receiver {
@@ -12995,7 +14140,7 @@ fn run_frames(
                     Value::Datum(datum) => {
                         state
                             .heap
-                            .set_datum_field(datum, name, updated)
+                            .set_datum_field(datum, name.clone(), updated)
                             .map_err(|error| execution_error(module, &frames, error.to_string()))?;
                     }
                     Value::List(list) => {
@@ -13036,6 +14181,7 @@ fn run_frames(
                 frames[frame_index].stack.push(result);
             }
             Instruction::MutateListIndex { delta, prefix } => {
+                let (delta, prefix) = (*delta, *prefix);
                 let key = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let list = match pop(&mut frames[frame_index].stack) {
@@ -13080,6 +14226,7 @@ fn run_frames(
                 frames[frame_index].stack.push(value);
             }
             Instruction::AddressLocal(slot) => {
+                let slot = *slot;
                 let Some(local) = frames[frame_index].locals.get_mut(usize::from(slot)) else {
                     return Err(execution_error(
                         module,
@@ -13104,6 +14251,7 @@ fn run_frames(
                 frames[frame_index].stack.push(Value::List(reference));
             }
             Instruction::LoadLocalRaw(slot) => {
+                let slot = *slot;
                 let Some(value) = frames[frame_index].locals.get(usize::from(slot)).cloned() else {
                     return Err(execution_error(
                         module,
@@ -13114,6 +14262,7 @@ fn run_frames(
                 frames[frame_index].stack.push(value);
             }
             Instruction::LoadLocal(slot) => {
+                let slot = *slot;
                 let Some(mut value) = frames[frame_index].locals.get(usize::from(slot)).cloned()
                 else {
                     return Err(execution_error(
@@ -13135,6 +14284,7 @@ fn run_frames(
                 frames[frame_index].stack.push(value);
             }
             Instruction::StoreLocal(slot) => {
+                let slot = *slot;
                 let value = match pop(&mut frames[frame_index].stack) {
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
@@ -13177,6 +14327,7 @@ fn run_frames(
                 }
             }
             Instruction::LoadStaticLocalOrJump { slot, target } => {
+                let (slot, target) = (*slot, *target);
                 let path = module
                     .procedure_path(frames[frame_index].procedure)
                     .unwrap_or("<unknown procedure>")
@@ -13195,6 +14346,7 @@ fn run_frames(
                 }
             }
             Instruction::InitializeStaticLocal(slot) => {
+                let slot = *slot;
                 let value = match pop(&mut frames[frame_index].stack) {
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
@@ -13264,6 +14416,7 @@ fn run_frames(
                 ));
             }
             Instruction::BeginTry { catch, end, local } => {
+                let (catch, end, local) = (*catch, *end, *local);
                 if catch >= program.instructions.len() || end >= program.instructions.len() {
                     return Err(execution_error(
                         module,
@@ -13336,7 +14489,7 @@ fn run_frames(
                 continue;
             }
             Instruction::Locate { argument_count } => {
-                let count = usize::from(argument_count);
+                let count = usize::from(*argument_count);
                 let stack_length = frames[frame_index].stack.len();
                 if count > stack_length {
                     return Err(execution_error(module, &frames, "bytecode stack underflow"));
@@ -13374,7 +14527,7 @@ fn run_frames(
                 frames[frame_index].stack.push(located);
             }
             Instruction::LocateIn { argument_count } => {
-                let count = usize::from(argument_count)
+                let count = usize::from(*argument_count)
                     .checked_add(1)
                     .expect("u16 argument count plus container fits usize");
                 let stack_length = frames[frame_index].stack.len();
@@ -13418,6 +14571,7 @@ fn run_frames(
                     .push(Value::number(f32::from(!is_truthy)));
             }
             Instruction::CompoundAssignment(operator) => {
+                let operator = *operator;
                 let right = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let left = pop(&mut frames[frame_index].stack)
@@ -13692,6 +14846,7 @@ fn run_frames(
                     .push(Value::number(f32::from(result)));
             }
             Instruction::JumpIfNull(target) => {
+                let target = *target;
                 let value = match pop(&mut frames[frame_index].stack) {
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
@@ -13705,6 +14860,7 @@ fn run_frames(
                 }
             }
             Instruction::JumpIfFalse(target) => {
+                let target = *target;
                 let condition = match pop(&mut frames[frame_index].stack) {
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
@@ -13720,6 +14876,7 @@ fn run_frames(
                 }
             }
             Instruction::Jump(target) => {
+                let target = *target;
                 if let Err(message) = validate_jump(target, program.instructions.len()) {
                     return Err(execution_error(module, &frames, message));
                 }
@@ -13727,7 +14884,8 @@ fn run_frames(
                 continue;
             }
             Instruction::JumpIfArgumentSupplied { parameter, target } => {
-                let parameter = usize::from(parameter);
+                let parameter = usize::from(*parameter);
+                let target = *target;
                 if frames[frame_index]
                     .supplied_parameters
                     .get(parameter)
@@ -13743,10 +14901,12 @@ fn run_frames(
                 }
             }
             Instruction::Call {
-                procedure: mut target,
+                procedure: target,
                 argument_count,
                 argument_names,
             } => {
+                let mut target = *target;
+                let argument_count = *argument_count;
                 if frames.len() >= limits.max_call_depth {
                     return Err(execution_error(
                         module,
@@ -13786,20 +14946,57 @@ fn run_frames(
                 let target_program = module
                     .resolve_procedure(target)
                     .map_err(|message| execution_error(module, &frames, message))?;
-                let mut target_frame = make_frame_named(
-                    target,
-                    target_program,
-                    &arguments,
-                    expanded_argument_names
-                        .as_deref()
-                        .unwrap_or(&argument_names),
-                    &context,
-                );
+                let names = expanded_argument_names
+                    .as_deref()
+                    .unwrap_or(&argument_names);
+                if names.iter().all(Option::is_none)
+                    && let Some(name) =
+                        canonical_static_native_builtin(module, target, target_program)
+                {
+                    let value = if name == "istext" {
+                        arguments.first().map(canonical_istext).ok_or_else(|| {
+                            "canonical istext call is missing its required argument".to_owned()
+                        })
+                    } else {
+                        execute_standard_builtin(name, &arguments, state)
+                    };
+                    // min/max are read-only before they can report an error.
+                    // Fall through to the canonical DM frame on failure so
+                    // its exact callee source and call stack are retained.
+                    if let Ok(value) = value {
+                        frames[frame_index].stack.push(value);
+                        frames[frame_index].instruction += 1;
+                        continue;
+                    }
+                }
+                // Monkestation's canonical type2parent helper implements a
+                // lexical type-path parent with several text operations. It is
+                // called millions of times while components register during
+                // map load. Only bypass the DM frame when the resolved body is
+                // bytecode-identical to that helper and its argument is the
+                // common type-path case; customized helpers and all coercion
+                // cases continue through ordinary DM execution.
+                if arguments.len() == 1
+                    && canonical_type2parent_program(target_program)
+                    && let Value::TypePath(path) = &arguments[0]
+                {
+                    frames[frame_index]
+                        .stack
+                        .push(canonical_type2parent(path).map_or(Value::Null, Value::TypePath));
+                    frames[frame_index].instruction += 1;
+                    continue;
+                }
+                let mut target_frame = if names.iter().all(Option::is_none) {
+                    make_frame_owned(target, target_program, arguments, &context)
+                } else {
+                    make_frame_named(target, target_program, &arguments, names, &context)
+                };
                 mark_boot_trace_frame(&mut target_frame, module, state, executed_steps);
                 frames.push(target_frame);
                 continue;
             }
             Instruction::CallCurrent { argument_count } => {
+                let argument_count = *argument_count;
                 if frames.len() >= limits.max_call_depth {
                     return Err(execution_error(
                         module,
@@ -13823,17 +15020,32 @@ fn run_frames(
                     forwarded_frame_arguments(&frames[frame_index], program)
                 };
                 let context = frame_context(&frames[frame_index]);
-                frames.push(if let Some(names) = expanded_argument_names.as_deref() {
-                    make_frame_named(procedure, program, &arguments, names, &context)
-                } else {
-                    make_frame(procedure, program, &arguments, &context)
-                });
+                frames.push(
+                    if expanded_argument_names
+                        .as_deref()
+                        .is_none_or(|names| names.iter().all(Option::is_none))
+                    {
+                        make_frame_owned(procedure, program, arguments, &context)
+                    } else {
+                        make_frame_named(
+                            procedure,
+                            program,
+                            &arguments,
+                            expanded_argument_names
+                                .as_deref()
+                                .expect("named arguments exist"),
+                            &context,
+                        )
+                    },
+                );
                 continue;
             }
             Instruction::CallParent {
                 procedure: target,
                 argument_count,
             } => {
+                let target = *target;
+                let argument_count = *argument_count;
                 if frames.len() >= limits.max_call_depth {
                     return Err(execution_error(
                         module,
@@ -13867,46 +15079,71 @@ fn run_frames(
                     .resolve_procedure(target)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let context = frame_context(&frames[frame_index]);
-                frames.push(if let Some(names) = expanded_argument_names.as_deref() {
-                    make_frame_named(target, target_program, &arguments, names, &context)
-                } else {
-                    make_frame(target, target_program, &arguments, &context)
-                });
+                frames.push(
+                    if expanded_argument_names
+                        .as_deref()
+                        .is_none_or(|names| names.iter().all(Option::is_none))
+                    {
+                        make_frame_owned(target, target_program, arguments, &context)
+                    } else {
+                        make_frame_named(
+                            target,
+                            target_program,
+                            &arguments,
+                            expanded_argument_names
+                                .as_deref()
+                                .expect("named arguments exist"),
+                            &context,
+                        )
+                    },
+                );
                 continue;
             }
             Instruction::CallDynamic {
+                static_selector,
                 argument_count,
                 argument_names,
                 null_receiver_is_global,
             } => {
+                let argument_count = *argument_count;
+                let null_receiver_is_global = *null_receiver_is_global;
                 let expanded_argument_names = (argument_count == EXPANDED_ARGUMENT_COUNT)
                     .then(|| frames[frame_index].pending_argument_names.take())
                     .flatten();
                 let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let stack_length = frames[frame_index].stack.len();
-                // Receiver and selector precede all explicit arguments.
-                if stack_length < count + 2 {
+                // A constant selector is embedded in the instruction. Fully
+                // dynamic call() selectors retain the original stack shape.
+                let prefix_count = 1 + usize::from(static_selector.is_none());
+                if stack_length < count + prefix_count {
                     return Err(execution_error(module, &frames, "bytecode stack underflow"));
                 }
                 let arguments = frames[frame_index].stack.split_off(stack_length - count);
-                let selector = frames[frame_index]
-                    .stack
-                    .pop()
-                    .expect("stack length was checked");
+                let selector = static_selector.is_none().then(|| {
+                    frames[frame_index]
+                        .stack
+                        .pop()
+                        .expect("stack length was checked")
+                });
                 let receiver = frames[frame_index]
                     .stack
                     .pop()
                     .expect("stack length was checked");
+                let selector_text = static_selector.as_deref().or_else(|| match &selector {
+                    Some(Value::Text(selector)) => Some(selector.as_ref()),
+                    _ => None,
+                });
                 if let Value::List(list) = receiver {
-                    let Value::Text(method) = selector else {
+                    let Some(method) = selector_text else {
+                        let selector = selector.as_ref().expect("dynamic selector exists");
                         return Err(execution_error(
                             module,
                             &frames,
                             format!("list procedure selector must be text, received {selector}"),
                         ));
                     };
-                    let Some(result) = execute_list_method(&method, list, &arguments, state) else {
+                    let Some(result) = execute_list_method(method, list, &arguments, state) else {
                         return Err(execution_error(
                             module,
                             &frames,
@@ -13916,12 +15153,13 @@ fn run_frames(
                     let result =
                         result.map_err(|message| execution_error(module, &frames, message))?;
                     frames[frame_index].stack.push(result);
-                } else if matches!((&receiver, &selector), (Value::Datum(_), Value::Text(_)))
-                    && let Ok((target, context)) = dynamic_call_target(
+                } else if matches!(receiver, Value::Datum(_))
+                    && let Some(method) = selector_text
+                    && let Ok((target, context)) = dynamic_call_target_named(
                         module,
                         state,
                         &receiver,
-                        &selector,
+                        method,
                         &frame_context(&frames[frame_index]),
                         false,
                     )
@@ -13936,23 +15174,30 @@ fn run_frames(
                     let target_program = module
                         .resolve_procedure(target)
                         .map_err(|message| execution_error(module, &frames, message))?;
-                    let mut target_frame = if let Some(names) = expanded_argument_names
+                    let names = expanded_argument_names
                         .as_deref()
-                        .or((!argument_names.is_empty()).then_some(argument_names.as_slice()))
-                    {
-                        make_frame_named(target, target_program, &arguments, names, &context)
-                    } else {
-                        make_frame(target, target_program, &arguments, &context)
-                    };
+                        .or((!argument_names.is_empty()).then_some(argument_names.as_slice()));
+                    let mut target_frame =
+                        if names.is_none_or(|names| names.iter().all(Option::is_none)) {
+                            make_frame_owned(target, target_program, arguments, &context)
+                        } else {
+                            make_frame_named(
+                                target,
+                                target_program,
+                                &arguments,
+                                names.expect("named arguments exist"),
+                                &context,
+                            )
+                        };
                     mark_boot_trace_frame(&mut target_frame, module, state, executed_steps);
                     frames.push(target_frame);
                     continue;
-                } else if let (Value::Datum(savefile), Value::Text(method)) = (&receiver, &selector)
+                } else if let (Value::Datum(savefile), Some(method)) = (&receiver, selector_text)
                     && state.heap.datum(*savefile).is_ok_and(|datum| {
                         let path = datum.type_path().as_str();
                         path == "/savefile" || path.starts_with("/savefile/")
                     })
-                    && method.as_ref() == "ExportText"
+                    && method == "ExportText"
                 {
                     let key = arguments
                         .first()
@@ -13972,22 +15217,22 @@ fn run_frames(
                     frames[frame_index]
                         .stack
                         .push(Value::text(format!("{key} = {{\"\n{encoded}\n\"}}\n\n")));
-                } else if let (Value::Datum(datum), Value::Text(method)) = (&receiver, &selector)
+                } else if let (Value::Datum(datum), Some(method)) = (&receiver, selector_text)
                     && is_matrix_datum(*datum, &state.heap)
                 {
                     let result = execute_matrix_method(*datum, method, &arguments, &mut state.heap)
                         .map_err(|message| execution_error(module, &frames, message))?;
                     frames[frame_index].stack.push(result);
-                } else if let (Value::Datum(datum), Value::Text(method)) = (&receiver, &selector)
+                } else if let (Value::Datum(datum), Some(method)) = (&receiver, selector_text)
                     && is_vector_datum(*datum, &state.heap)
                 {
                     let result = execute_vector_method(*datum, method, &arguments, &mut state.heap)
                         .map_err(|message| execution_error(module, &frames, message))?;
                     frames[frame_index].stack.push(result);
-                } else if let (Value::Datum(datum), Value::Text(method)) = (&receiver, &selector)
+                } else if let (Value::Datum(datum), Some(method)) = (&receiver, selector_text)
                     && is_regex_datum(*datum, state)
                 {
-                    let result = if method.as_ref() == "Replace" {
+                    let result = if method == "Replace" {
                         if !(2..=4).contains(&arguments.len()) {
                             return Err(execution_error(
                                 module,
@@ -14015,10 +15260,10 @@ fn run_frames(
                             .map_err(|message| execution_error(module, &frames, message))?
                     };
                     frames[frame_index].stack.push(result);
-                } else if let (Value::Datum(datum), Value::Text(method)) = (&receiver, &selector)
+                } else if let (Value::Datum(datum), Some(method)) = (&receiver, selector_text)
                     && is_icon_datum(*datum, &state.heap)
                     && matches!(
-                        method.as_ref(),
+                        method,
                         "MapColors"
                             | "Blend"
                             | "SetIntensity"
@@ -14035,7 +15280,7 @@ fn run_frames(
                             | "SwapColor"
                     )
                 {
-                    let result = match method.as_ref() {
+                    let result = match method {
                         "MapColors" => apply_icon_map_colors(*datum, &arguments, &mut state.heap)
                             .map(|()| Value::Null),
                         "Blend" => apply_icon_blend(*datum, &arguments, &mut state.heap)
@@ -14057,25 +15302,39 @@ fn run_frames(
                         ));
                     }
                     let caller_context = frame_context(&frames[frame_index]);
-                    let (target, context) = dynamic_call_target(
-                        module,
-                        state,
-                        &receiver,
-                        &selector,
-                        &caller_context,
-                        null_receiver_is_global,
-                    )
-                    .map_err(|message| execution_error(module, &frames, message))?;
+                    let target = if let Some(selector) = static_selector.as_deref() {
+                        dynamic_call_target_named(
+                            module,
+                            state,
+                            &receiver,
+                            selector,
+                            &caller_context,
+                            null_receiver_is_global,
+                        )
+                    } else {
+                        dynamic_call_target(
+                            module,
+                            state,
+                            &receiver,
+                            selector.as_ref().expect("dynamic selector exists"),
+                            &caller_context,
+                            null_receiver_is_global,
+                        )
+                    };
+                    let (target, context) =
+                        target.map_err(|message| execution_error(module, &frames, message))?;
                     let target_program = module
                         .resolve_procedure(target)
                         .map_err(|message| execution_error(module, &frames, message))?;
-                    let mut target_frame = make_frame(target, target_program, &arguments, &context);
+                    let mut target_frame =
+                        make_frame_owned(target, target_program, arguments, &context);
                     mark_boot_trace_frame(&mut target_frame, module, state, executed_steps);
                     frames.push(target_frame);
                     continue;
                 }
             }
             Instruction::Spawn { entry } => {
+                let entry = *entry;
                 let delay = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let delay = delay.as_number().ok_or_else(|| {
@@ -14104,11 +15363,6 @@ fn run_frames(
                     }
                     continue;
                 }
-                let delay = if delay.is_finite() && delay > 0.0 {
-                    (delay.floor() as u64).max(1)
-                } else {
-                    0
-                };
                 schedule_frames(state, vec![spawned], delay);
             }
             Instruction::Return => {
@@ -14117,6 +15371,7 @@ fn run_frames(
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
                 let finished = frames.pop().expect("returning frame exists");
+                let finish_atoms_profile = finished.atoms_profile_root;
                 let result = finished.caller_result_override.clone().unwrap_or(result);
                 if boot_trace_enabled()
                     && module
@@ -14151,6 +15406,9 @@ fn run_frames(
                         deferred_delta,
                     );
                 }
+                if finish_atoms_profile && let Some(profile) = state.atoms_profile.take() {
+                    emit_atoms_profile(&profile);
+                }
                 let Some(caller) = frames.last_mut() else {
                     return Ok(FrameRunOutcome::Complete(result));
                 };
@@ -14169,6 +15427,15 @@ fn make_frame(
     arguments: &[Value],
     context: &ExecutionContext,
 ) -> CallFrame {
+    make_frame_owned(procedure, program, arguments.to_vec(), context)
+}
+
+fn make_frame_owned(
+    procedure: ProcedureId,
+    program: &Program,
+    mut arguments: Vec<Value>,
+    context: &ExecutionContext,
+) -> CallFrame {
     let mut locals = vec![Value::Null; program.local_count];
     let bound_count = arguments
         .len()
@@ -14180,11 +15447,9 @@ fn make_frame(
     // retains any extra supplied arguments. This is observable in atom/New:
     // `new /obj` supplies no explicit location, but `/atom/New(loc, ...)`
     // can still assign `args[1]` before forwarding it to Initialize().
-    let mut positioned_arguments = arguments.to_vec();
-    positioned_arguments.resize(
-        positioned_arguments
-            .len()
-            .max(declared_argument_count(program)),
+    let supplied_argument_count = arguments.len();
+    arguments.resize(
+        arguments.len().max(declared_argument_count(program)),
         Value::Null,
     );
     CallFrame {
@@ -14195,10 +15460,10 @@ fn make_frame(
         result: Value::Null,
         src: context.src.clone(),
         usr: context.usr.clone(),
-        arguments: positioned_arguments,
+        arguments,
         args_list: None,
         supplied_parameters: (0..program.parameter_count)
-            .map(|index| index < arguments.len())
+            .map(|index| index < supplied_argument_count)
             .collect(),
         pending_argument_names: None,
         exception_handlers: Vec::new(),
@@ -14208,6 +15473,8 @@ fn make_frame(
         boot_trace_started: None,
         boot_trace_heap: None,
         boot_trace_step: 0,
+        atoms_profile_entry_counted: false,
+        atoms_profile_root: false,
     }
 }
 
@@ -14219,6 +15486,116 @@ fn boot_trace_enabled() -> bool {
 fn boot_dashboard_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("DREAM64_BOOT_DASHBOARD").is_some())
+}
+
+fn atoms_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DREAM64_PROFILE_ATOMS").is_some())
+}
+
+fn startup_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DREAM64_PROFILE_STARTUP").is_some())
+}
+
+const ATOMS_INITIALIZE_PATH: &str = "/datum/controller/subsystem/atoms/proc/Initialize";
+
+fn is_atoms_initialize_path(path: &str) -> bool {
+    path.split_once('@').map_or(path, |(base, _)| base) == ATOMS_INITIALIZE_PATH
+}
+
+fn is_subsystem_initialize_path(path: &str) -> bool {
+    let path = path.split_once('@').map_or(path, |(base, _)| base);
+    path.strip_prefix("/datum/controller/subsystem/")
+        .and_then(|suffix| suffix.rsplit_once("/proc/"))
+        .is_some_and(|(owner, selector)| !owner.is_empty() && selector == "Initialize")
+}
+
+fn atoms_profile_lines_with_event(profile: &AtomsProfile, event: &str) -> Vec<String> {
+    let mut procedures = profile
+        .samples
+        .keys()
+        .chain(profile.frame_entries.keys())
+        .copied()
+        .collect::<Vec<_>>();
+    procedures.sort_unstable_by_key(|procedure| (procedure.module_identity, procedure.procedure));
+    procedures.dedup();
+    procedures.sort_by(|left, right| {
+        let left_samples = profile.samples.get(left).copied().unwrap_or(0);
+        let right_samples = profile.samples.get(right).copied().unwrap_or(0);
+        let left_entries = profile.frame_entries.get(left).copied().unwrap_or(0);
+        let right_entries = profile.frame_entries.get(right).copied().unwrap_or(0);
+        right_samples
+            .cmp(&left_samples)
+            .then_with(|| right_entries.cmp(&left_entries))
+            .then_with(|| {
+                profile
+                    .paths
+                    .get(left)
+                    .map_or("<missing>", String::as_str)
+                    .cmp(profile.paths.get(right).map_or("<missing>", String::as_str))
+            })
+    });
+    let sample_count = profile.samples.values().copied().sum::<u64>();
+    let mut lines = vec![if let Some(root) = &profile.startup_root {
+        format!(
+            "boot-vm: startup-profile-{event} subsystem={root} elapsed_ms={} total_instructions={} samples={} procedures={}",
+            profile.started.elapsed().as_millis(),
+            profile.total_instructions,
+            sample_count,
+            procedures.len(),
+        )
+    } else {
+        format!(
+            "boot-vm: atoms-profile-{event} elapsed_ms={} total_instructions={} samples={} procedures={}",
+            profile.started.elapsed().as_millis(),
+            profile.total_instructions,
+            sample_count,
+            procedures.len(),
+        )
+    }];
+    for (rank, procedure) in procedures.into_iter().take(30).enumerate() {
+        let samples = profile.samples.get(&procedure).copied().unwrap_or(0);
+        let entries = profile.frame_entries.get(&procedure).copied().unwrap_or(0);
+        let path = profile
+            .paths
+            .get(&procedure)
+            .map_or("<missing>", String::as_str);
+        lines.push(if let Some(root) = &profile.startup_root {
+            format!(
+                "boot-vm: startup-profile-rank subsystem={root} rank={} samples={samples} entries={entries} procedure={path}",
+                rank + 1,
+            )
+        } else {
+            format!(
+                "boot-vm: atoms-profile-rank rank={} samples={samples} entries={entries} procedure={path}",
+                rank + 1,
+            )
+        });
+    }
+    lines
+}
+
+fn atoms_profile_lines(profile: &AtomsProfile) -> Vec<String> {
+    atoms_profile_lines_with_event(profile, "summary")
+}
+
+fn atoms_profile_snapshot_lines_if_due(
+    profile: &mut AtomsProfile,
+    now: Instant,
+    interval: Duration,
+) -> Option<Vec<String>> {
+    if now.duration_since(profile.last_snapshot) < interval {
+        return None;
+    }
+    profile.last_snapshot = now;
+    Some(atoms_profile_lines_with_event(profile, "snapshot"))
+}
+
+fn emit_atoms_profile(profile: &AtomsProfile) {
+    for line in atoms_profile_lines(profile) {
+        eprintln!("{line}");
+    }
 }
 
 fn mark_boot_trace_frame(
@@ -15083,6 +16460,24 @@ fn initialize_engine_resource(
     type_path: &TypePath,
     arguments: &[Value],
 ) -> Result<(), String> {
+    let path = type_path.as_str();
+    if path == "/image"
+        || path.starts_with("/image/")
+        || path == "/mutable_appearance"
+        || path.starts_with("/mutable_appearance/")
+    {
+        if let Some(source) = arguments.first() {
+            // `/image` and `/mutable_appearance` are engine-backed appearance
+            // objects. OpenDream's DreamObjectImage.Initialize copies the
+            // complete source appearance before the DM `New()` proc runs.
+            // This is observably different from storing the source datum in
+            // `.icon`: Monk's decal smoothing constructs `pic = new(image)`
+            // and later reuses `pic.icon` and `pic.icon_state`.
+            builtins::copy_image_appearance(source, datum, state)?;
+        }
+        return Ok(());
+    }
+
     let fields: &[&str] = match type_path.as_str() {
         "/icon" => &["icon", "icon_state", "dir", "frame", "moving"],
         _ => return Ok(()),
@@ -15128,12 +16523,18 @@ fn runtime_initial_field_value(
     type_path: &TypePath,
     field: &FieldName,
 ) -> Result<Value, String> {
+    if let Some(value) = state
+        .initial_field_value_cache
+        .get(type_path)
+        .and_then(|fields| fields.get(field))
+    {
+        return Ok(value.clone());
+    }
     let catalog_value = state
-        .initial_value(type_path, field)
-        .cloned()
-        .or_else(|| engine_builtin_initial_value(type_path, field))
+        .effective_initial_value(type_path, field)
         .unwrap_or(Value::Null);
     if !matches!(catalog_value, Value::Null) {
+        cache_runtime_initial_field_value(state, type_path, field, &catalog_value);
         return Ok(catalog_value);
     }
 
@@ -15156,6 +16557,7 @@ fn runtime_initial_field_value(
         current = state.type_parent(&path).cloned();
     }
     if !has_runtime_default {
+        cache_runtime_initial_field_value(state, type_path, field, &Value::Null);
         return Ok(Value::Null);
     }
 
@@ -15169,7 +16571,13 @@ fn runtime_initial_field_value(
         state
             .initial_prototypes
             .insert(type_path.clone(), prototype);
-        initialize_existing_datum(state, prototype, type_path.clone(), false, false)?;
+        state
+            .initial_prototypes_initializing
+            .insert(type_path.clone());
+        let initialization =
+            initialize_existing_datum(state, prototype, type_path.clone(), false, false);
+        state.initial_prototypes_initializing.remove(type_path);
+        initialization?;
         // This datum is the engine's hidden object-tree prototype used to
         // evaluate runtime instance defaults for type-scoped reads. It is not
         // an instantiated atom and must never become visible through `world`
@@ -15197,20 +16605,43 @@ fn runtime_initial_field_value(
         }
         prototype
     };
-    Ok(state
+    let value = state
         .heap
         .datum_field(prototype, field)
         .cloned()
-        .unwrap_or(Value::Null))
+        .unwrap_or(Value::Null);
+    if !state.initial_prototypes_initializing.contains(type_path) {
+        cache_runtime_initial_field_value(state, type_path, field, &value);
+    }
+    Ok(value)
+}
+
+fn cache_runtime_initial_field_value(
+    state: &mut ExecutionState,
+    type_path: &TypePath,
+    field: &FieldName,
+    value: &Value,
+) {
+    if state.initial_field_value_cache_entries >= MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES {
+        return;
+    }
+    let fields = state
+        .initial_field_value_cache
+        .entry(type_path.clone())
+        .or_default();
+    if fields.len() < MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE
+        && fields.insert(field.clone(), value.clone()).is_none()
+    {
+        state.initial_field_value_cache_entries += 1;
+    }
 }
 
 fn allocate_initialized_datum(
     state: &mut ExecutionState,
     type_path: TypePath,
 ) -> Result<DatumId, String> {
-    let compact_defaults = is_turf_type_path(&type_path);
     let datum = state.heap.allocate_datum(type_path.clone());
-    initialize_existing_datum(state, datum, type_path, false, compact_defaults)?;
+    initialize_existing_datum(state, datum, type_path, false, true)?;
     Ok(datum)
 }
 
@@ -15221,7 +16652,7 @@ fn initialize_existing_datum(
     preserve_cell: bool,
     compact_defaults: bool,
 ) -> Result<(), String> {
-    if compact_defaults {
+    if compact_defaults && preserve_cell {
         state.compact_default_datums.insert(datum);
     } else {
         state.compact_default_datums.remove(&datum);
@@ -15245,11 +16676,7 @@ fn initialize_existing_datum(
     let initial_values = if compact_defaults {
         BTreeMap::new()
     } else {
-        state
-            .initial_values
-            .get(&type_path)
-            .cloned()
-            .unwrap_or_default()
+        state.inherited_initial_values(&type_path)
     };
     let is_atom = is_atom_type_path(&type_path);
     if preserve_cell {
@@ -16307,18 +17734,13 @@ pub(crate) fn get_step_builtin(
             coordinate_source = current;
             break;
         }
-        let Ok(Value::Datum(parent)) = datum.field(&loc) else {
+        let Ok(Value::Datum(parent)) = datum_field_or_initial(state, current, &loc) else {
             break;
         };
-        current = *parent;
+        current = parent;
     }
-    let source = state
-        .heap()
-        .datum(coordinate_source)
-        .map_err(|error| error.to_string())?;
     let coordinate = |field: &FieldName| -> Result<f32, String> {
-        source
-            .field(field)
+        datum_field_or_initial(state, coordinate_source, field)
             .map_err(|error| error.to_string())?
             .as_number()
             .ok_or_else(|| format!("get_step source coordinate {field} is not numeric"))
@@ -16382,25 +17804,19 @@ pub(crate) fn get_step_builtin(
 fn direction_towards_builtin(
     source: &Value,
     target: &Value,
-    heap: &ValueHeap,
+    state: &ExecutionState,
 ) -> Result<Value, String> {
-    let (Value::Datum(source), Value::Datum(target)) = (source, target) else {
+    let (Some((source_x, source_y, source_z)), Some((target_x, target_y, target_z))) = (
+        builtins::datum_coordinates(state, source),
+        builtins::datum_coordinates(state, target),
+    ) else {
         return Ok(Value::number(0.0));
     };
-    let coordinate = |datum: DatumId, name: &str| -> Result<f32, String> {
-        heap.datum_field(
-            datum,
-            &FieldName::parse(name).expect("built-in coordinate field is valid"),
-        )
-        .map_err(|error| error.to_string())?
-        .as_number()
-        .ok_or_else(|| format!("get_step_towards coordinate {name} is not numeric"))
-    };
-    if coordinate(*source, "z")? != coordinate(*target, "z")? {
+    if source_z != target_z {
         return Ok(Value::number(0.0));
     }
-    let dx = coordinate(*target, "x")? - coordinate(*source, "x")?;
-    let dy = coordinate(*target, "y")? - coordinate(*source, "y")?;
+    let dx = target_x - source_x;
+    let dy = target_y - source_y;
     let mut direction = 0_u8;
     if dy > 0.0 {
         direction |= 1;
@@ -16607,22 +18023,12 @@ fn range_builtin(
     if !distance.is_finite() || distance < 0.0 {
         return Ok(Value::List(list));
     }
-    let Value::Datum(center) = center else {
+    let Some((center_x, center_y, center_z)) = builtins::datum_coordinates(state, center) else {
         return Ok(Value::List(list));
     };
     let x = FieldName::parse("x").expect("built-in coordinate field is valid");
     let y = FieldName::parse("y").expect("built-in coordinate field is valid");
     let z = FieldName::parse("z").expect("built-in coordinate field is valid");
-    let center = state
-        .heap
-        .datum(*center)
-        .map_err(|error| error.to_string())?;
-    let coordinate = |field: &FieldName| center.field(field).ok().and_then(Value::as_number);
-    let (Some(center_x), Some(center_y), Some(center_z)) =
-        (coordinate(&x), coordinate(&y), coordinate(&z))
-    else {
-        return Ok(Value::List(list));
-    };
     let distance = distance.floor();
     let matching = if state.world_turfs.is_empty() {
         // Standalone VM fixtures can supply coordinate-bearing atoms without
@@ -16777,14 +18183,15 @@ fn typesof_builtin(
             ));
         }
     };
+    // Canonical descendant paths occupy one contiguous lexical range in the
+    // BTreeSet. Start at the selector in O(log N) and stop at the first
+    // sibling instead of rescanning the complete project type catalog for
+    // every `typesof()`/`subtypesof()` helper call.
+    let descendant_prefix = format!("{}/", selector.as_str());
     let mut paths = catalog
-        .iter()
-        .filter(|path| {
-            path.as_str() == selector.as_str()
-                || path
-                    .as_str()
-                    .strip_prefix(selector.as_str())
-                    .is_some_and(|suffix| suffix.starts_with('/'))
+        .range(selector.clone()..)
+        .take_while(|path| {
+            path.as_str() == selector.as_str() || path.as_str().starts_with(&descendant_prefix)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -16997,6 +18404,270 @@ fn runtime_truthy(heap: &ValueHeap, value: &Value) -> Result<bool, String> {
     heap.truthy(value).map_err(|error| error.to_string())
 }
 
+fn logical_or_empty_list_field(
+    state: &mut ExecutionState,
+    receiver: Value,
+    name: &FieldName,
+) -> Result<Value, String> {
+    let current = match &receiver {
+        Value::TypePath(path) => match name.as_str() {
+            "type" => Value::TypePath(path.clone()),
+            "parent_type" => state
+                .type_parent(path)
+                .cloned()
+                .map_or(Value::Null, Value::TypePath),
+            _ => state
+                .initial_value(path, name)
+                .cloned()
+                .unwrap_or(Value::Null),
+        },
+        Value::ModifiedTypePath(path) => match name.as_str() {
+            "type" => Value::TypePath(path.base().clone()),
+            "parent_type" => state
+                .type_parent(path.base())
+                .cloned()
+                .map_or(Value::Null, Value::TypePath),
+            _ => path
+                .overrides()
+                .iter()
+                .rev()
+                .find(|(field, _)| field == name)
+                .map(|(_, value)| value.clone())
+                .or_else(|| state.initial_value(path.base(), name).cloned())
+                .unwrap_or(Value::Null),
+        },
+        Value::List(list) if name.as_str() == "len" => Value::number(
+            state
+                .heap
+                .list(*list)
+                .map_err(|error| error.to_string())?
+                .len() as f32,
+        ),
+        Value::Datum(datum) => {
+            let runtime_type = state
+                .heap
+                .datum(*datum)
+                .map_err(|error| error.to_string())?
+                .type_path()
+                .clone();
+            if name.as_str() == "type" {
+                Value::TypePath(runtime_type)
+            } else if name.as_str() == "parent_type" {
+                state
+                    .type_parent(&runtime_type)
+                    .cloned()
+                    .map_or(Value::Null, Value::TypePath)
+            } else if name.as_str() == "appearance"
+                && builtins::is_appearance_source(&runtime_type)
+                && matches!(
+                    datum_field_or_initial(state, *datum, name),
+                    Ok(Value::Null) | Err(ValueError::MissingField(_))
+                )
+            {
+                builtins::appearance_snapshot_builtin(*datum, state)?
+            } else if name.as_str() == "transform"
+                && builtins::is_appearance_source(&runtime_type)
+                && matches!(
+                    datum_field_or_initial(state, *datum, name),
+                    Ok(Value::Null) | Err(ValueError::MissingField(_))
+                )
+            {
+                Value::Datum(allocate_matrix(
+                    [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                    &mut state.heap,
+                )?)
+            } else if let Some(value) = lazy_atom_list_field(state, *datum, name)? {
+                value
+            } else if runtime_type.as_str() == "/savefile"
+                || runtime_type.as_str().starts_with("/savefile/")
+            {
+                match name.as_str() {
+                    "cd" => Value::text(
+                        savefile_current_directory(&state.savefiles.entry(*datum).or_default().cd)
+                            .to_owned(),
+                    ),
+                    "eof" => {
+                        let savefile = state.savefiles.entry(*datum).or_default();
+                        let path = savefile_current_directory(&savefile.cd);
+                        Value::number(if savefile.entries.contains_key(path) {
+                            0.0
+                        } else {
+                            1.0
+                        })
+                    }
+                    "dir" => {
+                        let children =
+                            savefile_directory_entries(state.savefiles.entry(*datum).or_default());
+                        let list = state.heap.allocate_list();
+                        let values = state
+                            .heap
+                            .list_mut(list)
+                            .map_err(|error| error.to_string())?;
+                        for child in children {
+                            values.add(Value::text(child));
+                        }
+                        Value::List(list)
+                    }
+                    _ => state
+                        .heap
+                        .datum_field(*datum, name)
+                        .cloned()
+                        .map_err(|error| error.to_string())?,
+                }
+            } else {
+                datum_field_or_shared(state, *datum, name).map_err(|error| error.to_string())?
+            }
+        }
+        Value::Null => return Err("field read received null".to_owned()),
+        value => return Err(format!("field read requires a datum, received {value}")),
+    };
+    if runtime_truthy(&state.heap, &current)? {
+        return Ok(current);
+    }
+
+    let value = Value::List(state.heap.allocate_list());
+    match receiver {
+        Value::Datum(datum) => {
+            assign_datum_or_shared_field(state, datum, name.clone(), value.clone())?;
+        }
+        Value::List(list) if name.as_str() == "len" => {
+            let visibility_before = state
+                .is_visibility_list(list)
+                .then(|| state.visibility_members(list))
+                .transpose()?;
+            if state.is_associative_list(list) {
+                // Assigning a non-number to len coerces to zero for both list
+                // kinds, which is the only alist length assignment allowed.
+            }
+            state
+                .heap
+                .list_mut(list)
+                .and_then(|values| values.resize(0))
+                .map_err(|error| error.to_string())?;
+            if let Some(before) = visibility_before {
+                state.normalize_and_synchronize_visibility_list(list, &before)?;
+            }
+        }
+        Value::Null => return Err("field write received null".to_owned()),
+        value => {
+            return Err(format!(
+                "field write requires a datum or list.len, received {value}"
+            ));
+        }
+    }
+    Ok(value)
+}
+
+fn logical_or_empty_list_index(
+    state: &mut ExecutionState,
+    receiver: Value,
+    key: Value,
+) -> Result<Value, String> {
+    let list = match &receiver {
+        Value::List(list) => *list,
+        Value::Text(text) => {
+            let index = value_to_list_index(&key)?;
+            let current = text
+                .chars()
+                .nth(index - 1)
+                .map(|character| Value::text(character.to_string()))
+                .unwrap_or(Value::Null);
+            if runtime_truthy(&state.heap, &current)? {
+                return Ok(current);
+            }
+            let _allocated_rhs = Value::List(state.heap.allocate_list());
+            return Err(format!("list assignment received {}", receiver));
+        }
+        Value::Datum(savefile)
+            if state.heap.datum(*savefile).is_ok_and(|datum| {
+                let path = datum.type_path().as_str();
+                path == "/savefile" || path.starts_with("/savefile/")
+            }) =>
+        {
+            let rendered_key = match &key {
+                Value::Text(key) => key.to_string(),
+                value => value.to_string(),
+            };
+            let resolved = savefile_resolve_path(
+                &state.savefiles.entry(*savefile).or_default().cd,
+                &rendered_key,
+            );
+            let entry = state
+                .heap
+                .allocate_datum(TypePath::parse("/savefile/entry").unwrap());
+            state.savefile_entries.insert(entry, (*savefile, resolved));
+            return Ok(Value::Datum(entry));
+        }
+        value => return Err(format!("list index operation received {value}")),
+    };
+    let current = if state.global_vars_proxy == Some(list) {
+        match &key {
+            Value::Text(name) => FieldName::parse(name)
+                .ok()
+                .and_then(|name| state.global(&name).cloned())
+                .unwrap_or(Value::Null),
+            _ => read_list_value(&state.heap, list, &key, false)
+                .cloned()
+                .unwrap_or(Value::Null),
+        }
+    } else if let Some(datum) = state.datum_vars_proxies.get(&list).copied() {
+        match &key {
+            Value::Text(name) => {
+                let field = FieldName::parse(name).ok();
+                if let Some(value) = field
+                    .as_ref()
+                    .map(|field| lazy_atom_list_field(state, datum, field))
+                    .transpose()?
+                    .flatten()
+                {
+                    value
+                } else {
+                    field
+                        .as_ref()
+                        .and_then(|field| datum_shared_storage(state, datum, field))
+                        .and_then(|storage| state.global(&storage).cloned())
+                        .or_else(|| {
+                            field
+                                .and_then(|field| datum_field_or_initial(state, datum, &field).ok())
+                        })
+                        .unwrap_or(Value::Null)
+                }
+            }
+            _ => read_list_value(&state.heap, list, &key, false)
+                .cloned()
+                .unwrap_or(Value::Null),
+        }
+    } else {
+        match read_list_value(&state.heap, list, &key, state.is_associative_list(list)) {
+            Ok(value) => value.clone(),
+            Err(ValueError::MissingKey) => Value::Null,
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+    if runtime_truthy(&state.heap, &current)? {
+        return Ok(current);
+    }
+
+    let value = Value::List(state.heap.allocate_list());
+    if state.is_visibility_list(list) {
+        return Err("cannot write to an index of a visibility relationship list".to_owned());
+    }
+    if state.global_vars_proxy == Some(list) {
+        let Value::Text(name) = key else {
+            return Err("global.vars writes require a text key".to_owned());
+        };
+        let name = FieldName::parse(&name).map_err(|error| error.to_string())?;
+        state.set_global(name, value.clone());
+    } else if let Some(datum) = state.datum_vars_proxies.get(&list).copied() {
+        write_datum_vars(state, datum, list, key, value.clone())?;
+    } else {
+        let associative = state.is_associative_list(list);
+        write_list_value(&mut state.heap, list, key, value.clone(), associative)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(value)
+}
+
 fn locate_in_container(
     search: &Value,
     container: &Value,
@@ -17126,15 +18797,15 @@ std::thread_local! {
 
 fn dynamic_call_target(
     module: &Module,
-    state: &ExecutionState,
+    state: &mut ExecutionState,
     receiver: &Value,
     selector: &Value,
     caller_context: &ExecutionContext,
     null_receiver_is_global: bool,
 ) -> Result<(ProcedureId, ExecutionContext), String> {
     let selector = match selector {
-        Value::Text(selector) => String::from(selector.as_ref()),
-        Value::TypePath(selector) => selector.to_string(),
+        Value::Text(selector) => selector.as_ref(),
+        Value::TypePath(selector) => selector.as_str(),
         _ => {
             return Err(format!(
                 "call procedure selector must be text or a type path, received {selector}"
@@ -17142,21 +18813,41 @@ fn dynamic_call_target(
         }
     };
 
+    dynamic_call_target_named(
+        module,
+        state,
+        receiver,
+        selector,
+        caller_context,
+        null_receiver_is_global,
+    )
+}
+
+fn dynamic_call_target_named(
+    module: &Module,
+    state: &mut ExecutionState,
+    receiver: &Value,
+    selector: &str,
+    caller_context: &ExecutionContext,
+    null_receiver_is_global: bool,
+) -> Result<(ProcedureId, ExecutionContext), String> {
     let (base_path, context) = match receiver {
-        Value::Null if null_receiver_is_global => ("/proc".to_owned(), caller_context.clone()),
+        Value::Null if null_receiver_is_global => (None, caller_context.clone()),
         Value::Null => {
             return Err("cannot call a procedure on null".to_owned());
         }
         Value::Datum(datum) => (
-            state
-                .heap()
-                .datum(*datum)
-                .map_err(|error| error.to_string())?
-                .type_path()
-                .to_string(),
+            Some(
+                state
+                    .heap()
+                    .datum(*datum)
+                    .map_err(|error| error.to_string())?
+                    .type_path()
+                    .clone(),
+            ),
             ExecutionContext::new(receiver.clone(), caller_context.usr.clone()),
         ),
-        Value::TypePath(path) => (path.to_string(), caller_context.clone()),
+        Value::TypePath(path) => (Some(path.clone()), caller_context.clone()),
         _ => {
             return Err(format!(
                 "call receiver must be a datum, type path, or null, received {receiver}"
@@ -17167,12 +18858,33 @@ fn dynamic_call_target(
         .trim_start_matches('/')
         .strip_prefix("proc/")
         .unwrap_or_else(|| selector.trim_start_matches('/'));
-    let requested = if selector.starts_with('/') {
-        selector.clone()
-    } else if base_path == "/proc" {
+    let absolute = selector.starts_with('/');
+    if !absolute
+        && let Some(base_path) = &base_path
+        && let Some(cached) = state
+            .dynamic_receiver_targets
+            .get(&(module.identity.0, base_path.clone()))
+            .and_then(|selectors| selectors.get(selector_path))
+    {
+        return cached.map_or_else(
+            || {
+                Err(format!(
+                    "dynamic call could not resolve procedure {:?}",
+                    format!("{}/proc/{selector_path}", base_path.as_str())
+                ))
+            },
+            |procedure| Ok((procedure, context)),
+        );
+    }
+    let requested = if absolute {
+        selector.to_owned()
+    } else if base_path.is_none() {
         format!("/proc/{selector_path}")
     } else {
-        format!("{base_path}/proc/{selector_path}")
+        format!(
+            "{}/proc/{selector_path}",
+            base_path.as_ref().expect("receiver path exists").as_str()
+        )
     };
 
     let find_candidate = |candidate: &str| {
@@ -17185,34 +18897,36 @@ fn dynamic_call_target(
     // Preserve their historical exact/lexical lookup. Ordinary receiver calls,
     // however, must follow the runtime object tree: DM parent_type can point
     // outside the receiver's lexical path (notably /obj -> /atom).
-    if selector.starts_with('/') || base_path == "/proc" {
+    let resolved = if absolute || base_path.is_none() {
         let mut candidate = requested.clone();
         loop {
             if let Some(procedure) = find_candidate(&candidate) {
-                return Ok((procedure, context));
+                break Some(procedure);
             }
             let Some(segment) = candidate.rfind("/proc/") else {
-                break;
+                break None;
             };
             let owner = &candidate[..segment];
             if owner == "/proc" || owner.is_empty() {
-                break;
+                break None;
             }
             let Some(parent_end) = owner.rfind('/') else {
-                break;
+                break None;
             };
             candidate = format!("{}/proc/{selector_path}", &owner[..parent_end]);
         }
     } else {
-        let mut current = TypePath::parse(&base_path).ok();
+        let mut current = base_path.clone();
         let mut visited = std::collections::BTreeSet::new();
+        let mut found = None;
         while let Some(owner) = current {
             if !visited.insert(owner.clone()) {
                 break;
             }
             let candidate = format!("{}/proc/{selector_path}", owner.as_str());
             if let Some(procedure) = find_candidate(&candidate) {
-                return Ok((procedure, context));
+                found = Some(procedure);
+                break;
             }
             current = state
                 .type_parents
@@ -17226,10 +18940,23 @@ fn dynamic_call_target(
                         .flatten()
                 });
         }
+        found
+    };
+    if !absolute && let Some(base_path) = base_path {
+        state
+            .dynamic_receiver_targets
+            .entry((module.identity.0, base_path))
+            .or_default()
+            .insert(selector_path.to_owned(), resolved);
     }
-    Err(format!(
-        "dynamic call could not resolve procedure {requested:?}"
-    ))
+    resolved.map_or_else(
+        || {
+            Err(format!(
+                "dynamic call could not resolve procedure {requested:?}"
+            ))
+        },
+        |procedure| Ok((procedure, context)),
+    )
 }
 
 fn hascall_builtin(
@@ -17337,6 +19064,14 @@ fn hascall_builtin(
     let mut current = Some(path);
     while let Some(owner) = current {
         let requested = format!("{}/proc/{selector}", owner.as_str());
+        // Project code overwhelmingly uses the declaration's canonical
+        // selector spelling. Resolve that common path through the module's
+        // effective procedure index instead of scanning every linked body for
+        // every ancestor. Preserve the historical case-insensitive fallback
+        // for reflective callers that supply a differently cased string.
+        if module.effective_procedure_id(&requested).is_some() {
+            return true;
+        }
         if module.paths.iter().any(|candidate| {
             candidate
                 .split_once('@')
@@ -17631,7 +19366,11 @@ fn engine_root_paths(runtime_type: &TypePath) -> &'static [&'static str] {
     } else if path == "/datum" || path.starts_with("/datum/") {
         &["/datum"]
     } else {
-        &[]
+        // Engine-owned datum kinds such as `/regex`, `/dm_filter`, `/matrix`,
+        // and `/icon` do not necessarily appear beneath `/datum` in the
+        // project's source tree, but they still expose BYOND's base datum
+        // storage.
+        &["/datum"]
     }
 }
 
@@ -17673,6 +19412,7 @@ const ENGINE_ATOM_FIELDS: &[&str] = &[
     "render_source",
     "render_target",
     "suffix",
+    "text",
     "transform",
     "underlays",
     "vis_contents",
@@ -17714,6 +19454,7 @@ const ENGINE_CLIENT_FIELDS: &[&str] = &[
     "gender",
     "inactivity",
     "mob",
+    "mouse_pointer_icon",
     "perspective",
     "pixel_w",
     "pixel_x",
@@ -17753,6 +19494,7 @@ const ENGINE_PARTICLE_FIELDS: &[&str] = &[
     "bound2",
     "gravity",
     "gradient",
+    "color_change",
     "transform",
     "icon",
     "icon_state",
@@ -17899,11 +19641,7 @@ fn initial_value_or_engine_root(
     runtime_type: &TypePath,
     field: &FieldName,
 ) -> Option<Value> {
-    state
-        .initial_value(runtime_type, field)
-        .or_else(|| engine_root_initial_value(state, runtime_type, field))
-        .cloned()
-        .or_else(|| engine_builtin_initial_value(runtime_type, field))
+    state.effective_initial_value(runtime_type, field)
 }
 
 /// Reads an ordinary datum member, falling back to inherited type-static
@@ -18452,24 +20190,30 @@ fn order_image_arguments(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::sync::Arc;
+    use std::time::Instant;
 
     use dm_core::{DmNumberBits, SourceSpan};
     use dm_lexer::{SpannedToken, TokenKind, lex};
     use dm_syntax::{DefinitionKind, parse};
-    use dm_value::{FieldName, ModifiedTypePath, TypePath};
+    use dm_value::{FieldName, ModifiedTypePath, TypePath, ValueError};
 
     use super::{
-        CompoundListIndexOperator, ExecutionContext, ExecutionLimits, ExecutionState,
-        InitializerBinding, InstanceInitializer, Instruction, ProcedureSpec, Program, Value,
-        advance_scheduler, allocate_initialized_datum, allocate_matrix, compile_initializer,
-        compile_initializer_into_module, compile_module, compile_module_specs,
-        compile_module_specs_selective, compile_module_specs_selective_with_errors,
-        compile_module_with_global_fields, compile_procedure,
-        compile_procedure_with_resolver_and_fields, condition_tokens, datum_field_or_initial,
-        dm_builtin_numeric_constant, execute, execute_in_context, execute_in_state, execute_module,
-        execute_module_in_context, execute_module_in_state, execute_module_with_limits,
-        execute_module_with_limits_in_state, execute_with_limits, execute_with_limits_in_state,
-        extend_heap_root_ids, interpolated_expression_close, is_subtype, matrix_components,
+        CANONICAL_TYPE2PARENT_SOURCE, CompoundListIndexOperator, ExecutionContext, ExecutionLimits,
+        ExecutionState, InitializerBinding, InstanceInitializer, Instruction,
+        MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES,
+        MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE, MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH,
+        MAXIMUM_LOW_YIELD_COLLECTION_GROWTH, MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH,
+        MINIMUM_HEAP_COLLECTION_GROWTH, Module, ProcedureSpec, Program, Value,
+        adaptive_heap_collection_growth, advance_scheduler, allocate_initialized_datum,
+        allocate_matrix, compile_initializer, compile_initializer_into_module, compile_module,
+        compile_module_specs, compile_module_specs_selective,
+        compile_module_specs_selective_with_errors, compile_module_with_global_fields,
+        compile_procedure, compile_procedure_with_resolver_and_fields, condition_tokens,
+        datum_field_or_initial, dm_builtin_numeric_constant, execute, execute_in_context,
+        execute_in_state, execute_module, execute_module_in_context, execute_module_in_state,
+        execute_module_with_limits, execute_module_with_limits_in_state, execute_with_limits,
+        execute_with_limits_in_state, initial_value_or_engine_root, interpolated_expression_close,
+        is_subtype, matrix_components,
     };
 
     #[test]
@@ -18493,12 +20237,96 @@ mod tests {
     }
 
     #[test]
+    fn builtin_generator_distribution_constants_have_byond_values() {
+        assert_eq!(dm_builtin_numeric_constant("UNIFORM_RAND"), Some(0.0));
+        assert_eq!(dm_builtin_numeric_constant("NORMAL_RAND"), Some(1.0));
+
+        let syntax = parse("/proc/_generator(rand = UNIFORM_RAND)\n\treturn rand\n")
+            .expect("generator wrapper fixture should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("UNIFORM_RAND should lower in a parameter default");
+        assert_eq!(
+            execute_module(
+                &module,
+                module.procedure_id("/proc/_generator").unwrap(),
+                &[],
+            ),
+            Ok(Value::number(0.0)),
+        );
+    }
+
+    #[test]
     fn interpolation_close_skips_brackets_inside_nested_quotes() {
         let expression = r#"src ? "nested[value]" : fallback]tail"#;
         let close = interpolated_expression_close(expression, 0).expect("outer close should exist");
         assert_eq!(
             &expression[..=close],
             r#"src ? "nested[value]" : fallback]"#
+        );
+    }
+
+    #[test]
+    fn canonical_type2parent_call_preserves_lexical_parent_results() {
+        let source = format!(
+            "{CANONICAL_TYPE2PARENT_SOURCE}/proc/run(child)\n\treturn type2parent(child)\n"
+        );
+        let syntax = parse(&source).expect("canonical helper fixture should parse");
+        let module = compile_module(&syntax.definitions).expect("canonical helper should compile");
+        assert!(super::canonical_type2parent_program(
+            module
+                .procedure(
+                    module
+                        .procedure_id("/proc/type2parent")
+                        .expect("helper entry")
+                )
+                .expect("helper program")
+        ));
+        let entry = module.procedure_id("/proc/run").expect("run entry");
+        for (child, expected) in [
+            ("/datum", None),
+            ("/obj", Some("/atom/movable")),
+            ("/mob", Some("/atom/movable")),
+            ("/area", Some("/atom")),
+            ("/turf", Some("/atom")),
+            ("/atom", Some("/datum")),
+            ("/datum/component/foo", Some("/datum/component")),
+        ] {
+            let result = execute_module(
+                &module,
+                entry,
+                &[Value::TypePath(
+                    TypePath::parse(child).expect("valid child path"),
+                )],
+            )
+            .expect("canonical helper call should execute");
+            assert_eq!(
+                result,
+                expected.map_or(Value::Null, |path| {
+                    Value::TypePath(TypePath::parse(path).expect("valid expected path"))
+                }),
+                "child {child}"
+            );
+        }
+    }
+
+    #[test]
+    fn customized_type2parent_remains_an_ordinary_dm_call() {
+        let syntax = parse(
+            "/proc/type2parent(child)\n\treturn /datum/custom\n/proc/run(child)\n\treturn type2parent(child)\n",
+        )
+        .expect("custom helper fixture should parse");
+        let module = compile_module(&syntax.definitions).expect("custom helper should compile");
+        let result = execute_module(
+            &module,
+            module.procedure_id("/proc/run").expect("run entry"),
+            &[Value::TypePath(
+                TypePath::parse("/datum/component/foo").expect("valid child path"),
+            )],
+        )
+        .expect("custom helper call should execute");
+        assert_eq!(
+            result,
+            Value::TypePath(TypePath::parse("/datum/custom").expect("valid custom result"))
         );
     }
 
@@ -18797,8 +20625,8 @@ mod tests {
         assert_ne!(created[0], created[1]);
         for datum in created {
             assert_eq!(
-                state.heap().datum_field(datum, &field("gc_destroyed")),
-                Ok(&Value::number(0.0)),
+                datum_field_or_initial(&state, datum, &field("gc_destroyed")),
+                Ok(Value::number(0.0)),
                 "newlist must apply effective inherited defaults before New",
             );
             assert_eq!(
@@ -19030,6 +20858,29 @@ mod tests {
         assert_eq!(
             execute_module(&module, entry, &[Value::number(1.0)]),
             Ok(Value::number(15.0))
+        );
+    }
+
+    #[test]
+    fn both_returning_try_catch_omits_dead_program_end_jump() {
+        let syntax = parse(
+            "/proc/run(should_throw)\n\ttry\n\t\tif(should_throw)\n\t\t\tthrow 5\n\t\treturn 7\n\tcatch\n\t\treturn 9\n",
+        )
+        .expect("both-returning try/catch should parse");
+        let module = compile_module(&syntax.definitions).expect("try/catch should compile");
+        let entry = module.procedure_id("/proc/run").expect("entry");
+        let program = module.procedure(entry).expect("compiled program");
+
+        assert!(!program.instructions.iter().any(
+            |instruction| matches!(instruction, Instruction::Jump(target) if *target >= program.instructions.len())
+        ));
+        assert_eq!(
+            execute_module(&module, entry, &[Value::number(0.0)]),
+            Ok(Value::number(7.0)),
+        );
+        assert_eq!(
+            execute_module(&module, entry, &[Value::number(1.0)]),
+            Ok(Value::number(9.0)),
         );
     }
 
@@ -19457,6 +21308,45 @@ mod tests {
     }
 
     #[test]
+    fn heap_gc_growth_window_adapts_to_reclaim_yield() {
+        assert_eq!(
+            adaptive_heap_collection_growth(4_000_000, 100_000),
+            MAXIMUM_LOW_YIELD_COLLECTION_GROWTH,
+            "a low reclaim yield must still respect the production peak-memory cap",
+        );
+        assert_eq!(
+            adaptive_heap_collection_growth(4_000_000, 400_000),
+            MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH,
+            "moderate reclaim yield must respect the same production peak-memory cap",
+        );
+        assert_eq!(
+            adaptive_heap_collection_growth(4_000_000, 2_000_000),
+            100_000,
+            "high reclaim yield should return to a pressure-sensitive 2.5% window",
+        );
+    }
+
+    #[test]
+    fn heap_gc_growth_window_has_deterministic_memory_bounds() {
+        assert_eq!(
+            adaptive_heap_collection_growth(1, 0),
+            MINIMUM_HEAP_COLLECTION_GROWTH,
+        );
+        assert_eq!(
+            adaptive_heap_collection_growth(usize::MAX, 0),
+            MAXIMUM_LOW_YIELD_COLLECTION_GROWTH,
+        );
+        assert_eq!(
+            adaptive_heap_collection_growth(usize::MAX / 2, usize::MAX / 16),
+            MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH,
+        );
+        assert_eq!(
+            adaptive_heap_collection_growth(usize::MAX / 4, usize::MAX / 2),
+            MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH,
+        );
+    }
+
+    #[test]
     fn list_gc_roots_later_same_tick_scheduler_continuations() {
         let syntax = parse(concat!(
             "/proc/collector()\n",
@@ -19540,15 +21430,8 @@ mod tests {
             defaults,
         )]));
 
-        let mut datum_roots = Vec::new();
-        let mut list_roots = Vec::new();
-        extend_heap_root_ids(
-            &mut datum_roots,
-            &mut list_roots,
-            state.initial_values.values().flat_map(BTreeMap::values),
-        );
-        assert!(datum_roots.is_empty());
-        assert_eq!(list_roots, [direct, nested]);
+        assert!(state.initial_value_datum_roots.is_empty());
+        assert_eq!(&*state.initial_value_list_roots, [direct, nested]);
 
         state.next_list_collection = 1;
         state.maybe_collect_unreachable_lists(&[]);
@@ -19717,6 +21600,279 @@ mod tests {
                 .list(world_contents)
                 .unwrap()
                 .contains(&Value::Datum(atom))
+        );
+    }
+
+    #[test]
+    fn runtime_datums_share_unchanged_scalar_defaults_without_becoming_gc_roots() {
+        let mut state = ExecutionState::new();
+        let path = TypePath::parse("/datum/sparse_runtime").unwrap();
+        let defaults = (0..96)
+            .map(|index| {
+                (
+                    field(&format!("default_{index}")),
+                    Value::number(index as f32),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        state.set_initial_values(BTreeMap::from([(path.clone(), defaults)]));
+
+        let mut datums = Vec::new();
+        for _ in 0..4_096 {
+            datums.push(
+                allocate_initialized_datum(&mut state, path.clone())
+                    .expect("sparse runtime datum should allocate"),
+            );
+        }
+        assert!(datums.iter().all(|datum| {
+            state
+                .heap()
+                .datum(*datum)
+                .is_ok_and(|datum| datum.fields_are_empty())
+        }));
+        assert_eq!(
+            datum_field_or_initial(&state, datums[0], &field("default_95")),
+            Ok(Value::number(95.0)),
+        );
+
+        state
+            .heap_mut()
+            .set_datum_field(datums[0], field("default_5"), Value::number(700.0))
+            .unwrap();
+        assert_eq!(
+            datum_field_or_initial(&state, datums[0], &field("default_5")),
+            Ok(Value::number(700.0)),
+        );
+        assert_eq!(state.heap().datum(datums[0]).unwrap().field_len(), 1);
+        assert!(!state.compact_default_datums.contains(&datums[0]));
+
+        let (reclaimed_datums, _) = state
+            .heap_mut()
+            .collect_unreachable_values_from_ids(&[datums[0]], &[]);
+        assert_eq!(reclaimed_datums, datums.len() - 1);
+        assert!(state.heap().datum(datums[0]).is_ok());
+    }
+
+    #[test]
+    fn sparse_effective_initial_cache_covers_inheritance_engine_roots_and_misses() {
+        let mut state = ExecutionState::new();
+        let parent = TypePath::parse("/datum/cache_parent").unwrap();
+        let child = TypePath::parse("/datum/cache_parent/child").unwrap();
+        let synthetic = TypePath::parse("/obj/cache_synthetic").unwrap();
+        let inherited = field("inherited");
+        let alpha = field("alpha");
+        let density = field("density");
+        let known_null = field("name");
+        let absent = field("definitely_absent");
+        state.set_type_parents(BTreeMap::from([
+            (parent.clone(), None),
+            (child.clone(), Some(parent.clone())),
+        ]));
+        state.set_initial_values(BTreeMap::from([
+            (
+                parent,
+                BTreeMap::from([(inherited.clone(), Value::number(7.0))]),
+            ),
+            (
+                TypePath::parse("/atom").unwrap(),
+                BTreeMap::from([(alpha.clone(), Value::number(201.0))]),
+            ),
+        ]));
+
+        let inherited_datum = state.heap_mut().allocate_datum(child.clone());
+        let synthetic_datum = state.heap_mut().allocate_datum(synthetic.clone());
+        assert_eq!(
+            state.initial_value(&child, &inherited),
+            Some(&Value::number(7.0)),
+            "the public borrowed catalog lookup must retain inherited behavior",
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                datum_field_or_initial(&state, inherited_datum, &inherited),
+                Ok(Value::number(7.0)),
+            );
+            assert_eq!(
+                datum_field_or_initial(&state, synthetic_datum, &alpha),
+                Ok(Value::number(201.0)),
+            );
+            assert_eq!(
+                datum_field_or_initial(&state, synthetic_datum, &density),
+                Ok(Value::number(0.0)),
+            );
+            assert_eq!(
+                datum_field_or_initial(&state, synthetic_datum, &known_null),
+                Ok(Value::Null),
+            );
+            assert!(matches!(
+                datum_field_or_initial(&state, synthetic_datum, &absent),
+                Err(ValueError::MissingField(_)),
+            ));
+        }
+
+        let cache = state.effective_initial_value_cache.borrow();
+        assert_eq!(
+            cache.get(&child).and_then(|fields| fields.get(&inherited)),
+            Some(&Some(Value::number(7.0))),
+        );
+        let synthetic_fields = cache.get(&synthetic).expect("synthetic reads are cached");
+        assert_eq!(
+            synthetic_fields.get(&alpha),
+            Some(&Some(Value::number(201.0))),
+        );
+        assert_eq!(
+            synthetic_fields.get(&density),
+            Some(&Some(Value::number(0.0))),
+        );
+        assert_eq!(synthetic_fields.get(&known_null), Some(&Some(Value::Null)));
+        assert_eq!(synthetic_fields.get(&absent), Some(&None));
+    }
+
+    #[test]
+    fn sparse_effective_initial_cache_invalidates_with_catalog_metadata() {
+        let mut state = ExecutionState::new();
+        let parent_a = TypePath::parse("/datum/cache_a").unwrap();
+        let parent_b = TypePath::parse("/datum/cache_b").unwrap();
+        let child = TypePath::parse("/datum/cache_child").unwrap();
+        let cached = field("cached");
+        let values = BTreeMap::from([
+            (
+                parent_a.clone(),
+                BTreeMap::from([(cached.clone(), Value::number(1.0))]),
+            ),
+            (
+                parent_b.clone(),
+                BTreeMap::from([(cached.clone(), Value::number(2.0))]),
+            ),
+        ]);
+        state.set_initial_values(values.clone());
+        state.set_type_parents(BTreeMap::from([
+            (parent_a.clone(), None),
+            (parent_b.clone(), None),
+            (child.clone(), Some(parent_a.clone())),
+        ]));
+
+        let prime = |state: &ExecutionState, expected: f32| {
+            assert_eq!(
+                initial_value_or_engine_root(state, &child, &cached),
+                Some(Value::number(expected)),
+            );
+            assert!(!state.effective_initial_value_cache.borrow().is_empty());
+        };
+        prime(&state, 1.0);
+
+        state.set_type_paths([child.clone()]);
+        assert!(state.effective_initial_value_cache.borrow().is_empty());
+        prime(&state, 1.0);
+
+        state.set_shared_type_paths(Arc::new(BTreeSet::from([child.clone()])));
+        assert!(state.effective_initial_value_cache.borrow().is_empty());
+        prime(&state, 1.0);
+
+        state.set_type_parents(BTreeMap::from([
+            (parent_a.clone(), None),
+            (parent_b.clone(), None),
+            (child.clone(), Some(parent_b.clone())),
+        ]));
+        assert!(state.effective_initial_value_cache.borrow().is_empty());
+        prime(&state, 2.0);
+
+        state.set_shared_type_parents(Arc::new(BTreeMap::from([
+            (parent_a.clone(), None),
+            (parent_b.clone(), None),
+            (child.clone(), Some(parent_a.clone())),
+        ])));
+        assert!(state.effective_initial_value_cache.borrow().is_empty());
+        prime(&state, 1.0);
+
+        let mut replaced_values = values;
+        replaced_values
+            .get_mut(&parent_a)
+            .unwrap()
+            .insert(cached.clone(), Value::number(3.0));
+        state.set_initial_values(replaced_values.clone());
+        assert!(state.effective_initial_value_cache.borrow().is_empty());
+        prime(&state, 3.0);
+
+        replaced_values
+            .get_mut(&parent_a)
+            .unwrap()
+            .insert(cached.clone(), Value::number(4.0));
+        state.set_shared_initial_values(Arc::new(replaced_values));
+        assert!(state.effective_initial_value_cache.borrow().is_empty());
+        prime(&state, 4.0);
+    }
+
+    #[test]
+    fn sparse_effective_initial_cache_is_bounded_without_eviction_churn() {
+        let mut state = ExecutionState::new();
+        let hot_path = TypePath::parse("/datum/cache_hot").unwrap();
+        let cold_path = TypePath::parse("/datum/cache_cold").unwrap();
+        let fields = (0..=MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE)
+            .map(|index| {
+                (
+                    field(&format!("cached_{index}")),
+                    Value::number(index as f32),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        state.set_initial_values(BTreeMap::from([
+            (hot_path.clone(), fields.clone()),
+            (cold_path.clone(), fields),
+        ]));
+
+        for index in 0..MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE {
+            assert_eq!(
+                initial_value_or_engine_root(&state, &hot_path, &field(&format!("cached_{index}")),),
+                Some(Value::number(index as f32)),
+            );
+        }
+        assert_eq!(
+            state.effective_initial_value_cache_entries.get(),
+            MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE,
+        );
+        let overflow = field(&format!(
+            "cached_{}",
+            MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE
+        ));
+        assert_eq!(
+            initial_value_or_engine_root(&state, &hot_path, &overflow),
+            Some(Value::number(
+                MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE as f32
+            )),
+        );
+        assert_eq!(
+            state
+                .effective_initial_value_cache
+                .borrow()
+                .get(&hot_path)
+                .map(HashMap::len),
+            Some(MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE),
+        );
+
+        // Simulate a globally saturated cache without constructing half a
+        // million fixture entries. New cold answers remain correct but are not
+        // admitted, while an existing hot entry remains available and stable.
+        state
+            .effective_initial_value_cache_entries
+            .set(MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES);
+        let cold_field = field("cached_0");
+        assert_eq!(
+            initial_value_or_engine_root(&state, &cold_path, &cold_field),
+            Some(Value::number(0.0)),
+        );
+        assert!(
+            !state
+                .effective_initial_value_cache
+                .borrow()
+                .contains_key(&cold_path)
+        );
+        assert_eq!(
+            initial_value_or_engine_root(&state, &hot_path, &cold_field),
+            Some(Value::number(0.0)),
+        );
+        assert_eq!(
+            state.effective_initial_value_cache_entries.get(),
+            MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES,
         );
     }
 
@@ -20022,6 +22178,26 @@ mod tests {
 
         assert_eq!(module.initializer_call_name_index_builds(), 1);
         assert_eq!(module.initializer_call_name_symbols_scanned(), 64);
+    }
+
+    #[test]
+    fn cloned_modules_share_immutable_programs_but_append_independently() {
+        let syntax = parse("/proc/base()\n\treturn 7\n").expect("procedure should parse");
+        let module = compile_module(&syntax.definitions).expect("procedure should compile");
+        let mut clone = module.clone();
+
+        assert!(Arc::ptr_eq(&module.procedures[0], &clone.procedures[0]));
+        let entry = compile_initializer_into_module(
+            &expression_tokens("base()"),
+            &BTreeMap::new(),
+            &mut clone,
+        )
+        .expect("initializer should append only to the clone");
+
+        assert_eq!(module.procedure_count(), 1);
+        assert_eq!(clone.procedure_count(), 2);
+        assert!(Arc::ptr_eq(&module.procedures[0], &clone.procedures[0]));
+        assert_eq!(execute_module(&clone, entry, &[]), Ok(Value::number(7.0)));
     }
 
     #[test]
@@ -20616,6 +22792,251 @@ mod tests {
     }
 
     #[test]
+    fn fully_eager_module_preserves_indexes_identity_and_dynamic_dispatch() {
+        let source = parse(
+            "/proc/entry(receiver)\n\treturn receiver.run()\n/datum/alpha/proc/run()\n\treturn 11\n/datum/beta/proc/run()\n\treturn 22\n",
+        )
+        .unwrap();
+        let specs = [
+            ProcedureSpec {
+                path: "/proc/entry@0".to_owned(),
+                definition: &source.definitions[0],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/datum/alpha/proc/run@0".to_owned(),
+                definition: &source.definitions[1],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/datum/beta/proc/run@0".to_owned(),
+                definition: &source.definitions[2],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+        ];
+        let module = compile_module_specs_selective(
+            &specs,
+            &[BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
+            &BTreeSet::from([0]),
+        )
+        .unwrap();
+        let lazy_observer = module.clone();
+        let expected_identity = module.identity.0;
+        let expected_paths = module.paths.clone();
+        let expected_names = module.names.clone();
+        let expected_dynamic_names = module.dynamic_names.clone();
+        let expected_procedure_types = module.procedure_types.clone();
+
+        let eager = module.clone().into_fully_eager().unwrap();
+        let independently_eager = module.into_fully_eager().unwrap();
+        assert_eq!(eager.deferred_procedure_count(), 0);
+        assert_eq!(eager.materialized_deferred_procedure_count(), 0);
+        assert_eq!(eager.identity.0, expected_identity);
+        assert_eq!(eager.paths, expected_paths);
+        assert_eq!(eager.names, expected_names);
+        assert_eq!(eager.dynamic_names, expected_dynamic_names);
+        assert_eq!(eager.procedure_types, expected_procedure_types);
+        assert_eq!(eager, independently_eager);
+        assert_eq!(eager, eager.clone());
+
+        assert_eq!(lazy_observer.deferred_procedure_count(), 2);
+        assert_eq!(lazy_observer.materialized_deferred_procedure_count(), 0);
+        let entry = eager.procedure_id_at(0).unwrap();
+        let mut state = ExecutionState::new();
+        for (path, expected) in [("/datum/alpha", 11.0), ("/datum/beta", 22.0)] {
+            let receiver = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse(path).unwrap());
+            assert_eq!(
+                execute_module_in_context(
+                    &eager,
+                    entry,
+                    &[Value::Datum(receiver)],
+                    &mut state,
+                    &ExecutionContext::default(),
+                ),
+                Ok(Value::number(expected))
+            );
+        }
+        assert_eq!(lazy_observer.materialized_deferred_procedure_count(), 0);
+    }
+
+    #[test]
+    fn fully_eager_module_surfaces_first_preflight_error_without_materializing_clones() {
+        let source = parse(
+            "/proc/entry()\n\treturn 1\n/proc/first()\n\treturn 2\n/proc/second()\n\treturn 3\n",
+        )
+        .unwrap();
+        let specs = source
+            .definitions
+            .iter()
+            .enumerate()
+            .map(|(index, definition)| ProcedureSpec {
+                path: ["/proc/entry@0", "/proc/first@0", "/proc/second@0"][index].to_owned(),
+                definition,
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            })
+            .collect::<Vec<_>>();
+        let module = compile_module_specs_selective_with_errors(
+            &specs,
+            &[BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
+            &BTreeSet::from([0]),
+            &BTreeMap::from([
+                (
+                    2,
+                    super::CompileError {
+                        message: "second preflight failure".to_owned(),
+                    },
+                ),
+                (
+                    1,
+                    super::CompileError {
+                        message: "first preflight failure".to_owned(),
+                    },
+                ),
+            ]),
+        )
+        .unwrap();
+        let observer = module.clone();
+
+        let error = module.into_fully_eager().unwrap_err();
+        assert_eq!(error.message, "/proc/first@0: first preflight failure");
+        assert_eq!(observer.materialized_deferred_procedure_count(), 0);
+    }
+
+    #[test]
+    fn fully_eager_module_surfaces_lowering_errors_in_procedure_order() {
+        let source = parse(
+            "/proc/entry()\n\treturn 1\n/proc/first_bad()\n\treturn unknown_first\n/proc/second_bad()\n\treturn unknown_second\n",
+        )
+        .unwrap();
+        let specs = source
+            .definitions
+            .iter()
+            .enumerate()
+            .map(|(index, definition)| ProcedureSpec {
+                path: ["/proc/entry@0", "/proc/first_bad@0", "/proc/second_bad@0"][index]
+                    .to_owned(),
+                definition,
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            })
+            .collect::<Vec<_>>();
+        let module = compile_module_specs_selective(
+            &specs,
+            &[BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
+            &BTreeSet::from([0]),
+        )
+        .unwrap();
+
+        let error = module.into_fully_eager().unwrap_err();
+        assert!(error.message.starts_with("/proc/first_bad@0: "));
+        assert!(error.message.contains("unknown local \"unknown_first\""));
+    }
+
+    #[test]
+    fn bounded_fully_eager_diagnostics_compile_good_bodies_and_report_stable_failures() {
+        let source = parse(concat!(
+            "/proc/entry()\n\treturn 1\n",
+            "/proc/good_before()\n\treturn 11\n",
+            "/proc/first_bad()\n\treturn unknown_first\n",
+            "/proc/good_after()\n\treturn 22\n",
+            "/proc/second_bad()\n\treturn unknown_second\n",
+            "/proc/third_bad()\n\treturn unknown_third\n",
+        ))
+        .unwrap();
+        let paths = [
+            "/proc/entry@0",
+            "/proc/good_before@0",
+            "/proc/first_bad@0",
+            "/proc/good_after@0",
+            "/proc/second_bad@0",
+            "/proc/third_bad@0",
+        ];
+        let specs = source
+            .definitions
+            .iter()
+            .enumerate()
+            .map(|(index, definition)| ProcedureSpec {
+                path: paths[index].to_owned(),
+                definition,
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut module = compile_module_specs_selective(
+            &specs,
+            &vec![BTreeMap::new(); specs.len()],
+            &BTreeSet::from([0]),
+        )
+        .unwrap();
+
+        let errors = module
+            .materialize_fully_eager_bounded(2)
+            .expect_err("three independent deferred bodies must fail");
+        assert_eq!(errors.total_failures(), 3);
+        assert_eq!(errors.successful_procedures(), 2);
+        assert_eq!(errors.diagnostics().len(), 2);
+        assert!(
+            errors.diagnostics()[0]
+                .message
+                .starts_with("/proc/first_bad@0: ")
+        );
+        assert!(
+            errors.diagnostics()[0]
+                .message
+                .contains("unknown local \"unknown_first\"")
+        );
+        assert!(
+            errors.diagnostics()[1]
+                .message
+                .starts_with("/proc/second_bad@0: ")
+        );
+        assert!(
+            errors.diagnostics()[1]
+                .message
+                .contains("unknown local \"unknown_second\"")
+        );
+        let rendered = errors.to_string();
+        assert!(rendered.starts_with(
+            "3 deferred procedures failed eager compilation; 2 compiled successfully; showing first 2 failures\n- /proc/first_bad@0: "
+        ));
+        assert!(!rendered.contains("third_bad"));
+
+        assert_eq!(module.deferred_procedure_count(), 3);
+        let mut state = ExecutionState::new();
+        for (index, expected) in [(1, 11.0), (3, 22.0)] {
+            assert_eq!(
+                execute_module_in_context(
+                    &module,
+                    module.procedure_id_at(index).unwrap(),
+                    &[],
+                    &mut state,
+                    &ExecutionContext::default(),
+                ),
+                Ok(Value::number(expected))
+            );
+        }
+        assert_eq!(module.deferred_procedure_count(), 3);
+    }
+
+    #[test]
     fn static_call_statement_executes_and_discards_its_result() {
         let source = parse(
             "/proc/entry()\n\thelper()\n\treturn global.calls\n/proc/helper()\n\tglobal.calls += 1\n\treturn 99\n",
@@ -20861,6 +23282,213 @@ mod tests {
     }
 
     #[test]
+    fn inline_spawned_assignment_is_one_detached_statement() {
+        let source = parse(concat!(
+            "/proc/entry()\n",
+            "\tspawn(1) global.spawn_value = 9\n",
+            "\treturn 1\n",
+            "/proc/read_spawn_value()\n",
+            "\treturn global.spawn_value\n",
+        ))
+        .expect("source should parse");
+        let module =
+            compile_module(&source.definitions).expect("inline spawned assignment should compile");
+        let entry = module.procedure_id("/proc/entry").expect("entry");
+        let mut state = ExecutionState::new();
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::number(1.0))
+        );
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::Null])
+        );
+        let read = module
+            .procedure_id("/proc/read_spawn_value")
+            .expect("reader");
+        assert_eq!(
+            execute_module_in_state(&module, read, &[], &mut state),
+            Ok(Value::number(9.0))
+        );
+    }
+
+    #[test]
+    fn compound_pointer_dereference_updates_the_pointed_local() {
+        let source = parse(concat!(
+            "/proc/scale(pointer)\n",
+            "\t*pointer *= 4\n",
+            "/proc/entry()\n",
+            "\tvar/value = 3\n",
+            "\tscale(&value)\n",
+            "\treturn value\n",
+        ))
+        .expect("source should parse");
+        let module = compile_module(&source.definitions)
+            .expect("compound pointer dereference should compile");
+        let entry = module.procedure_id("/proc/entry").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(12.0)));
+    }
+
+    #[test]
+    fn pick_expands_arglist_before_applying_single_list_semantics() {
+        let source = parse(concat!(
+            "/proc/expanded_pick(...)\n",
+            "\treturn pick(arglist(args))\n",
+            "/proc/entry()\n",
+            "\treturn expanded_pick(list(9))\n",
+        ))
+        .expect("source should parse");
+        let module =
+            compile_module(&source.definitions).expect("pick(arglist(...)) should compile");
+        let entry = module.procedure_id("/proc/entry").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(9.0)));
+    }
+
+    #[test]
+    fn dynamic_field_in_nested_conditional_false_arm_keeps_outer_ternary_delimiter() {
+        let source = parse(concat!(
+            "/proc/entry()\n",
+            "\tvar/datum/item = new\n",
+            "\tvar/list/cache = list(/datum = 7)\n",
+            "\treturn cache ? cache[(ispath(item) ? item : item:type)] : 0\n",
+        ))
+        .expect("source should parse");
+        let module = compile_module(&source.definitions)
+            .expect("nested conditional dynamic field should compile");
+        let entry = module.procedure_id("/proc/entry").expect("entry");
+        assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(7.0)));
+    }
+
+    #[test]
+    fn positive_spawn_delays_floor_by_tick_lag_with_a_one_tick_minimum() {
+        let source = parse(concat!(
+            "/proc/entry(delay)\n",
+            "\tspawn(delay)\n",
+            "\t\treturn 7\n",
+            "\treturn 11\n",
+        ))
+        .expect("spawn delay fixture should parse");
+        let module =
+            compile_module(&source.definitions).expect("spawn delay fixture should compile");
+        let entry = module.procedure_id("/proc/entry").unwrap();
+
+        for (delay, due_tick) in [(0.1, 1), (1.0, 1), (3.0, 1), (4.9, 2)] {
+            let mut state = ExecutionState::new();
+            let world = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/world").unwrap());
+            state
+                .heap_mut()
+                .set_datum_field(world, field("tick_lag"), Value::number(2.0))
+                .unwrap();
+            state.set_global(field("world"), Value::Datum(world));
+
+            assert_eq!(
+                execute_module_in_state(&module, entry, &[Value::number(delay)], &mut state,),
+                Ok(Value::number(11.0)),
+            );
+            assert_eq!(state.next_scheduled_tick(), Some(due_tick));
+            assert_eq!(
+                advance_scheduler(
+                    &module,
+                    due_tick.saturating_sub(1),
+                    ExecutionLimits::default(),
+                    &mut state,
+                ),
+                Ok(Vec::new()),
+            );
+            assert_eq!(
+                advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+                Ok(vec![Value::number(7.0)]),
+            );
+        }
+    }
+
+    #[test]
+    fn positive_sleep_delays_resume_nested_callers_on_byond_tick_deadlines() {
+        let source = parse(concat!(
+            "/proc/entry(delay)\n",
+            "\treturn sleeping_wrapper(delay) + 1\n",
+            "/proc/sleeping_wrapper(delay)\n",
+            "\tsleep(delay)\n",
+            "\treturn 20\n",
+        ))
+        .expect("sleep delay fixture should parse");
+        let module =
+            compile_module(&source.definitions).expect("sleep delay fixture should compile");
+        let entry = module.procedure_id("/proc/entry").unwrap();
+
+        for (delay, due_tick) in [(0.1, 1), (1.0, 1), (3.0, 1), (4.9, 2)] {
+            let mut state = ExecutionState::new();
+            let world = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/world").unwrap());
+            state
+                .heap_mut()
+                .set_datum_field(world, field("tick_lag"), Value::number(2.0))
+                .unwrap();
+            state.set_global(field("world"), Value::Datum(world));
+
+            assert_eq!(
+                execute_module_in_state(&module, entry, &[Value::number(delay)], &mut state,),
+                Ok(Value::Null),
+            );
+            assert_eq!(state.next_scheduled_tick(), Some(due_tick));
+            assert_eq!(
+                advance_scheduler(
+                    &module,
+                    due_tick.saturating_sub(1),
+                    ExecutionLimits::default(),
+                    &mut state,
+                ),
+                Ok(Vec::new()),
+            );
+            assert_eq!(
+                advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+                Ok(vec![Value::number(21.0)]),
+            );
+        }
+    }
+
+    #[test]
+    fn changing_tick_lag_does_not_move_an_existing_scheduler_deadline() {
+        let source = parse("/proc/entry()\n\tspawn(4.9)\n\t\treturn 7\n\treturn 11\n")
+            .expect("fixed-deadline fixture should parse");
+        let module =
+            compile_module(&source.definitions).expect("fixed-deadline fixture should compile");
+        let entry = module.procedure_id("/proc/entry").unwrap();
+        let mut state = ExecutionState::new();
+        let world = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/world").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(world, field("tick_lag"), Value::number(2.0))
+            .unwrap();
+        state.set_global(field("world"), Value::Datum(world));
+
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::number(11.0)),
+        );
+        assert_eq!(state.next_scheduled_tick(), Some(2));
+
+        state
+            .heap_mut()
+            .set_datum_field(world, field("tick_lag"), Value::number(10.0))
+            .unwrap();
+        assert_eq!(state.next_scheduled_tick(), Some(2));
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(Vec::new()),
+        );
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::number(7.0)]),
+        );
+    }
+
+    #[test]
     fn scheduler_advances_world_clock_and_short_work_observes_fresh_tick_usage() {
         let source = parse(
             "/proc/entry()\n\tspawn(3)\n\t\treturn_usage()\n/proc/return_usage()\n\tworld.observed = world.tick_usage\n",
@@ -20890,22 +23518,17 @@ mod tests {
             execute_module_in_state(&module, entry, &[], &mut state),
             Ok(Value::Null)
         );
-        assert_eq!(state.next_scheduled_tick(), Some(2));
-        assert_eq!(
-            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
-            Ok(vec![])
-        );
-        assert_eq!(crate::world_numeric_field(&state, "time"), Some(2.0));
+        assert_eq!(state.next_scheduled_tick(), Some(1));
         assert_eq!(
             advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
             Ok(vec![Value::Null])
         );
+        assert_eq!(crate::world_numeric_field(&state, "time"), Some(2.0));
         assert_eq!(
             state.heap().datum_field(world, &field("observed")),
             Ok(&Value::number(0.0))
         );
-        assert_eq!(crate::world_numeric_field(&state, "time"), Some(4.0));
-        assert_eq!(crate::world_numeric_field(&state, "timeofday"), Some(3.0));
+        assert_eq!(crate::world_numeric_field(&state, "timeofday"), Some(1.0));
         assert_eq!(crate::world_numeric_field(&state, "tick_usage"), Some(0.0));
     }
 
@@ -21611,6 +24234,111 @@ mod tests {
     }
 
     #[test]
+    fn constant_member_selectors_are_embedded_without_changing_dynamic_call_semantics() {
+        let source = parse(concat!(
+            "/datum/receiver/proc/static_entry()\n\treturn src.run(4)\n",
+            "/datum/receiver/proc/dynamic_entry(selector)\n\treturn call(src, selector)(4)\n",
+            "/datum/receiver/proc/run(value)\n\treturn src.base + value\n",
+        ))
+        .expect("member-call fixture should parse");
+        let module = compile_module(&source.definitions).expect("member calls should compile");
+        let static_entry = module
+            .procedure(
+                module
+                    .procedure_id("/datum/receiver/proc/static_entry")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(static_entry.instructions.iter().any(|instruction| matches!(
+            instruction,
+            Instruction::CallDynamic {
+                static_selector: Some(selector),
+                ..
+            } if selector == "run"
+        )));
+        assert!(!static_entry.instructions.iter().any(
+            |instruction| matches!(instruction, Instruction::PushText(selector) if selector.as_ref() == "run")
+        ));
+        let dynamic_entry = module
+            .procedure(
+                module
+                    .procedure_id("/datum/receiver/proc/dynamic_entry")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            dynamic_entry
+                .instructions
+                .iter()
+                .any(|instruction| matches!(
+                    instruction,
+                    Instruction::CallDynamic {
+                        static_selector: None,
+                        ..
+                    }
+                ))
+        );
+
+        let mut state = ExecutionState::new();
+        let receiver = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/receiver").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(receiver, field("base"), Value::number(3.0))
+            .unwrap();
+        let context = ExecutionContext::new(Value::Datum(receiver), Value::Null);
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                module
+                    .procedure_id("/datum/receiver/proc/static_entry")
+                    .unwrap(),
+                &[],
+                &mut state,
+                &context,
+            ),
+            Ok(Value::number(7.0))
+        );
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                module
+                    .procedure_id("/datum/receiver/proc/dynamic_entry")
+                    .unwrap(),
+                &[Value::text("run")],
+                &mut state,
+                &context,
+            ),
+            Ok(Value::number(7.0))
+        );
+    }
+
+    #[test]
+    fn constant_text_pushes_share_the_immutable_bytecode_allocation() {
+        let source = parse("/proc/run()\n\treturn \"atom_after_successful_initialize\"\n")
+            .expect("constant text fixture should parse");
+        let program = compile_procedure(&source.definitions[0])
+            .expect("constant text fixture should compile");
+        let constant = program
+            .instructions
+            .iter()
+            .find_map(|instruction| match instruction {
+                Instruction::PushText(text) => Some(text),
+                _ => None,
+            })
+            .expect("constant text instruction");
+        let first = execute(&program, &[]).expect("first execution");
+        let second = execute(&program, &[]).expect("second execution");
+        let (Value::Text(first), Value::Text(second)) = (first, second) else {
+            panic!("constant text execution should return text");
+        };
+        assert_eq!(first.as_ref(), "atom_after_successful_initialize");
+        assert!(Arc::ptr_eq(constant, &first));
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
     fn dynamic_call_follows_runtime_parent_type_outside_lexical_path() {
         let source = parse(concat!(
             "/atom/proc/add_debris_element()\n\treturn 17\n",
@@ -21726,8 +24454,279 @@ mod tests {
         );
         assert_eq!(
             crate::DYNAMIC_LOOKUP_PROBES.get(),
-            200,
-            "each call should probe only child then its runtime parent, independent of 2,000 cold symbols",
+            2,
+            "the first call should probe child and parent; the next 99 calls must use the receiver cache",
+        );
+    }
+
+    #[test]
+    fn dynamic_receiver_cache_retains_misses_and_invalidates_with_parent_metadata() {
+        let source = parse("/datum/base/proc/run()\n\treturn 7\n").unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+        let child = TypePath::parse("/datum/child").unwrap();
+        let base = TypePath::parse("/datum/base").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_type_parents(BTreeMap::from([(child.clone(), None)]));
+        let receiver = state.heap_mut().allocate_datum(child.clone());
+        let receiver = Value::Datum(receiver);
+        let selector = Value::text("run");
+        let context = ExecutionContext::default();
+
+        crate::DYNAMIC_LOOKUP_PROBES.set(0);
+        for _ in 0..2 {
+            assert!(
+                crate::dynamic_call_target(
+                    &module, &mut state, &receiver, &selector, &context, false,
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            crate::DYNAMIC_LOOKUP_PROBES.get(),
+            2,
+            "a failed receiver lookup should walk its parent chain only once",
+        );
+
+        state.set_type_parents(BTreeMap::from([(child, Some(base))]));
+        let (target, _) =
+            crate::dynamic_call_target(&module, &mut state, &receiver, &selector, &context, false)
+                .expect("replacing parent metadata must invalidate the cached miss");
+        assert_eq!(module.procedure_path(target), Some("/datum/base/proc/run"));
+        assert_eq!(crate::DYNAMIC_LOOKUP_PROBES.get(), 4);
+    }
+
+    #[test]
+    fn atoms_profile_path_activation_is_exact_across_reopening_suffixes() {
+        assert!(crate::is_atoms_initialize_path(
+            "/datum/controller/subsystem/atoms/proc/Initialize"
+        ));
+        assert!(crate::is_atoms_initialize_path(
+            "/datum/controller/subsystem/atoms/proc/Initialize@3"
+        ));
+        assert!(!crate::is_atoms_initialize_path(
+            "/datum/controller/subsystem/atoms/proc/InitializeAtoms@0"
+        ));
+        assert!(!crate::is_atoms_initialize_path(
+            "/datum/controller/subsystem/assets/proc/Initialize@0"
+        ));
+        assert!(crate::is_subsystem_initialize_path(
+            "/datum/controller/subsystem/lighting/proc/Initialize"
+        ));
+        assert!(crate::is_subsystem_initialize_path(
+            "/datum/controller/subsystem/processing/atoms/proc/Initialize@3"
+        ));
+        assert!(!crate::is_subsystem_initialize_path(
+            "/datum/controller/subsystem/lighting/proc/fire"
+        ));
+        assert!(!crate::is_subsystem_initialize_path(
+            "/datum/controller/master/proc/Initialize"
+        ));
+    }
+
+    #[test]
+    fn atoms_profile_survives_step_slices_counts_root_once_and_finishes_with_it() {
+        let source = parse(concat!(
+            "/datum/controller/subsystem/atoms/proc/Initialize()\n",
+            "\tvar/total = 0\n",
+            "\tfor(var/i in 1 to 8)\n",
+            "\t\ttotal += i\n",
+            "\treturn total\n",
+        ))
+        .unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+        let entry = module
+            .procedure_id(crate::ATOMS_INITIALIZE_PATH)
+            .expect("SSatoms entry");
+        let program = module.procedure(entry).unwrap();
+        let mut frame = crate::make_frame(entry, program, &[], &ExecutionContext::default());
+        frame.atoms_profile_root = true;
+        let mut frames = vec![frame];
+        let mut state = ExecutionState::new();
+        state.atoms_profile = Some(crate::AtomsProfile {
+            started: Instant::now(),
+            last_snapshot: Instant::now(),
+            startup_root: None,
+            total_instructions: 0,
+            samples: HashMap::new(),
+            frame_entries: HashMap::new(),
+            paths: HashMap::new(),
+        });
+        let limits = ExecutionLimits {
+            max_call_depth: 64,
+            max_steps: 3,
+        };
+        let mut slices = 0;
+        loop {
+            match crate::run_frames(
+                &module,
+                frames,
+                limits,
+                crate::StepBudgetBehavior::YieldScheduledContinuation,
+                &mut state,
+            )
+            .unwrap()
+            {
+                crate::FrameRunOutcome::Yielded {
+                    frames: continuation,
+                    ..
+                } => {
+                    slices += 1;
+                    let profile = state
+                        .atoms_profile
+                        .as_ref()
+                        .expect("profile survives yield");
+                    let key = crate::AtomsProfileProcedure {
+                        module_identity: module.identity.0,
+                        procedure: entry,
+                    };
+                    assert_eq!(profile.frame_entries.get(&key), Some(&1));
+                    assert_eq!(profile.total_instructions, slices * limits.max_steps);
+                    frames = continuation;
+                }
+                crate::FrameRunOutcome::Complete(value) => {
+                    assert_eq!(value, Value::number(36.0));
+                    break;
+                }
+            }
+        }
+        assert!(slices > 1);
+        assert!(
+            state.atoms_profile.is_none(),
+            "returning the marked root must finish and remove its profiler"
+        );
+    }
+
+    #[test]
+    fn atoms_profile_report_ranks_samples_then_entries() {
+        let source = parse(concat!(
+            "/proc/first()\n\treturn 1\n",
+            "/proc/second()\n\treturn 2\n",
+        ))
+        .unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+        let first = module.procedure_id("/proc/first").unwrap();
+        let second = module.procedure_id("/proc/second").unwrap();
+        let first_key = crate::AtomsProfileProcedure {
+            module_identity: module.identity.0,
+            procedure: first,
+        };
+        let second_key = crate::AtomsProfileProcedure {
+            module_identity: module.identity.0,
+            procedure: second,
+        };
+        let profile = crate::AtomsProfile {
+            started: Instant::now(),
+            last_snapshot: Instant::now(),
+            startup_root: None,
+            total_instructions: 12_345,
+            samples: HashMap::from([(first_key, 2), (second_key, 3)]),
+            frame_entries: HashMap::from([(first_key, 20), (second_key, 1)]),
+            paths: HashMap::from([
+                (first_key, "/proc/first".to_owned()),
+                (second_key, "/proc/second".to_owned()),
+            ]),
+        };
+        let lines = crate::atoms_profile_lines(&profile);
+        assert!(lines[0].contains("total_instructions=12345 samples=5 procedures=2"));
+        assert!(lines[1].contains("rank=1 samples=3 entries=1 procedure=/proc/second"));
+        assert!(lines[2].contains("rank=2 samples=2 entries=20 procedure=/proc/first"));
+
+        let startup = crate::AtomsProfile {
+            startup_root: Some("/datum/controller/subsystem/lighting/proc/Initialize@2".to_owned()),
+            ..profile
+        };
+        let lines = crate::atoms_profile_lines(&startup);
+        assert!(lines[0].contains(
+            "startup-profile-summary subsystem=/datum/controller/subsystem/lighting/proc/Initialize@2"
+        ));
+        assert!(lines[1].contains(
+            "startup-profile-rank subsystem=/datum/controller/subsystem/lighting/proc/Initialize@2 rank=1"
+        ));
+    }
+
+    #[test]
+    fn atoms_profile_periodic_snapshot_preserves_cumulative_counts() {
+        let started = Instant::now();
+        let key = crate::AtomsProfileProcedure {
+            module_identity: 7,
+            procedure: crate::ProcedureId::from_index(3).expect("small procedure id is valid"),
+        };
+        let mut profile = crate::AtomsProfile {
+            started,
+            last_snapshot: started,
+            startup_root: None,
+            total_instructions: 12_345,
+            samples: HashMap::from([(key, 3)]),
+            frame_entries: HashMap::from([(key, 9)]),
+            paths: HashMap::from([(key, "/proc/hot".to_owned())]),
+        };
+        assert!(
+            crate::atoms_profile_snapshot_lines_if_due(
+                &mut profile,
+                started + std::time::Duration::from_secs(59),
+                std::time::Duration::from_secs(60),
+            )
+            .is_none()
+        );
+        let lines = crate::atoms_profile_snapshot_lines_if_due(
+            &mut profile,
+            started + std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("the sixty-second boundary emits a snapshot");
+        assert!(lines[0].contains("atoms-profile-snapshot"));
+        assert!(lines[0].contains("total_instructions=12345 samples=3 procedures=1"));
+        assert_eq!(profile.total_instructions, 12_345);
+        assert_eq!(profile.samples.get(&key), Some(&3));
+        assert_eq!(profile.frame_entries.get(&key), Some(&9));
+        assert!(
+            crate::atoms_profile_snapshot_lines_if_due(
+                &mut profile,
+                started + std::time::Duration::from_secs(119),
+                std::time::Duration::from_secs(60),
+            )
+            .is_none(),
+            "the reporting interval restarts without resetting profile counts"
+        );
+    }
+
+    #[test]
+    fn owned_call_frame_preserves_arguments_locals_and_supplied_flags() {
+        let source = parse("/proc/callee(a, b, c, ...)\n\tvar/x\n\treturn a + b + c\n").unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+        let entry = module.procedure_id("/proc/callee").unwrap();
+        let program = module.procedure(entry).unwrap();
+        let context = ExecutionContext::default();
+        let arguments = vec![Value::number(1.0), Value::number(2.0)];
+        let borrowed = crate::make_frame(entry, program, &arguments, &context);
+        let owned = crate::make_frame_owned(entry, program, arguments, &context);
+        assert_eq!(owned.arguments, borrowed.arguments);
+        assert_eq!(owned.locals, borrowed.locals);
+        assert_eq!(owned.supplied_parameters, borrowed.supplied_parameters);
+        assert_eq!(
+            owned.arguments.len(),
+            3,
+            "omitted c is padded in implicit args"
+        );
+        assert_eq!(owned.arguments[2], Value::Null);
+        assert_eq!(owned.supplied_parameters, vec![true, true, false, false]);
+
+        let extras = vec![
+            Value::number(1.0),
+            Value::number(2.0),
+            Value::number(3.0),
+            Value::number(4.0),
+            Value::number(5.0),
+        ];
+        let borrowed = crate::make_frame(entry, program, &extras, &context);
+        let owned = crate::make_frame_owned(entry, program, extras, &context);
+        assert_eq!(owned.arguments, borrowed.arguments);
+        assert_eq!(owned.locals, borrowed.locals);
+        assert_eq!(owned.supplied_parameters, borrowed.supplied_parameters);
+        assert_eq!(
+            owned.arguments.len(),
+            5,
+            "variadic extras remain in implicit args"
         );
     }
 
@@ -22217,6 +25216,333 @@ mod tests {
     }
 
     #[test]
+    fn logical_or_assignment_ast_and_empty_list_superinstruction_shapes_are_exact() {
+        let parsed = parse("/proc/shape(value)\n\treturn (value ||= list())\n").unwrap();
+        let tokens = &parsed.definitions[0].body[0].tokens;
+        let expression = super::ExpressionParser::new(&tokens[1..]).parse().unwrap();
+        assert!(matches!(
+            expression,
+            super::Expression::LogicalOrAssignment { target, value }
+                if matches!(target.as_ref(), super::Expression::Local(name) if name == "value")
+                    && matches!(value.as_ref(), super::Expression::List(entries) if entries.is_empty())
+        ));
+
+        let source = parse(
+            "/proc/run()\n\tvar/local\n\tlocal ||= list()\n\tcache ||= list()\n\treturn local\n",
+        )
+        .unwrap();
+        let module = compile_module_specs(&[ProcedureSpec {
+            path: "/proc/run@0".to_owned(),
+            definition: &source.definitions[0],
+            parent: None,
+            static_calls: BTreeMap::new(),
+            src_fields: BTreeMap::new(),
+            global_fields: BTreeMap::from([("cache".to_owned(), field("cache"))]),
+        }])
+        .unwrap();
+        let instructions = &module
+            .procedure(module.procedure_id_at(0).unwrap())
+            .unwrap()
+            .instructions;
+        assert!(
+            instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::LogicalOrEmptyListLocal(_)))
+        );
+        assert!(instructions.iter().any(|instruction| matches!(
+            instruction,
+            Instruction::LogicalOrEmptyListGlobal(name) if name.as_str() == "cache"
+        )));
+
+        let register = parse(
+            "/datum/listener/proc/register(datum/target)\n\tvar/list/procs = (_signal_procs ||= list())\n\tvar/list/target_procs = (procs[target] ||= list())\n\treturn (target._listen_lookup ||= list())\n",
+        )
+        .unwrap();
+        let module = compile_module_specs(&[ProcedureSpec {
+            path: "/datum/listener/proc/register@0".to_owned(),
+            definition: &register.definitions[0],
+            parent: None,
+            static_calls: BTreeMap::new(),
+            src_fields: BTreeMap::from([("_signal_procs".to_owned(), field("_signal_procs"))]),
+            global_fields: BTreeMap::new(),
+        }])
+        .unwrap();
+        let instructions = &module
+            .procedure(module.procedure_id_at(0).unwrap())
+            .unwrap()
+            .instructions;
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|instruction| matches!(
+                    instruction,
+                    Instruction::LogicalOrEmptyListField(_)
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|instruction| matches!(instruction, Instruction::LogicalOrEmptyListIndex))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn logical_or_empty_list_truthy_skips_allocation_and_falsey_allocates_one_alias() {
+        let syntax = parse("/proc/run(value)\n\treturn (value ||= list())\n").unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let entry = module.procedure_id("/proc/run").unwrap();
+        assert!(
+            module
+                .procedure(entry)
+                .unwrap()
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::LogicalOrEmptyListLocal(_)))
+        );
+
+        let mut state = ExecutionState::new();
+        let existing = state.heap_mut().allocate_list();
+        let before = state.heap().live_list_count();
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::List(existing)], &mut state),
+            Ok(Value::List(existing))
+        );
+        assert_eq!(state.heap().live_list_count(), before);
+
+        let before = state.heap().live_list_count();
+        let Value::List(created) =
+            execute_module_in_state(&module, entry, &[Value::Null], &mut state).unwrap()
+        else {
+            panic!("falsey logical assignment must return its allocated list")
+        };
+        assert_eq!(state.heap().live_list_count(), before + 1);
+        assert!(state.heap().list(created).is_ok());
+    }
+
+    #[test]
+    fn logical_or_empty_list_preserves_pointer_aliases_and_list_copy_on_write() {
+        let syntax = parse(
+            "/proc/pointer()\n\tvar/value\n\tvar/pointer = &value\n\tvar/list/result = (value ||= list())\n\treturn pointer == result\n/proc/cow(list/value)\n\tvar/list/copy = value.Copy()\n\tvar/list/result = (value ||= list())\n\tresult.Add(2)\n\treturn (result == value) * 100 + value.len * 10 + copy.len\n",
+        )
+        .unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        assert_eq!(
+            execute_module(&module, module.procedure_id("/proc/pointer").unwrap(), &[]),
+            Ok(Value::number(1.0))
+        );
+
+        let mut state = ExecutionState::new();
+        let original = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(original)
+            .unwrap()
+            .add(Value::number(1.0));
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/cow").unwrap(),
+                &[Value::List(original)],
+                &mut state,
+            ),
+            Ok(Value::number(121.0))
+        );
+    }
+
+    #[test]
+    fn logical_or_empty_list_writes_through_global_and_datum_vars_proxies() {
+        let source = parse(
+            "/proc/global_proxy()\n\treturn (global.vars[\"cache\"] ||= list())\n/proc/datum_proxy(datum/target)\n\treturn (target.vars[\"slot\"] ||= list())\n",
+        )
+        .unwrap();
+        let module = compile_module_with_global_fields(
+            &source.definitions,
+            &BTreeMap::from([("cache".to_owned(), field("cache"))]),
+        )
+        .unwrap();
+        let mut state = ExecutionState::new();
+        state.set_global(field("cache"), Value::Null);
+        let global_result = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/global_proxy").unwrap(),
+            &[],
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(state.global(&field("cache")), Some(&global_result));
+
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/target").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(datum, field("slot"), Value::Null)
+            .unwrap();
+        let datum_result = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/datum_proxy").unwrap(),
+            &[Value::Datum(datum)],
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(
+            state.heap().datum_field(datum, &field("slot")),
+            Ok(&datum_result)
+        );
+    }
+
+    #[test]
+    fn logical_or_empty_list_reads_materializing_lvalues_exactly_once() {
+        let source = parse(
+            "/proc/field_once(savefile/target)\n\treturn (target.dir ||= list())\n/proc/index_once(savefile/target)\n\treturn (target[\"entry\"] ||= list())\n",
+        )
+        .unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+
+        let mut state = ExecutionState::new();
+        let savefile = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/savefile").unwrap());
+        let before_lists = state.heap().live_list_count();
+        assert!(matches!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/field_once").unwrap(),
+                &[Value::Datum(savefile)],
+                &mut state,
+            ),
+            Ok(Value::List(_))
+        ));
+        assert_eq!(state.heap().live_list_count(), before_lists + 1);
+
+        let before_datums = state.heap().live_datum_count();
+        let before_lists = state.heap().live_list_count();
+        assert!(matches!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/index_once").unwrap(),
+                &[Value::Datum(savefile)],
+                &mut state,
+            ),
+            Ok(Value::Datum(_))
+        ));
+        assert_eq!(state.heap().live_datum_count(), before_datums + 1);
+        assert_eq!(state.heap().live_list_count(), before_lists);
+    }
+
+    #[test]
+    fn logical_or_empty_list_captures_dynamic_references_once_and_preserves_errors() {
+        let source = parse(
+            "/datum/helper/proc/next()\n\tcounter += 1\n\treturn holder\n/datum/helper/proc/run()\n\treturn (next().slot ||= list())\n/datum/helper/proc/excluded()\n\treturn (next().slot ||= list(1))\n",
+        )
+        .unwrap();
+        let module = compile_module_specs(&[
+            ProcedureSpec {
+                path: "/datum/helper/proc/next@0".to_owned(),
+                definition: &source.definitions[0],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::from([
+                    ("counter".to_owned(), field("counter")),
+                    ("holder".to_owned(), field("holder")),
+                ]),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/datum/helper/proc/run@0".to_owned(),
+                definition: &source.definitions[1],
+                parent: None,
+                static_calls: BTreeMap::from([("next".to_owned(), 0)]),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/datum/helper/proc/excluded@0".to_owned(),
+                definition: &source.definitions[2],
+                parent: None,
+                static_calls: BTreeMap::from([("next".to_owned(), 0)]),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+        ])
+        .unwrap();
+        assert!(
+            module
+                .procedure(module.procedure_id_at(1).unwrap())
+                .unwrap()
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::LogicalOrEmptyListField(_)))
+        );
+        assert!(
+            !module
+                .procedure(module.procedure_id_at(2).unwrap())
+                .unwrap()
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::LogicalOrEmptyListField(_)))
+        );
+
+        let mut state = ExecutionState::new();
+        let helper = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/helper").unwrap());
+        let holder = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/holder").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(helper, field("counter"), Value::number(0.0))
+            .unwrap();
+        state
+            .heap_mut()
+            .set_datum_field(helper, field("holder"), Value::Datum(holder))
+            .unwrap();
+        state
+            .heap_mut()
+            .set_datum_field(holder, field("slot"), Value::Null)
+            .unwrap();
+        execute_module_in_context(
+            &module,
+            module.procedure_id_at(1).unwrap(),
+            &[],
+            &mut state,
+            &ExecutionContext::new(Value::Datum(helper), Value::Null),
+        )
+        .unwrap();
+        assert_eq!(
+            state.heap().datum_field(helper, &field("counter")),
+            Ok(&Value::number(1.0))
+        );
+
+        let error_source = parse(
+            "/proc/field_error(datum/target)\n\treturn (target.slot ||= list())\n/proc/index_error(list/target)\n\treturn (target[\"x\"] ||= list())\n",
+        )
+        .unwrap();
+        let errors = compile_module(&error_source.definitions).unwrap();
+        let field_error = execute_module(
+            &errors,
+            errors.procedure_id("/proc/field_error").unwrap(),
+            &[Value::Null],
+        )
+        .unwrap_err();
+        assert_eq!(field_error.message, "field read received null");
+        assert!(field_error.source_span.is_some());
+        let index_error = execute_module(
+            &errors,
+            errors.procedure_id("/proc/index_error").unwrap(),
+            &[Value::number(7.0)],
+        )
+        .unwrap_err();
+        assert_eq!(index_error.message, "list index operation received 7");
+        assert!(index_error.source_span.is_some());
+    }
+
+    #[test]
     fn plane_macro_nested_scope_keeps_cached_locals_visible() {
         let source = parse(
             "/proc/plane_macro(flag, other)\n\tvar/output = 0\n\tdo { if(flag) { var/_cached_plane = 7; var/_our_turf = other; if(_our_turf) { var/key = \"[_cached_plane]\"; output = _cached_plane; } else if(other) { output = _cached_plane; } else { output = _cached_plane; } } else { output = 2; } } while(0)\n\treturn output\n",
@@ -22292,6 +25618,30 @@ mod tests {
     }
 
     #[test]
+    fn bulk_list_subtraction_ignores_rhs_associations_and_preserves_surviving_values() {
+        let source = parse(concat!(
+            "/proc/run()\n",
+            "\tvar/list/left = list(\"x\")\n",
+            "\tleft[\"key\"] = \"associated\"\n",
+            "\tleft.Add(\"key\", /obj/item)\n",
+            "\tleft[\"keep\"] = \"value\"\n",
+            "\tvar/list/right = list()\n",
+            "\tright[\"key\"] = \"ignored\"\n",
+            "\tright.Add(/obj/item)\n",
+            "\tvar/list/copied = left - right\n",
+            "\tleft -= right\n",
+            "\treturn left.len + (left[1] == \"x\") + (left[2] == \"key\") + (left[3] == \"keep\") + (left[\"key\"] == \"associated\") + (left[\"keep\"] == \"value\") + copied.len + (copied[1] == \"x\") + (copied[2] == \"key\") + (copied[3] == \"keep\") + (copied[\"key\"] == \"associated\") + (copied[\"keep\"] == \"value\")\n",
+        ))
+        .expect("bulk subtraction source should parse");
+        let module =
+            compile_module(&source.definitions).expect("bulk subtraction source should compile");
+        assert_eq!(
+            execute_module(&module, module.procedure_id("/proc/run").unwrap(), &[]),
+            Ok(Value::number(16.0)),
+        );
+    }
+
+    #[test]
     fn null_plus_equals_list_initializes_a_lazy_list() {
         let source = parse("/proc/queue(value)\n\tvar/list/waiting\n\twaiting += list(value)\n\treturn waiting[1]\n")
         .expect("lazy list source should parse");
@@ -22332,6 +25682,20 @@ mod tests {
     fn multiline_parenthesized_lists_are_one_logical_statement() {
         let source = "/proc/run()\n\tvar/list/values = list(\n\t\tlist(1, 2),\n\t\tlist(3)\n\t\t,list(4, 5, 6),\n\t)\n\treturn values.len\n";
         assert_eq!(execute_source(source, 0.0), Value::number(3.0));
+    }
+
+    #[test]
+    fn multiline_list_with_safe_index_ternary_joins_its_closing_parenthesis() {
+        let source = concat!(
+            "/proc/run()\n",
+            "\tvar/list/traits\n",
+            "\t. = list(\n",
+            "\t\t\"sensors\" = 7,\n",
+            "\t\t\"link_allowed\" = ((traits?[\"ai\"] ? TRUE : FALSE) || FALSE),\n",
+            "\t)\n",
+            "\treturn .[\"sensors\"] + .[\"link_allowed\"]\n",
+        );
+        assert_eq!(execute_source(source, 0.0), Value::number(7.0));
     }
 
     #[test]
@@ -22834,7 +26198,7 @@ mod tests {
         let program = manual_program(
             vec![
                 Instruction::PushNumber(DmNumberBits::from_f32(7.0)),
-                Instruction::PushText("second".to_owned()),
+                Instruction::PushText(Arc::from("second")),
                 Instruction::MakeList(2),
                 Instruction::Return,
             ],
@@ -23330,6 +26694,28 @@ mod tests {
             Ok(Value::number(1.0))
         );
         assert_eq!(program.instructions.len(), program.source_spans.len());
+        assert!(!program.instructions.iter().any(
+            |instruction| matches!(instruction, Instruction::Jump(target) if *target >= program.instructions.len())
+        ));
+    }
+
+    #[test]
+    fn production_shaped_get_voice_omits_dead_if_else_end_jump() {
+        let source = "/atom/movable/virtualspeaker/proc/GetVoice(bool)\n\tif(bool && realvoice)\n\t\treturn realvoice\n\telse\n\t\treturn \"[src]\"\n";
+        let syntax = parse(source).expect("production-shaped GetVoice source should parse");
+        let program = compile_procedure_with_resolver_and_fields(
+            &syntax.definitions[0],
+            &HashMap::new(),
+            &BTreeMap::from([("realvoice".to_owned(), field("realvoice"))]),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("production-shaped GetVoice should compile");
+
+        assert_eq!(program.instructions.len(), 14);
+        assert!(!program.instructions.iter().any(
+            |instruction| matches!(instruction, Instruction::Jump(target) if *target >= program.instructions.len())
+        ));
     }
 
     #[test]
@@ -24539,6 +27925,71 @@ mod tests {
         );
         assert_eq!(state.initial_prototypes.len(), 1);
         assert_eq!(state.heap().list(world_contents).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn runtime_initial_field_cache_preserves_inheritance_null_overrides_and_invalidation() {
+        let mut state = ExecutionState::new();
+        let parent = TypePath::parse("/datum/initial_cache_parent").unwrap();
+        let child = TypePath::parse("/datum/initial_cache_parent/child").unwrap();
+        let inherited = field("inherited");
+        let overridden_null = field("overridden_null");
+        let runtime = field("runtime");
+        state.set_type_parents(BTreeMap::from([
+            (parent.clone(), None),
+            (child.clone(), Some(parent.clone())),
+        ]));
+        state.set_initial_values(BTreeMap::from([
+            (
+                parent.clone(),
+                BTreeMap::from([
+                    (inherited.clone(), Value::number(7.0)),
+                    (overridden_null.clone(), Value::number(8.0)),
+                    (runtime.clone(), Value::Null),
+                ]),
+            ),
+            (
+                child.clone(),
+                BTreeMap::from([(overridden_null.clone(), Value::Null)]),
+            ),
+        ]));
+        state.set_instance_initializers(
+            Arc::new(BTreeMap::from([(
+                parent.clone(),
+                vec![InstanceInitializer::Constant {
+                    field: runtime.clone(),
+                    value: Value::number(11.0),
+                }],
+            )])),
+            None,
+        );
+
+        for _ in 0..2 {
+            assert_eq!(
+                crate::runtime_initial_field_value(&mut state, &child, &inherited),
+                Ok(Value::number(7.0)),
+            );
+            assert_eq!(
+                crate::runtime_initial_field_value(&mut state, &child, &overridden_null),
+                Ok(Value::Null),
+            );
+            assert_eq!(
+                crate::runtime_initial_field_value(&mut state, &child, &runtime),
+                Ok(Value::number(11.0)),
+            );
+        }
+        assert_eq!(state.initial_field_value_cache_entries, 3);
+        assert_eq!(state.initial_prototypes.len(), 1);
+
+        state.set_initial_values(BTreeMap::from([(
+            parent,
+            BTreeMap::from([(inherited.clone(), Value::number(13.0))]),
+        )]));
+        assert!(state.initial_field_value_cache.is_empty());
+        assert_eq!(
+            crate::runtime_initial_field_value(&mut state, &child, &inherited),
+            Ok(Value::number(13.0)),
+        );
     }
 
     #[test]
@@ -25948,8 +29399,14 @@ mod tests {
         };
         let datum = state.heap().datum(regex).expect("regex datum should exist");
         assert_eq!(datum.type_path().to_string(), "/regex");
-        assert_eq!(datum.field(&field("datum_flags")), Ok(&Value::number(0.0)));
-        assert_eq!(datum.field(&field("tag")), Ok(&Value::Null));
+        assert_eq!(
+            datum_field_or_initial(&state, regex, &field("datum_flags")),
+            Ok(Value::number(0.0))
+        );
+        assert_eq!(
+            datum_field_or_initial(&state, regex, &field("tag")),
+            Ok(Value::Null)
+        );
         assert_eq!(
             datum.field(&field("_dream64_pattern")),
             Ok(&Value::text("[a-z]+"))
@@ -26757,6 +30214,153 @@ mod tests {
     }
 
     #[test]
+    fn native_walks_schedule_replace_stop_and_terminate_without_dm_tasks() {
+        let syntax = parse(concat!(
+            "/proc/directional(ref, direction, lag)\n\twalk(ref, direction, lag)\n",
+            "/proc/stop(ref)\n\twalk(ref, 0)\n",
+            "/proc/towards(ref, target, lag)\n\twalk_towards(ref, target, lag)\n",
+            "/proc/to(ref, target, minimum, lag)\n\twalk_to(ref, target, minimum, lag)\n",
+            "/proc/away(ref, target, maximum, lag)\n\twalk_away(ref, target, maximum, lag)\n",
+            "/proc/random(ref, lag)\n\twalk_rand(ref, lag)\n",
+        ))
+        .expect("walk surface fixture should parse");
+        let module =
+            compile_module(&syntax.definitions).expect("every walk surface should compile");
+        let mut state = ExecutionState::new();
+        let mut turfs = Vec::new();
+        for x in 1..=4 {
+            let turf = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/turf/walk_test").unwrap());
+            for (name, value) in [("x", x), ("y", 1), ("z", 1)] {
+                state
+                    .heap_mut()
+                    .set_datum_field(turf, field(name), Value::number(value as f32))
+                    .unwrap();
+            }
+            state.world_turfs.insert((x, 1, 1), turf);
+            turfs.push(turf);
+        }
+        let movable = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/walk_test").unwrap());
+        let target = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/walk_target").unwrap());
+        for (datum, x, loc) in [(movable, 1, turfs[0]), (target, 4, turfs[3])] {
+            for (name, value) in [("x", x), ("y", 1), ("z", 1)] {
+                state
+                    .heap_mut()
+                    .set_datum_field(datum, field(name), Value::number(value as f32))
+                    .unwrap();
+            }
+            state
+                .heap_mut()
+                .set_datum_field(datum, field("loc"), Value::Datum(loc))
+                .unwrap();
+        }
+        let x = |state: &ExecutionState| {
+            state
+                .heap()
+                .datum_field(movable, &field("x"))
+                .unwrap()
+                .as_number()
+                .unwrap()
+        };
+        let run = |name: &str, arguments: &[Value], state: &mut ExecutionState| {
+            execute_module_in_state(
+                &module,
+                module.procedure_id(&format!("/proc/{name}")).unwrap(),
+                arguments,
+                state,
+            )
+        };
+
+        assert_eq!(
+            run(
+                "directional",
+                &[
+                    Value::Datum(movable),
+                    Value::number(4.0),
+                    Value::number(2.0)
+                ],
+                &mut state,
+            ),
+            Ok(Value::Null),
+        );
+        assert_eq!(state.scheduled_task_count(), 0);
+        assert_eq!(state.next_scheduled_tick(), Some(2));
+        assert_eq!(x(&state), 1.0);
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(Vec::new()),
+        );
+        assert_eq!(x(&state), 1.0);
+        advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state).unwrap();
+        assert_eq!(x(&state), 2.0);
+
+        run(
+            "directional",
+            &[
+                Value::Datum(movable),
+                Value::number(8.0),
+                Value::number(1.0),
+            ],
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(state.next_scheduled_tick(), Some(3));
+        advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state).unwrap();
+        assert_eq!(x(&state), 1.0, "a later walk replaces the previous one");
+        run("stop", &[Value::Datum(movable)], &mut state).unwrap();
+        assert_eq!(state.next_scheduled_tick(), None);
+        advance_scheduler(&module, 5, ExecutionLimits::default(), &mut state).unwrap();
+        assert_eq!(x(&state), 1.0, "walk(ref, 0) stops future motion");
+
+        run(
+            "to",
+            &[
+                Value::Datum(movable),
+                Value::Datum(target),
+                Value::number(1.0),
+                Value::number(1.0),
+            ],
+            &mut state,
+        )
+        .unwrap();
+        for expected in [2.0, 3.0] {
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state).unwrap();
+            assert_eq!(x(&state), expected);
+        }
+        advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state).unwrap();
+        assert_eq!(x(&state), 3.0);
+        assert!(
+            state.native_walks.is_empty(),
+            "walk_to stops at minimum range"
+        );
+
+        run(
+            "away",
+            &[
+                Value::Datum(movable),
+                Value::Datum(target),
+                Value::number(1.0),
+                Value::number(1.0),
+            ],
+            &mut state,
+        )
+        .unwrap();
+        advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state).unwrap();
+        assert_eq!(x(&state), 2.0);
+        advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state).unwrap();
+        assert_eq!(x(&state), 2.0);
+        assert!(
+            state.native_walks.is_empty(),
+            "walk_away stops beyond maximum range"
+        );
+    }
+
+    #[test]
     fn mapping_multiz_get_step_resolves_up_down_and_world_bounds() {
         let syntax = parse(
             "/proc/neighbors(turf/center, turf/above, turf/below)\n\treturn list(get_step(center, UP), get_step(center, DOWN), get_step(above, UP), get_step(below, DOWN), get_step(center, UP | NORTH))\n",
@@ -26840,6 +30444,43 @@ mod tests {
                     .set_datum_field(datum, field(name), Value::number(0.0))
                     .unwrap();
             }
+        }
+
+        assert_eq!(
+            execute_in_state(&program, &[Value::Datum(source)], &mut state),
+            Ok(Value::Null)
+        );
+    }
+
+    #[test]
+    fn get_turf_reads_sparse_runtime_coordinate_and_loc_defaults() {
+        let syntax = parse("/proc/turf_of(atom/source)\n\treturn get_step(source, 0)\n")
+            .expect("get_turf-shaped source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("get_turf-shaped source should compile");
+        let mut state = ExecutionState::new();
+        let source_type = TypePath::parse("/obj/item/transient").unwrap();
+        state.set_initial_values(BTreeMap::from([(
+            source_type.clone(),
+            BTreeMap::from([
+                (field("loc"), Value::Null),
+                (field("x"), Value::number(0.0)),
+                (field("y"), Value::number(0.0)),
+                (field("z"), Value::number(0.0)),
+            ]),
+        )]));
+        let source = allocate_initialized_datum(&mut state, source_type)
+            .expect("sparse runtime atom should allocate");
+        for name in ["loc", "x", "y", "z"] {
+            assert!(
+                state
+                    .heap()
+                    .datum(source)
+                    .unwrap()
+                    .field(&field(name))
+                    .is_err(),
+                "unchanged {name} default should stay sparse"
+            );
         }
 
         assert_eq!(
@@ -28185,6 +31826,49 @@ mod tests {
     }
 
     #[test]
+    fn mutable_appearance_new_copies_decal_image_before_dm_constructor() {
+        let syntax = parse(
+            "/mutable_appearance/New(mutable_appearance/to_copy)\n\
+             \tif(!to_copy)\n\
+             \t\tsrc.plane = -32767\n\
+             /proc/build_smoothed_decal()\n\
+             \tvar/temp_image = image('icons/turf/floors/neon.dmi', null, \"neon-3\", 4, 8)\n\
+             \tvar/mutable_appearance/pic = new(temp_image)\n\
+             \treturn list(pic.icon, pic.icon_state, pic.layer, pic.dir, pic.plane)\n",
+        )
+        .expect("decal appearance-copy fixture should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("decal appearance-copy fixture should compile");
+        let procedure = module
+            .procedure_id("/proc/build_smoothed_decal")
+            .expect("decal appearance-copy fixture should have an entry proc");
+        let mut state = ExecutionState::new();
+        let Value::List(result) = execute_module_in_state(&module, procedure, &[], &mut state)
+            .expect("typed mutable-appearance construction should copy the image")
+        else {
+            panic!("decal appearance-copy fixture should return a list")
+        };
+        let values = state
+            .heap()
+            .list(result)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                Value::file("icons/turf/floors/neon.dmi"),
+                Value::text("neon-3"),
+                Value::number(4.0),
+                Value::number(8.0),
+                Value::number(0.0),
+            ],
+            "OpenDream/BYOND copy the complete source image before /mutable_appearance/New runs",
+        );
+    }
+
+    #[test]
     fn image_accepts_mutable_appearance_atom_and_icon_sources() {
         let syntax = parse(
             "/proc/build_sources()\n\tvar/mutable_appearance/mutable = new()\n\tmutable.icon = 'icons/mutable.dmi'\n\tmutable.icon_state = \"mutable\"\n\tmutable.pixel_x = 7\n\tvar/obj/source = new\n\tsource.icon = 'icons/atom.dmi'\n\tsource.icon_state = \"atom\"\n\tvar/icon/icon_source = icon('icons/icon.dmi')\n\treturn list(image(mutable), image(source), image(icon_source))\n",
@@ -29228,5 +32912,323 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn simple_for_field_assignment_bulk_path_preserves_values_under_tight_budget() {
+        let syntax = parse(
+            "/proc/run(list/items, value)\n\tfor(var/turf/item as anything in items)\n\t\titem.luminosity = value\n\treturn 7\n",
+        )
+        .unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let entry = module.procedure_id("/proc/run").unwrap();
+        let mut state = ExecutionState::new();
+        let items = state.heap_mut().allocate_list();
+        let mut datums = Vec::new();
+        for _ in 0..128 {
+            let datum = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/turf/test").unwrap());
+            state
+                .heap_mut()
+                .list_mut(items)
+                .unwrap()
+                .add(Value::Datum(datum));
+            datums.push(datum);
+        }
+        let result = execute_module_with_limits_in_state(
+            &module,
+            entry,
+            &[Value::List(items), Value::number(73.0)],
+            ExecutionLimits {
+                max_call_depth: 8,
+                max_steps: 4,
+            },
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(result.as_number(), Some(7.0));
+        for datum in datums {
+            assert_eq!(
+                datum_field_or_initial(&state, datum, &field("luminosity"))
+                    .unwrap()
+                    .as_number(),
+                Some(73.0),
+            );
+        }
+    }
+
+    #[test]
+    fn simple_for_field_assignment_falls_back_before_mixed_receiver_error() {
+        let syntax =
+            parse("/proc/run(list/items)\n\tfor(var/item in items)\n\t\titem.luminosity = 9\n")
+                .unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let entry = module.procedure_id("/proc/run").unwrap();
+        let mut state = ExecutionState::new();
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/turf/test").unwrap());
+        let items = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(items)
+            .unwrap()
+            .add(Value::Datum(datum));
+        state
+            .heap_mut()
+            .list_mut(items)
+            .unwrap()
+            .add(Value::number(1.0));
+
+        let error =
+            execute_module_in_state(&module, entry, &[Value::List(items)], &mut state).unwrap_err();
+        assert!(error.message.contains("field write requires a datum"));
+        assert_eq!(
+            datum_field_or_initial(&state, datum, &field("luminosity"))
+                .unwrap()
+                .as_number(),
+            Some(9.0),
+        );
+    }
+
+    #[test]
+    fn simple_for_field_assignment_snapshots_contents_and_uses_spatial_writes() {
+        let syntax = parse(
+            "/proc/run(list/items)\n\tfor(var/atom/movable/item as anything in items)\n\t\titem.loc = null\n\treturn 1\n",
+        )
+        .unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let entry = module.procedure_id("/proc/run").unwrap();
+        let mut state = ExecutionState::new();
+        let container = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/container").unwrap());
+        let contents = state.ensure_contents(container).unwrap();
+        let mut members = Vec::new();
+        for _ in 0..64 {
+            let member = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/obj/test").unwrap());
+            super::assign_datum_or_shared_field(
+                &mut state,
+                member,
+                field("loc"),
+                Value::Datum(container),
+            )
+            .unwrap();
+            members.push(member);
+        }
+        assert_eq!(state.heap().list(contents).unwrap().len(), members.len());
+
+        let result = execute_module_with_limits_in_state(
+            &module,
+            entry,
+            &[Value::List(contents)],
+            ExecutionLimits {
+                max_call_depth: 8,
+                max_steps: 4,
+            },
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(result.as_number(), Some(1.0));
+        assert!(state.heap().list(contents).unwrap().is_empty());
+        for member in members {
+            assert!(matches!(
+                datum_field_or_initial(&state, member, &field("loc")),
+                Ok(Value::Null)
+            ));
+        }
+    }
+
+    #[test]
+    #[ignore = "local release microbenchmark"]
+    fn simple_for_field_assignment_release_microbenchmark() {
+        const ITEMS: usize = 135_170;
+        let syntax = parse(
+            "/proc/fast(list/items, value)\n\tfor(var/turf/item as anything in items)\n\t\titem.luminosity = value\n/proc/bytecode(list/items, value)\n\tfor(var/turf/item as anything in items)\n\t\tif(item)\n\t\t\titem.luminosity = value\n",
+        )
+        .unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let mut state = ExecutionState::new();
+        let items = state.heap_mut().allocate_list();
+        for _ in 0..ITEMS {
+            let datum = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/turf/test").unwrap());
+            state
+                .heap_mut()
+                .list_mut(items)
+                .unwrap()
+                .add(Value::Datum(datum));
+        }
+        let bytecode = module.procedure_id("/proc/bytecode").unwrap();
+        let started = Instant::now();
+        execute_module_in_state(
+            &module,
+            bytecode,
+            &[Value::List(items), Value::number(1.0)],
+            &mut state,
+        )
+        .unwrap();
+        let bytecode_elapsed = started.elapsed();
+
+        let fast = module.procedure_id("/proc/fast").unwrap();
+        let started = Instant::now();
+        execute_module_in_state(
+            &module,
+            fast,
+            &[Value::List(items), Value::number(2.0)],
+            &mut state,
+        )
+        .unwrap();
+        let fast_elapsed = started.elapsed();
+        eprintln!(
+            "simple iteration field assignment items={ITEMS} bytecode_ms={} fast_ms={} speedup={:.2}",
+            bytecode_elapsed.as_millis(),
+            fast_elapsed.as_millis(),
+            bytecode_elapsed.as_secs_f64() / fast_elapsed.as_secs_f64(),
+        );
+    }
+
+    fn synthetic_builtin_module(name: &str, body: &str, caller: &str) -> Module {
+        let source = format!("{caller}\n{body}");
+        let syntax = parse(&source).unwrap();
+        let specs = [
+            ProcedureSpec {
+                path: "/proc/run".to_owned(),
+                definition: &syntax.definitions[0],
+                parent: None,
+                static_calls: BTreeMap::from([(name.to_owned(), 1)]),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: format!("/proc/{name}@dream64_builtin"),
+                definition: &syntax.definitions[1],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+        ];
+        compile_module_specs(&specs).unwrap()
+    }
+
+    #[test]
+    fn canonical_synthetic_max_executes_without_a_callee_frame() {
+        let module = synthetic_builtin_module(
+            "max",
+            "/proc/max(...)\n\tvar/list/values = args\n\tif(length(args) == 1 && islist(args[1]))\n\t\tvalues = args[1]\n\tif(!length(values))\n\t\treturn null\n\tvar/result = values[1]\n\tfor(var/value in values)\n\t\tif(value > result)\n\t\t\tresult = value\n\treturn result\n",
+            "/proc/run()\n\treturn max(3, 9, 4)",
+        );
+        let entry = module.procedure_id("/proc/run").unwrap();
+        let caller_steps = module.procedure(entry).unwrap().instructions.len() as u64;
+        assert_eq!(
+            execute_module_with_limits(
+                &module,
+                entry,
+                &[],
+                ExecutionLimits {
+                    max_call_depth: 8,
+                    max_steps: caller_steps,
+                },
+            )
+            .unwrap()
+            .as_number(),
+            Some(9.0),
+        );
+    }
+
+    #[test]
+    fn canonical_synthetic_istext_matches_all_value_families() {
+        let body = "/proc/istext(value)\n\treturn !isnull(value) && !isnum(value) && !ispath(value) && !islist(value) && !istype(value)\n";
+        let module =
+            synthetic_builtin_module("istext", body, "/proc/run(value)\n\treturn istext(value)");
+        let entry = module.procedure_id("/proc/run").unwrap();
+        let mut state = ExecutionState::new();
+        let list = state.heap_mut().allocate_list();
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/test").unwrap());
+        for (value, expected) in [
+            (Value::Null, 0.0),
+            (Value::number(1.0), 0.0),
+            (Value::TypePath(TypePath::parse("/datum").unwrap()), 0.0),
+            (Value::List(list), 0.0),
+            (Value::Datum(datum), 0.0),
+            (Value::text("yes"), 1.0),
+            (Value::file("icon.dmi"), 1.0),
+        ] {
+            assert_eq!(
+                execute_module_in_state(&module, entry, &[value], &mut state)
+                    .unwrap()
+                    .as_number(),
+                Some(expected),
+            );
+        }
+    }
+
+    #[test]
+    fn customized_synthetic_named_body_is_not_bypassed() {
+        let module = synthetic_builtin_module(
+            "max",
+            "/proc/max(...)\n\treturn 99\n",
+            "/proc/run()\n\treturn max(3, 9, 4)",
+        );
+        let entry = module.procedure_id("/proc/run").unwrap();
+        assert_eq!(
+            execute_module(&module, entry, &[]).unwrap().as_number(),
+            Some(99.0)
+        );
+    }
+
+    #[test]
+    fn canonical_synthetic_builtin_error_falls_back_to_exact_callee_trace() {
+        let module = synthetic_builtin_module(
+            "max",
+            "/proc/max(...)\n\tvar/list/values = args\n\tif(length(args) == 1 && islist(args[1]))\n\t\tvalues = args[1]\n\tif(!length(values))\n\t\treturn null\n\tvar/result = values[1]\n\tfor(var/value in values)\n\t\tif(value > result)\n\t\t\tresult = value\n\treturn result\n",
+            "/proc/run(value)\n\treturn max(value)",
+        );
+        let entry = module.procedure_id("/proc/run").unwrap();
+        let mut state = ExecutionState::new();
+        let stale = state.heap_mut().allocate_list();
+        state.heap_mut().destroy_list(stale).unwrap();
+        let error =
+            execute_module_in_state(&module, entry, &[Value::List(stale)], &mut state).unwrap_err();
+        assert!(error.message.contains("stale list handle"));
+        assert_eq!(error.call_stack.len(), 2);
+        assert_eq!(error.call_stack[0].procedure, "/proc/run");
+        assert_eq!(error.call_stack[1].procedure, "/proc/max@dream64_builtin");
+        assert!(error.call_stack[1].source_span.is_some());
+    }
+
+    #[test]
+    #[ignore = "local release microbenchmark"]
+    fn canonical_synthetic_builtin_release_microbenchmark() {
+        const CALLS: usize = 50_000;
+        let body = "/proc/max(...)\n\tvar/list/values = args\n\tif(length(args) == 1 && islist(args[1]))\n\t\tvalues = args[1]\n\tif(!length(values))\n\t\treturn null\n\tvar/result = values[1]\n\tfor(var/value in values)\n\t\tif(value > result)\n\t\t\tresult = value\n\treturn result\n";
+        let caller = format!(
+            "/proc/run()\n\tvar/result\n\tfor(var/i in 1 to {CALLS})\n\t\tresult = max(i, i + 1, i - 1)\n\treturn result"
+        );
+        let fast = synthetic_builtin_module("max", body, &caller);
+        let mut bytecode = fast.clone();
+        let target = bytecode.procedure_id("/proc/max@dream64_builtin").unwrap();
+        bytecode.paths[target.index()] = "/proc/max@benchmark_bytecode".to_owned();
+
+        let entry = fast.procedure_id("/proc/run").unwrap();
+        let started = Instant::now();
+        execute_module(&bytecode, entry, &[]).unwrap();
+        let bytecode_elapsed = started.elapsed();
+        let started = Instant::now();
+        execute_module(&fast, entry, &[]).unwrap();
+        let fast_elapsed = started.elapsed();
+        eprintln!(
+            "canonical synthetic max calls={CALLS} bytecode_ms={} fast_ms={} speedup={:.2}",
+            bytecode_elapsed.as_millis(),
+            fast_elapsed.as_millis(),
+            bytecode_elapsed.as_secs_f64() / fast_elapsed.as_secs_f64(),
+        );
     }
 }

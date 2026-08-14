@@ -164,15 +164,18 @@ dependencies = [
 name = "dm-lifecycle"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "dm-compiler",
  "dm-core",
  "dm-map",
  "dm-object-tree",
+ "dm-project",
  "dm-runtime",
  "dm-semantics",
  "dm-value",
  "dm-vm",
  "dm-world",
+ "md5",
 ]
 
 [[package]]
@@ -206,6 +209,7 @@ name = "dm-project"
 version = "0.1.0"
 dependencies = [
  "dm-core",
+ "md5",
 ]
 
 [[package]]
