@@ -652,6 +652,13 @@ pub struct PrecompiledLifecycle {
 }
 
 impl PrecompiledLifecycle {
+    /// Returns the complete linked module so runtime initializer expressions
+    /// can be appended without relinking the project inventory.
+    #[doc(hidden)]
+    pub fn module_mut_for_runtime_initializers(&mut self) -> &mut dm_vm::Module {
+        self.executable.module_mut()
+    }
+
     /// Exact effective lifecycle roots selected from the world/map plan.
     #[must_use]
     pub const fn targets(&self) -> usize {
@@ -1228,6 +1235,7 @@ pub fn execute_initialization_plan_with_scheduler_policy(
         &mut executable,
         None,
         false,
+        false,
     )
 }
 
@@ -1261,6 +1269,7 @@ pub fn execute_initialization_plan_with_precompiled(
             &mut precompiled.executable,
             Some(&mut precompiled.persistent_state),
             false,
+            false,
         )
     } else {
         execute_initialization_plan_with_executable(
@@ -1273,8 +1282,47 @@ pub fn execute_initialization_plan_with_precompiled(
             &mut precompiled.executable,
             None,
             false,
+            false,
         )
     }
+}
+
+/// Executes production boot using precompiled lifecycle bytecode and releases
+/// cold host metadata once dynamic map overrides have entered the live VM.
+///
+/// # Errors
+///
+/// Returns the same failures as [`execute_initialization_plan_with_precompiled`].
+/// The supplied runtime image is intentionally no longer reusable afterward.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_boot_initialization_plan_with_precompiled(
+    index: &LifecycleIndex,
+    plan: &InitializationPlan,
+    allocation: &WorldAllocation,
+    runtime: &mut RuntimeImage,
+    scheduler_limits: SchedulerDrainLimits,
+    readiness: Option<&HeadlessReadinessProbe>,
+    precompiled: &mut PrecompiledLifecycle,
+) -> Result<InitializationExecution, InitializationExecutionError> {
+    eprintln!(
+        "boot-progress: using precompiled lifecycle targets={} bodies={} procedures={} deferred={}",
+        precompiled.targets,
+        precompiled.reachable_bodies,
+        precompiled.module_procedures(),
+        precompiled.deferred_procedures(),
+    );
+    execute_initialization_plan_with_executable(
+        index,
+        plan,
+        allocation,
+        runtime,
+        scheduler_limits,
+        readiness,
+        &mut precompiled.executable,
+        readiness.map(|_| &mut precompiled.persistent_state),
+        false,
+        true,
+    )
 }
 
 /// Executes all independent mapped lifecycle hooks while collecting unique
@@ -1309,6 +1357,7 @@ pub fn audit_initialization_plan_with_precompiled(
         &mut precompiled.executable,
         None,
         true,
+        false,
     )
 }
 
@@ -1323,6 +1372,7 @@ fn execute_initialization_plan_with_executable(
     executable: &mut dm_semantics::ExecutableProcedures,
     persistent_state: Option<&mut Option<dm_vm::ExecutionState>>,
     collect_runtime_errors: bool,
+    release_runtime_metadata: bool,
 ) -> Result<InitializationExecution, InitializationExecutionError> {
     eprintln!("boot-progress: selecting lifecycle targets");
     let bindings = map_datum_bindings(plan, allocation, runtime);
@@ -1366,6 +1416,13 @@ fn execute_initialization_plan_with_executable(
             executable.module_mut(),
         )?;
         eprintln!("boot-progress: applied dynamic map overrides");
+        if release_runtime_metadata {
+            let released = runtime.release_transferred_metadata();
+            eprintln!(
+                "boot-progress: released transferred metadata variables={} types={} initializer_candidates={}",
+                released.variables, released.types, released.initializer_candidates,
+            );
+        }
         let mut result = InitializationExecution {
             world,
             ..InitializationExecution::default()
@@ -1520,6 +1577,13 @@ fn execute_initialization_plan_with_executable(
                 failures: audit_failures.len(),
             });
         }
+        if release_runtime_metadata {
+            for event in &mut result.events {
+                event.result = Value::Null;
+            }
+            let released = state.release_host_value_roots();
+            eprintln!("boot-progress: released consumed host result roots={released}");
+        }
         result.scheduler =
             drain_startup_scheduler(executable.module(), &mut state, scheduler_limits, readiness)?;
         Ok(result)
@@ -1567,6 +1631,8 @@ fn drain_startup_scheduler(
             .map_err(InitializationExecutionError::Scheduler)?;
         drain.rounds += 1;
         drain.completed_tasks += completed.len();
+        drop(completed);
+        state.release_host_value_roots();
         drain.final_tick = state.scheduler_tick();
     }
     drain.pending_tasks = state.scheduled_task_count();
@@ -1616,6 +1682,8 @@ pub fn advance_persistent_scheduler(
             Ok(completed) => {
                 drain.rounds = drain.rounds.saturating_add(1);
                 drain.completed_tasks = drain.completed_tasks.saturating_add(completed.len());
+                drop(completed);
+                state.release_host_value_roots();
                 drain.final_tick = state.scheduler_tick();
                 drain.pending_tasks = state.scheduled_task_count();
                 if drain.pending_tasks == 0 {

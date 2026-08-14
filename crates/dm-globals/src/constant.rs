@@ -171,7 +171,7 @@ impl ConstantParser<'_> {
     }
 
     fn parse_unary(&mut self) -> Result<ConstantValue, UnsupportedConstant> {
-        if let Some((operator @ ("!" | "+" | "-"), span)) = self.current_operator() {
+        if let Some((operator @ ("!" | "~" | "+" | "-"), span)) = self.current_operator() {
             let operator = operator.to_owned();
             self.index += 1;
             let operand = self.parse_unary()?;
@@ -388,6 +388,7 @@ fn evaluate_unary(
 ) -> Result<ConstantValue, UnsupportedConstant> {
     match operator {
         "!" => Ok(number_value(f32::from(!operand.truthy()))),
+        "~" => number_operand(operand, span).map(|number| number_value(bitwise_not(number))),
         "+" => number_operand(operand, span).map(number_value),
         "-" => number_operand(operand, span).map(|number| number_value(-number)),
         _ => Err(UnsupportedConstant {
@@ -417,7 +418,7 @@ fn evaluate_binary(
                 !equal
             })))
         }
-        "+" | "-" | "*" | "/" | "%" | "<" | "<=" | ">" | ">=" => {
+        "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<<" | ">>" | "<" | "<=" | ">" | ">=" => {
             let left = number_operand(left, span)?;
             let right = number_operand(right, span)?;
             let result = match operator {
@@ -426,6 +427,11 @@ fn evaluate_binary(
                 "*" => left * right,
                 "/" => left / right,
                 "%" => left % right,
+                "&" => bitwise_binary(left, right, |left, right| left & right),
+                "|" => bitwise_binary(left, right, |left, right| left | right),
+                "^" => bitwise_binary(left, right, |left, right| left ^ right),
+                "<<" => bitwise_shift(left, right, |left, right| left << right),
+                ">>" => bitwise_shift(left, right, |left, right| left >> right),
                 "<" => f32::from(left < right),
                 "<=" => f32::from(left <= right),
                 ">" => f32::from(left > right),
@@ -472,12 +478,45 @@ const fn binary_precedence(operator: &str) -> Option<u8> {
     match operator.as_bytes() {
         b"||" => Some(1),
         b"&&" => Some(2),
-        b"==" | b"!=" => Some(3),
-        b"<" | b"<=" | b">" | b">=" => Some(4),
-        b"+" | b"-" => Some(5),
-        b"*" | b"/" | b"%" => Some(6),
+        b"|" => Some(3),
+        b"^" => Some(4),
+        b"&" => Some(5),
+        b"==" | b"!=" => Some(6),
+        b"<<" | b">>" | b"<" | b"<=" | b">" | b">=" => Some(7),
+        b"+" | b"-" => Some(8),
+        b"*" | b"/" | b"%" => Some(9),
         _ => None,
     }
+}
+
+const DM_BIT_MASK: u32 = (1 << 24) - 1;
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn dm_u24(value: f32) -> u32 {
+    (value.trunc() as i64 as u32) & DM_BIT_MASK
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn bitwise_binary(left: f32, right: f32, operation: impl FnOnce(u32, u32) -> u32) -> f32 {
+    (operation(dm_u24(left), dm_u24(right)) & DM_BIT_MASK) as f32
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn bitwise_not(value: f32) -> f32 {
+    ((!dm_u24(value)) & DM_BIT_MASK) as f32
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn bitwise_shift(left: f32, right: f32, operation: impl FnOnce(u32, u32) -> u32) -> f32 {
+    let count = right.trunc().max(0.0) as u32;
+    if count >= 24 {
+        return 0.0;
+    }
+    (operation(dm_u24(left), count) & DM_BIT_MASK) as f32
 }
 
 fn number_value(value: f32) -> ConstantValue {

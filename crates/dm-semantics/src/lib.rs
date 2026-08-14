@@ -4613,6 +4613,7 @@ pub fn standard_instance_field_names(path: &str) -> &'static [&'static str] {
             "bound_x",
             "bound_y",
             "glide_size",
+            "locs",
             "screen_loc",
             "step_x",
             "step_y",
@@ -4659,6 +4660,19 @@ pub fn standard_instance_field_names(path: &str) -> &'static [&'static str] {
         // ordinary fields. Map readers in tg-derived projects use `next`
         // directly to advance a global regex sweep.
         "/regex" => &["text", "flags", "match", "index", "group", "next"],
+        // `/sound` is an engine value with fields supplied by BYOND even when
+        // no project declaration exists. OpenDream exposes the core fields
+        // through DreamObjectSound; BYOND also exposes constructor controls.
+        "/sound" => &[
+            "file",
+            "repeat",
+            "wait",
+            "channel",
+            "volume",
+            "frequency",
+            "pan",
+            "offset",
+        ],
         "/particles" => &[
             "color",
             "width",
@@ -7684,8 +7698,8 @@ GLOBAL_REAL(Master, /datum/controller/master)
         );
         assert_eq!(
             execute_effective(&compilation, "/datum/base/child/proc/run", &[Value::Null]),
-            Ok(Value::number(11.0)),
-            "explicit null is reused and BYOND arithmetic treats it as numeric zero",
+            Ok(Value::number(13.0)),
+            "BYOND applies the declared default to an explicitly null parameter before forwarding it to the parent",
         );
     }
 

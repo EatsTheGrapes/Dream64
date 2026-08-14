@@ -125,6 +125,22 @@ fn builtin_client_defaults() -> [(&'static str, Value); 12] {
     ]
 }
 
+fn builtin_sound_defaults() -> [(&'static str, Value); 8] {
+    // Verified against BYOND 516.1680. OpenDream's DreamObjectSound owns
+    // file/repeat/channel/volume/offset; wait/frequency/pan are the remaining
+    // public constructor controls.
+    [
+        ("file", Value::Null),
+        ("repeat", Value::Null),
+        ("wait", Value::Null),
+        ("channel", Value::Null),
+        ("volume", Value::number(100.0)),
+        ("frequency", Value::number(0.0)),
+        ("pan", Value::number(0.0)),
+        ("offset", Value::Null),
+    ]
+}
+
 fn materialize_builtin_atom_defaults(
     heap: &mut ValueHeap,
     datum: DatumId,
@@ -134,6 +150,7 @@ fn materialize_builtin_atom_defaults(
     is_client: bool,
     is_particles: bool,
     is_image: bool,
+    is_sound: bool,
 ) -> Result<(), ValueError> {
     // Every /datum has BYOND's built-in tag field, even though it has no
     // source declaration in user projects.
@@ -149,7 +166,7 @@ fn materialize_builtin_atom_defaults(
             }
         }
     }
-    if !is_atom && !is_client && !is_image {
+    if !is_atom && !is_client && !is_image && !is_sound {
         return Ok(());
     }
     // These names exist without source declarations in BYOND's built-in atom
@@ -202,6 +219,7 @@ fn materialize_builtin_atom_defaults(
         ("bound_x", Value::number(0.0)),
         ("bound_y", Value::number(0.0)),
         ("glide_size", Value::number(0.0)),
+        ("locs", Value::Null),
         ("screen_loc", Value::Null),
         ("step_x", Value::number(0.0)),
         ("step_y", Value::number(0.0)),
@@ -228,6 +246,7 @@ fn materialize_builtin_atom_defaults(
         ("pixel_z", Value::number(0.0)),
         ("transform", Value::Null),
     ];
+    let sound_defaults = builtin_sound_defaults();
     for (name, value) in is_atom
         .then_some(atom_defaults)
         .into_iter()
@@ -242,6 +261,12 @@ fn materialize_builtin_atom_defaults(
         .chain(
             is_client
                 .then_some(client_defaults.as_slice())
+                .into_iter()
+                .flatten(),
+        )
+        .chain(
+            is_sound
+                .then_some(sound_defaults.as_slice())
                 .into_iter()
                 .flatten(),
         )
@@ -514,6 +539,7 @@ fn builtin_initial_fields(path: &TypePath, world_name: &str) -> BTreeMap<FieldNa
                 ("bound_x", Value::number(0.0)),
                 ("bound_y", Value::number(0.0)),
                 ("glide_size", Value::number(0.0)),
+                ("locs", Value::Null),
                 ("screen_loc", Value::Null),
                 ("step_x", Value::number(0.0)),
                 ("step_y", Value::number(0.0)),
@@ -529,6 +555,11 @@ fn builtin_initial_fields(path: &TypePath, world_name: &str) -> BTreeMap<FieldNa
         }
         "/client" => {
             for (name, value) in builtin_client_defaults() {
+                insert(name, value);
+            }
+        }
+        "/sound" => {
+            for (name, value) in builtin_sound_defaults() {
                 insert(name, value);
             }
         }
@@ -831,6 +862,17 @@ pub struct RuntimeCacheReleaseStats {
     pub allocation_plans: usize,
 }
 
+/// Counts of cold host-side catalogs released after ownership transfers to the VM.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeMetadataReleaseStats {
+    /// Materialized frontend variables no longer needed by the running VM.
+    pub variables: usize,
+    /// Host allocation/type records duplicated by shared VM metadata.
+    pub types: usize,
+    /// Source initializer candidates retained only for future host allocation.
+    pub initializer_candidates: usize,
+}
+
 #[derive(Clone)]
 struct CompiledInstanceInitializer {
     path: String,
@@ -861,6 +903,7 @@ struct DatumAllocationPlan {
     is_client: bool,
     is_particles: bool,
     is_image: bool,
+    is_sound: bool,
 }
 
 struct DynamicInitializerFailure {
@@ -1362,6 +1405,31 @@ impl RuntimeImage {
     /// fails emits its entry event but no completion event.
     pub fn from_compilation_with_observer(
         compilation: &Compilation,
+        observer: impl FnMut(RuntimeImageConstructionEvent),
+    ) -> Result<Self, RuntimeImageError> {
+        Self::from_compilation_internal(compilation, None, observer)
+    }
+
+    /// Materializes a frontend snapshot by appending initializer entries to an
+    /// already-linked complete project module.
+    ///
+    /// Production boot links the complete dynamic procedure inventory before
+    /// allocating the runtime image. Reusing that registry and module avoids a
+    /// second whole-project registry build and symbolic link while preserving
+    /// the same append-only initializer identities.
+    #[doc(hidden)]
+    pub fn from_compilation_with_prelinked_module(
+        compilation: &Compilation,
+        procedures: &ProcedureRegistry,
+        module: &mut Module,
+        observer: impl FnMut(RuntimeImageConstructionEvent),
+    ) -> Result<Self, RuntimeImageError> {
+        Self::from_compilation_internal(compilation, Some((procedures, module)), observer)
+    }
+
+    fn from_compilation_internal(
+        compilation: &Compilation,
+        mut prelinked: Option<(&ProcedureRegistry, &mut Module)>,
         mut observer: impl FnMut(RuntimeImageConstructionEvent),
     ) -> Result<Self, RuntimeImageError> {
         let phase = RuntimeImageConstructionPhase::VariableRegistry;
@@ -1710,7 +1778,14 @@ impl RuntimeImage {
             usize::from(initializer_frontier.requires_complete_inventory);
         let registry_phase = RuntimeImageConstructionPhase::ProcedureRegistry;
         let registry_started = begin_runtime_phase(&mut observer, registry_phase);
-        let procedures = ProcedureRegistry::build(compilation);
+        let owned_procedures = prelinked
+            .is_none()
+            .then(|| ProcedureRegistry::build(compilation));
+        let procedures = prelinked
+            .as_ref()
+            .map(|(procedures, _)| *procedures)
+            .or(owned_procedures.as_ref())
+            .expect("runtime construction always has a procedure registry");
         complete_runtime_phase(
             &mut observer,
             registry_phase,
@@ -1719,22 +1794,33 @@ impl RuntimeImage {
         );
         let phase = RuntimeImageConstructionPhase::InitializerModuleLink;
         let phase_started = begin_runtime_phase(&mut observer, phase);
-        let initializer_executable = if initializer_frontier.requires_complete_inventory {
-            procedures.compile_vm_all_symbolic_deferred(compilation)
+        let mut owned_initializer_module = if prelinked.is_some() {
+            None
         } else {
-            procedures.compile_vm_initializer_typed_frontier_symbolic_deferred(
-                compilation,
-                initializer_frontier.selectors.iter().map(String::as_str),
-                initializer_frontier.constructed_types.iter(),
-                initializer_frontier.requires_dynamic_constructors,
-            )
+            let executable = if initializer_frontier.requires_complete_inventory {
+                procedures.compile_vm_all_symbolic_deferred(compilation)
+            } else {
+                procedures.compile_vm_initializer_typed_frontier_symbolic_deferred(
+                    compilation,
+                    initializer_frontier.selectors.iter().map(String::as_str),
+                    initializer_frontier.constructed_types.iter(),
+                    initializer_frontier.requires_dynamic_constructors,
+                )
+            };
+            if let Ok(executable) = &executable {
+                image.stats.initializer_module_procedures = executable.stats().procedures;
+            }
+            executable
+                .ok()
+                .map(|executable| executable.module().clone())
         };
-        if let Ok(executable) = &initializer_executable {
-            image.stats.initializer_module_procedures = executable.stats().procedures;
+        let mut initializer_module = prelinked
+            .as_mut()
+            .map(|(_, module)| &mut **module)
+            .or(owned_initializer_module.as_mut());
+        if let Some(module) = initializer_module.as_deref() {
+            image.stats.initializer_module_procedures = module.procedure_count();
         }
-        let mut initializer_module = initializer_executable
-            .ok()
-            .map(|executable| executable.module().clone());
         complete_runtime_phase(
             &mut observer,
             phase,
@@ -1744,7 +1830,7 @@ impl RuntimeImage {
 
         let phase = RuntimeImageConstructionPhase::InstanceInitializerCompilation;
         let phase_started = begin_runtime_phase(&mut observer, phase);
-        if let Some(module) = initializer_module.as_mut() {
+        if let Some(module) = initializer_module.as_deref_mut() {
             image.vm_instance_initializers =
                 Arc::new(image.compile_vm_instance_initializers(module)?);
             image.vm_instance_initializer_module = Some(Arc::new(module.clone()));
@@ -1779,7 +1865,7 @@ impl RuntimeImage {
                         entry,
                         step,
                         &mut state,
-                        initializer_module.as_mut(),
+                        initializer_module.as_deref_mut(),
                     ) {
                         Ok(value) => {
                             image.apply_step_value(entry, step, value)?;
@@ -1797,7 +1883,7 @@ impl RuntimeImage {
                 }
             }
         }
-        if let Some(module) = initializer_module.as_ref() {
+        if let Some(module) = initializer_module.as_deref() {
             image.stats.initializer_module_deferred_procedures = module.deferred_procedure_count();
             image.stats.initializer_module_materialized_procedures =
                 module.materialized_deferred_procedure_count();
@@ -1933,6 +2019,46 @@ impl RuntimeImage {
         stats
     }
 
+    /// Releases host-only catalogs after [`Self::take_execution_state`] has
+    /// transferred the live heap, globals, type/default catalogs, initializer
+    /// module, and project root into the persistent VM.
+    ///
+    /// This is intentionally one-way: the image may still receive its heap back
+    /// for orderly error cleanup, but it must not be used for further host-side
+    /// allocation or global reflection. Production boot uses this after dynamic
+    /// map overrides, the final consumer of those catalogs.
+    pub fn release_transferred_metadata(&mut self) -> RuntimeMetadataReleaseStats {
+        let stats = RuntimeMetadataReleaseStats {
+            variables: self.variables.len(),
+            types: self.types.len(),
+            initializer_candidates: self.instance_initializers.len(),
+        };
+        self.variables = Vec::new();
+        self.types.clear();
+        self.type_paths = Arc::new(BTreeSet::new());
+        self.type_parents = Arc::new(BTreeMap::new());
+        self.initial_values = Arc::new(BTreeMap::new());
+        self.shared_fields = Arc::new(BTreeMap::new());
+        self.global_types.clear();
+        self.world_name.clear();
+        self.canonical_world = None;
+        self.binding_index.globals.clear();
+        self.binding_index.statics.clear();
+        self.binding_index.instance_fields.clear();
+        self.runtime_variable_indices.clear();
+        self.global_variable_indices.clear();
+        self.diagnostics = Vec::new();
+        self.instance_initializers = Vec::new();
+        self.instance_initializer_indices_by_owner.clear();
+        self.compiled_instance_initializers.clear();
+        self.vm_instance_initializers = Arc::new(BTreeMap::new());
+        self.vm_instance_initializer_module = None;
+        self.instance_initializer_plans.clear();
+        self.datum_allocation_plans.clear();
+        self.project_root.clear();
+        stats
+    }
+
     /// Transfers the shared heap and materialized DM globals into VM state.
     ///
     /// # Panics
@@ -2018,6 +2144,7 @@ impl RuntimeImage {
             allocation.is_client,
             allocation.is_particles,
             allocation.is_image,
+            allocation.is_sound,
         )?;
         materialize_builtin_world_defaults(&mut self.heap, datum, type_path, &self.world_name)?;
         let plan = self.instance_initializer_plan(type_path, &allocation.ancestors)?;
@@ -2085,6 +2212,7 @@ impl RuntimeImage {
             allocation.is_client,
             allocation.is_particles,
             allocation.is_image,
+            allocation.is_sound,
         )?;
         materialize_builtin_world_defaults(state.heap_mut(), datum, type_path, &self.world_name)?;
         let plan = self.instance_initializer_plan(type_path, &allocation.ancestors)?;
@@ -2159,6 +2287,7 @@ impl RuntimeImage {
         let mut is_client = false;
         let mut is_particles = false;
         let mut is_image = false;
+        let mut is_sound = false;
         while let Some(path) = current.take() {
             if !visited.insert(path.clone()) {
                 return Err(RuntimeImageError::InheritanceCycle(path));
@@ -2173,6 +2302,7 @@ impl RuntimeImage {
             is_client |= path.as_str() == "/client";
             is_particles |= path.as_str() == "/particles";
             is_image |= path.as_str() == "/image";
+            is_sound |= path.as_str() == "/sound";
             chain.push(runtime_type.defaults.clone());
             current.clone_from(&runtime_type.parent);
         }
@@ -2190,6 +2320,7 @@ impl RuntimeImage {
             is_client,
             is_particles,
             is_image,
+            is_sound,
         };
         self.datum_allocation_plans
             .insert(type_path.clone(), plan.clone());
@@ -2305,14 +2436,18 @@ impl RuntimeImage {
                     message: failure.message,
                 }
             })?;
-            let Ok(program) =
-                compile_initializer_into_module(&initializer.tokens, &bindings, module)
-            else {
-                // Preserve lazy preflight behavior for invalid/unreachable
-                // type defaults; the existing per-type plan reports the
-                // source-mapped error when that type is requested.
-                continue;
-            };
+            let program =
+                match compile_initializer_into_module(&initializer.tokens, &bindings, module) {
+                    Ok(program) => program,
+                    Err(_error) => {
+                        // Preserve lazy preflight behavior for invalid/unreachable
+                        // type defaults; the existing per-type plan reports the
+                        // source-mapped error when that type is requested.
+                        #[cfg(test)]
+                        eprintln!("skipped VM initializer {path}: {}", _error.message);
+                        continue;
+                    }
+                };
             catalog
                 .entry(owner)
                 .or_default()
@@ -3138,12 +3273,15 @@ mod tests {
     use dm_lexer::{TokenKind, lex};
     use dm_semantics::{ProcedureRegistry, standard_instance_field_names};
     use dm_value::{FieldName, TypePath, Value};
-    use dm_vm::{compile_initializer, compile_module, execute_module_in_state};
+    use dm_vm::{
+        compile_initializer, compile_initializer_into_module, compile_module,
+        execute_module_in_state,
+    };
 
     use super::{
         ConstantFieldApplication, InitializerFailurePhase, InitializerProcedureFrontier,
-        RuntimeImage, RuntimeImageConstructionPhase, RuntimeImageError, builtin_client_defaults,
-        builtin_mob_defaults, world_clock_values,
+        RuntimeImage, RuntimeImageConstructionPhase, builtin_client_defaults, builtin_mob_defaults,
+        world_clock_values,
     };
 
     static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
@@ -5121,14 +5259,44 @@ mod tests {
             .heap_mut()
             .delete_datum_field(datum, &field("base"))
             .expect("datum should remain live in execution state");
-        let error = image
-            .evaluate_datum_expression(datum, "base", &mut state)
-            .expect_err("missing field should retain VM failure details");
-        assert!(matches!(
-            error,
-            RuntimeImageError::ExpressionExecution(ref error)
-                if error.source_span.is_some() && !error.call_stack.is_empty()
-        ));
+        assert_eq!(
+            image
+                .evaluate_datum_expression(datum, "base", &mut state)
+                .expect("a sparse/deleted physical slot retains its effective DM default"),
+            Value::number(4.0),
+        );
+    }
+
+    #[test]
+    fn transferred_metadata_release_preserves_live_vm_state() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "var/global/answer = 42\n/datum/example\n\tvar/value = 7\n",
+        );
+        let mut image = fixture.image();
+        let datum = image
+            .allocate_datum(&type_path("/datum/example"))
+            .expect("example datum should allocate");
+        let state = image.take_execution_state();
+        let released = image.release_transferred_metadata();
+
+        assert!(released.variables > 0);
+        assert!(released.types > 0);
+        assert_eq!(
+            state
+                .heap()
+                .datum_field(datum, &field("value"))
+                .expect("live VM heap remains intact"),
+            &Value::number(7.0),
+        );
+        assert_eq!(state.global(&field("answer")), Some(&Value::number(42.0)));
+        assert!(
+            state
+                .type_paths()
+                .any(|path| path == &type_path("/datum/example"))
+        );
     }
 
     #[test]
@@ -5324,6 +5492,92 @@ mod tests {
                 .into_iter()
                 .flat_map(|phase| [(phase, false), (phase, true)])
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn prelinked_project_module_is_reused_for_runtime_initializers() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/proc/value()\n\treturn 7\n/datum/base\n\tvar/list/items = list(value())\n/var/global/result = value()\n",
+        );
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.0.join("world.dme"))
+            .expect("fixture should compile");
+        let procedures = ProcedureRegistry::build(&compilation);
+        let executable = procedures
+            .compile_vm_all_symbolic_deferred(&compilation)
+            .expect("complete project module should link");
+        let mut module = executable.module().clone();
+        let project_procedures = module.procedure_count();
+        assert!(
+            module.procedure_paths().any(|path| path.contains("value")),
+            "linked paths: {:?}",
+            module.procedure_paths().collect::<Vec<_>>(),
+        );
+        assert!(
+            module.effective_procedure_id("/proc/value").is_some(),
+            "global value proc should be dynamically callable",
+        );
+        let value_tokens = lex("value()")
+            .unwrap()
+            .into_iter()
+            .filter(|token| {
+                !matches!(
+                    token.kind,
+                    TokenKind::LineStart { .. } | TokenKind::Newline | TokenKind::LineContinuation
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut probe = module.clone();
+        compile_initializer_into_module(&value_tokens, &BTreeMap::new(), &mut probe)
+            .expect("bare global call should append to a complete symbolic module");
+
+        let mut image = RuntimeImage::from_compilation_with_prelinked_module(
+            &compilation,
+            &procedures,
+            &mut module,
+            |_| {},
+        )
+        .expect("prelinked runtime image should build");
+
+        assert!(module.procedure_count() > project_procedures);
+        assert_eq!(
+            image
+                .variable("/var/result")
+                .map(|variable| &variable.value),
+            Some(&Value::number(7.0))
+        );
+        let new_tokens = lex("new /datum/base")
+            .unwrap()
+            .into_iter()
+            .filter(|token| {
+                !matches!(
+                    token.kind,
+                    TokenKind::LineStart { .. } | TokenKind::Newline | TokenKind::LineContinuation
+                )
+            })
+            .collect::<Vec<_>>();
+        let entry = compile_initializer_into_module(&new_tokens, &BTreeMap::new(), &mut module)
+            .expect("ordinary construction expression should append");
+        let mut state = image.take_execution_state();
+        let Value::Datum(datum) = execute_module_in_state(&module, entry, &[], &mut state)
+            .expect("VM new should use the appended initializer catalog")
+        else {
+            panic!("new should return a datum")
+        };
+        let Value::List(items) = state
+            .heap()
+            .datum_field(datum, &field("items"))
+            .expect("fresh list default should exist")
+        else {
+            panic!("items should be a list")
+        };
+        assert_eq!(
+            state.heap().list(*items).unwrap().get(1),
+            Ok(&Value::number(7.0))
         );
     }
 

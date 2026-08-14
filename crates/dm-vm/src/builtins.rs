@@ -13,7 +13,7 @@
     reason = "DM uses binary32 numbers for integer/index boundaries and native builtin dispatch shares a Result ABI"
 )]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::fs::OpenOptions;
@@ -21,6 +21,7 @@ use std::io::{Read as _, Write as _};
 use std::path::Component;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dm_value::{DatumId, FieldName, ListId, TypePath, Value};
@@ -110,6 +111,15 @@ pub(super) fn execute_standard_builtin(
     arguments: &[Value],
     state: &mut ExecutionState,
 ) -> Result<Value, String> {
+    execute_standard_builtin_with_usr(name, arguments, state, &Value::Null)
+}
+
+pub(super) fn execute_standard_builtin_with_usr(
+    name: &str,
+    arguments: &[Value],
+    state: &mut ExecutionState,
+    usr: &Value,
+) -> Result<Value, String> {
     match name {
         // Headless input has no interactive client. Preserve BYOND's supplied
         // default (the fourth positional argument), or null when absent.
@@ -152,8 +162,8 @@ pub(super) fn execute_standard_builtin(
         "min" => extrema_builtin(arguments, state, false),
         "max" => extrema_builtin(arguments, state, true),
         "length_char" => length_char(arguments, state),
-        "lowertext" => text_map(arguments, state, str::to_lowercase),
-        "uppertext" => text_map(arguments, state, str::to_uppercase),
+        "lowertext" => text_case_map(arguments, str::to_lowercase),
+        "uppertext" => text_case_map(arguments, str::to_uppercase),
         "trimtext" if matches!(arguments[0], Value::Null) => Ok(Value::Null),
         "trimtext" => text_map(arguments, state, |value| value.trim().to_owned()),
         "fcopy_rsc" => fcopy_rsc(arguments, state),
@@ -244,11 +254,10 @@ pub(super) fn execute_standard_builtin(
             resource_datum_builtin("/generator", &["type", "a", "b", "rand"], arguments, state)
         }
         "time2text" => time2text_builtin(arguments, state),
-        "view" => spatial_query(arguments, state, false, false),
-        "oview" => spatial_query(arguments, state, false, true),
-        "viewers" | "hearers" => spatial_query(arguments, state, true, false),
-        "ohearers" => spatial_query(arguments, state, true, true),
-        "oviewers" => spatial_query(arguments, state, true, true),
+        "view" => spatial_query(arguments, state, usr, false, false),
+        "oview" => spatial_query(arguments, state, usr, false, true),
+        "viewers" | "hearers" => spatial_query(arguments, state, usr, true, false),
+        "ohearers" | "oviewers" => spatial_query(arguments, state, usr, true, true),
         "step" => step_builtin(arguments, state),
         "step_towards" => step_towards_builtin(arguments, state),
         "step_to" => step_to_builtin(arguments, state),
@@ -2613,13 +2622,13 @@ fn list2params(arguments: &[Value], state: &ExecutionState) -> Result<Value, Str
     let mut pairs = Vec::with_capacity(list.len());
     for (_, key) in list.positions() {
         let key_text = runtime_text(key, state, "list2params key")?;
-        let associated = list.get_key(key).cloned().unwrap_or(Value::Null);
-        let value_text = runtime_text(&associated, state, "list2params value")?;
-        pairs.push(format!(
-            "{}={}",
-            form_encode(&key_text),
-            form_encode(&value_text)
-        ));
+        let encoded_key = form_encode(&key_text);
+        if let Ok(associated) = list.get_key(key) {
+            let value_text = runtime_text(associated, state, "list2params value")?;
+            pairs.push(format!("{encoded_key}={}", form_encode(&value_text)));
+        } else {
+            pairs.push(encoded_key);
+        }
     }
     Ok(Value::text(pairs.join("&")))
 }
@@ -3266,6 +3275,22 @@ fn text_map(
     Ok(Value::text(operation(&text)))
 }
 
+fn text_case_map(
+    arguments: &[Value],
+    operation: impl FnOnce(&str) -> String,
+) -> Result<Value, String> {
+    let Some(value) = arguments.first() else {
+        return Ok(Value::Null);
+    };
+    let Value::Text(text) = value else {
+        // BYOND's lowertext()/uppertext() leave non-text values unchanged.
+        // This matters for helpers such as uppertext(dir2text(0)), where the
+        // inner proc returns numeric NONE rather than a string.
+        return Ok(value.clone());
+    };
+    Ok(Value::text(operation(text)))
+}
+
 fn regex_quote(
     arguments: &[Value],
     state: &ExecutionState,
@@ -3757,10 +3782,14 @@ fn findtext(
     // observable when `file2text()` returns null for a directory entry from
     // `flist()`: map readers probe the result with `findtext()` before their
     // regex loop and must receive a normal no-match rather than a runtime.
-    let haystack = if matches!(arguments[0], Value::Null) {
-        String::new()
-    } else {
-        strict_text(&arguments[0], state, "findtext haystack")?
+    let haystack = match &arguments[0] {
+        Value::Null => String::new(),
+        Value::Text(text) | Value::File(text) => text.to_string(),
+        // BYOND's text-search family returns a normal no-match for a
+        // non-text haystack instead of raising a runtime. Monkestation's
+        // immune system relies on this when an older call site passes its
+        // `/datum/blood_type` singleton directly to `findtext()`.
+        _ => return Ok(Value::number(0.0)),
     };
     if let Value::Datum(regex) = arguments[1] {
         let start = signed_position(arguments.get(2), 1)?.max(1) as usize;
@@ -3957,13 +3986,35 @@ pub(super) fn regex_search(
     end: usize,
 ) -> Result<Option<(usize, usize, Vec<Option<String>>)>, String> {
     let pattern = translate_byond_regex_pattern(pattern);
-    let mut builder = fancy_regex::RegexBuilder::new(&pattern);
-    builder
-        .case_insensitive(flags.contains('i'))
-        .multi_line(flags.contains('m'));
-    let regex = builder
-        .build()
-        .map_err(|error| format!("invalid regex {pattern:?}: {error}"))?;
+    let case_insensitive = flags.contains('i');
+    let multi_line = flags.contains('m');
+    type RegexCache = HashMap<(String, bool, bool), Arc<fancy_regex::Regex>>;
+    static REGEX_CACHE: OnceLock<Mutex<RegexCache>> = OnceLock::new();
+    let key = (pattern.clone(), case_insensitive, multi_line);
+    let cache = REGEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let regex = cache
+        .lock()
+        .map_err(|_| "regex cache lock is poisoned".to_owned())?
+        .get(&key)
+        .cloned();
+    let regex = if let Some(regex) = regex {
+        regex
+    } else {
+        let mut builder = fancy_regex::RegexBuilder::new(&pattern);
+        builder
+            .case_insensitive(case_insensitive)
+            .multi_line(multi_line);
+        let regex = Arc::new(
+            builder
+                .build()
+                .map_err(|error| format!("invalid regex {pattern:?}: {error}"))?,
+        );
+        cache
+            .lock()
+            .map_err(|_| "regex cache lock is poisoned".to_owned())?
+            .insert(key, Arc::clone(&regex));
+        regex
+    };
     let captures = regex
         .captures_from_pos(haystack, start)
         .map_err(|error| format!("regex match failed for {pattern:?}: {error}"))?;
@@ -4191,10 +4242,30 @@ fn splicetext(
 }
 
 fn datum_coordinates(state: &ExecutionState, value: &Value) -> Option<(f32, f32, f32)> {
-    let Value::Datum(datum) = value else {
+    let Value::Datum(original) = value else {
         return None;
     };
-    let datum = state.heap.datum(*datum).ok()?;
+    // BYOND spatial builtins use the containing turf for objects nested in
+    // mobs, items, closets, and other movable containers. Their own x/y/z
+    // fields may still contain zero or a stale former turf coordinate. Follow
+    // loc links exactly as get_step(atom, 0) does, while retaining the
+    // original datum as the fallback for lightweight uncontained fixtures.
+    let loc = FieldName::parse("loc").expect("built-in loc field");
+    let mut coordinate_source = *original;
+    let mut current = *original;
+    let mut visited = HashSet::new();
+    while visited.insert(current) {
+        let datum = state.heap.datum(current).ok()?;
+        if super::is_turf_type_path(datum.type_path()) {
+            coordinate_source = current;
+            break;
+        }
+        let Ok(Value::Datum(parent)) = datum.field(&loc) else {
+            break;
+        };
+        current = *parent;
+    }
+    let datum = state.heap.datum(coordinate_source).ok()?;
     let coordinate = |name: &str| {
         datum
             .field(&FieldName::parse(name).expect("coordinate name is valid"))
@@ -4207,28 +4278,80 @@ fn datum_coordinates(state: &ExecutionState, value: &Value) -> Option<(f32, f32,
 fn spatial_query(
     arguments: &[Value],
     state: &mut ExecutionState,
+    usr: &Value,
     mobs_only: bool,
     exclude_center: bool,
 ) -> Result<Value, String> {
-    let (distance, center) = match arguments {
-        [center] => (5.0, center),
-        [distance, center] => (number(distance, "spatial query distance")?.floor(), center),
-        _ => return Err("spatial query requires a center and optional distance".to_owned()),
-    };
+    let default_distance = state
+        .global(&FieldName::parse("world").expect("built-in world global"))
+        .and_then(|world| match world {
+            Value::Datum(world) => state
+                .heap
+                .datum_field(
+                    *world,
+                    &FieldName::parse("view").expect("built-in world view field"),
+                )
+                .ok(),
+            _ => None,
+        })
+        .and_then(Value::as_number)
+        .filter(|distance| distance.is_finite() && *distance >= 0.0)
+        .unwrap_or(5.0)
+        .floor();
+    let mut distance_x = default_distance;
+    let mut distance_y = default_distance;
+    let mut center = usr.clone();
+    for argument in arguments {
+        match argument {
+            Value::Null => {}
+            Value::Datum(id) => {
+                let datum = state.heap.datum(*id).map_err(|error| error.to_string())?;
+                let atom = TypePath::parse("/atom").expect("built-in atom path");
+                if !is_subtype(state, datum.type_path(), &atom) {
+                    return Err(format!(
+                        "spatial query center requires an atom, received {argument}"
+                    ));
+                }
+                center = argument.clone();
+            }
+            Value::Number(value) => {
+                distance_x = value.to_f32().floor();
+                distance_y = distance_x;
+            }
+            Value::Text(value) => {
+                let (width, height) = value
+                    .split_once('x')
+                    .or_else(|| value.split_once('X'))
+                    .ok_or_else(|| {
+                        format!("spatial query distance requires a number or view size, received {argument}")
+                    })?;
+                let width = width.trim().parse::<u32>().map_err(|_| {
+                    format!("spatial query distance has an invalid width: {argument}")
+                })?;
+                let height = height.trim().parse::<u32>().map_err(|_| {
+                    format!("spatial query distance has an invalid height: {argument}")
+                })?;
+                distance_x = (width / 2) as f32;
+                distance_y = (height / 2) as f32;
+            }
+            _ => {
+                return Err(format!(
+                    "spatial query requires an atom and optional distance, received {argument}"
+                ));
+            }
+        }
+    }
     let output = state.heap.allocate_list();
-    let Some((center_x, center_y, center_z)) = datum_coordinates(state, center) else {
+    let Some((center_x, center_y, center_z)) = datum_coordinates(state, &center) else {
         return Ok(Value::List(output));
     };
-    if !distance.is_finite() || distance < 0.0 {
+    if !distance_x.is_finite() || distance_x < 0.0 || !distance_y.is_finite() || distance_y < 0.0 {
         return Ok(Value::List(output));
     }
     let matching = state
         .heap
         .datums()
         .filter_map(|(id, datum)| {
-            if exclude_center && matches!(center, Value::Datum(center_id) if *center_id == id) {
-                return None;
-            }
             let path = datum.type_path().as_str();
             if path == "/area" || path.starts_with("/area/") {
                 return None;
@@ -4236,14 +4359,13 @@ fn spatial_query(
             if mobs_only && path != "/mob" && !path.starts_with("/mob/") {
                 return None;
             }
-            let coordinate = |name: &str| {
-                datum
-                    .field(&FieldName::parse(name).expect("coordinate field"))
-                    .ok()?
-                    .as_number()
-            };
-            let (x, y, z) = (coordinate("x")?, coordinate("y")?, coordinate("z")?);
-            (z == center_z && (x - center_x).abs() <= distance && (y - center_y).abs() <= distance)
+            let (x, y, z) = datum_coordinates(state, &Value::Datum(id))?;
+            if exclude_center && x == center_x && y == center_y && z == center_z {
+                return None;
+            }
+            (z == center_z
+                && (x - center_x).abs() <= distance_x
+                && (y - center_y).abs() <= distance_y)
                 .then_some(id)
         })
         .collect::<Vec<_>>();
@@ -4545,6 +4667,12 @@ fn get_dist(arguments: &[Value], state: &ExecutionState) -> Result<Value, String
 pub(super) fn is_subtype(state: &ExecutionState, candidate: &TypePath, target: &TypePath) -> bool {
     if candidate == target {
         return true;
+    }
+    if let (Some(candidate), Some(target)) = (
+        state.subtype_interval(candidate),
+        state.subtype_interval(target),
+    ) {
+        return target.0 <= candidate.0 && candidate.1 <= target.1;
     }
     let mut current = candidate.clone();
     for _ in 0..512 {
@@ -6016,20 +6144,63 @@ fn parse_hex_color(text: &str) -> Option<Vec<u8>> {
 }
 
 fn rgb2num_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
-    if arguments
-        .get(1)
-        .and_then(Value::as_number)
-        .is_some_and(|space| space != 0.0)
-    {
-        return Err("rgb2num alternate color spaces are not implemented".to_owned());
-    }
     let text = strict_text(&arguments[0], state, "rgb2num")?;
     let components =
         parse_hex_color(&text).ok_or_else(|| format!("rgb2num invalid color {text:?}"))?;
+    let space = arguments.get(1).and_then(Value::as_number).unwrap_or(0.0);
+    let converted = match space as i32 {
+        0 => components[..3]
+            .iter()
+            .map(|component| f32::from(*component))
+            .collect::<Vec<_>>(),
+        1 | 2 => {
+            let red = f32::from(components[0]) / 255.0;
+            let green = f32::from(components[1]) / 255.0;
+            let blue = f32::from(components[2]) / 255.0;
+            let maximum = red.max(green).max(blue);
+            let minimum = red.min(green).min(blue);
+            let delta = maximum - minimum;
+            let hue = if delta == 0.0 {
+                0.0
+            } else if maximum == red {
+                60.0 * ((green - blue) / delta).rem_euclid(6.0)
+            } else if maximum == green {
+                60.0 * ((blue - red) / delta + 2.0)
+            } else {
+                60.0 * ((red - green) / delta + 4.0)
+            };
+            if space as i32 == 1 {
+                vec![
+                    hue,
+                    if maximum == 0.0 {
+                        0.0
+                    } else {
+                        delta / maximum * 100.0
+                    },
+                    maximum * 100.0,
+                ]
+            } else {
+                let lightness = (maximum + minimum) / 2.0;
+                vec![
+                    hue,
+                    if delta == 0.0 {
+                        0.0
+                    } else {
+                        delta / (1.0 - (2.0 * lightness - 1.0).abs()) * 100.0
+                    },
+                    lightness * 100.0,
+                ]
+            }
+        }
+        _ => return Err(format!("rgb2num invalid color space {space}")),
+    };
     let id = state.heap.allocate_list();
     let list = state.heap.list_mut(id).map_err(|error| error.to_string())?;
-    for component in components {
-        list.add(Value::number(f32::from(component)));
+    for component in converted {
+        list.add(Value::number(component));
+    }
+    if let Some(alpha) = components.get(3) {
+        list.add(Value::number(f32::from(*alpha)));
     }
     Ok(Value::List(id))
 }
@@ -6334,6 +6505,30 @@ mod color_text_file_tests {
         assert_eq!(parts.get(2), Ok(&Value::number(170.0)));
         assert_eq!(parts.get(3), Ok(&Value::number(255.0)));
         assert_eq!(parts.get(4), Ok(&Value::number(136.0)));
+    }
+
+    #[test]
+    fn rgb2num_converts_hsv_and_hsl_like_opendream() {
+        let mut state = ExecutionState::new();
+        for (space, expected) in [
+            (1.0, [291.70734, 56.164383, 85.882355]),
+            (2.0, [291.70734, 63.07692, 61.764706]),
+        ] {
+            let Value::List(parts) =
+                rgb2num_builtin(&[Value::text("#ca60db"), Value::number(space)], &mut state)
+                    .unwrap()
+            else {
+                panic!("rgb2num must return a list")
+            };
+            let parts = state.heap.list(parts).unwrap();
+            for (index, expected) in expected.into_iter().enumerate() {
+                let actual = parts.get(index + 1).unwrap().as_number().unwrap();
+                assert!(
+                    (actual - expected).abs() < 0.0001,
+                    "component {index}: {actual}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -7622,6 +7817,7 @@ mod spatial_tests {
         let Value::List(view) = spatial_query(
             &[Value::number(1.0), Value::Datum(center)],
             &mut state,
+            &Value::Null,
             false,
             false,
         )
@@ -7632,6 +7828,7 @@ mod spatial_tests {
         let Value::List(viewers) = spatial_query(
             &[Value::number(1.0), Value::Datum(center)],
             &mut state,
+            &Value::Null,
             true,
             false,
         )
@@ -7642,6 +7839,7 @@ mod spatial_tests {
         let Value::List(oview) = spatial_query(
             &[Value::number(1.0), Value::Datum(center)],
             &mut state,
+            &Value::Null,
             false,
             true,
         )
@@ -7659,6 +7857,50 @@ mod spatial_tests {
             panic!()
         };
         assert_eq!(state.heap.list(oviewers).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn view_families_default_to_usr_and_accept_arguments_in_either_order() {
+        let mut state = ExecutionState::new();
+        let world = state
+            .heap
+            .allocate_datum(TypePath::parse("/world").unwrap());
+        state
+            .heap
+            .set_datum_field(world, FieldName::parse("view").unwrap(), Value::number(2.0))
+            .unwrap();
+        state.set_global(FieldName::parse("world").unwrap(), Value::Datum(world));
+        let center = place(&mut state, "/mob/living", 5.0, 5.0);
+        place(&mut state, "/mob/living", 7.0, 5.0);
+        place(&mut state, "/mob/living", 8.0, 5.0);
+
+        let Value::List(defaulted) =
+            execute_standard_builtin_with_usr("viewers", &[], &mut state, &Value::Datum(center))
+                .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(state.heap.list(defaulted).unwrap().len(), 2);
+
+        for arguments in [
+            vec![Value::number(1.0), Value::Datum(center)],
+            vec![Value::Datum(center), Value::number(1.0)],
+        ] {
+            let Value::List(result) =
+                execute_standard_builtin_with_usr("viewers", &arguments, &mut state, &Value::Null)
+                    .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(state.heap.list(result).unwrap().len(), 1);
+        }
+
+        let Value::List(no_usr) =
+            execute_standard_builtin_with_usr("viewers", &[], &mut state, &Value::Null).unwrap()
+        else {
+            panic!()
+        };
+        assert!(state.heap.list(no_usr).unwrap().is_empty());
     }
 
     #[test]

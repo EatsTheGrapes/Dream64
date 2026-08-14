@@ -999,6 +999,10 @@ mod tests {
         assert_eq!(evaluate_number("!\"\""), 1.0_f32.to_bits());
         assert_eq!(evaluate_number("!/datum/example"), 0.0_f32.to_bits());
         assert_eq!(evaluate_number("!list()"), 0.0_f32.to_bits());
+        assert_eq!(evaluate_number("1 << 1"), 2.0_f32.to_bits());
+        assert_eq!(evaluate_number("3 | 4 & 1"), 3.0_f32.to_bits());
+        assert_eq!(evaluate_number("~0"), 16_777_215.0_f32.to_bits());
+        assert_eq!(evaluate_number("1 << 24"), 0.0_f32.to_bits());
     }
 
     #[test]

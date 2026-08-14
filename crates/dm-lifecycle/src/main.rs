@@ -11,7 +11,7 @@ use dm_lifecycle::{
     HeadlessReadinessProbe, LifecycleIndex, LifecycleKind, LifecycleResolution,
     SchedulerDrainLimits, SchedulerDrainTermination, advance_persistent_scheduler,
     audit_initialization_plan_with_precompiled, build_initialization_plan,
-    execute_initialization_plan_with_precompiled, precompile_lifecycle_for_world,
+    execute_boot_initialization_plan_with_precompiled, precompile_lifecycle_for_world,
     sweep_lifecycle_compatibility, sweep_lifecycle_compatibility_with_closures,
 };
 use dm_runtime::{RuntimeImage, RuntimeImageConstructionEvent, RuntimeInitializerDiagnostic};
@@ -166,29 +166,37 @@ fn run_main() -> ExitCode {
     if command == Command::Boot {
         eprintln!("boot-progress: materializing globals and type defaults");
     }
-    let mut runtime = match RuntimeImage::from_compilation_with_observer(
-        &compilation,
-        |event: RuntimeImageConstructionEvent| {
-            if command != Command::Boot {
-                return;
-            }
-            if event.completed {
-                eprintln!(
-                    "boot-progress: runtime-phase-complete phase={} elapsed_ms={} items={}",
-                    event.phase.as_str(),
-                    event.elapsed.as_millis(),
-                    event
-                        .items
-                        .map_or_else(|| "unknown".to_owned(), |items| items.to_string()),
-                );
-            } else {
-                eprintln!(
-                    "boot-progress: runtime-phase-start phase={}",
-                    event.phase.as_str()
-                );
-            }
-        },
-    ) {
+    let runtime_observer = |event: RuntimeImageConstructionEvent| {
+        if command != Command::Boot {
+            return;
+        }
+        if event.completed {
+            eprintln!(
+                "boot-progress: runtime-phase-complete phase={} elapsed_ms={} items={}",
+                event.phase.as_str(),
+                event.elapsed.as_millis(),
+                event
+                    .items
+                    .map_or_else(|| "unknown".to_owned(), |items| items.to_string()),
+            );
+        } else {
+            eprintln!(
+                "boot-progress: runtime-phase-start phase={}",
+                event.phase.as_str()
+            );
+        }
+    };
+    let runtime_result = if let Some((_, _, precompiled)) = prepared_boot.as_mut() {
+        RuntimeImage::from_compilation_with_prelinked_module(
+            &compilation,
+            &procedures,
+            precompiled.module_mut_for_runtime_initializers(),
+            runtime_observer,
+        )
+    } else {
+        RuntimeImage::from_compilation_with_observer(&compilation, runtime_observer)
+    };
+    let mut runtime = match runtime_result {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("runtime image: {error}");
@@ -335,7 +343,7 @@ fn run_main() -> ExitCode {
                 precompiled,
             )
         } else {
-            execute_initialization_plan_with_precompiled(
+            execute_boot_initialization_plan_with_precompiled(
                 &index,
                 &plan,
                 &allocation,

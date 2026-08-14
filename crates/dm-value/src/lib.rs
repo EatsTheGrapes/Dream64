@@ -13,7 +13,7 @@
 
 #![cfg_attr(not(test), deny(missing_docs))]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -392,18 +392,139 @@ fn set_named_field(
 /// the associated value. Associative reassignment preserves insertion order.
 #[derive(Clone, Debug, Default)]
 pub struct DmList {
+    storage: Option<Box<DmListStorage>>,
+}
+
+/// Lazily allocated storage for a non-empty or previously mutated DM list.
+///
+/// This type is public only because [`DmList`] uses standard dereferencing to
+/// keep its implementation compact. Its fields remain private; callers should
+/// continue to use the `DmList` API.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct DmListStorage {
     positional: Vec<Value>,
     associative: Vec<(Value, Value)>,
     order: Vec<ListOrder>,
+    associative_index: Option<Box<HashMap<SemanticKey, usize>>>,
 }
 
-#[derive(Clone, Debug)]
-enum ListOrder {
-    Positional(usize),
-    Associative(Value),
+impl std::ops::Deref for DmList {
+    type Target = DmListStorage;
+
+    fn deref(&self) -> &Self::Target {
+        static EMPTY: std::sync::OnceLock<DmListStorage> = std::sync::OnceLock::new();
+        self.storage
+            .as_deref()
+            .unwrap_or_else(|| EMPTY.get_or_init(DmListStorage::default))
+    }
+}
+
+impl std::ops::DerefMut for DmList {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.storage
+            .get_or_insert_with(|| Box::new(DmListStorage::default()))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ListOrder(u32);
+
+impl ListOrder {
+    const ASSOCIATIVE_BIT: u32 = 1 << 31;
+
+    fn positional(index: usize) -> Self {
+        Self(u32::try_from(index).expect("DM list positional storage exceeds 2^31 entries"))
+    }
+
+    fn associative(index: usize) -> Self {
+        Self(
+            u32::try_from(index).expect("DM list associative storage exceeds 2^31 entries")
+                | Self::ASSOCIATIVE_BIT,
+        )
+    }
+
+    const fn positional_index(self) -> Option<usize> {
+        if self.0 & Self::ASSOCIATIVE_BIT == 0 {
+            Some(self.0 as usize)
+        } else {
+            None
+        }
+    }
+
+    const fn associative_index(self) -> Option<usize> {
+        if self.0 & Self::ASSOCIATIVE_BIT != 0 {
+            Some((self.0 & !Self::ASSOCIATIVE_BIT) as usize)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum SemanticKey {
+    Null,
+    Number(u32),
+    Text(Arc<str>),
+    File(Arc<str>),
+    TypePath(TypePath),
+    Datum(DatumId),
+    List(ListId),
+}
+
+fn semantic_key(value: &Value) -> Option<SemanticKey> {
+    Some(match value {
+        Value::Null => SemanticKey::Null,
+        Value::Number(number) => {
+            let value = number.to_f32();
+            if value.is_nan() {
+                return None;
+            }
+            SemanticKey::Number(if value == 0.0 { 0 } else { number.bits() })
+        }
+        Value::Text(text) => SemanticKey::Text(Arc::clone(text)),
+        Value::File(path) => SemanticKey::File(Arc::clone(path)),
+        Value::TypePath(path) => SemanticKey::TypePath(path.clone()),
+        Value::Datum(datum) => SemanticKey::Datum(*datum),
+        Value::List(list) => SemanticKey::List(*list),
+        Value::ModifiedTypePath(_) => return None,
+    })
 }
 
 impl DmList {
+    const ASSOCIATIVE_INDEX_THRESHOLD: usize = 8;
+
+    fn rebuild_associative_index(&mut self) {
+        if self.associative.len() < Self::ASSOCIATIVE_INDEX_THRESHOLD {
+            self.associative_index = None;
+            return;
+        }
+        let mut index = HashMap::with_capacity(self.associative.len());
+        for (position, (key, _)) in self.associative.iter().enumerate() {
+            if let Some(key) = semantic_key(key) {
+                index.insert(key, position);
+            }
+        }
+        self.associative_index = Some(Box::new(index));
+    }
+
+    fn index_last_association(&mut self) {
+        if self.associative.len() == Self::ASSOCIATIVE_INDEX_THRESHOLD {
+            self.rebuild_associative_index();
+            return;
+        }
+        if self.associative.len() < Self::ASSOCIATIVE_INDEX_THRESHOLD {
+            return;
+        }
+        let position = self.associative.len() - 1;
+        let Some(key) = semantic_key(&self.associative[position].0) else {
+            return;
+        };
+        if let Some(index) = &mut self.associative_index {
+            index.insert(key, position);
+        }
+    }
+
     /// Returns the number of values and associative keys in iteration order.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -430,8 +551,8 @@ impl DmList {
 
     /// Appends a positional value and returns its 1-based index.
     pub fn add(&mut self, value: Value) -> usize {
-        self.order
-            .push(ListOrder::Positional(self.positional.len()));
+        let position = self.positional.len();
+        self.order.push(ListOrder::positional(position));
         self.positional.push(value);
         self.order.len()
     }
@@ -443,9 +564,14 @@ impl DmList {
     /// Returns a precise index error for zero or an index beyond `len`.
     pub fn get(&self, index: usize) -> Result<&Value, ValueError> {
         let zero_based = checked_index(index, self.order.len())?;
-        Ok(match &self.order[zero_based] {
-            ListOrder::Positional(position) => &self.positional[*position],
-            ListOrder::Associative(key) => key,
+        let entry = self.order[zero_based];
+        Ok(if let Some(position) = entry.positional_index() {
+            &self.positional[position]
+        } else {
+            &self.associative[entry
+                .associative_index()
+                .expect("validated associative order")]
+            .0
         })
     }
 
@@ -456,7 +582,7 @@ impl DmList {
     /// Returns a precise index error for zero or an index beyond `len`.
     pub fn set(&mut self, index: usize, value: Value) -> Result<Value, ValueError> {
         let zero_based = checked_index(index, self.order.len())?;
-        let ListOrder::Positional(position) = self.order[zero_based] else {
+        let Some(position) = self.order[zero_based].positional_index() else {
             return Err(ValueError::AssociativeIndexAssignment { index });
         };
         Ok(std::mem::replace(&mut self.positional[position], value))
@@ -469,28 +595,30 @@ impl DmList {
     /// Returns a precise index error for zero or an index beyond `len`.
     pub fn remove(&mut self, index: usize) -> Result<Value, ValueError> {
         let zero_based = checked_index(index, self.order.len())?;
-        match self.order.remove(zero_based) {
-            ListOrder::Positional(position) => {
-                for entry in &mut self.order {
-                    if let ListOrder::Positional(other) = entry
-                        && *other > position
-                    {
-                        *other -= 1;
-                    }
+        let entry = self.order.remove(zero_based);
+        if let Some(position) = entry.positional_index() {
+            for entry in &mut self.order {
+                if let Some(other) = entry.positional_index()
+                    && other > position
+                {
+                    *entry = ListOrder::positional(other - 1);
                 }
-                Ok(self.positional.remove(position))
             }
-            ListOrder::Associative(key) => {
-                let Some(association) = self
-                    .associative
-                    .iter()
-                    .position(|(candidate, _)| candidate.semantic_eq(&key))
-                else {
-                    return Err(ValueError::CorruptListStorage);
-                };
-                self.associative.remove(association);
-                Ok(key)
+            Ok(self.positional.remove(position))
+        } else {
+            let association = entry
+                .associative_index()
+                .ok_or(ValueError::CorruptListStorage)?;
+            let (key, _) = self.associative.remove(association);
+            for entry in &mut self.order {
+                if let Some(other) = entry.associative_index()
+                    && other > association
+                {
+                    *entry = ListOrder::associative(other - 1);
+                }
             }
+            self.rebuild_associative_index();
+            Ok(key)
         }
     }
 
@@ -512,7 +640,7 @@ impl DmList {
         let position = self.positional.len();
         self.positional.push(value);
         self.order
-            .insert(index - 1, ListOrder::Positional(position));
+            .insert(index - 1, ListOrder::positional(position));
         Ok(index)
     }
 
@@ -533,13 +661,17 @@ impl DmList {
             return Ok(copy);
         }
         for entry in &self.order[start - 1..end - 1] {
-            match entry {
-                ListOrder::Positional(position) => {
-                    copy.add(self.positional[*position].clone());
-                }
-                ListOrder::Associative(key) => {
-                    copy.set_key(key.clone(), self.get_key(key)?.clone());
-                }
+            if let Some(position) = entry.positional_index() {
+                copy.add(self.positional[position].clone());
+            } else {
+                let association = entry
+                    .associative_index()
+                    .ok_or(ValueError::CorruptListStorage)?;
+                let (key, value) = self
+                    .associative
+                    .get(association)
+                    .ok_or(ValueError::CorruptListStorage)?;
+                copy.set_key(key.clone(), value.clone());
             }
         }
         Ok(copy)
@@ -636,6 +768,13 @@ impl DmList {
     ///
     /// Returns [`ValueError::MissingKey`] when the key is absent.
     pub fn get_key(&self, key: &Value) -> Result<&Value, ValueError> {
+        if let (Some(index), Some(key)) = (&self.associative_index, semantic_key(key)) {
+            return index
+                .get(&key)
+                .and_then(|position| self.associative.get(*position))
+                .map(|(_, value)| value)
+                .ok_or(ValueError::MissingKey);
+        }
         self.associative
             .iter()
             .find(|(candidate, _)| candidate.semantic_eq(key))
@@ -648,37 +787,45 @@ impl DmList {
     /// Replacing a key retains its deterministic insertion position and
     /// returns the old value. New keys return `None`.
     pub fn set_key(&mut self, key: Value, value: Value) -> Option<Value> {
-        if let Some((_, current)) = self
-            .associative
-            .iter_mut()
-            .find(|(candidate, _)| candidate.semantic_eq(&key))
-        {
+        let indexed_key = semantic_key(&key);
+        let existing = match (&self.associative_index, indexed_key.as_ref()) {
+            (Some(index), Some(key)) => index.get(key).copied(),
+            _ => self
+                .associative
+                .iter()
+                .position(|(candidate, _)| candidate.semantic_eq(&key)),
+        };
+        if let Some(position) = existing {
+            let current = &mut self.associative[position].1;
             return Some(std::mem::replace(current, value));
         }
         if let Some((order_index, position)) =
             self.order.iter().enumerate().find_map(|(index, entry)| {
-                let ListOrder::Positional(position) = entry else {
+                let Some(position) = entry.positional_index() else {
                     return None;
                 };
-                self.positional[*position]
+                self.positional[position]
                     .semantic_eq(&key)
-                    .then_some((index, *position))
+                    .then_some((index, position))
             })
         {
             let existing_key = self.positional.remove(position);
             for entry in &mut self.order {
-                if let ListOrder::Positional(other) = entry
-                    && *other > position
+                if let Some(other) = entry.positional_index()
+                    && other > position
                 {
-                    *other -= 1;
+                    *entry = ListOrder::positional(other - 1);
                 }
             }
-            self.order[order_index] = ListOrder::Associative(existing_key.clone());
+            self.order[order_index] = ListOrder::associative(self.associative.len());
             self.associative.push((existing_key, value));
+            self.index_last_association();
             return None;
         }
-        self.order.push(ListOrder::Associative(key.clone()));
+        let position = self.associative.len();
+        self.order.push(ListOrder::associative(position));
         self.associative.push((key, value));
+        self.index_last_association();
         None
     }
 
@@ -695,12 +842,20 @@ impl DmList {
             .associative
             .iter()
             .position(|(candidate, _)| candidate.semantic_eq(key))?;
-        let order_index = self.order.iter().position(|entry| match entry {
-            ListOrder::Associative(candidate) => candidate.semantic_eq(key),
-            ListOrder::Positional(_) => false,
-        })?;
+        let order_index = self
+            .order
+            .iter()
+            .position(|entry| entry.associative_index() == Some(index))?;
         let (_, value) = self.associative.remove(index);
         self.order.remove(order_index);
+        for entry in &mut self.order {
+            if let Some(other) = entry.associative_index()
+                && other > index
+            {
+                *entry = ListOrder::associative(other - 1);
+            }
+        }
+        self.rebuild_associative_index();
         Some(value)
     }
 
@@ -708,9 +863,10 @@ impl DmList {
     #[must_use]
     pub fn positions(&self) -> impl ExactSizeIterator<Item = (usize, &Value)> {
         self.order.iter().enumerate().map(|(index, entry)| {
-            let value = match entry {
-                ListOrder::Positional(position) => &self.positional[*position],
-                ListOrder::Associative(key) => key,
+            let value = if let Some(position) = entry.positional_index() {
+                &self.positional[position]
+            } else {
+                &self.associative[entry.associative_index().expect("valid list order")].0
             };
             (index + 1, value)
         })
@@ -810,8 +966,11 @@ struct Slot<T> {
     value: Option<T>,
 }
 
+const ARENA_CHUNK_SLOTS: usize = 16 * 1024;
+
 struct Arena<T> {
-    slots: Vec<Slot<T>>,
+    chunks: Vec<Vec<Slot<T>>>,
+    slot_len: usize,
     free: Vec<u32>,
     live: usize,
 }
@@ -819,7 +978,8 @@ struct Arena<T> {
 impl<T> Default for Arena<T> {
     fn default() -> Self {
         Self {
-            slots: Vec::new(),
+            chunks: Vec::new(),
+            slot_len: 0,
             free: Vec::new(),
             live: 0,
         }
@@ -827,64 +987,127 @@ impl<T> Default for Arena<T> {
 }
 
 impl<T> Arena<T> {
+    fn slot(&self, index: usize) -> Option<&Slot<T>> {
+        let chunk = index / ARENA_CHUNK_SLOTS;
+        let offset = index % ARENA_CHUNK_SLOTS;
+        self.chunks.get(chunk)?.get(offset)
+    }
+
+    fn slot_mut(&mut self, index: usize) -> Option<&mut Slot<T>> {
+        let chunk = index / ARENA_CHUNK_SLOTS;
+        let offset = index % ARENA_CHUNK_SLOTS;
+        self.chunks.get_mut(chunk)?.get_mut(offset)
+    }
+
     fn insert(&mut self, value: T) -> (u32, u32) {
         self.live += 1;
         if let Some(index) = self.free.pop() {
-            let slot = &mut self.slots[index as usize];
+            let slot = self
+                .slot_mut(index as usize)
+                .expect("free arena index must address an allocated slot");
             debug_assert!(slot.value.is_none());
             slot.value = Some(value);
             return (index, slot.generation);
         }
-        let index = u32::try_from(self.slots.len()).expect("heap cannot exceed u32::MAX slots");
-        self.slots.push(Slot {
-            generation: 0,
-            value: Some(value),
-        });
+
+        let index = u32::try_from(self.slot_len).expect("heap cannot exceed u32::MAX slots");
+        if self
+            .chunks
+            .last()
+            .is_none_or(|chunk| chunk.len() == ARENA_CHUNK_SLOTS)
+        {
+            self.chunks.push(Vec::with_capacity(ARENA_CHUNK_SLOTS));
+        }
+        self.chunks
+            .last_mut()
+            .expect("arena chunk was just ensured")
+            .push(Slot {
+                generation: 0,
+                value: Some(value),
+            });
+        self.slot_len += 1;
         (index, 0)
     }
 
     fn get(&self, index: u32, generation: u32) -> Option<&T> {
-        let slot = self.slots.get(index as usize)?;
+        let slot = self.slot(index as usize)?;
         (slot.generation == generation)
             .then_some(slot.value.as_ref())
             .flatten()
     }
 
     fn get_mut(&mut self, index: u32, generation: u32) -> Option<&mut T> {
-        let slot = self.slots.get_mut(index as usize)?;
+        let slot = self.slot_mut(index as usize)?;
         (slot.generation == generation)
             .then_some(slot.value.as_mut())
             .flatten()
     }
 
     fn remove(&mut self, index: u32, generation: u32) -> Option<T> {
-        let slot = self.slots.get_mut(index as usize)?;
-        if slot.generation != generation {
-            return None;
-        }
-        let value = slot.value.take()?;
+        let (value, reusable) = {
+            let slot = self.slot_mut(index as usize)?;
+            if slot.generation != generation {
+                return None;
+            }
+            let value = slot.value.take()?;
+            let reusable = if let Some(next_generation) = slot.generation.checked_add(1) {
+                slot.generation = next_generation;
+                true
+            } else {
+                false
+            };
+            (value, reusable)
+        };
         self.live -= 1;
-        if let Some(next_generation) = slot.generation.checked_add(1) {
-            slot.generation = next_generation;
+        if reusable {
             self.free.push(index);
         }
         Some(value)
     }
 
     fn iter(&self) -> impl Iterator<Item = (u32, u32, &T)> {
-        self.slots.iter().enumerate().filter_map(|(index, slot)| {
-            let index = u32::try_from(index).ok()?;
-            Some((index, slot.generation, slot.value.as_ref()?))
-        })
+        self.chunks
+            .iter()
+            .enumerate()
+            .flat_map(|(chunk_index, chunk)| {
+                chunk.iter().enumerate().filter_map(move |(offset, slot)| {
+                    let index = chunk_index * ARENA_CHUNK_SLOTS + offset;
+                    let index = u32::try_from(index).ok()?;
+                    Some((index, slot.generation, slot.value.as_ref()?))
+                })
+            })
     }
 
     fn live_generation(&self, index: u32) -> Option<u32> {
-        let slot = self.slots.get(index as usize)?;
+        let slot = self.slot(index as usize)?;
         slot.value.as_ref().map(|_| slot.generation)
     }
 
     const fn len(&self) -> usize {
         self.live
+    }
+
+    const fn slot_len(&self) -> usize {
+        self.slot_len
+    }
+
+    fn sweep_unmarked(&mut self, marked: &[bool]) -> usize {
+        debug_assert_eq!(marked.len(), self.slot_len);
+        let mut reclaimed = 0;
+        for index in 0..self.slot_len {
+            let Some(slot) = self.slot(index) else {
+                continue;
+            };
+            if marked[index] || slot.value.is_none() {
+                continue;
+            }
+            let generation = slot.generation;
+            let index = u32::try_from(index).expect("arena index is bounded by insertion");
+            if self.remove(index, generation).is_some() {
+                reclaimed += 1;
+            }
+        }
+        reclaimed
     }
 }
 
@@ -976,6 +1199,183 @@ impl ValueHeap {
             debug_assert!(removed.is_some());
         }
         unreachable.len()
+    }
+
+    /// Reclaims every datum and list unreachable from the supplied runtime roots.
+    ///
+    /// Datum fields and list entries form one object graph, including cycles.
+    /// This marks both identity kinds transitively before invalidating any
+    /// handles, matching DM's collection of unreferenced datum/list cycles.
+    /// Returns the number of reclaimed datums followed by reclaimed lists.
+    pub fn collect_unreachable_values(&mut self, roots: &[Value]) -> (usize, usize) {
+        fn collect_root_ids(
+            value: &Value,
+            datum_roots: &mut Vec<DatumId>,
+            list_roots: &mut Vec<ListId>,
+        ) {
+            match value {
+                Value::Datum(datum) => datum_roots.push(*datum),
+                Value::List(list) => list_roots.push(*list),
+                Value::ModifiedTypePath(path) => {
+                    for (_, value) in path.overrides() {
+                        collect_root_ids(value, datum_roots, list_roots);
+                    }
+                }
+                Value::Null
+                | Value::Number(_)
+                | Value::Text(_)
+                | Value::File(_)
+                | Value::TypePath(_) => {}
+            }
+        }
+
+        let mut datum_roots = Vec::new();
+        let mut list_roots = Vec::new();
+        for value in roots {
+            collect_root_ids(value, &mut datum_roots, &mut list_roots);
+        }
+        self.collect_unreachable_values_from_ids(&datum_roots, &list_roots)
+    }
+
+    /// Reclaims every datum and list unreachable from compact identity roots.
+    ///
+    /// This variant avoids materializing a full [`Value`] for each root in
+    /// large worlds. Dense arena-index mark vectors also avoid hash-table
+    /// capacity spikes while preserving stable-generation validation.
+    pub fn collect_unreachable_values_from_ids(
+        &mut self,
+        datum_roots: &[DatumId],
+        list_roots: &[ListId],
+    ) -> (usize, usize) {
+        #[derive(Clone, Copy)]
+        enum Pending {
+            Datum(DatumId),
+            List(ListId),
+        }
+
+        fn enqueue_value(
+            heap: &ValueHeap,
+            value: &Value,
+            pending: &mut Vec<Pending>,
+            marked_datums: &mut [bool],
+            marked_lists: &mut [bool],
+        ) {
+            match value {
+                Value::Datum(datum) => {
+                    enqueue_datum(heap, *datum, pending, marked_datums, marked_lists)
+                }
+                Value::List(list) => {
+                    enqueue_list(heap, *list, pending, marked_datums, marked_lists)
+                }
+                Value::ModifiedTypePath(path) => {
+                    for (_, value) in path.overrides() {
+                        enqueue_value(heap, value, pending, marked_datums, marked_lists);
+                    }
+                }
+                Value::Null
+                | Value::Number(_)
+                | Value::Text(_)
+                | Value::File(_)
+                | Value::TypePath(_) => {}
+            }
+        }
+
+        fn enqueue_datum(
+            heap: &ValueHeap,
+            datum: DatumId,
+            pending: &mut Vec<Pending>,
+            marked_datums: &mut [bool],
+            _marked_lists: &mut [bool],
+        ) {
+            let index = datum.index() as usize;
+            if index >= marked_datums.len() || marked_datums[index] || heap.datum(datum).is_err() {
+                return;
+            }
+            marked_datums[index] = true;
+            pending.push(Pending::Datum(datum));
+        }
+
+        fn enqueue_list(
+            heap: &ValueHeap,
+            list: ListId,
+            pending: &mut Vec<Pending>,
+            _marked_datums: &mut [bool],
+            marked_lists: &mut [bool],
+        ) {
+            let index = list.index() as usize;
+            if index >= marked_lists.len() || marked_lists[index] || heap.list(list).is_err() {
+                return;
+            }
+            marked_lists[index] = true;
+            pending.push(Pending::List(list));
+        }
+
+        let mut pending = Vec::new();
+        let mut marked_datums = vec![false; self.datums.slot_len()];
+        let mut marked_lists = vec![false; self.lists.slot_len()];
+        for datum in datum_roots {
+            enqueue_datum(
+                self,
+                *datum,
+                &mut pending,
+                &mut marked_datums,
+                &mut marked_lists,
+            );
+        }
+        for list in list_roots {
+            enqueue_list(
+                self,
+                *list,
+                &mut pending,
+                &mut marked_datums,
+                &mut marked_lists,
+            );
+        }
+        while let Some(value) = pending.pop() {
+            match value {
+                Pending::Datum(datum) => {
+                    let Ok(datum) = self.datum(datum) else {
+                        continue;
+                    };
+                    for (_, value) in datum.fields() {
+                        enqueue_value(
+                            self,
+                            value,
+                            &mut pending,
+                            &mut marked_datums,
+                            &mut marked_lists,
+                        );
+                    }
+                }
+                Pending::List(list) => {
+                    let Ok(list) = self.list(list) else {
+                        continue;
+                    };
+                    for (_, value) in list.positions() {
+                        enqueue_value(
+                            self,
+                            value,
+                            &mut pending,
+                            &mut marked_datums,
+                            &mut marked_lists,
+                        );
+                    }
+                    for (_, value) in list.associations() {
+                        enqueue_value(
+                            self,
+                            value,
+                            &mut pending,
+                            &mut marked_datums,
+                            &mut marked_lists,
+                        );
+                    }
+                }
+            }
+        }
+
+        let reclaimed_lists = self.lists.sweep_unmarked(&marked_lists);
+        let reclaimed_datums = self.datums.sweep_unmarked(&marked_datums);
+        (reclaimed_datums, reclaimed_lists)
     }
 
     /// Allocates an empty mutable list.
@@ -1427,6 +1827,72 @@ mod tests {
     }
 
     #[test]
+    fn large_associative_lists_keep_indexed_lookup_and_byond_order_in_sync() {
+        assert_eq!(std::mem::size_of::<ListOrder>(), 4);
+        let mut list = DmList::default();
+        for index in 0..16 {
+            list.set_key(
+                Value::text(format!("signal-{index}")),
+                Value::number(index as f32),
+            );
+        }
+        assert_eq!(list.len(), 16);
+        assert!(
+            list.get_key(&text("signal-12"))
+                .unwrap()
+                .semantic_eq(&Value::number(12.0))
+        );
+        assert!(
+            list.set_key(text("signal-12"), Value::number(99.0))
+                .unwrap()
+                .semantic_eq(&Value::number(12.0))
+        );
+        assert!(
+            list.remove_key(&text("signal-3"))
+                .unwrap()
+                .semantic_eq(&Value::number(3.0))
+        );
+        assert!(
+            list.get_key(&text("signal-12"))
+                .unwrap()
+                .semantic_eq(&Value::number(99.0))
+        );
+        assert_eq!(list.get(4).unwrap(), &text("signal-4"));
+
+        let mut numeric = DmList::default();
+        for index in 1..8 {
+            numeric.set_key(Value::number(index as f32), Value::number(index as f32));
+        }
+        numeric.set_key(Value::number(-0.0), text("zero"));
+        assert!(
+            numeric
+                .get_key(&Value::number(0.0))
+                .unwrap()
+                .semantic_eq(&text("zero"))
+        );
+    }
+
+    #[test]
+    fn empty_lists_keep_only_pointer_sized_lazy_storage() {
+        assert_eq!(
+            std::mem::size_of::<DmList>(),
+            std::mem::size_of::<Option<Box<DmListStorage>>>()
+        );
+        let mut list = DmList::default();
+        assert!(list.storage.is_none());
+        assert!(list.is_empty());
+        assert_eq!(list.len(), 0);
+        assert!(
+            list.storage.is_none(),
+            "read-only access stays allocation-free"
+        );
+
+        list.add(Value::number(7.0));
+        assert!(list.storage.is_some());
+        assert!(list.get(1).unwrap().semantic_eq(&Value::number(7.0)));
+    }
+
+    #[test]
     fn range_insert_swap_and_resize_preserve_order_and_associations() {
         let mut list = DmList::default();
         list.add(text("a"));
@@ -1553,6 +2019,34 @@ mod tests {
     }
 
     #[test]
+    fn arena_growth_is_chunked_and_handles_cross_chunk_boundaries() {
+        let mut arena = Arena::default();
+        let mut handles = Vec::with_capacity(ARENA_CHUNK_SLOTS + 1);
+        for value in 0..=ARENA_CHUNK_SLOTS {
+            handles.push(arena.insert(value));
+        }
+
+        assert_eq!(arena.chunks.len(), 2);
+        assert_eq!(arena.chunks[0].len(), ARENA_CHUNK_SLOTS);
+        assert_eq!(arena.chunks[1].len(), 1);
+        let (last_index, last_generation) = handles[ARENA_CHUNK_SLOTS];
+        assert_eq!(
+            arena.get(last_index, last_generation),
+            Some(&ARENA_CHUNK_SLOTS)
+        );
+
+        let (old_index, old_generation) = handles[ARENA_CHUNK_SLOTS - 1];
+        assert_eq!(
+            arena.remove(old_index, old_generation),
+            Some(ARENA_CHUNK_SLOTS - 1)
+        );
+        let (reused_index, reused_generation) = arena.insert(99_999);
+        assert_eq!(reused_index, old_index);
+        assert_ne!(reused_generation, old_generation);
+        assert_eq!(arena.get(reused_index, reused_generation), Some(&99_999));
+    }
+
+    #[test]
     fn truth_rules_validate_reference_liveness() {
         let mut heap = ValueHeap::new();
         let list = heap.allocate_list();
@@ -1633,5 +2127,68 @@ mod tests {
         let reused = heap.allocate_list();
         assert_eq!(reused.index(), garbage.index());
         assert_ne!(reused.generation(), garbage.generation());
+    }
+
+    #[test]
+    fn value_collection_reclaims_unreachable_datum_list_cycles() {
+        let mut heap = ValueHeap::new();
+        let root = heap.allocate_datum(TypePath::parse("/datum/root").unwrap());
+        let child = heap.allocate_datum(TypePath::parse("/datum/child").unwrap());
+        let reachable = heap.allocate_list();
+        heap.set_datum_field(root, field("items"), Value::List(reachable))
+            .unwrap();
+        heap.list_mut(reachable).unwrap().add(Value::Datum(child));
+        heap.set_datum_field(child, field("owner"), Value::Datum(root))
+            .unwrap();
+
+        let garbage_datum = heap.allocate_datum(TypePath::parse("/datum/garbage").unwrap());
+        let garbage_list = heap.allocate_list();
+        heap.set_datum_field(garbage_datum, field("cycle"), Value::List(garbage_list))
+            .unwrap();
+        heap.list_mut(garbage_list)
+            .unwrap()
+            .add(Value::Datum(garbage_datum));
+
+        assert_eq!(
+            heap.collect_unreachable_values(&[Value::Datum(root)]),
+            (1, 1)
+        );
+        assert!(heap.datum(root).is_ok());
+        assert!(heap.datum(child).is_ok());
+        assert!(heap.list(reachable).is_ok());
+        assert!(matches!(
+            heap.datum(garbage_datum),
+            Err(ValueError::StaleDatum(id)) if id == garbage_datum
+        ));
+        assert!(matches!(
+            heap.list(garbage_list),
+            Err(ValueError::StaleList(id)) if id == garbage_list
+        ));
+    }
+
+    #[test]
+    fn compact_identity_collection_deduplicates_dense_roots_and_validates_generations() {
+        let mut heap = ValueHeap::new();
+        let root = heap.allocate_datum(TypePath::parse("/datum/root").unwrap());
+        let held = heap.allocate_list();
+        heap.set_datum_field(root, field("held"), Value::List(held))
+            .unwrap();
+        let stale = heap.allocate_datum(TypePath::parse("/datum/stale").unwrap());
+        heap.destroy_datum(stale).unwrap();
+        let replacement = heap.allocate_datum(TypePath::parse("/datum/replacement").unwrap());
+        assert_eq!(stale.index(), replacement.index());
+        let garbage = heap.allocate_list();
+
+        let datum_roots = std::iter::repeat_n(root, 100_000)
+            .chain([stale])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            heap.collect_unreachable_values_from_ids(&datum_roots, &[]),
+            (1, 1),
+        );
+        assert!(heap.datum(root).is_ok());
+        assert!(heap.list(held).is_ok());
+        assert!(heap.datum(replacement).is_err());
+        assert!(heap.list(garbage).is_err());
     }
 }
