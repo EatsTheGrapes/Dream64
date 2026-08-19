@@ -10540,6 +10540,7 @@ impl ExecutionState {
                 std::iter::once(&frame.usr),
             );
             extend_heap_root_ids(&mut datum_roots, &mut list_roots, &frame.arguments);
+            list_roots.extend(frame.args_list);
             extend_heap_root_ids(
                 &mut datum_roots,
                 &mut list_roots,
@@ -10797,6 +10798,14 @@ struct CallFrame {
     boot_trace_step: u64,
     atoms_profile_entry_counted: bool,
     atoms_profile_root: bool,
+    shuttle_trace_target: Option<DatumId>,
+    shuttle_trace_post_return: Option<ShuttleTracePostReturn>,
+}
+
+#[derive(Clone, Debug)]
+enum ShuttleTracePostReturn {
+    AtmosInit,
+    NullifyNode { slot: Option<usize> },
 }
 
 #[derive(Debug)]
@@ -13071,6 +13080,7 @@ fn run_frames(
             Instruction::LogicalOrEmptyListField(name) => {
                 let receiver = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
+                let receiver = canonicalize_value(&state.heap, &receiver);
                 let value = logical_or_empty_list_field(state, receiver, name)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 frames[frame_index].stack.push(value);
@@ -13080,6 +13090,7 @@ fn run_frames(
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let receiver = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
+                let receiver = canonicalize_value(&state.heap, &receiver);
                 let value = logical_or_empty_list_index(state, receiver, key)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 frames[frame_index].stack.push(value);
@@ -13093,6 +13104,7 @@ fn run_frames(
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
+                let receiver = canonicalize_value(&state.heap, &receiver);
                 if let Value::Text(text) = &receiver {
                     let index = value_to_list_index(&key)
                         .map_err(|message| execution_error(module, &frames, message))?;
@@ -13144,7 +13156,6 @@ fn run_frames(
                             .and_then(|name| state.global(&name).cloned())
                             .unwrap_or(Value::Null),
                         _ => read_list_value(&state.heap, list, &key, false)
-                            .cloned()
                             .unwrap_or(Value::Null),
                     }
                 } else if let Some(datum) = state.datum_vars_proxies.get(&list).copied() {
@@ -13174,13 +13185,12 @@ fn run_frames(
                             }
                         }
                         _ => read_list_value(&state.heap, list, &key, false)
-                            .cloned()
                             .unwrap_or(Value::Null),
                     }
                 } else {
                     match read_list_value(&state.heap, list, &key, state.is_associative_list(list))
                     {
-                        Ok(value) => value.clone(),
+                        Ok(value) => value,
                         // BYOND associative lookup returns null for an absent key.
                         // Lazy-list idioms such as `lists[target] ||= list()` rely
                         // on this before inserting the new association.
@@ -13201,16 +13211,17 @@ fn run_frames(
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                let list = match pop(&mut frames[frame_index].stack) {
-                    Ok(Value::List(list)) => list,
-                    Ok(value) => {
+                let receiver = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let list = match canonicalize_value(&state.heap, &receiver) {
+                    Value::List(list) => list,
+                    value => {
                         return Err(execution_error(
                             module,
                             &frames,
                             format!("list assignment received {value}"),
                         ));
                     }
-                    Err(message) => return Err(execution_error(module, &frames, message)),
                 };
                 if state.is_visibility_list(list) {
                     return Err(execution_error(
@@ -13260,16 +13271,17 @@ fn run_frames(
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                let list = match pop(&mut frames[frame_index].stack) {
-                    Ok(Value::List(list)) => list,
-                    Ok(value) => {
+                let receiver = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let list = match canonicalize_value(&state.heap, &receiver) {
+                    Value::List(list) => list,
+                    value => {
                         return Err(execution_error(
                             module,
                             &frames,
                             format!("list assignment received {value}"),
                         ));
                     }
-                    Err(message) => return Err(execution_error(module, &frames, message)),
                 };
                 if state.is_visibility_list(list) {
                     return Err(execution_error(
@@ -13359,7 +13371,7 @@ fn run_frames(
                         .unwrap_or(Value::Null)
                 } else {
                     match read_list_value(&state.heap, list, &key, associative) {
-                        Ok(value) => value.clone(),
+                        Ok(value) => value,
                         Err(ValueError::MissingKey) => Value::Null,
                         Err(error) => {
                             return Err(execution_error(module, &frames, error.to_string()));
@@ -13412,22 +13424,24 @@ fn run_frames(
                 }
             }
             Instruction::ListLength => {
-                let length = match pop(&mut frames[frame_index].stack) {
-                    Ok(Value::Null) => 0,
-                    Ok(Value::List(list)) => match state.heap.list(list) {
+                let target = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let target = canonicalize_value(&state.heap, &target);
+                let length = match target {
+                    Value::Null => 0,
+                    Value::List(list) => match state.heap.list(list) {
                         Ok(values) => values.len(),
                         Err(error) => {
                             return Err(execution_error(module, &frames, error.to_string()));
                         }
                     },
-                    Ok(value) => {
+                    value => {
                         return Err(execution_error(
                             module,
                             &frames,
                             format!("list length operation received {value}"),
                         ));
                     }
-                    Err(message) => return Err(execution_error(module, &frames, message)),
                 };
                 let length = length.to_string().parse::<f32>().map_err(|error| {
                     execution_error(
@@ -13441,6 +13455,7 @@ fn run_frames(
             Instruction::PrepareIteration => {
                 let iterable = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
+                let iterable = canonicalize_value(&state.heap, &iterable);
                 let world_contents = match &iterable {
                     Value::Datum(datum) => state.heap.datum(*datum).is_ok_and(|datum| {
                         let path = datum.type_path().as_str();
@@ -13579,7 +13594,9 @@ fn run_frames(
             }
             Instruction::LoadSrc => {
                 let src = frames[frame_index].src.clone();
-                frames[frame_index].stack.push(src);
+                frames[frame_index]
+                    .stack
+                    .push(canonicalize_value(&state.heap, &src));
             }
             Instruction::StoreSrc => {
                 let src = pop(&mut frames[frame_index].stack)
@@ -13588,7 +13605,9 @@ fn run_frames(
             }
             Instruction::LoadUsr => {
                 let usr = frames[frame_index].usr.clone();
-                frames[frame_index].stack.push(usr);
+                frames[frame_index]
+                    .stack
+                    .push(canonicalize_value(&state.heap, &usr));
             }
             Instruction::LoadCaller => {
                 let caller = if frame_index == 0 {
@@ -13597,13 +13616,16 @@ fn run_frames(
                     materialize_callee_chain(module, state, &frames[..frame_index])
                         .map_err(|message| execution_error(module, &frames, message))?
                 };
-                frames[frame_index].stack.push(caller);
+                frames[frame_index]
+                    .stack
+                    .push(canonicalize_value(&state.heap, &caller));
             }
             Instruction::LoadField(name) => {
                 let receiver = match pop(&mut frames[frame_index].stack) {
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
+                let receiver = canonicalize_value(&state.heap, &receiver);
                 let value = match receiver {
                     Value::TypePath(path) => match name.as_str() {
                         "type" => Value::TypePath(path),
@@ -13727,7 +13749,7 @@ fn run_frames(
                                 },
                             }
                         } else {
-                            match datum_field_or_shared(state, datum, &name) {
+                    match datum_field_or_shared(state, datum, &name) {
                                 Ok(value) => value,
                                 Err(error) => {
                                     if matches!(error, ValueError::MissingField(_)) {
@@ -13863,6 +13885,7 @@ fn run_frames(
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
+                let receiver = canonicalize_value(&state.heap, &receiver);
                 match receiver {
                     Value::Datum(datum) => {
                         assign_datum_or_shared_field(state, datum, name.clone(), value.clone())
@@ -13935,6 +13958,7 @@ fn run_frames(
                         format!("runtime global {name:?} is absent"),
                     ));
                 };
+                let value = canonicalize_value(&state.heap, &value);
                 if boot_trace_enabled() && name.as_str() == "SSdcs" {
                     eprintln!(
                         "boot-vm: global-read name=SSdcs value={} procedure={}",
@@ -13966,13 +13990,17 @@ fn run_frames(
             }
             Instruction::LoadDatumVars => {
                 let datum = match pop(&mut frames[frame_index].stack) {
-                    Ok(Value::Datum(datum)) => datum,
                     Ok(value) => {
-                        return Err(execution_error(
-                            module,
-                            &frames,
-                            format!("vars requires a datum, received {value}"),
-                        ));
+                        match canonicalize_value(&state.heap, &value) {
+                            Value::Datum(datum) => datum,
+                            _ => {
+                                return Err(execution_error(
+                                    module,
+                                    &frames,
+                                    format!("vars requires a datum, received {value}"),
+                                ));
+                            }
+                        }
                     }
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
@@ -14112,6 +14140,7 @@ fn run_frames(
                 let (delta, prefix) = (*delta, *prefix);
                 let receiver = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
+                let receiver = canonicalize_value(&state.heap, &receiver);
                 let current = match &receiver {
                     Value::Datum(datum) => datum_field_or_initial(state, *datum, &name)
                         .map_err(|error| execution_error(module, &frames, error.to_string()))?
@@ -14184,16 +14213,17 @@ fn run_frames(
                 let (delta, prefix) = (*delta, *prefix);
                 let key = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
-                let list = match pop(&mut frames[frame_index].stack) {
-                    Ok(Value::List(list)) => list,
-                    Ok(value) => {
+                let receiver = pop(&mut frames[frame_index].stack)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                let list = match canonicalize_value(&state.heap, &receiver) {
+                    Value::List(list) => list,
+                    value => {
                         return Err(execution_error(
                             module,
                             &frames,
                             format!("list mutation requires a list, received {value}"),
                         ));
                     }
-                    Err(message) => return Err(execution_error(module, &frames, message)),
                 };
                 if state.is_visibility_list(list) {
                     return Err(execution_error(
@@ -14204,7 +14234,7 @@ fn run_frames(
                 }
                 let associative = state.is_associative_list(list);
                 let current = match read_list_value(&state.heap, list, &key, associative) {
-                    Ok(value) => value.clone(),
+                    Ok(value) => value,
                     // BYOND treats an absent associative entry like null for
                     // postfix/prefix mutation. Idioms such as
                     // `counter[target]++` therefore insert 1 on first use.
@@ -14259,7 +14289,9 @@ fn run_frames(
                         format!("invalid local slot {slot}"),
                     ));
                 };
-                frames[frame_index].stack.push(value);
+                frames[frame_index]
+                    .stack
+                    .push(canonicalize_value(&state.heap, &value));
             }
             Instruction::LoadLocal(slot) => {
                 let slot = *slot;
@@ -14281,7 +14313,9 @@ fn run_frames(
                         .cloned()
                         .map_err(|error| execution_error(module, &frames, error.to_string()))?;
                 }
-                frames[frame_index].stack.push(value);
+                frames[frame_index]
+                    .stack
+                    .push(canonicalize_value(&state.heap, &value));
             }
             Instruction::StoreLocal(slot) => {
                 let slot = *slot;
@@ -14780,7 +14814,7 @@ fn run_frames(
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                let equal = values_equal(&left, &right);
+                let equal = values_equal(&state.heap, &left, &right);
                 let result = if matches!(instruction, Instruction::NotEqual) {
                     !equal
                 } else {
@@ -14811,16 +14845,16 @@ fn run_frames(
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let needle = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
-                let contains = if let Value::List(list) = container {
-                    state
-                        .heap
-                        .list(list)
-                        .map_err(|error| execution_error(module, &frames, error.to_string()))?
-                        .positions()
-                        .any(|(_, value)| values_equal(&needle, value))
-                } else {
-                    false
-                };
+            let contains = if let Value::List(list) = container {
+                state
+                    .heap
+                    .list(list)
+                    .map_err(|error| execution_error(module, &frames, error.to_string()))?
+                    .positions()
+                    .any(|(_, value)| values_equal(&state.heap, &needle, value))
+            } else {
+                false
+            };
                 frames[frame_index]
                     .stack
                     .push(Value::number(f32::from(contains)));
@@ -14851,7 +14885,7 @@ fn run_frames(
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                if matches!(value, Value::Null) {
+                if matches!(canonicalize_value(&state.heap, &value), Value::Null) {
                     if let Err(message) = validate_jump(target, program.instructions.len()) {
                         return Err(execution_error(module, &frames, message));
                     }
@@ -14986,11 +15020,20 @@ fn run_frames(
                     frames[frame_index].instruction += 1;
                     continue;
                 }
+                let shuttle_trace_slot = shuttle_trace_slot_from_arguments(&arguments);
                 let mut target_frame = if names.iter().all(Option::is_none) {
                     make_frame_owned(target, target_program, arguments, &context)
                 } else {
                     make_frame_named(target, target_program, &arguments, names, &context)
                 };
+                shuttle_trace_prepare_call(
+                    module,
+                    state,
+                    &frames[frame_index],
+                    target,
+                    shuttle_trace_slot,
+                    &mut target_frame,
+                );
                 mark_boot_trace_frame(&mut target_frame, module, state, executed_steps);
                 frames.push(target_frame);
                 continue;
@@ -15019,25 +15062,33 @@ fn run_frames(
                 } else {
                     forwarded_frame_arguments(&frames[frame_index], program)
                 };
+                let shuttle_trace_slot = shuttle_trace_slot_from_arguments(&arguments);
                 let context = frame_context(&frames[frame_index]);
-                frames.push(
-                    if expanded_argument_names
-                        .as_deref()
-                        .is_none_or(|names| names.iter().all(Option::is_none))
-                    {
-                        make_frame_owned(procedure, program, arguments, &context)
-                    } else {
-                        make_frame_named(
-                            procedure,
-                            program,
-                            &arguments,
-                            expanded_argument_names
-                                .as_deref()
-                                .expect("named arguments exist"),
-                            &context,
-                        )
-                    },
+                let mut target_frame = if expanded_argument_names
+                    .as_deref()
+                    .is_none_or(|names| names.iter().all(Option::is_none))
+                {
+                    make_frame_owned(procedure, program, arguments, &context)
+                } else {
+                    make_frame_named(
+                        procedure,
+                        program,
+                        &arguments,
+                        expanded_argument_names
+                            .as_deref()
+                            .expect("named arguments exist"),
+                        &context,
+                    )
+                };
+                shuttle_trace_prepare_call(
+                    module,
+                    state,
+                    &frames[frame_index],
+                    procedure,
+                    shuttle_trace_slot,
+                    &mut target_frame,
                 );
+                frames.push(target_frame);
                 continue;
             }
             Instruction::CallParent {
@@ -15075,28 +15126,36 @@ fn run_frames(
                 } else {
                     forwarded_frame_arguments(&frames[frame_index], program)
                 };
+                let shuttle_trace_slot = shuttle_trace_slot_from_arguments(&arguments);
                 let target_program = module
                     .resolve_procedure(target)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let context = frame_context(&frames[frame_index]);
-                frames.push(
-                    if expanded_argument_names
-                        .as_deref()
-                        .is_none_or(|names| names.iter().all(Option::is_none))
-                    {
-                        make_frame_owned(target, target_program, arguments, &context)
-                    } else {
-                        make_frame_named(
-                            target,
-                            target_program,
-                            &arguments,
-                            expanded_argument_names
-                                .as_deref()
-                                .expect("named arguments exist"),
-                            &context,
-                        )
-                    },
+                let mut target_frame = if expanded_argument_names
+                    .as_deref()
+                    .is_none_or(|names| names.iter().all(Option::is_none))
+                {
+                    make_frame_owned(target, target_program, arguments, &context)
+                } else {
+                    make_frame_named(
+                        target,
+                        target_program,
+                        &arguments,
+                        expanded_argument_names
+                            .as_deref()
+                            .expect("named arguments exist"),
+                        &context,
+                    )
+                };
+                shuttle_trace_prepare_call(
+                    module,
+                    state,
+                    &frames[frame_index],
+                    target,
+                    shuttle_trace_slot,
+                    &mut target_frame,
                 );
+                frames.push(target_frame);
                 continue;
             }
             Instruction::CallDynamic {
@@ -15177,6 +15236,7 @@ fn run_frames(
                     let names = expanded_argument_names
                         .as_deref()
                         .or((!argument_names.is_empty()).then_some(argument_names.as_slice()));
+                    let shuttle_trace_slot = shuttle_trace_slot_from_arguments(&arguments);
                     let mut target_frame =
                         if names.is_none_or(|names| names.iter().all(Option::is_none)) {
                             make_frame_owned(target, target_program, arguments, &context)
@@ -15189,6 +15249,14 @@ fn run_frames(
                                 &context,
                             )
                         };
+                    shuttle_trace_prepare_call(
+                        module,
+                        state,
+                        &frames[frame_index],
+                        target,
+                        shuttle_trace_slot,
+                        &mut target_frame,
+                    );
                     mark_boot_trace_frame(&mut target_frame, module, state, executed_steps);
                     frames.push(target_frame);
                     continue;
@@ -15323,11 +15391,20 @@ fn run_frames(
                     };
                     let (target, context) =
                         target.map_err(|message| execution_error(module, &frames, message))?;
+                    let shuttle_trace_slot = shuttle_trace_slot_from_arguments(&arguments);
                     let target_program = module
                         .resolve_procedure(target)
                         .map_err(|message| execution_error(module, &frames, message))?;
                     let mut target_frame =
                         make_frame_owned(target, target_program, arguments, &context);
+                    shuttle_trace_prepare_call(
+                        module,
+                        state,
+                        &frames[frame_index],
+                        target,
+                        shuttle_trace_slot,
+                        &mut target_frame,
+                    );
                     mark_boot_trace_frame(&mut target_frame, module, state, executed_steps);
                     frames.push(target_frame);
                     continue;
@@ -15370,7 +15447,7 @@ fn run_frames(
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                let finished = frames.pop().expect("returning frame exists");
+                let mut finished = frames.pop().expect("returning frame exists");
                 let finish_atoms_profile = finished.atoms_profile_root;
                 let result = finished.caller_result_override.clone().unwrap_or(result);
                 if boot_trace_enabled()
@@ -15409,6 +15486,28 @@ fn run_frames(
                 if finish_atoms_profile && let Some(profile) = state.atoms_profile.take() {
                     emit_atoms_profile(&profile);
                 }
+                if let Some(post_return) = finished.shuttle_trace_post_return.take() {
+                    if let Value::Datum(component) = finished.src {
+                        match post_return {
+                            ShuttleTracePostReturn::NullifyNode { slot } => {
+                                shuttle_trace_emit_snapshot(
+                                    state,
+                                    component,
+                                    "nullify-node-after",
+                                    slot,
+                                );
+                            }
+                            ShuttleTracePostReturn::AtmosInit => {
+                                shuttle_trace_emit_snapshot(
+                                    state,
+                                    component,
+                                    "atmos-init-after",
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                }
                 let Some(caller) = frames.last_mut() else {
                     return Ok(FrameRunOutcome::Complete(result));
                 };
@@ -15418,6 +15517,303 @@ fn run_frames(
             }
         }
         frames[frame_index].instruction += 1;
+    }
+}
+
+fn shuttle_trace_enabled() -> bool {
+    true
+}
+
+fn shuttle_trace_target_filter() -> &'static Option<String> {
+    static FILTER: OnceLock<Option<String>> = OnceLock::new();
+    FILTER.get_or_init(|| {
+        Some(
+            std::env::var("DREAM64_SHUTTLE_TRACE_TARGET")
+                .unwrap_or_else(|_| "/mixer/layer4".to_owned()),
+        )
+    })
+}
+
+fn shuttle_trace_is_late_shuttle_move(path: &str) -> bool {
+    path.contains("lateShuttleMove")
+}
+
+fn shuttle_trace_is_nullify_node(path: &str) -> bool {
+    path.contains("nullify_node@") || path.ends_with("/nullify_node")
+}
+
+fn shuttle_trace_is_atmos_init(path: &str) -> bool {
+    path.contains("atmos_init@") || path.ends_with("/atmos_init")
+}
+
+fn shuttle_trace_matches_target(state: &ExecutionState, datum: DatumId) -> bool {
+    shuttle_trace_target_filter().as_ref().is_some_and(|target| {
+        state
+            .heap
+            .datum(datum)
+            .is_ok_and(|datum| datum.type_path().as_str().contains(target))
+    })
+}
+
+fn shuttle_trace_slot_from_value(value: &Value) -> Option<usize> {
+    let value = value.as_number()?;
+    if !value.is_finite() || value.fract() != 0.0 {
+        return None;
+    }
+    let value = value.trunc() as i64;
+    usize::try_from(value).ok().filter(|slot| *slot > 0)
+}
+
+fn shuttle_trace_slot_from_arguments(arguments: &[Value]) -> Option<usize> {
+    arguments.first().and_then(shuttle_trace_slot_from_value)
+}
+
+fn shuttle_trace_turn_dir(direction: i32, angle: i32) -> i32 {
+    const DIRECTIONS: [i32; 8] = [1, 9, 8, 10, 2, 6, 4, 5];
+    let Some(index) = DIRECTIONS.iter().position(|candidate| *candidate == direction) else {
+        return direction;
+    };
+    let steps = angle / 45;
+    DIRECTIONS[(index as i32 + steps).rem_euclid(8) as usize]
+}
+
+fn shuttle_trace_expected_slot_direction(dir_value: f32, flipped: bool, slot: usize) -> Option<i32> {
+    if !dir_value.is_finite() {
+        return None;
+    }
+    if dir_value.fract() != 0.0 || dir_value < i32::MIN as f32 || dir_value > i32::MAX as f32 {
+        return None;
+    }
+    let direction = dir_value.trunc() as i32;
+    let mut node1 = shuttle_trace_turn_dir(direction, -180);
+    let node2 = shuttle_trace_turn_dir(direction, -90);
+    let mut node3 = shuttle_trace_turn_dir(direction, 0);
+    if flipped {
+        node1 = shuttle_trace_turn_dir(node1, 180);
+        node3 = shuttle_trace_turn_dir(node3, 180);
+    }
+    match slot {
+        1 => Some(node1),
+        2 => Some(node2),
+        3 => Some(node3),
+        _ => None,
+    }
+}
+
+fn shuttle_trace_list_len(state: &ExecutionState, list: Option<ListId>) -> usize {
+    list.and_then(|list| state.heap.list(list).ok())
+        .map_or(0, |list| list.len())
+}
+
+fn shuttle_trace_list_slot(state: &ExecutionState, list: Option<ListId>, slot: usize) -> Option<Value> {
+    let list = list?;
+    state
+        .heap
+        .list(list)
+        .ok()?
+        .get(slot)
+        .ok()
+        .cloned()
+}
+
+fn shuttle_trace_field_text(state: &ExecutionState, datum: DatumId, name: &str) -> String {
+    let field = FieldName::parse(name).expect("built-in atom variable");
+    match state.heap.datum_field(datum, &field) {
+        Ok(value) => value.to_string(),
+        Err(_) => "<missing>".to_owned(),
+    }
+}
+
+fn shuttle_trace_field_u8(state: &ExecutionState, datum: DatumId, name: &str) -> Option<usize> {
+    let field = FieldName::parse(name).expect("built-in atom variable");
+    state
+        .heap
+        .datum_field(datum, &field)
+        .ok()
+        .and_then(Value::as_number)
+        .filter(|value| value.is_finite() && value.fract() == 0.0)
+        .and_then(|value| {
+            let value = value as i64;
+            usize::try_from(value).ok().filter(|slot| *slot > 0)
+        })
+}
+
+fn shuttle_trace_field_bool(state: &ExecutionState, datum: DatumId, name: &str) -> bool {
+    let field = FieldName::parse(name).expect("built-in atom variable");
+    state
+        .heap
+        .datum_field(datum, &field)
+        .ok()
+        .and_then(Value::as_number)
+        .is_some_and(|value| value != 0.0)
+}
+
+fn shuttle_trace_field_number(state: &ExecutionState, datum: DatumId, name: &str) -> Option<f32> {
+    let field = FieldName::parse(name).expect("built-in atom variable");
+    state
+        .heap
+        .datum_field(datum, &field)
+        .ok()
+        .and_then(Value::as_number)
+}
+
+fn shuttle_trace_list_field(state: &ExecutionState, datum: DatumId, name: &str) -> Option<ListId> {
+    let field = FieldName::parse(name).expect("built-in atom variable");
+    match state.heap.datum_field(datum, &field) {
+        Ok(Value::List(list)) => Some(*list),
+        _ => None,
+    }
+}
+
+fn shuttle_trace_datum_type(state: &ExecutionState, target: DatumId) -> String {
+    state
+        .heap
+        .datum(target)
+        .map(|datum| datum.type_path().to_owned().to_string())
+        .unwrap_or_else(|_| "<missing>".to_owned())
+}
+
+fn shuttle_trace_value_ref(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::Datum(datum)) => format!("datum({datum:?})"),
+        Some(Value::Null) => "null".to_owned(),
+        Some(value) => format!("other({value})"),
+        None => "none".to_owned(),
+    }
+}
+
+fn shuttle_trace_prepare_call(
+    module: &Module,
+    state: &ExecutionState,
+    caller: &CallFrame,
+    procedure: ProcedureId,
+    nullify_slot: Option<usize>,
+    target_frame: &mut CallFrame,
+) {
+    target_frame.shuttle_trace_target = caller.shuttle_trace_target;
+    target_frame.shuttle_trace_post_return = None;
+
+    if !shuttle_trace_enabled() {
+        return;
+    }
+    let Some(path) = module.procedure_path(procedure) else {
+        return;
+    };
+
+    if shuttle_trace_is_late_shuttle_move(path)
+        && let Value::Datum(target) = target_frame.src
+        && shuttle_trace_matches_target(state, target)
+    {
+        target_frame.shuttle_trace_target = Some(target);
+        shuttle_trace_emit_snapshot(state, target, "lateShuttleMove-entry", None);
+        return;
+    }
+
+    let Some(shuttle_target) = target_frame.shuttle_trace_target else {
+        return;
+    };
+    if shuttle_trace_is_nullify_node(path) {
+        let slot = nullify_slot;
+        shuttle_trace_emit_snapshot(state, shuttle_target, "nullify-node-before", slot);
+        target_frame.shuttle_trace_post_return =
+            Some(ShuttleTracePostReturn::NullifyNode { slot });
+    }
+    if shuttle_trace_is_atmos_init(path) {
+        shuttle_trace_emit_snapshot(state, shuttle_target, "atmos-init-before", None);
+        target_frame.shuttle_trace_post_return = Some(ShuttleTracePostReturn::AtmosInit);
+    }
+}
+
+fn shuttle_trace_emit_snapshot(
+    state: &ExecutionState,
+    component: DatumId,
+    event: &str,
+    note: Option<usize>,
+) {
+    if !shuttle_trace_enabled() {
+        return;
+    }
+    let component_type = shuttle_trace_datum_type(state, component);
+    let target_dir = shuttle_trace_field_number(state, component, "dir").unwrap_or_default();
+    let target_flipped = shuttle_trace_field_bool(state, component, "flipped");
+    let device_type = shuttle_trace_field_u8(state, component, "device_type").unwrap_or(3);
+    let nodes = shuttle_trace_list_field(state, component, "nodes");
+    let parents = shuttle_trace_list_field(state, component, "parents");
+    let node_len = shuttle_trace_list_len(state, nodes);
+    let parent_len = shuttle_trace_list_len(state, parents);
+    let slot_count = *[node_len, parent_len, device_type].iter().max().unwrap_or(&3).max(&1);
+    let note = note.map_or_else(|| "n/a".to_owned(), |slot| slot.to_string());
+    let target_location = shuttle_trace_field_text(state, component, "loc");
+    let target_x = shuttle_trace_field_text(state, component, "x");
+    let target_y = shuttle_trace_field_text(state, component, "y");
+    let target_z = shuttle_trace_field_text(state, component, "z");
+    eprintln!(
+        "shuttle-trace event={event} component={component:?} type={component_type} note={note} \
+device_type={device_type} target_dir={target_dir} target_flipped={target_flipped} \
+target_loc={target_location} target_xyz={target_x},{target_y},{target_z}"
+    );
+    for slot in 1..=slot_count {
+        let expected_direction =
+            shuttle_trace_expected_slot_direction(target_dir, target_flipped, slot).unwrap_or(-1);
+        let node_value = shuttle_trace_list_slot(state, nodes, slot);
+        let parent_value = shuttle_trace_list_slot(state, parents, slot);
+        let node = match node_value {
+            Some(Value::Datum(node)) => Some(node),
+            _ => None,
+        };
+        let parent = match parent_value {
+            Some(Value::Datum(parent)) => Some(parent),
+            _ => None,
+        };
+        let node_type = node
+            .and_then(|datum| state.heap.datum(datum).ok())
+            .map(|datum| datum.type_path().to_string())
+            .unwrap_or_else(|| "<null>".to_owned());
+        let parent_type = parent
+            .and_then(|datum| state.heap.datum(datum).ok())
+            .map(|datum| datum.type_path().to_string())
+            .unwrap_or_else(|| "<null>".to_owned());
+        let node_x = node
+            .map(|datum| shuttle_trace_field_text(state, datum, "x"))
+            .unwrap_or_else(|| "null".to_owned());
+        let node_y = node
+            .map(|datum| shuttle_trace_field_text(state, datum, "y"))
+            .unwrap_or_else(|| "null".to_owned());
+        let node_z = node
+            .map(|datum| shuttle_trace_field_text(state, datum, "z"))
+            .unwrap_or_else(|| "null".to_owned());
+        let node_dir = node
+            .map(|datum| shuttle_trace_field_text(state, datum, "dir"))
+            .unwrap_or_else(|| "null".to_owned());
+        let node_pipe = node
+            .map(|datum| shuttle_trace_field_text(state, datum, "piping_layer"))
+            .unwrap_or_else(|| "null".to_owned());
+        let node_loc = node
+            .and_then(|datum| {
+                let field = FieldName::parse("loc").expect("built-in atom variable");
+                state.heap.datum_field(datum, &field).ok().cloned()
+            })
+            .map(|value| shuttle_trace_value_ref(Some(&value)))
+            .unwrap_or_else(|| "null".to_owned());
+        eprintln!(
+            "shuttle-trace event={event} component={component:?} slot={slot} \
+expected_dir={expected_direction} node={node_ref} node_type={node_type} node_x={node_x} node_y={node_y} node_z={node_z} \
+node_dir={node_dir} node_pipe={node_pipe} node_loc={node_loc} parent={parent_ref} parent_type={parent_type}",
+            component = component,
+            event = event,
+            slot = slot,
+            expected_direction = expected_direction,
+            node_ref = shuttle_trace_value_ref(node_value.as_ref()),
+            node_type = node_type,
+            node_x = node_x,
+            node_y = node_y,
+            node_z = node_z,
+            node_dir = node_dir,
+            node_pipe = node_pipe,
+            node_loc = node_loc,
+            parent_ref = shuttle_trace_value_ref(parent_value.as_ref()),
+            parent_type = parent_type
+        );
     }
 }
 
@@ -15469,6 +15865,8 @@ fn make_frame_owned(
         exception_handlers: Vec::new(),
         detached_waitfor: false,
         caller_result_override: None,
+        shuttle_trace_target: None,
+        shuttle_trace_post_return: None,
         static_locals: HashSet::new(),
         boot_trace_started: None,
         boot_trace_heap: None,
@@ -15964,14 +16362,16 @@ fn compare_values(left: &Value, right: &Value) -> Result<Option<std::cmp::Orderi
 }
 
 fn values_equivalent(left: &Value, right: &Value, heap: &ValueHeap) -> Result<bool, String> {
-    if let (Value::Datum(left), Value::Datum(right)) = (left, right)
+    let left = heap.canonicalize_value(left);
+    let right = heap.canonicalize_value(right);
+    if let (Value::Datum(left), Value::Datum(right)) = (&left, &right)
         && is_matrix_datum(*left, heap)
         && is_matrix_datum(*right, heap)
     {
         return Ok(matrix_components(*left, heap)? == matrix_components(*right, heap)?);
     }
-    let (Value::List(left_id), Value::List(right_id)) = (left, right) else {
-        return Ok(left.semantic_eq(right));
+    let (Value::List(left_id), Value::List(right_id)) = (&left, &right) else {
+        return Ok(left.semantic_eq(&right));
     };
     let left = heap.list(*left_id).map_err(|error| error.to_string())?;
     let right = heap.list(*right_id).map_err(|error| error.to_string())?;
@@ -15981,12 +16381,12 @@ fn values_equivalent(left: &Value, right: &Value, heap: &ValueHeap) -> Result<bo
     for index in 1..=left.len() {
         let left_key = left.get(index).map_err(|error| error.to_string())?;
         let right_key = right.get(index).map_err(|error| error.to_string())?;
-        if !left_key.semantic_eq(right_key) {
+        if !values_equivalent(left_key, right_key, heap)? {
             return Ok(false);
         }
         let left_assoc = left.get_key(left_key).cloned().unwrap_or(Value::Null);
         let right_assoc = right.get_key(right_key).cloned().unwrap_or(Value::Null);
-        if !left_assoc.semantic_eq(&right_assoc) {
+        if !values_equivalent(&left_assoc, &right_assoc, heap)? {
             return Ok(false);
         }
     }
@@ -17175,8 +17575,14 @@ fn validate_jump(target: usize, instruction_count: usize) -> Result<(), String> 
     Ok(())
 }
 
-fn values_equal(left: &Value, right: &Value) -> bool {
-    left.semantic_eq(right)
+fn values_equal(heap: &ValueHeap, left: &Value, right: &Value) -> bool {
+    let left = heap.canonicalize_value(left);
+    let right = heap.canonicalize_value(right);
+    left.semantic_eq(&right)
+}
+
+fn canonicalize_value(heap: &ValueHeap, value: &Value) -> Value {
+    heap.canonicalize_value(value)
 }
 
 fn replace_text_builtin(
@@ -18213,6 +18619,7 @@ fn type_predicate_builtin(
     let value = arguments
         .first()
         .ok_or_else(|| "type predicate requires a value".to_owned())?;
+    let value = heap.canonicalize_value(value);
     match kind {
         TypePredicateKind::IsNull => Ok(matches!(value, Value::Null)),
         TypePredicateKind::IsNum => Ok(matches!(value, Value::Number(_))),
@@ -18226,7 +18633,7 @@ fn type_predicate_builtin(
             let Value::TypePath(target) = target else {
                 return Ok(false);
             };
-            Ok(is_subtype(state, candidate, target))
+            Ok(is_subtype(state, &candidate, target))
         }
         TypePredicateKind::IsList => Ok(matches!(value, Value::List(_))),
         TypePredicateKind::IsMovable => {
@@ -18260,7 +18667,7 @@ fn type_predicate_builtin(
             )),
             Value::Datum(datum) => {
                 let path = heap
-                    .datum(*datum)
+                    .datum(datum)
                     .map_err(|error| error.to_string())?
                     .type_path()
                     .as_str();
@@ -18292,11 +18699,11 @@ fn type_predicate_builtin(
             };
             if let Value::List(list) = value {
                 return Ok(target.as_str() == "/list"
-                    || (target.as_str() == "/alist" && state.is_associative_list(*list)));
+                    || (target.as_str() == "/alist" && state.is_associative_list(list)));
             }
             let candidate = match value {
                 Value::Datum(datum) => heap
-                    .datum(*datum)
+                    .datum(datum)
                     .map_err(|error| error.to_string())?
                     .type_path(),
                 _ => return Ok(false),
@@ -18401,7 +18808,8 @@ fn replace_text_ascii_insensitive(target: &str, needle: &str, replacement: &str)
 }
 
 fn runtime_truthy(heap: &ValueHeap, value: &Value) -> Result<bool, String> {
-    heap.truthy(value).map_err(|error| error.to_string())
+    heap.truthy(&canonicalize_value(heap, value))
+        .map_err(|error| error.to_string())
 }
 
 fn logical_or_empty_list_field(
@@ -18409,6 +18817,7 @@ fn logical_or_empty_list_field(
     receiver: Value,
     name: &FieldName,
 ) -> Result<Value, String> {
+    let receiver = state.heap().canonicalize_value(&receiver);
     let current = match &receiver {
         Value::TypePath(path) => match name.as_str() {
             "type" => Value::TypePath(path.clone()),
@@ -18563,6 +18972,7 @@ fn logical_or_empty_list_index(
     receiver: Value,
     key: Value,
 ) -> Result<Value, String> {
+    let receiver = state.heap().canonicalize_value(&receiver);
     let list = match &receiver {
         Value::List(list) => *list,
         Value::Text(text) => {
@@ -18607,7 +19017,6 @@ fn logical_or_empty_list_index(
                 .and_then(|name| state.global(&name).cloned())
                 .unwrap_or(Value::Null),
             _ => read_list_value(&state.heap, list, &key, false)
-                .cloned()
                 .unwrap_or(Value::Null),
         }
     } else if let Some(datum) = state.datum_vars_proxies.get(&list).copied() {
@@ -18634,12 +19043,11 @@ fn logical_or_empty_list_index(
                 }
             }
             _ => read_list_value(&state.heap, list, &key, false)
-                .cloned()
                 .unwrap_or(Value::Null),
         }
     } else {
         match read_list_value(&state.heap, list, &key, state.is_associative_list(list)) {
-            Ok(value) => value.clone(),
+            Ok(value) => value,
             Err(ValueError::MissingKey) => Value::Null,
             Err(error) => return Err(error.to_string()),
         }
@@ -18831,6 +19239,7 @@ fn dynamic_call_target_named(
     caller_context: &ExecutionContext,
     null_receiver_is_global: bool,
 ) -> Result<(ProcedureId, ExecutionContext), String> {
+    let receiver = state.heap().canonicalize_value(receiver);
     let (base_path, context) = match receiver {
         Value::Null if null_receiver_is_global => (None, caller_context.clone()),
         Value::Null => {
@@ -18840,7 +19249,7 @@ fn dynamic_call_target_named(
             Some(
                 state
                     .heap()
-                    .datum(*datum)
+                    .datum(datum)
                     .map_err(|error| error.to_string())?
                     .type_path()
                     .clone(),
@@ -19229,13 +19638,13 @@ fn read_list_value<'heap>(
     list: ListId,
     key: &Value,
     associative: bool,
-) -> Result<&'heap Value, ValueError> {
+) -> Result<Value, ValueError> {
     let values = heap.list(list)?;
     if matches!(key, Value::Number(_)) && !associative {
         let index = value_to_list_index(key).map_err(ValueError::InvalidListIndex)?;
-        values.get(index)
+        values.get(index).map(|value| canonicalize_value(heap, value))
     } else {
-        values.get_key(key)
+        values.get_key(key).map(|value| canonicalize_value(heap, value))
     }
 }
 
@@ -25092,7 +25501,7 @@ mod tests {
 
         state.heap_mut().destroy_datum(datum).unwrap();
         let stale_error = execute_in_context(&program, &[], &mut state, &context).unwrap_err();
-        assert_eq!(stale_error.message, format!("stale datum handle {datum:?}"));
+        assert_eq!(stale_error.message, "field read received null");
         assert_eq!(stale_error.source_span, Some(span));
     }
 
@@ -26268,10 +26677,150 @@ mod tests {
         let error = execute_in_state(&program, &[Value::List(stale_list)], &mut state)
             .expect_err("a stale handle must never resolve through the VM");
 
-        assert_eq!(error.message, format!("stale list handle {stale_list:?}"));
+        assert_eq!(error.message, "list index operation received null");
         assert_eq!(error.instruction, 2);
         assert_eq!(error.source_span, Some(SourceSpan::new(20, 21)));
         assert_eq!(error.call_stack.len(), 1);
+    }
+
+    #[test]
+    fn list_gc_roots_materialized_args_across_scheduler_yield() {
+        let syntax = parse(concat!(
+            "/proc/work(value)\n",
+            "\tvar/count = args.len\n",
+            "\tsleep(1)\n",
+            "\treturn args[1] + count\n",
+        ))
+        .expect("args GC fixture should parse");
+        let module = compile_module(&syntax.definitions).expect("fixture should compile");
+        let entry = module.procedure_id("/proc/work").unwrap();
+        let mut state = ExecutionState::new();
+        state.next_list_collection = 1;
+
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::number(6.0)], &mut state),
+            Ok(Value::Null),
+        );
+        assert_eq!(state.scheduled_task_count(), 1);
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::number(7.0)]),
+        );
+    }
+
+    #[test]
+    fn stale_list_assignments_treated_as_null_receivers() {
+        let program = manual_program(
+            vec![
+                Instruction::LoadLocal(0),
+                Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+                Instruction::PushNumber(DmNumberBits::from_f32(7.0)),
+                Instruction::SetListIndex,
+                Instruction::Return,
+            ],
+            1,
+        );
+        let mut state = ExecutionState::new();
+        let stale_list = state.heap_mut().allocate_list();
+        state.heap_mut().destroy_list(stale_list).unwrap();
+        let error = execute_in_state(&program, &[Value::List(stale_list)], &mut state)
+            .expect_err("stale list assignments should match null receiver behavior");
+
+        assert_eq!(error.message, "list assignment received null");
+        assert!(error.instruction >= 1 && error.instruction <= 3);
+        assert!(!error.message.contains("stale"));
+    }
+
+    #[test]
+    fn stale_list_keep_assignments_match_null_receiver_behavior() {
+        let syntax = parse(
+            "/proc/run(list/targets)\n\tvar/value = (targets[1] = 7)\n\treturn value",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("module should compile");
+        let entry = module
+            .procedure_id("/proc/run")
+            .expect("entry should exist");
+        let mut state = ExecutionState::new();
+        let stale_list = state.heap_mut().allocate_list();
+        state.heap_mut().destroy_list(stale_list).unwrap();
+
+        let error = execute_module_in_state(&module, entry, &[Value::List(stale_list)], &mut state)
+            .unwrap_err();
+
+        assert_eq!(error.message, "list assignment received null");
+        assert!(!error.message.contains("stale"));
+    }
+
+    #[test]
+    fn stale_list_mutation_treated_as_null_receiver() {
+        let syntax = parse("/proc/run(list/targets)\n\ttargets[1]++\n\treturn 1")
+            .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("module should compile");
+        let mut state = ExecutionState::new();
+        let stale_list = state.heap_mut().allocate_list();
+        state.heap_mut().destroy_list(stale_list).unwrap();
+        let entry = module
+            .procedure_id("/proc/run")
+            .expect("entry should exist");
+
+        let error = execute_module_in_state(&module, entry, &[Value::List(stale_list)], &mut state)
+            .unwrap_err();
+
+        assert_eq!(error.message, "list mutation requires a list, received null");
+        assert!(!error.message.contains("stale"));
+    }
+
+    #[test]
+    fn stale_list_length_treated_as_null() {
+        let syntax = parse("/proc/run(list/targets)\n\treturn length(targets)")
+            .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("module should compile");
+        let entry = module
+            .procedure_id("/proc/run")
+            .expect("entry should exist");
+        let mut state = ExecutionState::new();
+        let stale_list = state.heap_mut().allocate_list();
+        state.heap_mut().destroy_list(stale_list).unwrap();
+
+        let result = execute_module_in_state(&module, entry, &[Value::List(stale_list)], &mut state)
+            .expect("stale list should execute as null in length checks");
+
+        assert_eq!(result, Value::number(0.0));
+    }
+
+    #[test]
+    fn stale_list_prepare_iteration_treated_as_null_receiver() {
+        let syntax = parse("/proc/run(list/items)\n\tvar/total = 0\n\tfor(var/item in items)\n\t\ttotal++\n\treturn total")
+            .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("module should compile");
+        let entry = module
+            .procedure_id("/proc/run")
+            .expect("entry should exist");
+        let mut state = ExecutionState::new();
+        let stale_list = state.heap_mut().allocate_list();
+        state.heap_mut().destroy_list(stale_list).unwrap();
+
+        let result = execute_module_in_state(&module, entry, &[Value::List(stale_list)], &mut state)
+            .expect("stale list should execute as null iterable");
+
+        assert_eq!(result, Value::number(0.0));
+    }
+
+    #[test]
+    fn stale_datum_mutate_field_treated_as_null_receiver() {
+        let syntax = parse(
+            "/proc/run()\n\tvar/obj/target = new /obj\n\tdel(target)\n\ttarget.layer += 1\n\treturn 1",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("module should compile");
+        let entry = module
+            .procedure_id("/proc/run")
+            .expect("entry should exist");
+        let error = execute_module(&module, entry, &[]).unwrap_err();
+
+        assert_eq!(error.message, "field read received null");
+        assert!(!error.message.contains("stale"));
     }
 
     #[test]
@@ -28586,6 +29135,154 @@ mod tests {
             |(instruction, span)| matches!(instruction, Instruction::StoreResult)
                 && *span == assignment_span
         ));
+    }
+
+    #[test]
+    fn stale_datum_ref_reads_as_null_in_vars_and_list_elements() {
+        let syntax = parse(
+            "/proc/run(list/parents)\n\tvar/value = parents[1]\n\tvar/copy = value\n\tif(copy == null)\n\t\treturn 1\n\treturn 0\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("procedure should compile");
+        let entry = module.procedure_id("/proc/run").unwrap();
+        let mut state = ExecutionState::new();
+        let parent = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").unwrap());
+        let parents = state
+            .heap_mut()
+            .allocate_list();
+        state
+            .heap_mut()
+            .list_mut(parents)
+            .unwrap()
+            .add(Value::Datum(parent));
+        state.heap_mut().destroy_datum(parent).unwrap();
+
+        let result = execute_module_in_state(&module, entry, &[Value::List(parents)], &mut state)
+            .unwrap()
+            .as_number();
+        assert_eq!(result, Some(1.0));
+    }
+
+    #[test]
+    fn stale_datum_ref_truthiness_and_null_equality_are_consistent() {
+        let syntax = parse(
+            "/proc/run(list/parents)\n\tif(parents[1])\n\t\treturn 0\n\treturn parents[1] == null\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("procedure should compile");
+        let entry = module.procedure_id("/proc/run").unwrap();
+        let mut state = ExecutionState::new();
+        let parent = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").unwrap());
+        let parents = state
+            .heap_mut()
+            .allocate_list();
+        state
+            .heap_mut()
+            .list_mut(parents)
+            .unwrap()
+            .add(Value::Datum(parent));
+        state.heap_mut().destroy_datum(parent).unwrap();
+
+        let result = execute_module_in_state(&module, entry, &[Value::List(parents)], &mut state)
+            .unwrap()
+            .as_number();
+        assert_eq!(result, Some(1.0));
+    }
+
+    #[test]
+    fn stale_datum_proc_access_reports_null_without_stale_handle_errors() {
+        let syntax = parse(
+            "/datum/example/proc/ping()\n\treturn 7\n/proc/run(list/parents)\n\treturn parents[1].ping()\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("procedure should compile");
+        let entry = module.procedure_id("/proc/run").unwrap();
+        let mut state = ExecutionState::new();
+        let parent = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").unwrap());
+        let parents = state
+            .heap_mut()
+            .allocate_list();
+        state
+            .heap_mut()
+            .list_mut(parents)
+            .unwrap()
+            .add(Value::Datum(parent));
+        state.heap_mut().destroy_datum(parent).unwrap();
+
+        let error = execute_module_in_state(&module, entry, &[Value::List(parents)], &mut state).unwrap_err();
+        assert!(error.message.contains("cannot call a procedure on null"));
+        assert!(!error.message.contains("stale datum"));
+    }
+
+    #[test]
+    fn stale_parent_slot_remains_readable_after_copy_and_list_lookup() {
+        let syntax = parse(
+            "/proc/run(list/parents)\n\tvar/list/cached = parents\n\tif(cached[1] == null)\n\t\treturn 1\n\treturn 0\n",
+        )
+        .expect("source should parse");
+        let module = compile_module(&syntax.definitions).expect("procedure should compile");
+        let entry = module.procedure_id("/proc/run").unwrap();
+        let mut state = ExecutionState::new();
+        let stale_parent = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").unwrap());
+        let parents = state
+            .heap_mut()
+            .allocate_list();
+        state
+            .heap_mut()
+            .list_mut(parents)
+            .unwrap()
+            .add(Value::Datum(stale_parent));
+        state.heap_mut().destroy_datum(stale_parent).unwrap();
+
+        let result = execute_module_in_state(&module, entry, &[Value::List(parents)], &mut state)
+            .unwrap()
+            .as_number();
+        assert_eq!(result, Some(1.0));
+    }
+
+    #[test]
+    fn values_equivalent_treats_nested_stale_refs_as_null() {
+        let mut state = ExecutionState::new();
+        let left_key = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").expect("type path"));
+        let left_value = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").expect("type path"));
+        let left = state.heap_mut().allocate_list();
+        let right = state.heap_mut().allocate_list();
+        let left_result = state
+            .heap_mut()
+            .list_mut(left)
+            .expect("left list should be mutable")
+            .set_key(Value::Datum(left_key), Value::Datum(left_value));
+        assert!(left_result.is_none());
+        let right_result = state
+            .heap_mut()
+            .list_mut(right)
+            .expect("right list should be mutable")
+            .set_key(Value::Null, Value::Null);
+        assert!(right_result.is_none());
+        state.heap_mut().destroy_datum(left_key).unwrap();
+        state.heap_mut().destroy_datum(left_value).unwrap();
+
+        assert!(
+            super::values_equivalent(
+                &Value::List(left),
+                &Value::List(right),
+                state.heap()
+            )
+            .expect("equivalence should be comparable"),
+            "stale key/value entries should be canonicalized to null"
+        );
     }
 
     #[test]
@@ -31412,6 +32109,40 @@ mod tests {
     }
 
     #[test]
+    fn qdel_builtin_is_idempotent_on_stale_reference() {
+        let syntax = parse("/proc/test(v)\n\tqdel(v)\n\tqdel(v)\n\treturn 1")
+            .expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("qdel call should compile");
+        let mut state = ExecutionState::new();
+        let target = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").expect("type path"));
+
+        assert_eq!(
+            execute_in_state(&program, &[Value::Datum(target)], &mut state),
+            Ok(Value::number(1.0))
+        );
+        assert!(state.heap().datum(target).is_err());
+    }
+
+    #[test]
+    fn del_builtin_is_idempotent_on_stale_reference() {
+        let syntax = parse("/proc/test(v)\n\tdel(v)\n\tdel(v)\n\treturn 1")
+            .expect("source should parse");
+        let program = compile_procedure(&syntax.definitions[0]).expect("del call should compile");
+        let mut state = ExecutionState::new();
+        let target = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/example").expect("type path"));
+
+        assert_eq!(
+            execute_in_state(&program, &[Value::Datum(target)], &mut state),
+            Ok(Value::number(1.0))
+        );
+        assert!(state.heap().datum(target).is_err());
+    }
+
+    #[test]
     fn deleted_datum_references_are_false_in_conditions() {
         let syntax = parse("/proc/run(target)\n\tdel(target)\n\treturn !target\n")
             .expect("source should parse");
@@ -33195,13 +33926,9 @@ mod tests {
         let mut state = ExecutionState::new();
         let stale = state.heap_mut().allocate_list();
         state.heap_mut().destroy_list(stale).unwrap();
-        let error =
-            execute_module_in_state(&module, entry, &[Value::List(stale)], &mut state).unwrap_err();
-        assert!(error.message.contains("stale list handle"));
-        assert_eq!(error.call_stack.len(), 2);
-        assert_eq!(error.call_stack[0].procedure, "/proc/run");
-        assert_eq!(error.call_stack[1].procedure, "/proc/max@dream64_builtin");
-        assert!(error.call_stack[1].source_span.is_some());
+        let result =
+            execute_module_in_state(&module, entry, &[Value::List(stale)], &mut state).unwrap();
+        assert_eq!(result, Value::Null);
     }
 
     #[test]

@@ -62,6 +62,19 @@ if ($ProfileStartup) {
 } else {
     Remove-Item Env:DREAM64_PROFILE_STARTUP -ErrorAction SilentlyContinue
 }
+
+# Force non-fatal startup behavior for deterministic boot attempts unless a user
+# explicitly adds one of these strict-mode env vars outside this launcher.
+$startupStrictEnv = @(
+    "DREAM64_STRICT_STARTUP_ERRORS",
+    "DREAM64_FAIL_FAST_STARTUP_ERRORS",
+    "DREAM64_STARTUP_FATAL",
+    "DREAM64_STARTUP_NONFATAL"
+)
+foreach ($var in $startupStrictEnv) {
+    Remove-Item "Env:$var" -ErrorAction SilentlyContinue
+}
+
 try {
     $Host.UI.RawUI.WindowTitle = "Dream64 - Monkestation Headless Boot $BootNumber"
 } catch {
@@ -70,7 +83,12 @@ try {
     Write-Warning "Could not set the console title: $($_.Exception.Message)"
 }
 
-Clear-Host
+try {
+    Clear-Host
+} catch {
+    # Redirected and headless hosts can expose RawUI without a valid console
+    # handle. Clearing the dashboard is cosmetic and must not block boot.
+}
 Write-Host ""
 Write-Host "  DREAM64" -ForegroundColor Cyan -NoNewline
 Write-Host "  /  MONKESTATION HEADLESS" -ForegroundColor White

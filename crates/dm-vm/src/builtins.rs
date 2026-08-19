@@ -3066,13 +3066,14 @@ fn qdel_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value
         return Ok(Value::Null);
     }
     for argument in arguments {
-        qdel_value(argument, state).map_err(|error| format!("qdel failed: {error}"))?;
+        let argument = state.heap.canonicalize_value(argument);
+        qdel_value(&argument, state).map_err(|error| format!("qdel failed: {error}"))?;
     }
     Ok(Value::Null)
 }
 
 fn del_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
-    match &arguments[0] {
+    match &state.heap.canonicalize_value(&arguments[0]) {
         Value::Null => {}
         Value::Datum(datum) => {
             unregister_runtime_datum(state, *datum)?;
@@ -3094,7 +3095,7 @@ fn del_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value,
 }
 
 fn qdel_value(value: &Value, state: &mut ExecutionState) -> Result<(), String> {
-    match value {
+    match &state.heap.canonicalize_value(value) {
         Value::Null => Ok(()),
         Value::Number(_)
         | Value::Text(_)
@@ -5039,19 +5040,19 @@ fn step_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value
             Value::Datum(datum) => Some(*datum),
             _ => None,
         });
-    if old_loc != Some(turf) {
-        synchronize_moved_atom_contents(state, atom, old_loc, Some(turf))?;
-    }
     for (name, value) in [
         ("x", Value::number(target.0)),
         ("y", Value::number(target.1)),
         ("z", Value::number(target.2)),
         ("loc", Value::Datum(turf)),
     ] {
-        state
-            .heap
-            .set_datum_field(atom, FieldName::parse(name).expect("movement field"), value)
-            .map_err(|error| error.to_string())?;
+            state
+                .heap
+                .set_datum_field(atom, FieldName::parse(name).expect("movement field"), value)
+                .map_err(|error| error.to_string())?;
+    }
+    if old_loc != Some(turf) {
+        synchronize_moved_atom_contents(state, atom, old_loc, Some(turf))?;
     }
     Ok(Value::number(1.0))
 }
@@ -6069,9 +6070,6 @@ pub(super) fn move_movable_to_turf(
             Value::Datum(datum) => Some(*datum),
             _ => None,
         });
-    if old_loc != Some(turf) {
-        synchronize_moved_atom_contents(state, movable, old_loc, Some(turf))?;
-    }
     let coordinates =
         ["x", "y", "z"].map(|name| FieldName::parse(name).expect("built-in coordinate field"));
     let values = coordinates
@@ -6093,6 +6091,9 @@ pub(super) fn move_movable_to_turf(
             .heap
             .set_datum_field(movable, field, value)
             .map_err(|error| error.to_string())?;
+    }
+    if old_loc != Some(turf) {
+        synchronize_moved_atom_contents(state, movable, old_loc, Some(turf))?;
     }
     Ok(())
 }
@@ -6119,13 +6120,13 @@ pub(super) fn move_movable_to_atom(
             Value::Datum(datum) => Some(*datum),
             _ => None,
         });
-    if old_loc != Some(location) {
-        synchronize_moved_atom_contents(state, movable, old_loc, Some(location))?;
-    }
     state
         .heap
         .set_datum_field(movable, loc, Value::Datum(location))
         .map_err(|error| error.to_string())?;
+    if old_loc != Some(location) {
+        synchronize_moved_atom_contents(state, movable, old_loc, Some(location))?;
+    }
     Ok(())
 }
 

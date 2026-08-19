@@ -241,6 +241,57 @@ fn headless_boot_drains_spawned_startup_work_to_stable_idle() {
 }
 
 #[test]
+fn headless_boot_continues_on_startup_scheduler_failure() {
+    let types = concat!(
+        "var/global/trace = 0\n",
+        "/proc/fail_startup()\n",
+        "\tCRASH(\"isolated\")\n",
+        "/proc/finish_startup()\n",
+        "\tglobal.trace = 7\n",
+        "/world/New()\n",
+        "\tspawn(1)\n",
+        "\t\tfail_startup()\n",
+        "\tspawn(2)\n",
+        "\t\tfinish_startup()\n",
+        "/turf/boot\n/area/boot\n",
+    );
+    let map = "\"a\" = (/turf/boot, /area/boot)\n(1,1,1) = {\"\na\n\"}\n";
+    let (_project, compilation, map_source) = TestProject::compile(types, map);
+    let procedures = ProcedureRegistry::build(&compilation);
+    let mut runtime = RuntimeImage::from_compilation(&compilation).expect("runtime should build");
+    let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
+    let world = build_plan(&parse(&map_source).expect("map should parse"), &compilation);
+    let plan = build_initialization_plan(&runtime, &index, &world, "boot.dmm");
+    let allocation = allocate_world(&world, &mut runtime).expect("world should allocate");
+
+    let execution = execute_initialization_plan(
+        &compilation,
+        &procedures,
+        &index,
+        &plan,
+        &allocation,
+        &mut runtime,
+    )
+    .expect("startup task failure should not abort boot");
+
+    assert_eq!(execution.scheduler.failed_tasks, 1);
+    assert_eq!(
+        execution.scheduler.termination,
+        SchedulerDrainTermination::StableIdle
+    );
+    assert_eq!(execution.scheduler.pending_tasks, 0);
+    assert_eq!(execution.scheduler.completed_tasks, 1);
+    let trace = runtime
+        .variables()
+        .iter()
+        .find(|variable| variable.path.ends_with("/trace"))
+        .unwrap_or_else(|| panic!("trace global should exist"))
+        .value
+        .clone();
+    assert_eq!(trace, Value::number(7.0));
+}
+
+#[test]
 fn headless_boot_reports_pending_work_at_scheduler_tick_limit() {
     let types = concat!(
         "/world/New()\n",

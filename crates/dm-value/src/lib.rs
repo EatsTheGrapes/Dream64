@@ -216,6 +216,32 @@ impl Value {
     }
 }
 
+impl ValueHeap {
+    /// Canonicalizes stale heap references to `null`.
+    ///
+    /// Heap handles must remain stable internally for identity, but DM-visible
+    /// semantics must treat deleted datums and lists as null-like values. This
+    /// helper preserves internals while converting only externally observed liveness
+    /// failures to `Value::Null`.
+    pub fn canonicalize_value(&self, value: &Value) -> Value {
+        match value {
+            Value::Datum(datum) => {
+                self.datum(*datum)
+                    .is_ok()
+                    .then_some(value.clone())
+                    .unwrap_or(Value::Null)
+            }
+            Value::List(list) => {
+                self.list(*list)
+                    .is_ok()
+                    .then_some(value.clone())
+                    .unwrap_or(Value::Null)
+            }
+            _ => value.clone(),
+        }
+    }
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         self.semantic_eq(other)
@@ -4636,5 +4662,44 @@ mod tests {
         assert!(heap.list(held).is_ok());
         assert!(heap.datum(replacement).is_err());
         assert!(heap.list(garbage).is_err());
+    }
+
+    #[test]
+    fn canonicalize_deleted_datum_and_list_refs_are_null() {
+        let mut heap = ValueHeap::new();
+        let datum = heap.allocate_datum(TypePath::parse("/datum/example").unwrap());
+        let list = heap.allocate_list();
+        let value = Value::Datum(datum);
+        heap.destroy_datum(datum).unwrap();
+        assert_eq!(heap.canonicalize_value(&value), Value::Null);
+        let value = Value::List(list);
+        heap.destroy_list(list).unwrap();
+        assert_eq!(heap.canonicalize_value(&Value::List(list)), Value::Null);
+        assert_eq!(heap.canonicalize_value(&value), Value::Null);
+    }
+
+    #[test]
+    fn canonicalize_deleted_refs_equal_null_and_are_falsy() {
+        let mut heap = ValueHeap::new();
+        let datum = heap.allocate_datum(TypePath::parse("/datum/example").unwrap());
+        let copied = Value::Datum(datum);
+        heap.destroy_datum(datum).unwrap();
+        assert!(matches!(heap.canonicalize_value(&copied), Value::Null));
+        assert_eq!(heap.truthy(&copied).unwrap(), false);
+        assert_eq!(heap.canonicalize_value(&copied), Value::Null);
+    }
+
+    #[test]
+    fn canonicalized_list_keys_preserve_associative_key_lookup_identity() {
+        let mut heap = ValueHeap::new();
+        let list = heap.allocate_list();
+        let stale_key = heap.allocate_datum(TypePath::parse("/datum/example").unwrap());
+        let stored_value = Value::number(7.0);
+        heap.list_mut(list)
+            .unwrap()
+            .set_key(Value::Datum(stale_key), stored_value.clone());
+        heap.destroy_datum(stale_key).unwrap();
+        let lookup = Value::Datum(stale_key);
+        assert_eq!(heap.list(list).unwrap().get_key(&lookup), Ok(&stored_value));
     }
 }

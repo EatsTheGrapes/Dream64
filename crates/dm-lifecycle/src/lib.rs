@@ -6,6 +6,7 @@
 pub mod artifact;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::sync::Arc;
 
 use dm_compiler::Compilation;
@@ -857,8 +858,8 @@ pub struct SchedulerDrain {
     /// Number of persistent scheduled threads terminated by an isolated
     /// runtime error during this drain.
     ///
-    /// Startup drains remain fail-fast and therefore never report failures in
-    /// this field.
+    /// Startup drains continue by default and report any startup-thread
+    /// failure in this field.
     pub failed_tasks: usize,
     /// Tasks still pending when draining stopped.
     pub pending_tasks: usize,
@@ -1578,8 +1579,7 @@ fn execute_initialization_plan_with_executable(
                 &ExecutionContext::new(Value::Datum(datum), Value::Null),
             ) {
                 Ok(value) => value,
-                Err(error)
-                    if collect_runtime_errors && matches!(subject, EventSubject::MapAtom(_)) =>
+                Err(error) if collect_runtime_errors && matches!(subject, EventSubject::MapAtom(_)) =>
                 {
                     failed_datums.insert(datum);
                     let key = format!("{}: {error}", target.procedure_path);
@@ -1642,8 +1642,12 @@ fn execute_initialization_plan_with_executable(
             let released = state.release_host_value_roots();
             eprintln!("boot-progress: released consumed host result roots={released}");
         }
-        result.scheduler =
-            drain_startup_scheduler(executable.module(), &mut state, scheduler_limits, readiness)?;
+        result.scheduler = drain_startup_scheduler(
+            executable.module(),
+            &mut state,
+            scheduler_limits,
+            readiness,
+        )?;
         Ok(result)
     })();
     if execution.is_ok()
@@ -1685,13 +1689,33 @@ fn drain_startup_scheduler(
             break;
         }
         let advance = next_tick.saturating_sub(state.scheduler_tick());
-        let completed = advance_scheduler(module, advance, ExecutionLimits::default(), state)
-            .map_err(InitializationExecutionError::Scheduler)?;
-        drain.rounds += 1;
-        drain.completed_tasks += completed.len();
-        drop(completed);
+        match advance_scheduler(module, advance, ExecutionLimits::default(), state) {
+            Ok(completed) => {
+                drain.rounds += 1;
+                drain.completed_tasks += completed.len();
+                drop(completed);
+            }
+            Err(error) => {
+                if startup_fail_fast_on_error() {
+                    return Err(InitializationExecutionError::Scheduler(error));
+                }
+                drain.rounds += 1;
+                drain.failed_tasks = drain.failed_tasks.saturating_add(1);
+                eprintln!("startup-runtime: isolated scheduled thread failure (continuing): {error}");
+            }
+        }
         state.release_host_value_roots();
         drain.final_tick = state.scheduler_tick();
+        if drain.rounds == 1 || drain.rounds % 1000 == 0 {
+            eprintln!(
+                "boot-progress: startup-scheduler slice={} tick={} completed={} failed={} pending={}",
+                drain.rounds,
+                drain.final_tick,
+                drain.completed_tasks,
+                drain.failed_tasks,
+                state.scheduled_task_count()
+            );
+        }
     }
     drain.pending_tasks = state.scheduled_task_count();
     if readiness.is_some_and(|probe| readiness_probe_matches(state, probe)) {
@@ -1708,6 +1732,16 @@ fn drain_startup_scheduler(
         drain.pending_tasks
     );
     Ok(drain)
+}
+
+fn startup_fail_fast_on_error() -> bool {
+    static STARTUP_CONTINUE: std::sync::OnceLock<bool> =
+        std::sync::OnceLock::new();
+    *STARTUP_CONTINUE.get_or_init(|| {
+        env::var_os("DREAM64_STRICT_STARTUP_ERRORS").is_some()
+            || env::var_os("DREAM64_FAIL_FAST_STARTUP_ERRORS").is_some()
+            || env::var_os("DREAM64_STARTUP_FATAL").is_some()
+    })
 }
 
 /// Advances persistent scheduled server work in a bounded host-loop slice.
