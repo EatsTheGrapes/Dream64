@@ -108,13 +108,17 @@ fn builtin_mob_defaults() -> [(&'static str, Value); 9] {
     ]
 }
 
-fn builtin_client_defaults() -> [(&'static str, Value); 12] {
+fn builtin_client_defaults() -> [(&'static str, Value); 16] {
     [
         ("control_freak", Value::number(0.0)),
         ("dir", Value::number(2.0)),
         ("eye", Value::Null),
         ("gender", Value::text("neuter")),
         ("inactivity", Value::number(0.0)),
+        ("key", Value::Null),
+        ("ckey", Value::Null),
+        ("address", Value::Null),
+        ("computer_id", Value::Null),
         ("mob", Value::Null),
         ("perspective", Value::number(0.0)),
         ("pixel_x", Value::number(0.0)),

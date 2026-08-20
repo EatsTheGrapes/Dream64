@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use dm_compiler::{Compilation, CompilerDatabase};
+use dm_lifecycle::ipc::{LoopbackIpc, parse_loopback_address};
 use dm_lifecycle::{
     HeadlessReadinessProbe, LifecycleIndex, LifecycleKind, LifecycleResolution,
     SchedulerDrainLimits, SchedulerDrainTermination, advance_persistent_scheduler,
@@ -459,6 +460,17 @@ fn run_main() -> ExitCode {
             return ExitCode::FAILURE;
         }
         eprintln!("boot-progress: headless ready; entering persistent scheduler loop");
+        let ipc_address =
+            env::var("DREAM64_IPC_ADDR").unwrap_or_else(|_| "127.0.0.1:51664".to_owned());
+        let mut ipc_address = match parse_loopback_address(&ipc_address).and_then(LoopbackIpc::bind)
+        {
+            Ok(ipc) => ipc,
+            Err(error) => {
+                eprintln!("loopback IPC: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        eprintln!("server-progress: loopback-ipc={}", ipc_address.local_addr());
         let max_slices = env::var_os("DREAM64_BOOT_MAX_SLICES")
             .and_then(|limit| {
                 limit
@@ -475,6 +487,7 @@ fn run_main() -> ExitCode {
         loop {
             let slice_started = Instant::now();
             let tick_duration = precompiled.persistent_tick_duration();
+            ipc_address.apply_lifecycle_tick_boundary(precompiled);
             let scheduler = match advance_persistent_scheduler(
                 precompiled,
                 &mut runtime,
@@ -546,9 +559,10 @@ fn prepare_compiled_executable(
     // trust the heavyweight executable. On a warm boot this is the only
     // non-artifact project load and does not lex, parse, build an object tree,
     // lower a body, or construct runtime state.
-    let (project, project_snapshot_hit) = Project::load_cached_exact(environment, cache_file)
-        .map_err(|error| format!("project snapshot: {error}"))?;
-    let project_fingerprint = *project.content_fingerprint().as_bytes();
+    let (project, project_snapshot_hit, project_fingerprint) =
+        Project::load_cached_exact_with_fingerprint(environment, cache_file)
+            .map_err(|error| format!("project snapshot: {error}"))?;
+    let project_fingerprint = *project_fingerprint.as_bytes();
     let miss_reason = if project_snapshot_hit {
         match decode_compiled_executable(artifact_file, project_fingerprint) {
             Ok((compilation, executable)) => {

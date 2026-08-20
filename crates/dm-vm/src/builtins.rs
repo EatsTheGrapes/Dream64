@@ -24,14 +24,208 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use dm_dmf::UiCommand;
 use dm_value::{DatumId, FieldName, ListId, TypePath, Value};
 
 use super::{
-    CompoundAssignmentOperator, ExecutionState, NativeWalk, NativeWalkKind, compare_values,
+    CompoundAssignmentOperator, ExecutionState, LocalClientUiEvent, NativeWalk, NativeWalkKind,
+    compare_values,
 };
+use crate::worker_lane::{
+    AtmosCompareResult, AtmosCompareSnapshot, AtmosGasSample, compare_atmos_batch,
+};
+
+fn atmos_field(name: &str) -> FieldName {
+    FieldName::parse(name).expect("atmos built-in field is valid")
+}
+
+fn atmos_setup_differences(
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
+    let (Value::List(difference_check), Value::List(active_turfs)) = (&arguments[0], &arguments[1])
+    else {
+        return Err("atmos difference batch requires turf and active lists".to_owned());
+    };
+    let thresholds = (
+        number(&arguments[2], "minimum moles delta")?,
+        number(&arguments[3], "minimum air ratio")?,
+        number(&arguments[4], "minimum temperature delta")?,
+    );
+    let turfs = state
+        .heap()
+        .list(*difference_check)
+        .map_err(|e| e.to_string())?
+        .positions()
+        .filter_map(|(_, value)| match value {
+            Value::Datum(id) => Some(*id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let positions = turfs
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i))
+        .collect::<HashMap<_, _>>();
+    let adjacent_field = atmos_field("atmos_adjacent_turfs");
+    let air_field = atmos_field("air");
+    let cycle_field = atmos_field("current_cycle");
+    let mut owners = Vec::new();
+    let mut jobs = Vec::new();
+    for (potential_index, potential) in turfs.iter().copied().enumerate() {
+        let Ok(Value::Datum(potential_air)) =
+            super::datum_field_or_initial(state, potential, &air_field)
+        else {
+            continue;
+        };
+        let Ok(Value::List(adjacent)) =
+            super::datum_field_or_initial(state, potential, &adjacent_field)
+        else {
+            continue;
+        };
+        let enemies = state
+            .heap()
+            .list(adjacent)
+            .map_err(|e| e.to_string())?
+            .positions()
+            .filter_map(|(_, value)| match value {
+                Value::Datum(id) => Some(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for enemy in enemies {
+            if positions
+                .get(&enemy)
+                .is_some_and(|index| *index < potential_index)
+            {
+                continue;
+            }
+            if super::datum_field_or_initial(state, enemy, &cycle_field)
+                .ok()
+                .and_then(|v| v.as_number())
+                == Some(f32::NEG_INFINITY)
+            {
+                continue;
+            }
+            let Ok(Value::Datum(enemy_air)) =
+                super::datum_field_or_initial(state, enemy, &air_field)
+            else {
+                continue;
+            };
+            jobs.push(atmos_compare_snapshot(
+                state,
+                potential_air,
+                enemy_air,
+                thresholds,
+            )?);
+            owners.push((potential_index, potential, enemy));
+        }
+    }
+    let workers = std::env::var("DREAM64_ATMOS_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+    let results = compare_atmos_batch(&jobs, workers);
+    let excited_field = atmos_field("excited");
+    let mut activated = HashSet::new();
+    for ((potential_index, potential, enemy), result) in owners.into_iter().zip(results) {
+        if matches!(result, AtmosCompareResult::Compatible) || !activated.insert(potential_index) {
+            continue;
+        }
+        for turf in [potential, enemy] {
+            let excited = super::datum_field_or_initial(state, turf, &excited_field)
+                .ok()
+                .is_some_and(|v| super::runtime_truthy(state.heap(), &v).unwrap_or(false));
+            if !excited {
+                state
+                    .heap_mut()
+                    .set_datum_field(turf, excited_field.clone(), Value::number(1.0))
+                    .map_err(|e| e.to_string())?;
+                state
+                    .heap_mut()
+                    .list_mut(*active_turfs)
+                    .map_err(|e| e.to_string())?
+                    .add(Value::Datum(turf));
+            }
+        }
+    }
+    for turf in turfs {
+        state
+            .heap_mut()
+            .set_datum_field(turf, cycle_field.clone(), Value::number(f32::NEG_INFINITY))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(Value::Null)
+}
+
+fn atmos_compare_snapshot(
+    state: &ExecutionState,
+    cached: DatumId,
+    sample: DatumId,
+    thresholds: (f32, f32, f32),
+) -> Result<AtmosCompareSnapshot, String> {
+    let gases_field = atmos_field("gases");
+    let temperature_field = atmos_field("temperature");
+    let Ok(Value::List(cached_gases)) = super::datum_field_or_initial(state, cached, &gases_field)
+    else {
+        return Err("cached gases is not a list".to_owned());
+    };
+    let Ok(Value::List(sample_gases)) = super::datum_field_or_initial(state, sample, &gases_field)
+    else {
+        return Err("sample gases is not a list".to_owned());
+    };
+    let cached_values = state.heap().list(cached_gases).map_err(|e| e.to_string())?;
+    let sample_values = state.heap().list(sample_gases).map_err(|e| e.to_string())?;
+    let mut keys = cached_values
+        .positions()
+        .map(|(_, key)| key.clone())
+        .collect::<Vec<_>>();
+    for (_, key) in sample_values.positions() {
+        if !keys.iter().any(|candidate| candidate.semantic_eq(key)) {
+            keys.push(key.clone());
+        }
+    }
+    let gas_value = |list: ListId, key: &Value| {
+        state
+            .heap()
+            .list(list)
+            .ok()
+            .and_then(|v| v.get_key(key).ok())
+            .and_then(|v| match v {
+                Value::List(id) => state.heap().list(*id).ok(),
+                _ => None,
+            })
+            .and_then(|v| v.get(1).ok())
+            .and_then(Value::as_number)
+            .unwrap_or(0.0)
+    };
+    let gases = keys
+        .into_iter()
+        .map(|key| AtmosGasSample {
+            id: Arc::from(key.to_string()),
+            cached: gas_value(cached_gases, &key),
+            sample: gas_value(sample_gases, &key),
+        })
+        .collect();
+    let temperature = |datum| {
+        super::datum_field_or_initial(state, datum, &temperature_field)
+            .ok()
+            .and_then(|v| v.as_number())
+            .unwrap_or(0.0)
+    };
+    Ok(AtmosCompareSnapshot {
+        gases,
+        cached_temperature: temperature(cached),
+        sample_temperature: temperature(sample),
+        minimum_moles_delta: thresholds.0,
+        minimum_air_ratio: thresholds.1,
+        minimum_temperature_delta: thresholds.2,
+    })
+}
 
 pub(super) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
     Some(match name {
+        "_dream64_atmos_setup_differences" => (5, 5),
         "abs" | "ceil" | "floor" | "fract" | "trunc" | "sign" | "sqrt" | "sin" | "cos" | "tan"
         | "arcsin" | "arccos" | "length_char" | "lowertext" | "uppertext" | "trimtext"
         | "ascii2text" | "text2path" | "isinf" | "isnan" | "ckey" | "fexists" | "file2text"
@@ -130,6 +324,7 @@ pub(super) fn execute_standard_builtin_with_usr(
     usr: &Value,
 ) -> Result<Value, String> {
     match name {
+        "_dream64_atmos_setup_differences" => atmos_setup_differences(arguments, state),
         // Headless input has no interactive client. Preserve BYOND's supplied
         // default (the fourth positional argument), or null when absent.
         "input" => Ok(arguments.get(3).cloned().unwrap_or(Value::Null)),
@@ -187,7 +382,7 @@ pub(super) fn execute_standard_builtin_with_usr(
         "browse" => headless_browse(arguments, state),
         "browse_rsc" => headless_transfer("browse_rsc", arguments, state),
         "ftp" => headless_transfer("ftp", arguments, state),
-        "winset" => headless_winset(arguments, state),
+        "winset" => headless_winset(arguments, state, usr),
         "winshow" => headless_winshow(arguments, state),
         "winclone" => headless_winclone(arguments, state),
         "winget" => headless_winget(arguments, state),
@@ -635,7 +830,9 @@ pub(super) fn execute_external_call(
             )))
         }
         "iconforge_cleanup" if arguments.is_empty() => {
-            state.clear_iconforge();
+            // rust-g's cleanup releases rendered icon/image caches. Loaded
+            // GAGS configurations and outstanding async jobs remain valid.
+            // The headless VM has no rendered cache to release here.
             Ok(Value::Null)
         }
         "iconforge_cache_valid" if arguments.len() == 3 => Ok(Value::text(
@@ -2495,9 +2692,31 @@ fn rust_g_hash_file(arguments: &[Value], state: &ExecutionState) -> Result<Value
             "hash_file algorithm {algorithm:?} is unavailable in the Dream64 host"
         ));
     }
-    let path = relaxed_resolved_file_path(&arguments[1..], state, "hash_file path")?;
-    let bytes = fs::read(&path)
-        .map_err(|error| format!("hash_file failed to read '{}': {error}", path.display()))?;
+    // Native BYOND extension arguments are stringified at the DLL boundary.
+    // In particular, an `/icon` backed by a resource is passed to rust-g as
+    // that resource path. Preserve the datum distinction internally, then
+    // unwrap it for this file-taking external call.
+    let icon_argument = matches!(&arguments[1], Value::Datum(_));
+    let path_argument = match &arguments[1] {
+        Value::Datum(_) => icon_backing_resource(&arguments[1], state, 0)?,
+        value => value.clone(),
+    };
+    let path = relaxed_resolved_file_path(&[path_argument], state, "hash_file path")?;
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        // Headless icon composition preserves the intended backing resource
+        // path but does not rasterize generated spritesheets to disk. Keep
+        // cache keys stable for those virtual icon resources.
+        Err(error) if icon_argument && error.kind() == std::io::ErrorKind::NotFound => {
+            path.to_string_lossy().as_bytes().to_vec()
+        }
+        Err(error) => {
+            return Err(format!(
+                "hash_file failed to read '{}': {error}",
+                path.display()
+            ));
+        }
+    };
     Ok(Value::text(format!("{:x}", md5::compute(bytes))))
 }
 
@@ -3588,20 +3807,62 @@ fn headless_transfer(
     Ok(Value::List(descriptor))
 }
 
-fn headless_winset(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
-    let Some(Value::Datum(client)) = arguments.first() else {
+fn local_client_for_value(state: &ExecutionState, value: &Value) -> Option<DatumId> {
+    let Value::Datum(datum) = value else {
+        return None;
+    };
+    if state.client_session(*datum).is_some() {
+        return Some(*datum);
+    }
+    let client = FieldName::parse("client").expect("engine client field");
+    let Value::Datum(client) = state.heap.datum_field(*datum, &client).ok()? else {
+        return None;
+    };
+    state.client_session(*client).is_some().then_some(*client)
+}
+
+fn headless_winset(
+    arguments: &[Value],
+    state: &mut ExecutionState,
+    usr: &Value,
+) -> Result<Value, String> {
+    let Some(client) = arguments
+        .first()
+        .and_then(|value| local_client_for_value(state, value))
+        .or_else(|| local_client_for_value(state, usr))
+    else {
         // BYOND accepts null when no client is available; a headless server
         // has no window to mutate in that case.
         return Ok(Value::Null);
     };
+    if let (Some(control), Some(parameters), Some(session)) = (
+        arguments.get(1).and_then(value_text),
+        arguments.get(2).and_then(value_text),
+        state.client_session_mut(client),
+    ) {
+        session
+            .apply_command(UiCommand::WinSet {
+                control: control.to_owned(),
+                parameters: parameters.to_owned(),
+            })
+            .map_err(|error| format!("client UI winset failed: {error:?}"))?;
+        state.emit_local_client_ui_event(
+            client,
+            LocalClientUiEvent::Winset {
+                control: control.to_owned(),
+                parameters: parameters.to_owned(),
+            },
+        );
+        return Ok(Value::Null);
+    }
     let field = FieldName::parse("_dream64_winset").expect("headless UI field is valid");
-    let settings = match state.heap.datum_field(*client, &field) {
+    let settings = match state.heap.datum_field(client, &field) {
         Ok(Value::List(settings)) => *settings,
         _ => {
             let settings = state.heap.allocate_list();
             state
                 .heap
-                .set_datum_field(*client, field, Value::List(settings))
+                .set_datum_field(client, field, Value::List(settings))
                 .map_err(|error| error.to_string())?;
             settings
         }
@@ -3620,6 +3881,18 @@ fn headless_winshow(arguments: &[Value], state: &mut ExecutionState) -> Result<V
     let Some(Value::Datum(client)) = arguments.first() else {
         return Ok(Value::Null);
     };
+    if let (Some(control), Some(session)) = (
+        arguments.get(1).and_then(value_text),
+        state.client_session_mut(*client),
+    ) {
+        session
+            .apply_command(UiCommand::WinShow {
+                control: control.to_owned(),
+                visible: arguments.get(2).is_none_or(truthy),
+            })
+            .map_err(|error| format!("client UI winshow failed: {error:?}"))?;
+        return Ok(Value::Null);
+    }
     let field = FieldName::parse("_dream64_winshow").expect("headless UI field");
     let settings = match state.heap.datum_field(*client, &field) {
         Ok(Value::List(list)) => *list,
@@ -3651,6 +3924,19 @@ fn headless_winclone(arguments: &[Value], state: &mut ExecutionState) -> Result<
     let [Value::Datum(client), source, destination] = arguments else {
         return Ok(Value::number(0.0));
     };
+    if let (Some(source), Some(destination), Some(session)) = (
+        value_text(source),
+        value_text(destination),
+        state.client_session_mut(*client),
+    ) {
+        session
+            .apply_command(UiCommand::WinClone {
+                source: source.to_owned(),
+                destination: destination.to_owned(),
+            })
+            .map_err(|error| format!("client UI winclone failed: {error:?}"))?;
+        return Ok(Value::number(1.0));
+    }
     let field = FieldName::parse("_dream64_winset").expect("headless UI field");
     let Some(Value::List(settings)) = state.heap.datum_field(*client, &field).ok().cloned() else {
         return Ok(Value::number(0.0));
@@ -3678,6 +3964,17 @@ fn headless_winget(arguments: &[Value], state: &ExecutionState) -> Result<Value,
         [Value::Datum(client), control, property] => (*client, control, property),
         _ => return Ok(Value::text("")),
     };
+    if let (Some(control), Some(property), Some(session)) = (
+        value_text(control),
+        value_text(property),
+        state.client_session(client),
+    ) {
+        return session
+            .ui()
+            .winget(control, property)
+            .map(Value::text)
+            .map_err(|error| format!("client UI winget failed: {error:?}"));
+    }
     let Some(Value::List(settings)) = state
         .heap
         .datum_field(
@@ -3715,6 +4012,16 @@ fn headless_winexists(arguments: &[Value], state: &ExecutionState) -> Result<Val
     let Some(Value::Datum(client)) = arguments.first() else {
         return Ok(Value::number(0.0));
     };
+    if let (Some(control), Some(session)) = (
+        arguments.get(1).and_then(value_text),
+        state.client_session(*client),
+    ) {
+        return Ok(Value::number(if session.ui().winexists(control) {
+            1.0
+        } else {
+            0.0
+        }));
+    }
     let control = arguments.get(1).cloned().unwrap_or(Value::Null);
     let exists = state
         .heap
@@ -4480,6 +4787,17 @@ pub(super) fn datum_coordinates(state: &ExecutionState, value: &Value) -> Option
     let Value::Datum(original) = value else {
         return None;
     };
+    if state
+        .heap
+        .datum(*original)
+        .is_ok_and(|datum| super::is_area_type_path(datum.type_path()))
+    {
+        return state
+            .world_areas
+            .iter()
+            .find_map(|(coordinate, area)| (*area == *original).then_some(*coordinate))
+            .map(|(x, y, z)| (x as f32, y as f32, z as f32));
+    }
     // BYOND spatial builtins use the containing turf for objects nested in
     // mobs, items, closets, and other movable containers. Their own x/y/z
     // fields may still contain zero or a stale former turf coordinate. Follow
@@ -5046,10 +5364,10 @@ fn step_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Value
         ("z", Value::number(target.2)),
         ("loc", Value::Datum(turf)),
     ] {
-            state
-                .heap
-                .set_datum_field(atom, FieldName::parse(name).expect("movement field"), value)
-                .map_err(|error| error.to_string())?;
+        state
+            .heap
+            .set_datum_field(atom, FieldName::parse(name).expect("movement field"), value)
+            .map_err(|error| error.to_string())?;
     }
     if old_loc != Some(turf) {
         synchronize_moved_atom_contents(state, atom, old_loc, Some(turf))?;
@@ -5419,7 +5737,8 @@ pub(super) fn synchronize_moved_atom_contents(
             .map_err(|error| error.to_string())?
             .remove_first(&Value::Datum(atom));
     }
-    if let Some(list) = new_loc.and_then(|container| contents_list(state, container)) {
+    if let Some(container) = new_loc.filter(|container| *container != atom) {
+        let list = state.ensure_contents(container)?;
         state
             .heap
             .list_mut(list)
@@ -5618,6 +5937,17 @@ fn list_operator_snapshot(
     let list = state.heap.list(list).map_err(|error| error.to_string())?;
     Ok(list
         .positions()
+        // A destroyed engine object can remain as an invalid arena handle in
+        // a long-lived bookkeeping list until its owning DM subsystem removes
+        // it. Never propagate that handle into a newly constructed list: it
+        // would canonicalize to null only when the consumer iterates it. This
+        // distinction preserves an explicitly stored DM null while keeping
+        // list union/addition results free of dead object references.
+        .filter(|(_, key)| match key {
+            Value::Datum(datum) => state.heap.datum(*datum).is_ok(),
+            Value::List(nested) => state.heap.list(*nested).is_ok(),
+            _ => true,
+        })
         .map(|(_, key)| {
             let associated = list.get_key(key).ok().cloned();
             ListOperatorEntry {
@@ -6103,6 +6433,26 @@ pub(super) fn move_movable_to_atom(
     movable: DatumId,
     location: DatumId,
 ) -> Result<(), String> {
+    // BYOND does not permit a movable to contain itself, directly or through
+    // one of its descendants. Besides corrupting contents, such a cycle makes
+    // recursive movement notifications recurse forever.
+    let loc = FieldName::parse("loc").expect("built-in loc field");
+    let mut cursor = Some(location);
+    let mut visited = HashSet::new();
+    while let Some(container) = cursor {
+        if container == movable || !visited.insert(container) {
+            return Ok(());
+        }
+        cursor = state
+            .heap
+            .datum_field(container, &loc)
+            .ok()
+            .and_then(|value| match value {
+                Value::Datum(parent) => Some(*parent),
+                _ => None,
+            });
+    }
+
     let location_is_turf = state.heap.datum(location).is_ok_and(|datum| {
         let path = datum.type_path().as_str();
         path == "/turf" || path.starts_with("/turf/")
@@ -6111,7 +6461,6 @@ pub(super) fn move_movable_to_atom(
         return move_movable_to_turf(state, movable, location);
     }
 
-    let loc = FieldName::parse("loc").expect("built-in loc field");
     let old_loc = state
         .heap
         .datum_field(movable, &loc)
@@ -6865,6 +7214,98 @@ pub(super) fn execute_output(
     state: &mut ExecutionState,
 ) -> Result<(), String> {
     if let Value::Datum(target) = target {
+        let routed_client = local_client_for_value(state, &Value::Datum(*target));
+        if let Some(target) = routed_client
+            && let Value::Datum(descriptor) = value
+            && state.heap.datum(*descriptor).is_ok_and(|datum| {
+                let path = datum.type_path().as_str();
+                path == "/output" || path.starts_with("/output/")
+            })
+        {
+            let message = state
+                .heap
+                .datum_field(*descriptor, &FieldName::parse("message").unwrap())
+                .map_err(|error| error.to_string())?
+                .clone();
+            let control = state
+                .heap
+                .datum_field(*descriptor, &FieldName::parse("control").unwrap())
+                .map_err(|error| error.to_string())?
+                .clone();
+            let control = runtime_text(&control, state, "output control")?;
+            let message = runtime_text(&message, state, "output message")?;
+            state.emit_local_client_ui_event(
+                target,
+                LocalClientUiEvent::Output { control, message },
+            );
+            return Ok(());
+        }
+        if let Some(target) = routed_client
+            && let Value::List(descriptor) = value
+        {
+            let descriptor = state
+                .heap
+                .list(*descriptor)
+                .map_err(|error| error.to_string())?;
+            let keyed = |name: &str| descriptor.get_key(&Value::text(name)).ok().cloned();
+            if let Some(kind) = keyed("kind").as_ref().and_then(value_text) {
+                if kind == "browse_rsc" {
+                    let resource = keyed("resource").unwrap_or(Value::Null);
+                    let name = keyed("name")
+                        .as_ref()
+                        .and_then(value_text)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let path = match resource {
+                        Value::File(path) | Value::Text(path) => PathBuf::from(path.as_ref()),
+                        _ => PathBuf::new(),
+                    };
+                    let path = if path.is_absolute() {
+                        path
+                    } else {
+                        match state.project_root.as_ref() {
+                            Some(root) => root.join(&path),
+                            None => path,
+                        }
+                    };
+                    let bytes = fs::read(&path).map_err(|error| {
+                        format!("browse_rsc failed to read {}: {error}", path.display())
+                    })?;
+                    state.emit_local_client_ui_event(
+                        target,
+                        LocalClientUiEvent::BrowseResource { name, bytes },
+                    );
+                    return Ok(());
+                }
+            }
+            if let Some(body) = keyed("body") {
+                let html = runtime_text(&body, state, "browse body")?;
+                let options = keyed("options")
+                    .map(|value| runtime_text(&value, state, "browse options"))
+                    .transpose()?
+                    .unwrap_or_default();
+                let window = options
+                    .split(';')
+                    .find_map(|item| item.trim().strip_prefix("window="))
+                    .unwrap_or_default()
+                    .to_owned();
+                state.emit_local_client_ui_event(
+                    target,
+                    LocalClientUiEvent::Browse { window, html },
+                );
+                return Ok(());
+            }
+            if let (Some(message), Some(control)) = (keyed("message"), keyed("control")) {
+                state.emit_local_client_ui_event(
+                    target,
+                    LocalClientUiEvent::Output {
+                        control: runtime_text(&control, state, "output control")?,
+                        message: runtime_text(&message, state, "output message")?,
+                    },
+                );
+                return Ok(());
+            }
+        }
         let field = FieldName::parse("_dream64_output_events")
             .expect("headless output event field is valid");
         let events = match state.heap.datum_field(*target, &field) {
@@ -8636,7 +9077,28 @@ mod color_text_file_tests {
                 &[Value::text("md5"), Value::text("asset.css")],
                 &mut state,
             ),
-            Ok(expected)
+            Ok(expected.clone())
+        );
+        let icon = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/icon").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(
+                icon,
+                FieldName::parse("icon").unwrap(),
+                Value::file("asset.css"),
+            )
+            .unwrap();
+        assert_eq!(
+            execute_external_call(
+                &library,
+                &Value::text("hash_file"),
+                &[Value::text("md5"), Value::Datum(icon)],
+                &mut state,
+            ),
+            Ok(expected),
+            "rust-g observes an icon's backing resource path at the native call boundary",
         );
         assert_eq!(
             execute_external_call(
@@ -8670,8 +9132,153 @@ mod color_text_file_tests {
 }
 
 #[cfg(test)]
+mod atmos_batch_tests {
+    use super::*;
+
+    fn mixture(state: &mut ExecutionState, oxygen: f32) -> DatumId {
+        let mixture = state
+            .heap
+            .allocate_datum(TypePath::parse("/datum/gas_mixture").unwrap());
+        let gases = state.heap.allocate_list();
+        let values = state.heap.allocate_list();
+        state
+            .heap
+            .list_mut(values)
+            .unwrap()
+            .add(Value::number(oxygen));
+        state
+            .heap
+            .list_mut(gases)
+            .unwrap()
+            .set_key(Value::text("o2"), Value::List(values));
+        state
+            .heap
+            .set_datum_field(mixture, atmos_field("gases"), Value::List(gases))
+            .unwrap();
+        state
+            .heap
+            .set_datum_field(mixture, atmos_field("temperature"), Value::number(293.15))
+            .unwrap();
+        mixture
+    }
+
+    #[test]
+    fn native_atmos_batch_snapshots_workers_and_commits_in_turf_order() {
+        let mut state = ExecutionState::new();
+        let first = state
+            .heap
+            .allocate_datum(TypePath::parse("/turf/open/test").unwrap());
+        let second = state
+            .heap
+            .allocate_datum(TypePath::parse("/turf/open/test").unwrap());
+        let first_air = mixture(&mut state, 10.0);
+        let second_air = mixture(&mut state, 1.0);
+        for (turf, air, neighbor) in [(first, first_air, second), (second, second_air, first)] {
+            let adjacent = state.heap.allocate_list();
+            state
+                .heap
+                .list_mut(adjacent)
+                .unwrap()
+                .add(Value::Datum(neighbor));
+            for (field, value) in [
+                (atmos_field("air"), Value::Datum(air)),
+                (atmos_field("atmos_adjacent_turfs"), Value::List(adjacent)),
+                (atmos_field("current_cycle"), Value::number(0.0)),
+                (atmos_field("excited"), Value::number(0.0)),
+            ] {
+                state.heap.set_datum_field(turf, field, value).unwrap();
+            }
+        }
+        let difference = state.heap.allocate_list();
+        state
+            .heap
+            .list_mut(difference)
+            .unwrap()
+            .add(Value::Datum(first));
+        state
+            .heap
+            .list_mut(difference)
+            .unwrap()
+            .add(Value::Datum(second));
+        let active = state.heap.allocate_list();
+        assert_eq!(
+            atmos_setup_differences(
+                &[
+                    Value::List(difference),
+                    Value::List(active),
+                    Value::number(0.01),
+                    Value::number(0.001),
+                    Value::number(4.0),
+                ],
+                &mut state,
+            ),
+            Ok(Value::Null),
+        );
+        assert_eq!(
+            state
+                .heap
+                .list(active)
+                .unwrap()
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>(),
+            [Value::Datum(first), Value::Datum(second)],
+        );
+        for turf in [first, second] {
+            assert_eq!(
+                super::super::datum_field_or_initial(&state, turf, &atmos_field("current_cycle"))
+                    .unwrap(),
+                Value::number(f32::NEG_INFINITY),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod spatial_tests {
     use super::*;
+
+    #[test]
+    fn list_union_does_not_propagate_destroyed_object_handles_as_null() {
+        let mut state = ExecutionState::new();
+        let live = state
+            .heap
+            .allocate_datum(TypePath::parse("/mob/live").unwrap());
+        let destroyed = state
+            .heap
+            .allocate_datum(TypePath::parse("/mob/destroyed").unwrap());
+        let source = state.heap.allocate_list();
+        {
+            let source = state.heap.list_mut(source).unwrap();
+            source.add(Value::Datum(live));
+            source.add(Value::Null);
+            source.add(Value::Datum(destroyed));
+        }
+        state.heap.destroy_datum(destroyed).unwrap();
+
+        let result = state.heap.allocate_list();
+        execute_list_compound_operator(
+            CompoundAssignmentOperator::BitOr,
+            result,
+            &Value::List(source),
+            &mut state,
+        )
+        .unwrap();
+
+        let values = state
+            .heap
+            .list(result)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(values, [Value::Datum(live), Value::Null]);
+        assert!(
+            values
+                .iter()
+                .all(|value| !value.semantic_eq(&Value::Datum(destroyed)))
+        );
+    }
 
     fn place(state: &mut ExecutionState, path: &str, x: f32, y: f32) -> dm_value::DatumId {
         let id = state.heap.allocate_datum(TypePath::parse(path).unwrap());
@@ -9203,6 +9810,84 @@ mod spatial_tests {
                 Ok(&Value::text(kind))
             );
         }
+    }
+
+    #[test]
+    fn registered_client_sessions_receive_authoritative_window_builtins() {
+        let mut state = ExecutionState::new();
+        let client = state
+            .open_local_client(
+                "window \"main\"\n\telem \"status\"\n\t\ttype = LABEL\n\t\tis-visible = true\n",
+            )
+            .expect("a valid local skin should create a client");
+
+        assert_eq!(
+            execute_standard_builtin(
+                "winset",
+                &[
+                    Value::Datum(client),
+                    Value::text("main.status"),
+                    Value::text("text=connected"),
+                ],
+                &mut state,
+            ),
+            Ok(Value::Null)
+        );
+        assert_eq!(
+            execute_standard_builtin(
+                "winget",
+                &[
+                    Value::Datum(client),
+                    Value::text("main.status"),
+                    Value::text("text"),
+                ],
+                &mut state,
+            ),
+            Ok(Value::text("connected"))
+        );
+        assert_eq!(
+            execute_standard_builtin(
+                "winshow",
+                &[
+                    Value::Datum(client),
+                    Value::text("main.status"),
+                    Value::number(0.0)
+                ],
+                &mut state,
+            ),
+            Ok(Value::Null)
+        );
+        assert_eq!(
+            state
+                .client_session(client)
+                .expect("registered session should remain attached")
+                .ui()
+                .winget("main.status", "is-visible"),
+            Ok("false".to_owned())
+        );
+        assert_eq!(
+            execute_standard_builtin(
+                "winexists",
+                &[Value::Datum(client), Value::text("main.status")],
+                &mut state,
+            ),
+            Ok(Value::number(1.0))
+        );
+    }
+
+    #[test]
+    fn local_client_creation_rejects_an_invalid_skin_before_allocating_a_session() {
+        let mut state = ExecutionState::new();
+
+        let error = state
+            .open_local_client("window missing-quotes\n")
+            .expect_err("malformed DMF should not create a local client");
+        let unrelated_client = state
+            .heap
+            .allocate_datum(TypePath::parse("/client").unwrap());
+
+        assert!(!error.diagnostics.is_empty());
+        assert!(state.client_session_mut(unrelated_client).is_none());
     }
 
     #[test]

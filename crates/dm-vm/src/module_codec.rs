@@ -16,7 +16,7 @@ use crate::{
 const MAGIC: &[u8; 8] = b"DM64MOD\0";
 const VERSION: u16 = 1;
 #[cfg(test)]
-const INSTRUCTION_TAG_COUNT: u8 = 130;
+const INSTRUCTION_TAG_COUNT: u8 = 132;
 const MAX_ARTIFACT_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const MAX_PROCEDURES: usize = 1_000_000;
 const MAX_PROCEDURE_TYPES: usize = 1_000_000;
@@ -770,6 +770,11 @@ fn encode_instruction(
         }
         Instruction::LogicalOrEmptyListIndex => unit!(128),
         Instruction::PickExpandedArguments => unit!(129),
+        Instruction::PrepareRhsFirstIndexAssignment => unit!(130),
+        Instruction::LoadDeclaredField(value) => {
+            writer.u8(131);
+            writer.string(value.as_str())?;
+        }
     }
     Ok(())
 }
@@ -1027,6 +1032,8 @@ fn decode_instruction(
         127 => Instruction::LogicalOrEmptyListField(reader.field()?),
         128 => Instruction::LogicalOrEmptyListIndex,
         129 => Instruction::PickExpandedArguments,
+        130 => Instruction::PrepareRhsFirstIndexAssignment,
+        131 => Instruction::LoadDeclaredField(reader.field()?),
         unknown => {
             return Err(ModuleCodecError::new(format!(
                 "unknown instruction tag {unknown}"
@@ -1520,6 +1527,8 @@ mod tests {
                 weighted: vec![false, true],
             },
             Instruction::PickExpandedArguments,
+            Instruction::PrepareRhsFirstIndexAssignment,
+            Instruction::LoadDeclaredField(field("cell")),
             Instruction::Prob,
             Instruction::Round { argument_count: 2 },
             Instruction::Length,

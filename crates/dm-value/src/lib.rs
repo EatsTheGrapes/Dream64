@@ -19,6 +19,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
 use dm_core::DmNumberBits;
+use rayon::prelude::*;
 
 /// A canonical absolute DM type path.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -225,18 +226,16 @@ impl ValueHeap {
     /// failures to `Value::Null`.
     pub fn canonicalize_value(&self, value: &Value) -> Value {
         match value {
-            Value::Datum(datum) => {
-                self.datum(*datum)
-                    .is_ok()
-                    .then_some(value.clone())
-                    .unwrap_or(Value::Null)
-            }
-            Value::List(list) => {
-                self.list(*list)
-                    .is_ok()
-                    .then_some(value.clone())
-                    .unwrap_or(Value::Null)
-            }
+            Value::Datum(datum) => self
+                .datum(*datum)
+                .is_ok()
+                .then_some(value.clone())
+                .unwrap_or(Value::Null),
+            Value::List(list) => self
+                .list(*list)
+                .is_ok()
+                .then_some(value.clone())
+                .unwrap_or(Value::Null),
             _ => value.clone(),
         }
     }
@@ -2171,6 +2170,33 @@ pub struct HeapCollectionStats {
     pub list_arena: ArenaStats,
 }
 
+const PARALLEL_ROOT_VALIDATION_THRESHOLD: usize = 32_768;
+
+/// Validates independent GC roots against the immutable heap view. Mark graph
+/// mutation and sweeping remain on the collector thread; only this read-only,
+/// embarrassingly parallel phase is distributed.
+fn validate_gc_roots_parallel<T, F>(roots: &[T], is_live: F) -> Vec<T>
+where
+    T: Copy + Send + Sync,
+    F: Fn(T) -> bool + Sync,
+{
+    let workers = std::thread::available_parallelism().map_or(1, usize::from);
+    if workers <= 1 || roots.len() < PARALLEL_ROOT_VALIDATION_THRESHOLD {
+        return roots
+            .iter()
+            .copied()
+            .filter(|root| is_live(*root))
+            .collect();
+    }
+    // Indexed parallel iteration retains source order when collected into a
+    // Vec, so the subsequent graph walk and sweep remain deterministic.
+    roots
+        .par_iter()
+        .copied()
+        .filter(|root| is_live(*root))
+        .collect()
+}
+
 impl ValueHeap {
     /// Creates an empty heap.
     #[must_use]
@@ -2389,23 +2415,22 @@ impl ValueHeap {
         let mut pending = Vec::new();
         let mut marked_datums = vec![false; self.datums.slot_len()];
         let mut marked_lists = vec![false; self.lists.slot_len()];
-        for datum in datum_roots {
-            enqueue_datum(
-                self,
-                *datum,
-                &mut pending,
-                &mut marked_datums,
-                &mut marked_lists,
-            );
+        let datum_roots =
+            validate_gc_roots_parallel(datum_roots, |datum| self.datum(datum).is_ok());
+        let list_roots = validate_gc_roots_parallel(list_roots, |list| self.list(list).is_ok());
+        for datum in &datum_roots {
+            let index = datum.index() as usize;
+            if !marked_datums[index] {
+                marked_datums[index] = true;
+                pending.push(Pending::Datum(*datum));
+            }
         }
-        for list in list_roots {
-            enqueue_list(
-                self,
-                *list,
-                &mut pending,
-                &mut marked_datums,
-                &mut marked_lists,
-            );
+        for list in &list_roots {
+            let index = list.index() as usize;
+            if !marked_lists[index] {
+                marked_lists[index] = true;
+                pending.push(Pending::List(*list));
+            }
         }
         while let Some(value) = pending.pop() {
             match value {
@@ -3731,6 +3756,52 @@ mod tests {
         assert!(list.order.capacity() > list.order.len());
         assert_eq!(list.get(1), Ok(&Value::number(0.0)));
         assert_eq!(list.get(87_000), Ok(&Value::number(86_999.0)));
+    }
+
+    #[test]
+    fn parallel_gc_root_validation_preserves_source_order() {
+        let roots = (0_u32..40_000).collect::<Vec<_>>();
+        let validated = validate_gc_roots_parallel(&roots, |root| root % 3 == 0);
+        let expected = roots
+            .iter()
+            .copied()
+            .filter(|root| root % 3 == 0)
+            .collect::<Vec<_>>();
+        assert_eq!(validated, expected);
+    }
+
+    #[test]
+    #[ignore = "local release multicore GC benchmark"]
+    fn gc_parallel_root_validation_release_benchmark() {
+        const ROOTS: usize = 1_000_000;
+        const LIVE: usize = 100_000;
+        let mut heap = ValueHeap::new();
+        let live = (0..LIVE)
+            .map(|_| heap.allocate_datum(TypePath::parse("/datum/gc_root").unwrap()))
+            .collect::<Vec<_>>();
+        let roots = (0..ROOTS)
+            .map(|index| live[index % LIVE])
+            .collect::<Vec<_>>();
+        // Initialize the persistent pool outside the measurement.
+        let _ = validate_gc_roots_parallel(&roots, |root| heap.datum(root).is_ok());
+        let started = std::time::Instant::now();
+        let sequential = roots
+            .iter()
+            .copied()
+            .filter(|root| heap.datum(*root).is_ok())
+            .collect::<Vec<_>>();
+        let sequential_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        let parallel = validate_gc_roots_parallel(&roots, |root| heap.datum(root).is_ok());
+        let parallel_elapsed = started.elapsed();
+        assert_eq!(parallel, sequential);
+        eprintln!(
+            "GC root validation roots={ROOTS} workers={} sequential_us={} parallel_us={} speedup={:.2}",
+            std::thread::available_parallelism().map_or(1, usize::from),
+            sequential_elapsed.as_micros(),
+            parallel_elapsed.as_micros(),
+            sequential_elapsed.as_secs_f64() / parallel_elapsed.as_secs_f64(),
+        );
     }
 
     #[test]

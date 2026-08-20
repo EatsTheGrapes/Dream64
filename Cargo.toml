@@ -1,10 +1,12 @@
 [workspace]
 members = [
+	"crates/dm-client",
 	"crates/dm-conformance",
 	"crates/dm-compiler",
 	"crates/dm-core",
 	"crates/dm-dmf",
 	"crates/dm-globals",
+	"crates/dm-jit",
 	"crates/dm-lexer",
 	"crates/dm-lifecycle",
 	"crates/dm-lowering",

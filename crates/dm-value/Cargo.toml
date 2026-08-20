@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 dm-core = { path = "../dm-core" }
+rayon = "1.11"
 
 [lints]
 workspace = true

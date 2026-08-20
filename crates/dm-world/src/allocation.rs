@@ -176,16 +176,24 @@ pub fn materialize_world_map_state(
             Value::number(declared.max(mapped as f32)),
         )?;
     }
-    let mut atom_contents = BTreeMap::new();
-    for datum in &allocation.allocation_order {
+    fn ensure_atom_contents(
+        image: &mut RuntimeImage,
+        atom_contents: &mut BTreeMap<DatumId, dm_value::ListId>,
+        datum: DatumId,
+    ) -> Result<dm_value::ListId, WorldAllocationError> {
+        if let Some(contents) = atom_contents.get(&datum) {
+            return Ok(*contents);
+        }
         let contents = image.heap_mut().allocate_list();
         image.heap_mut().set_datum_field(
-            *datum,
+            datum,
             FieldName::parse("contents").expect("built-in atom contents field is valid"),
             Value::List(contents),
         )?;
-        atom_contents.insert(*datum, contents);
+        atom_contents.insert(datum, contents);
+        Ok(contents)
     }
+    let mut atom_contents = BTreeMap::new();
     for snapshot in &allocation.snapshots {
         if let Some(turf) = snapshot.turf {
             if let Some(area) = snapshot.area {
@@ -195,8 +203,8 @@ pub fn materialize_world_map_state(
                     Value::Datum(area),
                 )?;
             }
-            let turf_contents = atom_contents[&turf];
             for movable in &snapshot.movables {
+                let turf_contents = ensure_atom_contents(image, &mut atom_contents, turf)?;
                 image.heap_mut().set_datum_field(
                     *movable,
                     FieldName::parse("loc").expect("built-in atom loc field is valid"),
@@ -209,7 +217,7 @@ pub fn materialize_world_map_state(
             }
         }
         if let Some(area) = snapshot.area {
-            let area_contents = atom_contents[&area];
+            let area_contents = ensure_atom_contents(image, &mut atom_contents, area)?;
             if let Some(turf) = snapshot.turf {
                 image
                     .heap_mut()

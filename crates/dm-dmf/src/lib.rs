@@ -224,6 +224,749 @@ pub fn parse(source: &str) -> Document {
     Parser::new(source).run()
 }
 
+/// A resolved, client-facing view of the window controls in a DMF document.
+///
+/// The tree deliberately retains property spelling and source order.  Runtime
+/// UI state belongs in the client protocol layer; this type describes only the
+/// immutable skin definition from which that state is initialized.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ControlTree {
+    /// Named windows in source order.
+    pub windows: Vec<WindowNode>,
+    /// Diagnostics produced while resolving controls.
+    pub diagnostics: Vec<ControlTreeDiagnostic>,
+}
+
+impl ControlTree {
+    /// Lowers the window sections of a parsed DMF document into control nodes.
+    ///
+    /// Anonymous controls remain present but cannot be addressed by client
+    /// commands such as `winset`; duplicate identifiers are retained in source
+    /// order and reported so a compatibility policy can select one later.
+    #[must_use]
+    pub fn from_document(document: &Document) -> Self {
+        let mut tree = Self::default();
+        for section in &document.sections {
+            let Section::Window(window) = section else {
+                continue;
+            };
+            let mut node = WindowNode {
+                id: window.name.clone(),
+                span: window.span,
+                controls: Vec::with_capacity(window.controls.len()),
+            };
+            for control in &window.controls {
+                if let Some(id) = &control.id
+                    && node
+                        .controls
+                        .iter()
+                        .any(|existing: &ControlNode| existing.id.as_deref() == Some(id))
+                {
+                    tree.diagnostics.push(ControlTreeDiagnostic {
+                        kind: ControlTreeDiagnosticKind::DuplicateControlId,
+                        message: format!(
+                            "duplicate control identifier {id:?} in window {:?}",
+                            window.name
+                        ),
+                        span: control.span,
+                    });
+                }
+                let control_type = control
+                    .properties
+                    .iter()
+                    .rev()
+                    .find(|property| property.key.eq_ignore_ascii_case("type"))
+                    .map_or(ControlType::Unknown, |property| {
+                        ControlType::from_dmf(&property.value.decoded)
+                    });
+                node.controls.push(ControlNode {
+                    id: control.id.clone(),
+                    span: control.span,
+                    control_type,
+                    properties: control.properties.clone(),
+                });
+            }
+            tree.windows.push(node);
+        }
+        tree
+    }
+
+    /// Resolves an addressable control by window and control identifier.
+    #[must_use]
+    pub fn control(&self, window_id: &str, control_id: &str) -> Option<&ControlNode> {
+        self.windows
+            .iter()
+            .find(|window| window.id == window_id)?
+            .controls
+            .iter()
+            .find(|control| control.id.as_deref() == Some(control_id))
+    }
+}
+
+/// One named DMF window in a [`ControlTree`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowNode {
+    /// Window identifier.
+    pub id: String,
+    /// Source range of the window definition.
+    pub span: SourceSpan,
+    /// Controls in source order.
+    pub controls: Vec<ControlNode>,
+}
+
+/// One DMF control in a [`WindowNode`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControlNode {
+    /// Optional control identifier.
+    pub id: Option<String>,
+    /// Source range of the control definition.
+    pub span: SourceSpan,
+    /// Recognized type from the final `type` property, if any.
+    pub control_type: ControlType,
+    /// Ordered, loss-aware control properties.
+    pub properties: Vec<Property>,
+}
+
+impl ControlNode {
+    /// Returns the final case-insensitive value of a DMF property.
+    #[must_use]
+    pub fn property(&self, name: &str) -> Option<&str> {
+        self.properties
+            .iter()
+            .rev()
+            .find(|property| property.key.eq_ignore_ascii_case(name))
+            .map(|property| property.value.decoded.as_str())
+    }
+
+    /// Resolves a pixel rectangle from the supported `pos` and `size` forms.
+    #[must_use]
+    pub fn pixel_rect(&self) -> Option<PixelRect> {
+        let (x, y) = parse_pair(self.property("pos")?)?;
+        let (width, height) = parse_size(self.property("size")?)?;
+        Some(PixelRect {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+}
+
+/// A DMF control rectangle in client pixels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PixelRect {
+    /// Left coordinate.
+    pub x: u32,
+    /// Top coordinate.
+    pub y: u32,
+    /// Width.
+    pub width: u32,
+    /// Height.
+    pub height: u32,
+}
+
+fn parse_pair(value: &str) -> Option<(u32, u32)> {
+    let (left, right) = value.split_once(',')?;
+    Some((left.trim().parse().ok()?, right.trim().parse().ok()?))
+}
+
+fn parse_size(value: &str) -> Option<(u32, u32)> {
+    let normalized = value.to_ascii_lowercase();
+    let (width, height) = normalized.split_once('x')?;
+    Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
+}
+
+/// The compatibility-relevant kind of a DMF control.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlType {
+    /// A top-level client window.
+    Main,
+    /// A game map rendering surface.
+    Map,
+    /// An embedded browser surface.
+    Browser,
+    /// A text input control.
+    Input,
+    /// A text output control.
+    Output,
+    /// A static text label.
+    Label,
+    /// An interactive button.
+    Button,
+    /// A control type not yet modeled by this compatibility slice.
+    Unknown,
+}
+
+impl ControlType {
+    fn from_dmf(value: &str) -> Self {
+        match value.to_ascii_uppercase().as_str() {
+            "MAIN" => Self::Main,
+            "MAP" => Self::Map,
+            "BROWSER" => Self::Browser,
+            "INPUT" => Self::Input,
+            "OUTPUT" => Self::Output,
+            "LABEL" => Self::Label,
+            "BUTTON" => Self::Button,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// A non-fatal issue found while lowering a [`ControlTree`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControlTreeDiagnostic {
+    /// Machine-readable classification of the issue.
+    pub kind: ControlTreeDiagnosticKind,
+    /// Human-readable explanation.
+    pub message: String,
+    /// Relevant source range.
+    pub span: SourceSpan,
+}
+
+/// Categories of control-tree lowering issues.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlTreeDiagnosticKind {
+    /// Two controls in a window use the same addressable identifier.
+    DuplicateControlId,
+}
+
+/// Mutable, per-client UI state initialized from a [`ControlTree`].
+///
+/// This is deliberately headless: it models the observable control properties
+/// and commands that a future native shell will render, rather than embedding a
+/// particular toolkit in the compatibility layer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UiState {
+    tree: ControlTree,
+    overrides: Vec<ControlOverride>,
+}
+
+impl UiState {
+    /// Creates empty runtime overrides for a parsed skin.
+    #[must_use]
+    pub fn new(tree: ControlTree) -> Self {
+        Self {
+            tree,
+            overrides: Vec::new(),
+        }
+    }
+
+    /// Returns the immutable skin definition backing this state.
+    #[must_use]
+    pub const fn tree(&self) -> &ControlTree {
+        &self.tree
+    }
+
+    /// Applies one authoritative server-to-client UI command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the command references an invalid control or has
+    /// malformed parameters.
+    pub fn apply(&mut self, command: UiCommand) -> Result<UiCommandReply, UiStateError> {
+        match command {
+            UiCommand::WinSet {
+                control,
+                parameters,
+            } => {
+                self.winset(&control, &parameters)?;
+                Ok(UiCommandReply::Applied)
+            }
+            UiCommand::WinGet { control, property } => {
+                Ok(UiCommandReply::Property(self.winget(&control, &property)?))
+            }
+            UiCommand::WinShow { control, visible } => {
+                self.winshow(&control, visible)?;
+                Ok(UiCommandReply::Applied)
+            }
+            UiCommand::WinExists { control } => {
+                Ok(UiCommandReply::Exists(self.winexists(&control)))
+            }
+            UiCommand::WinClone {
+                source,
+                destination,
+            } => {
+                self.winclone(&source, &destination)?;
+                Ok(UiCommandReply::Applied)
+            }
+        }
+    }
+
+    /// Applies semicolon-separated `property=value` assignments to a control.
+    ///
+    /// Values may be quoted and are stored without their surrounding quotes.
+    /// An unknown control leaves the state unchanged and returns an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the control cannot be resolved or an assignment is malformed.
+    pub fn winset(&mut self, control: &str, parameters: &str) -> Result<(), UiStateError> {
+        let (window_id, control_id) = self.resolve_control(control)?;
+        let assignments = parse_assignments(parameters)?;
+        let overrides = self.overrides_mut(&window_id, &control_id);
+        for (property, value) in assignments {
+            if let Some(existing) = overrides
+                .properties
+                .iter_mut()
+                .find(|existing| existing.name.eq_ignore_ascii_case(&property))
+            {
+                existing.value = value;
+            } else {
+                overrides.properties.push(RuntimeProperty {
+                    name: property,
+                    value,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns a control property, preferring a runtime override over the skin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the control cannot be resolved.
+    pub fn winget(&self, control: &str, property: &str) -> Result<String, UiStateError> {
+        let (window_id, control_id) = self.resolve_control(control)?;
+        if let Some(value) = self
+            .overrides
+            .iter()
+            .find(|override_| {
+                override_.window_id == window_id && override_.control_id == control_id
+            })
+            .and_then(|override_| {
+                override_
+                    .properties
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.name.eq_ignore_ascii_case(property))
+            })
+        {
+            return Ok(value.value.clone());
+        }
+        let value = self
+            .tree
+            .control(&window_id, &control_id)
+            .and_then(|node| {
+                node.properties
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.key.eq_ignore_ascii_case(property))
+            })
+            .map_or_else(String::new, |entry| entry.value.decoded.clone());
+        Ok(value)
+    }
+
+    /// Sets a control's `is-visible` runtime property.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the control cannot be resolved.
+    pub fn winshow(&mut self, control: &str, visible: bool) -> Result<(), UiStateError> {
+        self.winset(
+            control,
+            if visible {
+                "is-visible=true"
+            } else {
+                "is-visible=false"
+            },
+        )
+    }
+
+    /// Returns whether a named control is present in the loaded skin.
+    #[must_use]
+    pub fn winexists(&self, control: &str) -> bool {
+        self.resolve_control(control).is_ok()
+    }
+
+    /// Copies runtime overrides from one control to another.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either control cannot be resolved.
+    pub fn winclone(&mut self, source: &str, destination: &str) -> Result<(), UiStateError> {
+        let (source_window, source_control) = self.resolve_control(source)?;
+        let (destination_window, destination_control) = self.resolve_control(destination)?;
+        let properties = self
+            .overrides
+            .iter()
+            .find(|override_| {
+                override_.window_id == source_window && override_.control_id == source_control
+            })
+            .map_or_else(Vec::new, |override_| override_.properties.clone());
+        let destination = self.overrides_mut(&destination_window, &destination_control);
+        destination.properties = properties;
+        Ok(())
+    }
+
+    fn resolve_control(&self, address: &str) -> Result<(String, String), UiStateError> {
+        let Some((window_id, control_id)) = address.split_once('.') else {
+            let matches: Vec<_> = self
+                .tree
+                .windows
+                .iter()
+                .filter_map(|window| {
+                    window
+                        .controls
+                        .iter()
+                        .any(|control| control.id.as_deref() == Some(address))
+                        .then_some((window.id.as_str(), address))
+                })
+                .collect();
+            return match matches.as_slice() {
+                [(window_id, control_id)] => {
+                    Ok(((*window_id).to_owned(), (*control_id).to_owned()))
+                }
+                [] => Err(UiStateError::UnknownControl(address.to_owned())),
+                _ => Err(UiStateError::AmbiguousControl(address.to_owned())),
+            };
+        };
+        self.tree
+            .control(window_id, control_id)
+            .map(|_| (window_id.to_owned(), control_id.to_owned()))
+            .ok_or_else(|| UiStateError::UnknownControl(address.to_owned()))
+    }
+
+    fn overrides_mut(&mut self, window_id: &str, control_id: &str) -> &mut ControlOverride {
+        if let Some(index) = self.overrides.iter().position(|override_| {
+            override_.window_id == window_id && override_.control_id == control_id
+        }) {
+            return &mut self.overrides[index];
+        }
+        self.overrides.push(ControlOverride {
+            window_id: window_id.to_owned(),
+            control_id: control_id.to_owned(),
+            properties: Vec::new(),
+        });
+        self.overrides
+            .last_mut()
+            .expect("a runtime override was just added")
+    }
+}
+
+/// An authoritative request from game code to one client's UI.
+///
+/// This enum is transport-neutral so the runtime can use it for local testing
+/// before the client/server connection protocol is selected.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UiCommand {
+    /// Apply `property=value` assignments to a control.
+    WinSet {
+        /// Qualified or unqualified control address.
+        control: String,
+        /// Semicolon-separated assignment string.
+        parameters: String,
+    },
+    /// Read one effective control property.
+    WinGet {
+        /// Qualified or unqualified control address.
+        control: String,
+        /// Property name to read.
+        property: String,
+    },
+    /// Change a control's visible state.
+    WinShow {
+        /// Qualified or unqualified control address.
+        control: String,
+        /// Requested visibility.
+        visible: bool,
+    },
+    /// Determine whether a control exists in the loaded skin.
+    WinExists {
+        /// Qualified or unqualified control address.
+        control: String,
+    },
+    /// Copy runtime overrides from one control to another.
+    WinClone {
+        /// Source control address.
+        source: String,
+        /// Destination control address.
+        destination: String,
+    },
+}
+
+/// The deterministic result of applying a [`UiCommand`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UiCommandReply {
+    /// A mutating command completed successfully.
+    Applied,
+    /// A requested property value.
+    Property(String),
+    /// Whether a requested control exists.
+    Exists(bool),
+}
+
+/// The headless client-side state for one connected player.
+///
+/// A session owns no gameplay state. It accepts authoritative [`UiCommand`]s
+/// from the server and queues local interaction events for the server to
+/// consume at a deterministic scheduling boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientSession {
+    ui: UiState,
+    events: Vec<UiEvent>,
+}
+
+impl ClientSession {
+    /// Creates a player session using a parsed DMF control tree as its skin.
+    #[must_use]
+    pub fn new(tree: ControlTree) -> Self {
+        Self {
+            ui: UiState::new(tree),
+            events: Vec::new(),
+        }
+    }
+
+    /// Returns the current headless UI state.
+    #[must_use]
+    pub const fn ui(&self) -> &UiState {
+        &self.ui
+    }
+
+    /// Applies an authoritative server command to this player's UI.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the command cannot be applied to the loaded skin.
+    pub fn apply_command(&mut self, command: UiCommand) -> Result<UiCommandReply, UiStateError> {
+        self.ui.apply(command)
+    }
+
+    /// Queues a local UI event for delivery to the server.
+    pub fn push_event(&mut self, event: UiEvent) {
+        self.events.push(event);
+    }
+
+    /// Drains local UI events in the order they occurred.
+    #[must_use]
+    pub fn take_events(&mut self) -> Vec<UiEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Handles a capability-limited message from an embedded browser control.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sender origin is not allowed, the source is
+    /// not a browser control, or the requested UI operation cannot be applied.
+    pub fn handle_browser_message(
+        &mut self,
+        source_origin: &str,
+        source_control: &str,
+        policy: &BrowserPolicy,
+        message: BrowserBridgeRequest,
+    ) -> Result<BrowserBridgeReply, BrowserBridgeError> {
+        if source_origin != policy.origin {
+            return Err(BrowserBridgeError::OriginDenied {
+                expected: policy.origin.clone(),
+                actual: source_origin.to_owned(),
+            });
+        }
+        let Some((window, control)) = source_control.split_once('.') else {
+            return Err(BrowserBridgeError::NotBrowserControl(
+                source_control.to_owned(),
+            ));
+        };
+        if self
+            .ui
+            .tree()
+            .control(window, control)
+            .is_none_or(|node| node.control_type != ControlType::Browser)
+        {
+            return Err(BrowserBridgeError::NotBrowserControl(
+                source_control.to_owned(),
+            ));
+        }
+        match message {
+            BrowserBridgeRequest::Ui(command) => self
+                .apply_command(command)
+                .map(BrowserBridgeReply::Ui)
+                .map_err(BrowserBridgeError::Ui),
+            BrowserBridgeRequest::Command { command } => {
+                self.push_event(UiEvent::Command { command });
+                Ok(BrowserBridgeReply::Accepted)
+            }
+            BrowserBridgeRequest::Topic { topic } => {
+                self.push_event(UiEvent::BrowserTopic {
+                    control: source_control.to_owned(),
+                    topic,
+                });
+                Ok(BrowserBridgeReply::Accepted)
+            }
+        }
+    }
+}
+
+/// An interaction emitted by one client UI session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UiEvent {
+    /// A configured macro or client command was invoked.
+    Command {
+        /// The command text to route through the server's client-command path.
+        command: String,
+    },
+    /// A named control was activated, such as by a button click.
+    ControlActivated {
+        /// Fully-qualified control address.
+        control: String,
+    },
+    /// Keyboard state changed while the client UI had focus.
+    Key {
+        /// Platform-neutral key identifier supplied by the shell.
+        key: String,
+        /// Whether the key was pressed (`true`) or released (`false`).
+        pressed: bool,
+    },
+    /// A browser control sent a BYOND topic request.
+    BrowserTopic {
+        /// Fully-qualified browser control address.
+        control: String,
+        /// Topic payload or URL supplied by the browser bridge.
+        topic: String,
+    },
+}
+
+/// Per-browser capability policy supplied by the client shell.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserPolicy {
+    /// The sole origin permitted to call the native Dream64 bridge.
+    pub origin: String,
+}
+
+/// A message requested by JavaScript through the Dream64 `window.Byond` bridge.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BrowserBridgeRequest {
+    /// Invoke a client UI operation.
+    Ui(UiCommand),
+    /// Send a client command to the server.
+    Command {
+        /// Command text to dispatch through the client-command path.
+        command: String,
+    },
+    /// Send a browser topic to the server.
+    Topic {
+        /// Topic payload supplied by the browser page.
+        topic: String,
+    },
+}
+
+/// The result of a [`BrowserBridgeRequest`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BrowserBridgeReply {
+    /// The message was accepted and emitted as an event.
+    Accepted,
+    /// The result from a UI operation.
+    Ui(UiCommandReply),
+}
+
+/// A browser page attempted to use a bridge capability it does not hold.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BrowserBridgeError {
+    /// The sender did not match the browser control's configured origin.
+    OriginDenied {
+        /// Allowed origin.
+        expected: String,
+        /// Origin reported by the webview.
+        actual: String,
+    },
+    /// The message did not originate from a declared browser control.
+    NotBrowserControl(String),
+    /// A valid browser message contained an invalid UI request.
+    Ui(UiStateError),
+}
+
+/// JavaScript bootstrap injected only into browser controls by the future shell.
+///
+/// The host must serialize requests as JSON and route them through
+/// [`ClientSession::handle_browser_message`]. The bridge intentionally exposes
+/// no filesystem, process, or arbitrary native APIs.
+pub const WEBVIEW2_BYOND_BRIDGE_BOOTSTRAP: &str = r#"window.Byond = Object.freeze({
+  command(command) { window.chrome.webview.postMessage({ kind: "command", command }); },
+  topic(topic) { window.chrome.webview.postMessage({ kind: "topic", topic }); },
+  ui(command) { window.chrome.webview.postMessage({ kind: "ui", command }); }
+});"#;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ControlOverride {
+    window_id: String,
+    control_id: String,
+    properties: Vec<RuntimeProperty>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimeProperty {
+    name: String,
+    value: String,
+}
+
+/// A UI command could not be applied to the loaded skin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UiStateError {
+    /// The supplied control name resolves to no loaded control.
+    UnknownControl(String),
+    /// An unqualified control name exists in more than one window.
+    AmbiguousControl(String),
+    /// A `winset` parameter lacks a property name or `=` separator.
+    MalformedAssignment(String),
+    /// A quoted `winset` parameter did not terminate.
+    UnterminatedAssignmentQuote,
+}
+
+fn parse_assignments(parameters: &str) -> Result<Vec<(String, String)>, UiStateError> {
+    let mut assignments = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, character) in parameters.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if matches!(character, '\\') && quote.is_some() {
+            escaped = true;
+        } else if quote == Some(character) {
+            quote = None;
+        } else if quote.is_none() && matches!(character, '\"' | '\'') {
+            quote = Some(character);
+        } else if quote.is_none() && character == ';' {
+            assignments.push(parse_assignment(&parameters[start..offset])?);
+            start = offset + character.len_utf8();
+        }
+    }
+    if quote.is_some() {
+        return Err(UiStateError::UnterminatedAssignmentQuote);
+    }
+    if !parameters[start..].trim().is_empty() {
+        assignments.push(parse_assignment(&parameters[start..])?);
+    }
+    Ok(assignments)
+}
+
+fn parse_assignment(source: &str) -> Result<(String, String), UiStateError> {
+    let Some((name, value)) = source.split_once('=') else {
+        return Err(UiStateError::MalformedAssignment(source.trim().to_owned()));
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(UiStateError::MalformedAssignment(source.trim().to_owned()));
+    }
+    let value = value.trim();
+    let value = if let Some(quote) = value
+        .chars()
+        .next()
+        .filter(|quote| matches!(quote, '\"' | '\''))
+    {
+        match quoted_content(value, quote) {
+            QuotedResult::Complete { decoded, consumed } if value[consumed..].trim().is_empty() => {
+                decoded
+            }
+            QuotedResult::Unterminated => return Err(UiStateError::UnterminatedAssignmentQuote),
+            _ => return Err(UiStateError::MalformedAssignment(source.trim().to_owned())),
+        }
+    } else {
+        value.to_owned()
+    };
+    Ok((name.to_owned(), value))
+}
+
 struct Parser<'source> {
     source: &'source str,
     document: Document,
@@ -768,7 +1511,10 @@ fn extend_last_element_span(section: &mut Section, end: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiagnosticKind, DiagnosticSeverity, Section, ValueKind, parse};
+    use super::{
+        ControlTree, ControlTreeDiagnosticKind, ControlType, DiagnosticKind, DiagnosticSeverity,
+        Section, ValueKind, parse,
+    };
 
     #[test]
     fn parses_synthetic_monk_compatibility_shapes() {
@@ -870,5 +1616,199 @@ mod tests {
             diagnostic.kind == DiagnosticKind::DuplicateProperty
                 && diagnostic.severity == DiagnosticSeverity::Warning
         }));
+    }
+
+    #[test]
+    fn lowers_addressable_controls_without_discarding_anonymous_elements() {
+        let document =
+            parse("window \"main\"\n\telem \"map\"\n\t\ttype = map\n\telem\n\t\ttype = LABEL\n");
+        let tree = ControlTree::from_document(&document);
+
+        assert!(tree.diagnostics.is_empty());
+        assert_eq!(tree.windows.len(), 1);
+        assert_eq!(tree.windows[0].controls.len(), 2);
+        assert_eq!(tree.windows[0].controls[0].control_type, ControlType::Map);
+        assert_eq!(tree.windows[0].controls[1].control_type, ControlType::Label);
+        assert_eq!(
+            tree.control("main", "map").map(|node| node.id.as_deref()),
+            Some(Some("map"))
+        );
+        assert!(tree.control("main", "missing").is_none());
+    }
+
+    #[test]
+    fn reports_duplicate_control_identifiers_deterministically() {
+        let document = parse(
+            "window \"main\"\n\telem \"map\"\n\t\ttype = MAP\n\telem \"map\"\n\t\ttype = BROWSER\n",
+        );
+        let tree = ControlTree::from_document(&document);
+
+        assert_eq!(tree.diagnostics.len(), 1);
+        assert_eq!(
+            tree.diagnostics[0].kind,
+            ControlTreeDiagnosticKind::DuplicateControlId
+        );
+        assert_eq!(
+            tree.control("main", "map").map(|node| node.control_type),
+            Some(ControlType::Map)
+        );
+    }
+
+    #[test]
+    fn ui_state_overrides_skin_properties_and_parses_quoted_assignments() {
+        let document = parse(
+            "window \"main\"\n\telem \"chat\"\n\t\ttype = OUTPUT\n\t\tis-visible = true\n\t\ttext = \"ready\"\n",
+        );
+        let mut state = super::UiState::new(ControlTree::from_document(&document));
+
+        assert_eq!(state.winget("main.chat", "text"), Ok("ready".to_owned()));
+        state
+            .winset("main.chat", "text=\"hello; world\"; is-visible=false")
+            .expect("the control exists and the assignments are valid");
+
+        assert_eq!(state.winget("chat", "text"), Ok("hello; world".to_owned()));
+        assert_eq!(state.winget("chat", "is-visible"), Ok("false".to_owned()));
+        assert!(state.winexists("main.chat"));
+        assert!(!state.winexists("main.missing"));
+    }
+
+    #[test]
+    fn ui_state_clones_runtime_overrides_without_changing_skin_defaults() {
+        let document = parse(
+            "window \"main\"\n\telem \"source\"\n\t\ttype = LABEL\n\t\ttext = \"skin\"\n\telem \"target\"\n\t\ttype = LABEL\n\t\ttext = \"target skin\"\n",
+        );
+        let mut state = super::UiState::new(ControlTree::from_document(&document));
+        state
+            .winset("main.source", "text=runtime")
+            .expect("source control should exist");
+        state
+            .winclone("main.source", "main.target")
+            .expect("both controls should exist");
+
+        assert_eq!(
+            state.winget("main.target", "text"),
+            Ok("runtime".to_owned())
+        );
+        assert_eq!(state.winget("main.source", "type"), Ok("LABEL".to_owned()));
+    }
+
+    #[test]
+    fn ui_commands_have_transport_neutral_deterministic_replies() {
+        let document = parse("window \"main\"\n\telem \"status\"\n\t\ttype = LABEL\n");
+        let mut state = super::UiState::new(ControlTree::from_document(&document));
+
+        assert_eq!(
+            state.apply(super::UiCommand::WinSet {
+                control: "main.status".to_owned(),
+                parameters: "text=connected".to_owned(),
+            }),
+            Ok(super::UiCommandReply::Applied)
+        );
+        assert_eq!(
+            state.apply(super::UiCommand::WinGet {
+                control: "main.status".to_owned(),
+                property: "text".to_owned(),
+            }),
+            Ok(super::UiCommandReply::Property("connected".to_owned()))
+        );
+        assert_eq!(
+            state.apply(super::UiCommand::WinExists {
+                control: "main.missing".to_owned(),
+            }),
+            Ok(super::UiCommandReply::Exists(false))
+        );
+    }
+
+    #[test]
+    fn client_sessions_isolate_ui_state_and_preserve_event_order() {
+        let document = parse("window \"main\"\n\telem \"status\"\n\t\ttype = LABEL\n");
+        let tree = ControlTree::from_document(&document);
+        let mut first = super::ClientSession::new(tree.clone());
+        let second = super::ClientSession::new(tree);
+
+        first
+            .apply_command(super::UiCommand::WinSet {
+                control: "main.status".to_owned(),
+                parameters: "text=first".to_owned(),
+            })
+            .expect("the control exists");
+        first.push_event(super::UiEvent::Key {
+            key: "W".to_owned(),
+            pressed: true,
+        });
+        first.push_event(super::UiEvent::Command {
+            command: ".say hello".to_owned(),
+        });
+
+        assert_eq!(
+            first.ui().winget("main.status", "text"),
+            Ok("first".to_owned())
+        );
+        assert_eq!(second.ui().winget("main.status", "text"), Ok(String::new()));
+        assert_eq!(
+            first.take_events(),
+            vec![
+                super::UiEvent::Key {
+                    key: "W".to_owned(),
+                    pressed: true,
+                },
+                super::UiEvent::Command {
+                    command: ".say hello".to_owned(),
+                },
+            ]
+        );
+        assert!(first.take_events().is_empty());
+    }
+
+    #[test]
+    fn browser_bridge_requires_the_configured_origin_and_a_browser_control() {
+        let document = parse(
+            "window \"main\"\n\telem \"browser\"\n\t\ttype = BROWSER\n\telem \"label\"\n\t\ttype = LABEL\n",
+        );
+        let mut session = super::ClientSession::new(ControlTree::from_document(&document));
+        let policy = super::BrowserPolicy {
+            origin: "https://tgui.example".to_owned(),
+        };
+
+        assert_eq!(
+            session.handle_browser_message(
+                "https://tgui.example",
+                "main.browser",
+                &policy,
+                super::BrowserBridgeRequest::Topic {
+                    topic: "?src=ui;action=refresh".to_owned(),
+                },
+            ),
+            Ok(super::BrowserBridgeReply::Accepted)
+        );
+        assert_eq!(
+            session.take_events(),
+            vec![super::UiEvent::BrowserTopic {
+                control: "main.browser".to_owned(),
+                topic: "?src=ui;action=refresh".to_owned(),
+            }]
+        );
+        assert!(matches!(
+            session.handle_browser_message(
+                "https://evil.example",
+                "main.browser",
+                &policy,
+                super::BrowserBridgeRequest::Command {
+                    command: ".quit".to_owned(),
+                },
+            ),
+            Err(super::BrowserBridgeError::OriginDenied { .. })
+        ));
+        assert!(matches!(
+            session.handle_browser_message(
+                "https://tgui.example",
+                "main.label",
+                &policy,
+                super::BrowserBridgeRequest::Command {
+                    command: ".quit".to_owned(),
+                },
+            ),
+            Err(super::BrowserBridgeError::NotBrowserControl(_))
+        ));
     }
 }

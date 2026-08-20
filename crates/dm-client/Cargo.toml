@@ -1,0 +1,28 @@
+[package]
+name = "dm-client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+dm-compiler = { path = "../dm-compiler" }
+dm-dmf = { path = "../dm-dmf" }
+dm-lifecycle = { path = "../dm-lifecycle" }
+dm-map = { path = "../dm-map" }
+dm-project = { path = "../dm-project" }
+dm-runtime = { path = "../dm-runtime" }
+dm-value = { path = "../dm-value" }
+dm-vm = { path = "../dm-vm" }
+dm-world = { path = "../dm-world" }
+flate2 = "1.1"
+png = "0.17"
+softbuffer = "0.4.8"
+winit = "0.30.13"
+
+[target.'cfg(windows)'.dependencies]
+wry = "0.53"
+
+[lints]
+workspace = true

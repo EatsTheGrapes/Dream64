@@ -4,6 +4,8 @@
 
 /// Versioned, self-validating storage for compiled Dream64 payloads.
 pub mod artifact;
+/// Loopback-only client IPC with scheduler-boundary command application.
+pub mod ipc;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -716,6 +718,30 @@ impl PrecompiledLifecycle {
             .filter(|tick_lag| tick_lag.is_finite() && *tick_lag > 0.0)
             .unwrap_or(1.0);
         std::time::Duration::from_secs_f64(f64::from(tick_lag) / 10.0)
+    }
+
+    /// Returns the live VM state retained by a completed headless boot.
+    ///
+    /// Hosts use this at the persistent-scheduler boundary to service local
+    /// client sessions without duplicating world state in a second runtime.
+    #[must_use]
+    pub fn persistent_state_mut(&mut self) -> Option<&mut dm_vm::ExecutionState> {
+        self.persistent_state.as_mut()
+    }
+
+    /// Installs a loopback guest in the persistent world and queues the
+    /// project's effective `/client/New()` hook on the world scheduler.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when persistent startup is incomplete or the guest
+    /// cannot be created and scheduled.
+    pub fn connect_local_guest(&mut self) -> Result<dm_vm::LocalClientState, String> {
+        let state = self
+            .persistent_state
+            .as_mut()
+            .ok_or_else(|| "persistent world is not ready for clients".to_owned())?;
+        state.connect_local_guest(self.executable.module())
     }
 }
 
@@ -1579,7 +1605,8 @@ fn execute_initialization_plan_with_executable(
                 &ExecutionContext::new(Value::Datum(datum), Value::Null),
             ) {
                 Ok(value) => value,
-                Err(error) if collect_runtime_errors && matches!(subject, EventSubject::MapAtom(_)) =>
+                Err(error)
+                    if collect_runtime_errors && matches!(subject, EventSubject::MapAtom(_)) =>
                 {
                     failed_datums.insert(datum);
                     let key = format!("{}: {error}", target.procedure_path);
@@ -1642,12 +1669,8 @@ fn execute_initialization_plan_with_executable(
             let released = state.release_host_value_roots();
             eprintln!("boot-progress: released consumed host result roots={released}");
         }
-        result.scheduler = drain_startup_scheduler(
-            executable.module(),
-            &mut state,
-            scheduler_limits,
-            readiness,
-        )?;
+        result.scheduler =
+            drain_startup_scheduler(executable.module(), &mut state, scheduler_limits, readiness)?;
         Ok(result)
     })();
     if execution.is_ok()
@@ -1701,7 +1724,9 @@ fn drain_startup_scheduler(
                 }
                 drain.rounds += 1;
                 drain.failed_tasks = drain.failed_tasks.saturating_add(1);
-                eprintln!("startup-runtime: isolated scheduled thread failure (continuing): {error}");
+                eprintln!(
+                    "startup-runtime: isolated scheduled thread failure (continuing): {error}"
+                );
             }
         }
         state.release_host_value_roots();
@@ -1735,8 +1760,7 @@ fn drain_startup_scheduler(
 }
 
 fn startup_fail_fast_on_error() -> bool {
-    static STARTUP_CONTINUE: std::sync::OnceLock<bool> =
-        std::sync::OnceLock::new();
+    static STARTUP_CONTINUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *STARTUP_CONTINUE.get_or_init(|| {
         env::var_os("DREAM64_STRICT_STARTUP_ERRORS").is_some()
             || env::var_os("DREAM64_FAIL_FAST_STARTUP_ERRORS").is_some()

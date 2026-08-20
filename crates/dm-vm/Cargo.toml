@@ -7,7 +7,9 @@ rust-version.workspace = true
 
 [dependencies]
 dm-core = { path = "../dm-core" }
+dm-dmf = { path = "../dm-dmf" }
 dm-lexer = { path = "../dm-lexer" }
+dm-jit = { path = "../dm-jit" }
 dm-syntax = { path = "../dm-syntax" }
 dm-value = { path = "../dm-value" }
 fancy-regex = "0.16"
@@ -15,6 +17,7 @@ fast_poisson = { version = "1.0.2", features = ["single_precision"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 md5 = "0.7"
 serde_json = { version = "1", features = ["preserve_order"] }
+smallvec = "1"
 
 [lints]
 workspace = true

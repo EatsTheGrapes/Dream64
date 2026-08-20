@@ -169,18 +169,32 @@ impl Project {
         root_file: impl AsRef<Path>,
         cache_file: impl AsRef<Path>,
     ) -> Result<(Self, bool), ProjectError> {
+        let (project, hit, _) = Self::load_cached_exact_with_fingerprint(root_file, cache_file)?;
+        Ok((project, hit))
+    }
+
+    /// Loads an exact cached project and returns the already-computed content identity.
+    ///
+    /// Executable-cache callers need this identity immediately after validation. Returning
+    /// it here avoids hashing every cached source and resource a second time on each warm boot.
+    #[doc(hidden)]
+    pub fn load_cached_exact_with_fingerprint(
+        root_file: impl AsRef<Path>,
+        cache_file: impl AsRef<Path>,
+    ) -> Result<(Self, bool, ProjectContentFingerprint), ProjectError> {
         let root_file = root_file.as_ref();
         let cache_file = cache_file.as_ref();
         let (project, metadata_hit) = Self::load_cached(root_file, cache_file)?;
-        if metadata_hit
-            && project
+        let cached_fingerprint = project.content_fingerprint();
+        if metadata_hit {
+            if project
                 .current_filesystem_content_fingerprint()
-                .is_ok_and(|current| current == project.content_fingerprint())
-        {
-            return Ok((project, true));
-        }
-        if !metadata_hit {
-            return Ok((project, false));
+                .is_ok_and(|current| current == cached_fingerprint)
+            {
+                return Ok((project, true, cached_fingerprint));
+            }
+        } else {
+            return Ok((project, false, cached_fingerprint));
         }
 
         let canonical_root = fs::canonicalize(root_file).map_err(|source| ProjectError::Io {
@@ -190,7 +204,8 @@ impl Project {
         let project = Self::load(&canonical_root)?;
         let manifest_file = cache_manifest_path(cache_file);
         write_cached_project_best_effort(&project, cache_file, &manifest_file);
-        Ok((project, false))
+        let fingerprint = project.content_fingerprint();
+        Ok((project, false, fingerprint))
     }
 
     fn current_filesystem_content_fingerprint(&self) -> io::Result<ProjectContentFingerprint> {

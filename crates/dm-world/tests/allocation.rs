@@ -48,6 +48,34 @@ fn field(name: &str) -> FieldName {
 }
 
 #[test]
+fn empty_world_scale_turfs_do_not_allocate_contents_lists() {
+    const SIDE: usize = 128;
+    let (_project, compilation) = TestProject::compile("/area/test\n/turf/test\n");
+    let row = "a".repeat(SIDE);
+    let rows = std::iter::repeat_n(row, SIDE)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let map_source = format!("\"a\" = (/turf/test, /area/test)\n(1,1,1) = {{\"\n{rows}\n\"}}\n");
+    let map = parse(&map_source).expect("large empty map should parse");
+    let plan = build_plan(&map, &compilation);
+    let mut image = RuntimeImage::from_compilation(&compilation).expect("image should materialize");
+    let allocation = allocate_world(&plan, &mut image).expect("world should allocate");
+    let world = image
+        .allocate_datum(&dm_value::TypePath::parse("/world").unwrap())
+        .expect("world datum should allocate");
+    let before = image.heap().live_list_count();
+
+    materialize_world_map_state(&allocation, &mut image, world).unwrap();
+
+    let added = image.heap().live_list_count() - before;
+    assert_eq!(allocation.snapshots().len(), SIDE * SIDE);
+    assert_eq!(
+        added, 2,
+        "only the shared area's contents and world.contents should allocate; empty turfs stay sparse",
+    );
+}
+
+#[test]
 fn allocates_defaults_and_constants_but_defers_dynamic_map_values() {
     let (_project, compilation) = TestProject::compile(concat!(
         "/area/test\n\tvar/name = \"base\"\n",

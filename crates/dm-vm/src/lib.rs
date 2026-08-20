@@ -4,6 +4,7 @@
 
 mod builtins;
 mod module_codec;
+pub mod worker_lane;
 
 pub use module_codec::ModuleCodecError;
 
@@ -23,10 +24,18 @@ use builtins::{
 };
 
 use dm_core::{DmNumberBits, SourceSpan};
+use dm_dmf::{
+    ClientSession, ControlTree, Diagnostic, DiagnosticSeverity, UiEvent, parse as parse_dmf,
+};
+use dm_jit::{
+    CompiledNumericTrace, NumericExecutionState, NumericInstruction, NumericRunOutcome,
+    compile_numeric_field_trace, compile_numeric_trace,
+};
 use dm_lexer::{SpannedToken, TokenKind, lex};
 use dm_syntax::{Definition, DefinitionKind, SourceLine};
 pub use dm_value::Value;
 use dm_value::{DatumId, FieldName, ListId, ModifiedTypePath, TypePath, ValueError, ValueHeap};
+use smallvec::SmallVec;
 
 // Dream Maker compiles text macros to non-printing format characters. Keep
 // the same representation boundary in Dream64 so the formatter still has the
@@ -336,6 +345,12 @@ pub enum Instruction {
     LoadCaller,
     /// Pops a datum receiver and pushes one named field.
     LoadField(FieldName),
+    /// Reads a field validated through the receiver's declared DM type.
+    ///
+    /// BYOND can hold a runtime-incompatible value in a typed variable. The
+    /// statically valid slot then reads as null instead of becoming an
+    /// undefined dynamic field access.
+    LoadDeclaredField(FieldName),
     /// Pops a value and datum receiver, then writes one named field.
     StoreField(FieldName),
     /// Stores one datum field while preserving the assigned value on the stack.
@@ -393,6 +408,11 @@ pub enum Instruction {
     },
     /// Clones the top stack value.
     Duplicate,
+    /// Reorders `value, receiver, key` to `receiver, key, value`.
+    ///
+    /// Direct indexed assignment evaluates its RHS before its destination in
+    /// BYOND, while the list-write instruction consumes destination first.
+    PrepareRhsFirstIndexAssignment,
     /// Pushes the current procedure's special `.` return value.
     LoadResult,
     /// Pops into the current procedure's special `.` return value.
@@ -1421,19 +1441,17 @@ pub fn compile_module_with_global_fields(
         paths.push(path);
     }
 
-    let procedures = definitions
-        .iter()
-        .map(|definition| {
-            compile_procedure_with_resolver_and_fields(
-                definition,
-                &call_names,
-                &BTreeMap::new(),
-                global_fields,
-                &BTreeMap::new(),
-            )
-            .map(Arc::new)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let procedures = parallel_collect_ordered(definitions.len(), |index| {
+        let definition = &definitions[index];
+        compile_procedure_with_resolver_and_fields(
+            definition,
+            &call_names,
+            &BTreeMap::new(),
+            global_fields,
+            &BTreeMap::new(),
+        )
+        .map(Arc::new)
+    })?;
     Ok(Module {
         identity: next_module_identity(),
         procedures,
@@ -1499,33 +1517,22 @@ pub fn compile_module_specs_with_global_types(
     }
     let call_index = SpecCallIndex::build(&paths)?;
 
-    let procedures = specs
+    let targets = specs
         .iter()
-        .zip(global_types)
-        .map(|(spec, global_types)| {
-            let mut targets = HashMap::new();
-            if let Some(parent) = spec.parent {
-                targets.insert("..".to_owned(), ProcedureId::from_index(parent)?);
-            }
-            targets.extend(static_call_targets(
-                &spec.path,
-                &call_index,
-                referenced_static_call_names(spec.definition),
-            ));
-            for (selector, target) in &spec.static_calls {
-                targets.insert(selector.clone(), ProcedureId::from_index(*target)?);
-            }
-            compile_procedure_with_resolver_and_fields(
-                spec.definition,
-                &targets,
-                &spec.src_fields,
-                &spec.global_fields,
-                global_types,
-            )
-            .map(Arc::new)
-            .map_err(|error| compile_error(format!("{}: {}", spec.path, error.message)))
-        })
+        .map(|spec| resolved_spec_targets(spec, &call_index))
         .collect::<Result<Vec<_>, _>>()?;
+    let procedures = parallel_collect_ordered(specs.len(), |index| {
+        let spec = &specs[index];
+        compile_procedure_with_resolver_and_fields(
+            spec.definition,
+            &targets[index],
+            &spec.src_fields,
+            &spec.global_fields,
+            &global_types[index],
+        )
+        .map(Arc::new)
+        .map_err(|error| compile_error(format!("{}: {}", spec.path, error.message)))
+    })?;
     Ok(Module {
         identity: next_module_identity(),
         procedures,
@@ -1591,21 +1598,30 @@ pub fn compile_module_specs_selective_with_errors(
         paths.push(spec.path.clone());
     }
     let call_index = SpecCallIndex::build(&paths)?;
+    let targets = specs
+        .iter()
+        .map(|spec| resolved_spec_targets(spec, &call_index))
+        .collect::<Result<Vec<_>, _>>()?;
+    let eager_programs = parallel_collect_ordered(specs.len(), |index| {
+        if !eager_indices.contains(&index) {
+            return Ok(None);
+        }
+        let spec = &specs[index];
+        compile_procedure_with_resolver_and_fields(
+            spec.definition,
+            &targets[index],
+            &spec.src_fields,
+            &spec.global_fields,
+            &global_types[index],
+        )
+        .map(|program| Some(Arc::new(program)))
+        .map_err(|error| compile_error(format!("{}: {}", spec.path, error.message)))
+    })?;
     let mut procedures = Vec::with_capacity(specs.len());
     let mut deferred = HashMap::new();
     for (index, (spec, global_types)) in specs.iter().zip(global_types).enumerate() {
-        let targets = resolved_spec_targets(spec, &call_index)?;
-        if eager_indices.contains(&index) {
-            procedures.push(Arc::new(
-                compile_procedure_with_resolver_and_fields(
-                    spec.definition,
-                    &targets,
-                    &spec.src_fields,
-                    &spec.global_fields,
-                    global_types,
-                )
-                .map_err(|error| compile_error(format!("{}: {}", spec.path, error.message)))?,
-            ));
+        if let Some(program) = eager_programs[index].clone() {
+            procedures.push(program);
         } else {
             let procedure = ProcedureId::from_index(index)?;
             procedures.push(Arc::new(Program {
@@ -1620,7 +1636,7 @@ pub fn compile_module_specs_selective_with_errors(
                 procedure,
                 DeferredProcedure {
                     definition: Arc::new(spec.definition.clone()),
-                    targets: Arc::new(targets),
+                    targets: Arc::new(targets[index].clone()),
                     src_fields: Arc::new(spec.src_fields.clone()),
                     global_fields: Arc::new(spec.global_fields.clone()),
                     global_types: Arc::new(global_types.clone()),
@@ -1640,6 +1656,48 @@ pub fn compile_module_specs_selective_with_errors(
         procedure_types: procedure_type_catalog_from_specs(specs),
         initializer_call_names: None,
     })
+}
+
+/// Runs independent lowering jobs across the host's available CPUs while
+/// publishing their results strictly in source order. Stable reassembly keeps
+/// the first diagnostic and serialized module bytes independent of scheduling.
+fn parallel_collect_ordered<T, E, F>(len: usize, compile: F) -> Result<Vec<T>, E>
+where
+    T: Send,
+    E: Send,
+    F: Fn(usize) -> Result<T, E> + Sync,
+{
+    const PARALLEL_THRESHOLD: usize = 64;
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(len.max(1));
+    if workers == 1 || len < PARALLEL_THRESHOLD {
+        return (0..len).map(compile).collect();
+    }
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let compile = &compile;
+        for worker in 0..workers {
+            let sender = sender.clone();
+            scope.spawn(move || {
+                for index in (worker..len).step_by(workers) {
+                    if sender.send((index, compile(index))).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+    });
+    let mut results = (0..len).map(|_| None).collect::<Vec<_>>();
+    for (index, result) in receiver {
+        results[index] = Some(result);
+    }
+    results
+        .into_iter()
+        .map(|result| result.expect("every lowering worker reports exactly one result"))
+        .collect()
 }
 
 fn resolved_spec_targets(
@@ -3117,12 +3175,16 @@ fn compile_assignment_statement(
             instructions.push(Instruction::StoreLocal(slot));
         }
         Expression::Index { list, index } => {
-            emit_expression(&list, locals, instructions, procedures)?;
-            emit_expression(&index, locals, instructions, procedures)?;
-            compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
             if operator == "=" {
+                compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
+                emit_expression(&list, locals, instructions, procedures)?;
+                emit_expression(&index, locals, instructions, procedures)?;
+                instructions.push(Instruction::PrepareRhsFirstIndexAssignment);
                 instructions.push(Instruction::SetListIndex);
             } else {
+                emit_expression(&list, locals, instructions, procedures)?;
+                emit_expression(&index, locals, instructions, procedures)?;
+                compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
                 instructions.push(Instruction::CompoundListIndex(
                     compound_list_index_operator(operator)?,
                 ));
@@ -8233,16 +8295,26 @@ fn emit_expression(
             {
                 instructions.push(Instruction::LoadGlobal(storage.clone()));
             } else {
+                let declared = expression_static_type(receiver, locals).is_some();
                 emit_expression(receiver, locals, instructions, procedures)?;
-                instructions.push(Instruction::LoadField(name.clone()));
+                instructions.push(if declared {
+                    Instruction::LoadDeclaredField(name.clone())
+                } else {
+                    Instruction::LoadField(name.clone())
+                });
             }
         }
         Expression::SafeField { receiver, name } => {
+            let declared = expression_static_type(receiver, locals).is_some();
             emit_expression(receiver, locals, instructions, procedures)?;
             instructions.push(Instruction::Duplicate);
             let null_jump = instructions.len();
             instructions.push(Instruction::JumpIfNull(usize::MAX));
-            instructions.push(Instruction::LoadField(name.clone()));
+            instructions.push(if declared {
+                Instruction::LoadDeclaredField(name.clone())
+            } else {
+                Instruction::LoadField(name.clone())
+            });
             let end = instructions.len();
             instructions[null_jump] = Instruction::JumpIfNull(end);
         }
@@ -9007,12 +9079,15 @@ fn emit_assignment_expression(
             instructions[null_jump] = Instruction::JumpIfNull(end);
         }
         Expression::Index { list, index } => {
-            emit_expression(list, locals, instructions, procedures)?;
-            emit_expression(index, locals, instructions, procedures)?;
             if operator == "=" {
                 emit_expression(value, locals, instructions, procedures)?;
+                emit_expression(list, locals, instructions, procedures)?;
+                emit_expression(index, locals, instructions, procedures)?;
+                instructions.push(Instruction::PrepareRhsFirstIndexAssignment);
                 instructions.push(Instruction::SetListIndexKeep);
             } else {
+                emit_expression(list, locals, instructions, procedures)?;
+                emit_expression(index, locals, instructions, procedures)?;
                 emit_expression(value, locals, instructions, procedures)?;
                 instructions.push(Instruction::CompoundListIndexKeep(
                     compound_list_index_operator(operator)?,
@@ -9354,6 +9429,13 @@ pub struct ExecutionState {
     reference_lists: HashSet<ListId>,
     savefiles: HashMap<DatumId, SavefileState>,
     savefile_entries: HashMap<DatumId, (DatumId, String)>,
+    client_sessions: BTreeMap<DatumId, ClientSession>,
+    local_client_skin: Option<ControlTree>,
+    local_client_outbound_events: BTreeMap<DatumId, Vec<LocalClientUiEvent>>,
+    local_client_mobs: BTreeMap<DatumId, DatumId>,
+    local_client_commands: Vec<(u64, DatumId, LocalMovementDirection)>,
+    local_client_command_sequence: u64,
+    local_guest_sequence: u64,
     global_vars_proxy: Option<ListId>,
     datum_vars_proxies: HashMap<ListId, DatumId>,
     datum_vars_by_datum: HashMap<DatumId, ListId>,
@@ -9440,6 +9522,151 @@ pub struct ExecutionState {
     default_world_area: Option<DatumId>,
 }
 
+/// A local client could not be created from the supplied DMF skin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalClientError {
+    /// DMF diagnostics that prevented session creation.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// One cardinal movement requested by a locally attached client.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalMovementDirection {
+    /// Increase Y by one.
+    North,
+    /// Decrease Y by one.
+    South,
+    /// Increase X by one.
+    East,
+    /// Decrease X by one.
+    West,
+}
+
+/// Authoritative location of one locally attached client and mob.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalClientState {
+    /// Client datum identity.
+    pub client: DatumId,
+    /// Controlled mob identity.
+    pub mob: DatumId,
+    /// Current turf X coordinate.
+    pub x: i32,
+    /// Current turf Y coordinate.
+    pub y: i32,
+    /// Current turf Z coordinate.
+    pub z: i32,
+}
+
+/// One authoritative UI operation emitted by DM for a connected local client.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalClientUiEvent {
+    /// Mutate named DMF control properties.
+    Winset {
+        /// Target DMF control address.
+        control: String,
+        /// BYOND winset parameter string.
+        parameters: String,
+    },
+    /// Append a message to an output control.
+    Output {
+        /// Target output control address.
+        control: String,
+        /// Text appended to the control.
+        message: String,
+    },
+    /// Register a browser-visible resource under a logical name.
+    BrowseResource {
+        /// Browser-visible logical resource name.
+        name: String,
+        /// Complete resource payload.
+        bytes: Vec<u8>,
+    },
+    /// Display HTML in a browser control.
+    Browse {
+        /// BYOND browser window/control selector.
+        window: String,
+        /// HTML document body.
+        html: String,
+    },
+}
+
+/// One stable map cell copied out of the runtime heap.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocalClientMapTile {
+    /// Turf X coordinate.
+    pub x: i32,
+    /// Turf Y coordinate.
+    pub y: i32,
+    /// Canonical turf type path.
+    pub type_path: String,
+    /// DM-visible color converted to stable text when present.
+    pub color: Option<String>,
+    /// Materialized atom identities currently contained by this turf.
+    pub occupants: Vec<DatumId>,
+    /// Turf and contained atoms in stable plane/layer/insertion draw order.
+    pub appearances: Vec<LocalClientAppearance>,
+}
+
+/// Owned DM appearance data required by the local renderer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocalClientAppearance {
+    /// Source atom or appearance datum when one exists.
+    pub datum: DatumId,
+    /// Canonical runtime type path.
+    pub type_path: String,
+    /// Backing DMI/resource path after unwrapping `/icon` objects.
+    pub icon: Option<String>,
+    /// Selected icon state.
+    pub icon_state: Option<String>,
+    /// BYOND direction bitfield.
+    pub dir: i32,
+    /// Draw layer.
+    pub layer: f32,
+    /// Draw plane.
+    pub plane: f32,
+    /// X pixel offset.
+    pub pixel_x: f32,
+    /// Y pixel offset.
+    pub pixel_y: f32,
+    /// W pixel offset.
+    pub pixel_w: f32,
+    /// Z pixel offset.
+    pub pixel_z: f32,
+    /// DM color represented as stable transport text.
+    pub color: Option<String>,
+    /// Alpha in BYOND's 0 through 255 range.
+    pub alpha: f32,
+    /// Nested underlays in stable plane/layer/insertion order.
+    pub underlays: Vec<LocalClientAppearance>,
+    /// Nested overlays in stable plane/layer/insertion order.
+    pub overlays: Vec<LocalClientAppearance>,
+}
+
+/// Owned map snapshot suitable for transport to a local client.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocalClientMapSnapshot {
+    /// Maximum X coordinate represented by the world at this Z level.
+    pub width: i32,
+    /// Maximum Y coordinate represented by the world at this Z level.
+    pub height: i32,
+    /// Selected Z level.
+    pub z: i32,
+    /// Tiles in deterministic Y-then-X world index order.
+    pub tiles: Vec<LocalClientMapTile>,
+}
+
+impl fmt::Display for LocalClientError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "DMF contains {} error diagnostic(s)",
+            self.diagnostics.len()
+        )
+    }
+}
+
+impl std::error::Error for LocalClientError {}
+
 #[derive(Clone, Debug, Default)]
 struct SavefileState {
     entries: HashMap<String, Value>,
@@ -9462,6 +9689,13 @@ impl ExecutionState {
             reference_lists: HashSet::new(),
             savefiles: HashMap::new(),
             savefile_entries: HashMap::new(),
+            client_sessions: BTreeMap::new(),
+            local_client_skin: None,
+            local_client_outbound_events: BTreeMap::new(),
+            local_client_mobs: BTreeMap::new(),
+            local_client_commands: Vec::new(),
+            local_client_command_sequence: 0,
+            local_guest_sequence: 0,
             global_vars_proxy: None,
             datum_vars_proxies: HashMap::new(),
             datum_vars_by_datum: HashMap::new(),
@@ -9972,7 +10206,6 @@ impl ExecutionState {
                     self.heap
                         .set_datum_field(turf, loc.clone(), Value::Datum(area))
                         .map_err(|error| error.to_string())?;
-                    self.ensure_contents(turf)?;
                     self.heap
                         .list_mut(area_contents)
                         .map_err(|error| error.to_string())?
@@ -10055,6 +10288,524 @@ impl ExecutionState {
         &mut self.heap
     }
 
+    /// Allocates a local `/client` and atomically installs its parsed DMF skin.
+    ///
+    /// # Errors
+    ///
+    /// Returns the parser diagnostics without allocating a client when the
+    /// supplied DMF contains any errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the engine's built-in `/client` type path becomes invalid.
+    pub fn open_local_client(&mut self, dmf_source: &str) -> Result<DatumId, LocalClientError> {
+        let document = parse_dmf(dmf_source);
+        let diagnostics: Vec<_> = document
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+            .cloned()
+            .collect();
+        if !diagnostics.is_empty() {
+            return Err(LocalClientError { diagnostics });
+        }
+        let client = self
+            .heap
+            .allocate_datum(TypePath::parse("/client").expect("the engine client path is valid"));
+        self.install_client_session(client, ControlTree::from_document(&document));
+        Ok(client)
+    }
+
+    /// Installs a skin-backed UI session for a connected client datum.
+    pub fn install_client_session(&mut self, client: DatumId, tree: ControlTree) {
+        self.client_sessions
+            .insert(client, ClientSession::new(tree));
+    }
+
+    /// Sets the parsed skin cloned into subsequently connected local clients.
+    pub fn set_local_client_skin(&mut self, tree: ControlTree) {
+        self.local_client_skin = Some(tree);
+    }
+
+    /// Drains authoritative UI operations in exact DM execution order.
+    #[must_use]
+    pub fn take_local_client_outbound_events(
+        &mut self,
+        client: DatumId,
+    ) -> Vec<LocalClientUiEvent> {
+        self.local_client_outbound_events
+            .remove(&client)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn emit_local_client_ui_event(
+        &mut self,
+        client: DatumId,
+        event: LocalClientUiEvent,
+    ) {
+        if self.client_sessions.contains_key(&client) {
+            self.local_client_outbound_events
+                .entry(client)
+                .or_default()
+                .push(event);
+        }
+    }
+
+    /// Returns the UI session associated with a connected client datum.
+    #[must_use]
+    pub fn client_session(&self, client: DatumId) -> Option<&ClientSession> {
+        self.client_sessions.get(&client)
+    }
+
+    /// Returns the mutable UI session associated with a connected client datum.
+    pub fn client_session_mut(&mut self, client: DatumId) -> Option<&mut ClientSession> {
+        self.client_sessions.get_mut(&client)
+    }
+
+    /// Drains local UI events emitted by one connected client.
+    #[must_use]
+    pub fn take_client_events(&mut self, client: DatumId) -> Vec<UiEvent> {
+        self.client_sessions
+            .get_mut(&client)
+            .map_or_else(Vec::new, ClientSession::take_events)
+    }
+
+    /// Binds an existing local client to an existing mob datum.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale identities or non-client/non-mob runtime types.
+    pub fn attach_local_client(
+        &mut self,
+        client: DatumId,
+        mob: DatumId,
+    ) -> Result<LocalClientState, String> {
+        let client_path = self
+            .heap
+            .datum(client)
+            .map_err(|error| error.to_string())?
+            .type_path()
+            .as_str();
+        if client_path != "/client" && !client_path.starts_with("/client/") {
+            return Err("local controller identity is not a /client".to_owned());
+        }
+        let mob_path = self
+            .heap
+            .datum(mob)
+            .map_err(|error| error.to_string())?
+            .type_path()
+            .as_str();
+        if mob_path != "/mob" && !mob_path.starts_with("/mob/") {
+            return Err("local controlled identity is not a /mob".to_owned());
+        }
+        assign_datum_field(
+            self,
+            client,
+            FieldName::parse("mob").unwrap(),
+            Value::Datum(mob),
+        )?;
+        assign_datum_field(
+            self,
+            mob,
+            FieldName::parse("client").unwrap(),
+            Value::Datum(client),
+        )?;
+        if self.local_client_coordinates(mob).is_err() {
+            let turf = self
+                .world_turfs
+                .first_key_value()
+                .map(|(_, turf)| *turf)
+                .ok_or_else(|| "local client cannot attach to an empty world".to_owned())?;
+            assign_datum_field(
+                self,
+                mob,
+                FieldName::parse("loc").unwrap(),
+                Value::Datum(turf),
+            )?;
+        }
+        self.local_client_mobs.insert(client, mob);
+        self.local_client_state(client)
+    }
+
+    /// Allocates a local client and mob and places the mob on the first indexed turf.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the authoritative world has no materialized turf.
+    pub fn create_attached_local_client(&mut self) -> Result<LocalClientState, String> {
+        let turf = self.world_turfs.values().next().copied().ok_or_else(|| {
+            "cannot attach a local client before the map is materialized".to_owned()
+        })?;
+        let client = self
+            .heap
+            .allocate_datum(TypePath::parse("/client").expect("engine client path is valid"));
+        let mob = self
+            .heap
+            .allocate_datum(TypePath::parse("/mob").expect("engine mob path is valid"));
+        assign_datum_field(
+            self,
+            mob,
+            FieldName::parse("loc").unwrap(),
+            Value::Datum(turf),
+        )?;
+        self.attach_local_client(client, mob)
+    }
+
+    /// Creates a deterministic loopback guest and queues its project-defined
+    /// `/client/New()` hook at the current scheduler boundary.
+    ///
+    /// The client session and client/mob relationship are installed before the
+    /// frame becomes runnable, so `New()` observes the same fully connected
+    /// identity that later UI builtins use. A sleeping hook remains an ordinary
+    /// scheduled continuation; runtime failures are returned by
+    /// [`advance_scheduler`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the world has no turf, the client cannot be bound,
+    /// or the runtime client type has no effective `New` implementation.
+    pub fn connect_local_guest(&mut self, module: &Module) -> Result<LocalClientState, String> {
+        if self.local_client_skin.is_none()
+            && let Some(root) = self.project_root.as_deref()
+        {
+            let skin_path = root.join("interface").join("skin.dmf");
+            if skin_path.is_file() {
+                let source = std::fs::read_to_string(&skin_path).map_err(|error| {
+                    format!(
+                        "failed to read local client skin {}: {error}",
+                        skin_path.display()
+                    )
+                })?;
+                let document = parse_dmf(&source);
+                if let Some(diagnostic) = document
+                    .diagnostics
+                    .iter()
+                    .find(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+                {
+                    return Err(format!(
+                        "local client skin {} is invalid: {}",
+                        skin_path.display(),
+                        diagnostic.message
+                    ));
+                }
+                self.local_client_skin = Some(ControlTree::from_document(&document));
+            }
+        }
+        let attached = self.create_attached_local_client()?;
+        let sequence = self.local_guest_sequence.saturating_add(1);
+        self.local_guest_sequence = sequence;
+        let key = format!("Guest-{sequence}");
+        for (name, value) in [
+            ("key", Value::text(key.as_str())),
+            ("ckey", Value::text(key.to_ascii_lowercase())),
+            ("address", Value::text("127.0.0.1")),
+            (
+                "computer_id",
+                Value::text(format!("dream64-local-{sequence}")),
+            ),
+        ] {
+            let field = FieldName::parse(name).expect("guest identity field is valid");
+            if datum_field_or_initial(self, attached.client, &field).is_ok() {
+                assign_datum_field(self, attached.client, field, value)?;
+            }
+        }
+        self.install_client_session(
+            attached.client,
+            self.local_client_skin.clone().unwrap_or_default(),
+        );
+
+        let receiver = Value::Datum(attached.client);
+        let (procedure, context) = dynamic_call_target_named(
+            module,
+            self,
+            &receiver,
+            "New",
+            &ExecutionContext::new(receiver.clone(), receiver.clone()),
+            false,
+        )?;
+        let program = module.resolve_procedure(procedure)?;
+        let frame = make_frame(procedure, program, &[], &context);
+        schedule_frames(self, vec![frame], 0.0);
+        Ok(attached)
+    }
+
+    /// Queues cardinal movement for deterministic application at a scheduler boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the client is not attached or the controlled mob is stale.
+    pub fn queue_local_movement(
+        &mut self,
+        client: DatumId,
+        direction: LocalMovementDirection,
+    ) -> Result<(), String> {
+        let mob = self
+            .local_client_mobs
+            .get(&client)
+            .copied()
+            .ok_or_else(|| "local client is not attached to a mob".to_owned())?;
+        self.heap.datum(mob).map_err(|error| error.to_string())?;
+        let sequence = self.local_client_command_sequence;
+        self.local_client_command_sequence = sequence.saturating_add(1);
+        self.local_client_commands
+            .push((sequence, client, direction));
+        Ok(())
+    }
+
+    /// Applies every queued local command in stable enqueue order.
+    ///
+    /// This is the host's scheduler-boundary commit point. No movement mutates
+    /// the live world before this method is called.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an attached datum or its authoritative turf is stale.
+    pub fn apply_local_client_commands(&mut self) -> Result<Vec<LocalClientState>, String> {
+        let mut commands = std::mem::take(&mut self.local_client_commands);
+        commands.sort_by_key(|(sequence, _, _)| *sequence);
+        let mut committed = Vec::with_capacity(commands.len());
+        for (_, client, direction) in commands {
+            let mob = *self
+                .local_client_mobs
+                .get(&client)
+                .ok_or_else(|| "local client detached before movement commit".to_owned())?;
+            let current = self.local_client_coordinates(mob)?;
+            let (dx, dy) = match direction {
+                LocalMovementDirection::North => (0, 1),
+                LocalMovementDirection::South => (0, -1),
+                LocalMovementDirection::East => (1, 0),
+                LocalMovementDirection::West => (-1, 0),
+            };
+            if let Some(destination) = self.turf_at(current.0 + dx, current.1 + dy, current.2) {
+                assign_datum_field(
+                    self,
+                    mob,
+                    FieldName::parse("loc").unwrap(),
+                    Value::Datum(destination),
+                )?;
+            }
+            committed.push(self.local_client_state(client)?);
+        }
+        Ok(committed)
+    }
+
+    /// Returns the authoritative location for an attached local client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown client or a mob outside a turf.
+    pub fn local_client_state(&self, client: DatumId) -> Result<LocalClientState, String> {
+        let mob = *self
+            .local_client_mobs
+            .get(&client)
+            .ok_or_else(|| "local client is not attached to a mob".to_owned())?;
+        let (x, y, z) = self.local_client_coordinates(mob)?;
+        Ok(LocalClientState {
+            client,
+            mob,
+            x,
+            y,
+            z,
+        })
+    }
+
+    /// Copies one Z level into a stable transport-owned map snapshot.
+    #[must_use]
+    pub fn local_client_map_snapshot(&self, z: i32) -> LocalClientMapSnapshot {
+        let color_field = FieldName::parse("color").unwrap();
+        let mut tiles = self
+            .world_turfs
+            .iter()
+            .filter_map(|(&(x, y, cell_z), &turf)| {
+                (cell_z == z)
+                    .then(|| {
+                        let datum = self.heap.datum(turf).ok()?;
+                        let color = datum_field_or_initial(self, turf, &color_field)
+                            .ok()
+                            .and_then(|value| {
+                                (!matches!(value, Value::Null)).then(|| value.to_string())
+                            });
+                        let occupants: Vec<DatumId> = datum_field_or_initial(
+                            self,
+                            turf,
+                            &FieldName::parse("contents").unwrap(),
+                        )
+                        .ok()
+                        .and_then(|value| match value {
+                            Value::List(list) => self.heap.list(list).ok(),
+                            _ => None,
+                        })
+                        .map(|contents| {
+                            contents
+                                .positions()
+                                .filter_map(|(_, value)| match value {
+                                    Value::Datum(id) => Some(*id),
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                        let mut draw_datums = Vec::with_capacity(occupants.len() + 1);
+                        draw_datums.push(turf);
+                        draw_datums.extend(occupants.iter().copied());
+                        let mut appearances = draw_datums
+                            .into_iter()
+                            .enumerate()
+                            .filter_map(|(order, datum)| {
+                                self.local_client_appearance(datum, 0, &mut HashSet::new())
+                                    .map(|appearance| (order, appearance))
+                            })
+                            .collect::<Vec<_>>();
+                        appearances.sort_by(|(left_order, left), (right_order, right)| {
+                            left.plane
+                                .total_cmp(&right.plane)
+                                .then_with(|| left.layer.total_cmp(&right.layer))
+                                .then_with(|| left_order.cmp(right_order))
+                        });
+                        let appearances = appearances
+                            .into_iter()
+                            .map(|(_, appearance)| appearance)
+                            .collect();
+                        Some(LocalClientMapTile {
+                            x,
+                            y,
+                            type_path: datum.type_path().as_str().to_owned(),
+                            color,
+                            occupants,
+                            appearances,
+                        })
+                    })
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        tiles.sort_by_key(|tile| (tile.y, tile.x));
+        let width = tiles.iter().map(|tile| tile.x).max().unwrap_or(0);
+        let height = tiles.iter().map(|tile| tile.y).max().unwrap_or(0);
+        LocalClientMapSnapshot {
+            width,
+            height,
+            z,
+            tiles,
+        }
+    }
+
+    fn local_client_appearance(
+        &self,
+        datum: DatumId,
+        depth: usize,
+        visited: &mut HashSet<DatumId>,
+    ) -> Option<LocalClientAppearance> {
+        if depth >= 16 || !visited.insert(datum) {
+            return None;
+        }
+        let type_path = self.heap.datum(datum).ok()?.type_path().as_str().to_owned();
+        let value =
+            |name: &str| datum_field_or_initial(self, datum, &FieldName::parse(name).unwrap()).ok();
+        let numeric = |name: &str, fallback: f32| {
+            value(name)
+                .and_then(|value| value.as_number())
+                .unwrap_or(fallback)
+        };
+        let text = |name: &str| match value(name) {
+            Some(Value::Text(text) | Value::File(text)) => Some(text.to_string()),
+            Some(Value::Null) | None => None,
+            Some(value) => Some(value.to_string()),
+        };
+        let icon = value("icon").and_then(|value| self.local_client_icon_resource(&value, 0));
+        let mut nested = |name: &str| {
+            let mut entries = match value(name) {
+                Some(Value::List(list)) => self
+                    .heap
+                    .list(list)
+                    .ok()
+                    .map(|values| {
+                        values
+                            .positions()
+                            .filter_map(|(_, value)| match value {
+                                Value::Datum(datum) => Some(*datum),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                Some(Value::Datum(datum)) => vec![datum],
+                _ => Vec::new(),
+            }
+            .into_iter()
+            .enumerate()
+            .filter_map(|(order, child)| {
+                self.local_client_appearance(child, depth + 1, visited)
+                    .map(|appearance| (order, appearance))
+            })
+            .collect::<Vec<_>>();
+            entries.sort_by(|(left_order, left), (right_order, right)| {
+                left.plane
+                    .total_cmp(&right.plane)
+                    .then_with(|| left.layer.total_cmp(&right.layer))
+                    .then_with(|| left_order.cmp(right_order))
+            });
+            entries
+                .into_iter()
+                .map(|(_, appearance)| appearance)
+                .collect()
+        };
+        let underlays = nested("underlays");
+        let overlays = nested("overlays");
+        visited.remove(&datum);
+        Some(LocalClientAppearance {
+            datum,
+            type_path,
+            icon,
+            icon_state: text("icon_state"),
+            dir: numeric("dir", 2.0) as i32,
+            layer: numeric("layer", 0.0),
+            plane: numeric("plane", 0.0),
+            pixel_x: numeric("pixel_x", 0.0),
+            pixel_y: numeric("pixel_y", 0.0),
+            pixel_w: numeric("pixel_w", 0.0),
+            pixel_z: numeric("pixel_z", 0.0),
+            color: text("color"),
+            alpha: numeric("alpha", 255.0),
+            underlays,
+            overlays,
+        })
+    }
+
+    fn local_client_icon_resource(&self, value: &Value, depth: usize) -> Option<String> {
+        if depth >= 16 {
+            return None;
+        }
+        match value {
+            Value::File(path) | Value::Text(path) => Some(path.to_string()),
+            Value::Datum(icon) => {
+                let datum = self.heap.datum(*icon).ok()?;
+                let path = datum.type_path().as_str();
+                if path != "/icon" && !path.starts_with("/icon/") {
+                    return None;
+                }
+                let backing =
+                    datum_field_or_initial(self, *icon, &FieldName::parse("icon").unwrap()).ok()?;
+                self.local_client_icon_resource(&backing, depth + 1)
+            }
+            _ => None,
+        }
+    }
+
+    fn local_client_coordinates(&self, mob: DatumId) -> Result<(i32, i32, i32), String> {
+        let loc = FieldName::parse("loc").unwrap();
+        let Value::Datum(turf) =
+            datum_field_or_initial(self, mob, &loc).map_err(|error| error.to_string())?
+        else {
+            return Err("controlled mob is not located on a turf".to_owned());
+        };
+        self.world_turfs
+            .iter()
+            .find_map(|(coordinate, candidate)| (*candidate == turf).then_some(*coordinate))
+            .ok_or_else(|| {
+                "controlled mob turf is absent from the authoritative world index".to_owned()
+            })
+    }
+
     pub(crate) fn environment_override(&self, name: &str) -> Option<&Option<Value>> {
         self.environment_overrides.get(name)
     }
@@ -10110,11 +10861,6 @@ impl ExecutionState {
 
     pub(crate) fn iconforge_gags_source(&self, path: &str) -> Option<&std::path::Path> {
         self.iconforge_gags_configs.get(path).map(PathBuf::as_path)
-    }
-
-    pub(crate) fn clear_iconforge(&mut self) {
-        self.iconforge_jobs.clear();
-        self.iconforge_gags_configs.clear();
     }
 
     pub(crate) fn enqueue_sql_job(&mut self, result: String) -> String {
@@ -10505,6 +11251,9 @@ impl ExecutionState {
                 .flat_map(|(entry, (savefile, _))| [*entry, *savefile]),
         );
         datum_roots.extend(self.deleting_datums.iter().copied());
+        datum_roots.extend(self.client_sessions.keys().copied());
+        datum_roots.extend(self.local_client_mobs.keys().copied());
+        datum_roots.extend(self.local_client_mobs.values().copied());
         datum_roots.extend(self.compact_default_datums.iter().copied());
         datum_roots.extend(self.world_turfs.values().copied());
         datum_roots.extend(self.world_areas.values().copied());
@@ -10668,6 +11417,25 @@ impl ExecutionState {
                 list_arena.chunks,
                 list_arena.reserved,
             );
+            if std::env::var_os("DREAM64_PROFILE_MEMORY").is_some() {
+                let mut counts = HashMap::<TypePath, usize>::new();
+                for (_, datum) in self.heap.datums() {
+                    *counts.entry(datum.type_path().clone()).or_default() += 1;
+                }
+                let mut counts = counts.into_iter().collect::<Vec<_>>();
+                counts.sort_unstable_by(|(left_path, left_count), (right_path, right_count)| {
+                    right_count
+                        .cmp(left_count)
+                        .then_with(|| left_path.as_str().cmp(right_path.as_str()))
+                });
+                let summary = counts
+                    .into_iter()
+                    .take(20)
+                    .map(|(path, count)| format!("{}={count}", path.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                eprintln!("boot-vm: heap-type-census {summary}");
+            }
         }
     }
 }
@@ -10800,6 +11568,9 @@ struct CallFrame {
     atoms_profile_root: bool,
     shuttle_trace_target: Option<DatumId>,
     shuttle_trace_post_return: Option<ShuttleTracePostReturn>,
+    // Materialized native numeric continuation. The PC, locals, and operand
+    // stack survive scheduler slices exactly like the interpreter frame.
+    numeric_jit_state: Option<NumericExecutionState>,
 }
 
 #[derive(Clone, Debug)]
@@ -11618,6 +12389,50 @@ fn run_frames(
                 *profile.frame_entries.entry(key).or_default() += 1;
             }
         }
+        // Tier zero: an entire straight-line, numeric-only procedure can bypass
+        // bytecode dispatch. Runtime type guards keep general DM coercion and
+        // error behavior in the reference interpreter.
+        if instruction_index == 0
+            && remaining_steps > 0
+            && let Some((outcome, returns_null)) = try_run_guarded_jit(
+                module,
+                procedure,
+                program,
+                &mut frames[frame_index],
+                remaining_steps,
+                state,
+            )
+        {
+            let (accounted_steps, result) = match outcome {
+                NumericRunOutcome::Returned { value, steps } => {
+                    // Native Return has no VM-visible side effect. Replay that
+                    // final instruction through the ordinary arm below so call
+                    // unwinding, tracing, and scheduler behavior stay unified.
+                    (u64::from(steps.saturating_sub(1)), Some(value))
+                }
+                NumericRunOutcome::BudgetExhausted { steps, .. } => (u64::from(steps), None),
+            };
+            let scheduler_batches_before = executed_steps / 4_096;
+            remaining_steps = remaining_steps.saturating_sub(accounted_steps);
+            executed_steps += accounted_steps;
+            for _ in scheduler_batches_before..(executed_steps / 4_096) {
+                account_scheduler_tick_usage(state);
+            }
+            if let Some(profile) = &mut state.atoms_profile {
+                profile.total_instructions =
+                    profile.total_instructions.saturating_add(accounted_steps);
+            }
+            if let Some(result) = result {
+                frames[frame_index].numeric_jit_state = None;
+                frames[frame_index].stack.push(if returns_null {
+                    Value::Null
+                } else {
+                    Value::number(result)
+                });
+                frames[frame_index].instruction = program.instructions.len() - 1;
+            }
+        }
+        let instruction_index = frames[frame_index].instruction;
         let Some(instruction) = program.instructions.get(instruction_index) else {
             return Err(execution_error(
                 module,
@@ -11854,14 +12669,38 @@ fn run_frames(
                 }
                 let arguments_start = stack.len() - count;
                 let type_path_index = arguments_start - 1;
-                let (type_path, overrides) = match stack[type_path_index].clone() {
-                    Value::TypePath(path) => (path, None),
-                    Value::ModifiedTypePath(modified) => (modified.base().clone(), Some(modified)),
-                    value => {
+                let constructor_type = stack[type_path_index].clone();
+                let (type_path, overrides) = match &constructor_type {
+                    Value::TypePath(path) => (path.clone(), None),
+                    Value::ModifiedTypePath(modified) => {
+                        (modified.base().clone(), Some(modified.clone()))
+                    }
+                    // BYOND accepts a textual type spelling as the operand to
+                    // dynamic `new`. Map-authored variables can retain this
+                    // representation verbatim, as with display-case
+                    // `start_showpiece_type` overrides. Resolve it through the
+                    // registered runtime catalog just like text2path(); an
+                    // unknown string remains an invalid constructor operand.
+                    Value::Text(text) => {
+                        let Some(path) = state
+                            .type_paths
+                            .iter()
+                            .find(|path| path.as_str() == text.as_ref())
+                            .cloned()
+                        else {
+                            return Err(execution_error(
+                                module,
+                                &frames,
+                                format!("new requires a type path, received {constructor_type}"),
+                            ));
+                        };
+                        (path, None)
+                    }
+                    _ => {
                         return Err(execution_error(
                             module,
                             &frames,
-                            format!("new requires a type path, received {value}"),
+                            format!("new requires a type path, received {constructor_type}"),
                         ));
                     }
                 };
@@ -12230,15 +13069,17 @@ fn run_frames(
                 if count > frames[frame_index].stack.len() {
                     return Err(execution_error(module, &frames, "bytecode stack underflow"));
                 }
-                let arguments = {
-                    let stack = &mut frames[frame_index].stack;
-                    stack.split_off(stack.len() - count)
-                };
-                let arguments = if name == "image" {
-                    order_image_arguments(&arguments, &argument_names)
-                        .map_err(|message| execution_error(module, &frames, message))?
+                // Builtins overwhelmingly take only a handful of values. Keep those arguments
+                // inline instead of allocating a fresh heap Vec at every call site; atoms init
+                // alone executes millions of these small native dispatches.
+                let arguments = pop_builtin_arguments(&mut frames[frame_index].stack, count);
+                let ordered_arguments;
+                let arguments: &[Value] = if name == "image" {
+                    ordered_arguments = order_image_arguments(&arguments, &argument_names)
+                        .map_err(|message| execution_error(module, &frames, message))?;
+                    &ordered_arguments
                 } else {
-                    arguments
+                    &arguments
                 };
                 let value = if name == "del" {
                     execute_del(
@@ -13155,8 +13996,7 @@ fn run_frames(
                             .ok()
                             .and_then(|name| state.global(&name).cloned())
                             .unwrap_or(Value::Null),
-                        _ => read_list_value(&state.heap, list, &key, false)
-                            .unwrap_or(Value::Null),
+                        _ => read_list_value(&state.heap, list, &key, false).unwrap_or(Value::Null),
                     }
                 } else if let Some(datum) = state.datum_vars_proxies.get(&list).copied() {
                     match &key {
@@ -13184,8 +14024,7 @@ fn run_frames(
                                     .unwrap_or(Value::Null)
                             }
                         }
-                        _ => read_list_value(&state.heap, list, &key, false)
-                            .unwrap_or(Value::Null),
+                        _ => read_list_value(&state.heap, list, &key, false).unwrap_or(Value::Null),
                     }
                 } else {
                     match read_list_value(&state.heap, list, &key, state.is_associative_list(list))
@@ -13456,6 +14295,11 @@ fn run_frames(
                 let iterable = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let iterable = canonicalize_value(&state.heap, &iterable);
+                let contents_owner = match &iterable {
+                    Value::Datum(datum) => Some(*datum),
+                    Value::List(list) => state.contents_owners.get(list).copied(),
+                    _ => None,
+                };
                 let world_contents = match &iterable {
                     Value::Datum(datum) => state.heap.datum(*datum).is_ok_and(|datum| {
                         let path = datum.type_path().as_str();
@@ -13496,6 +14340,14 @@ fn run_frames(
                     Value::List(list) if world_contents => Value::List(
                         world_contents_iteration_snapshot(state, list)
                             .map_err(|error| execution_error(module, &frames, error))?,
+                    ),
+                    Value::List(list) if contents_owner.is_some() => Value::List(
+                        atom_contents_iteration_snapshot(
+                            state,
+                            contents_owner.expect("contents owner exists"),
+                            list,
+                        )
+                        .map_err(|error| execution_error(module, &frames, error))?,
                     ),
                     Value::List(list) => Value::List(
                         state
@@ -13620,7 +14472,8 @@ fn run_frames(
                     .stack
                     .push(canonicalize_value(&state.heap, &caller));
             }
-            Instruction::LoadField(name) => {
+            instruction @ (Instruction::LoadField(name) | Instruction::LoadDeclaredField(name)) => {
+                let statically_declared = matches!(instruction, Instruction::LoadDeclaredField(_));
                 let receiver = match pop(&mut frames[frame_index].stack) {
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
@@ -13701,6 +14554,11 @@ fn run_frames(
                                 allocate_matrix([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], &mut state.heap)
                                     .map_err(|message| execution_error(module, &frames, message))?,
                             )
+                        } else if is_area_type_path(&runtime_type)
+                            && matches!(name.as_str(), "x" | "y" | "z")
+                            && let Some(coordinate) = area_coordinate_field(state, datum, &name)
+                        {
+                            coordinate
                         } else if let Some(value) = lazy_atom_list_field(state, datum, &name)
                             .map_err(|message| execution_error(module, &frames, message))?
                         {
@@ -13749,8 +14607,11 @@ fn run_frames(
                                 },
                             }
                         } else {
-                    match datum_field_or_shared(state, datum, &name) {
+                            match datum_field_or_shared(state, datum, &name) {
                                 Ok(value) => value,
+                                Err(ValueError::MissingField(_)) if statically_declared => {
+                                    Value::Null
+                                }
                                 Err(error) => {
                                     if matches!(error, ValueError::MissingField(_)) {
                                         eprintln!(
@@ -13990,18 +14851,16 @@ fn run_frames(
             }
             Instruction::LoadDatumVars => {
                 let datum = match pop(&mut frames[frame_index].stack) {
-                    Ok(value) => {
-                        match canonicalize_value(&state.heap, &value) {
-                            Value::Datum(datum) => datum,
-                            _ => {
-                                return Err(execution_error(
-                                    module,
-                                    &frames,
-                                    format!("vars requires a datum, received {value}"),
-                                ));
-                            }
+                    Ok(value) => match canonicalize_value(&state.heap, &value) {
+                        Value::Datum(datum) => datum,
+                        _ => {
+                            return Err(execution_error(
+                                module,
+                                &frames,
+                                format!("vars requires a datum, received {value}"),
+                            ));
                         }
-                    }
+                    },
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
                 let list = if let Some(list) = state.datum_vars_by_datum.get(&datum).copied() {
@@ -14254,6 +15113,14 @@ fn run_frames(
                     return Err(execution_error(module, &frames, "bytecode stack underflow"));
                 };
                 frames[frame_index].stack.push(value);
+            }
+            Instruction::PrepareRhsFirstIndexAssignment => {
+                let stack = &mut frames[frame_index].stack;
+                if stack.len() < 3 {
+                    return Err(execution_error(module, &frames, "bytecode stack underflow"));
+                }
+                let len = stack.len();
+                stack[len - 3..].rotate_left(1);
             }
             Instruction::AddressLocal(slot) => {
                 let slot = *slot;
@@ -14845,16 +15712,31 @@ fn run_frames(
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let needle = pop(&mut frames[frame_index].stack)
                     .map_err(|message| execution_error(module, &frames, message))?;
-            let contains = if let Value::List(list) = container {
-                state
-                    .heap
-                    .list(list)
-                    .map_err(|error| execution_error(module, &frames, error.to_string()))?
-                    .positions()
-                    .any(|(_, value)| values_equal(&state.heap, &needle, value))
-            } else {
-                false
-            };
+                // BYOND treats atoms (including turfs and world) as their
+                // `contents` list when they appear on the right-hand side of
+                // binary `in`. This is the same container coercion used by a
+                // for-in header. In particular, `node in get_step(src, dir)`
+                // tests whether the adjacent turf contains that node.
+                let container = canonicalize_value(&state.heap, &container);
+                let container = match container {
+                    Value::Datum(datum) => datum_field_or_initial(
+                        state,
+                        datum,
+                        &FieldName::parse("contents").expect("built-in contents field is valid"),
+                    )
+                    .unwrap_or(Value::Null),
+                    value => value,
+                };
+                let contains = if let Value::List(list) = container {
+                    state
+                        .heap
+                        .list(list)
+                        .map_err(|error| execution_error(module, &frames, error.to_string()))?
+                        .positions()
+                        .any(|(_, value)| values_equal(&state.heap, &needle, value))
+                } else {
+                    false
+                };
                 frames[frame_index]
                     .stack
                     .push(Value::number(f32::from(contains)));
@@ -15520,6 +16402,334 @@ fn run_frames(
     }
 }
 
+thread_local! {
+    static NUMERIC_JIT_CACHE: RefCell<HashMap<(u64, ProcedureId), Option<CompiledNumericTrace>>> =
+        RefCell::new(HashMap::new());
+    static LUMCOUNT_JIT_CACHE: RefCell<HashMap<(u64, ProcedureId), Option<LumcountTrace>>> =
+        RefCell::new(HashMap::new());
+}
+
+struct LumcountTrace {
+    compiled: CompiledNumericTrace,
+    fields: [FieldName; 4],
+    lighting_global: FieldName,
+    queue_field: FieldName,
+}
+
+fn try_run_guarded_jit(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+    frame: &mut CallFrame,
+    remaining_steps: u64,
+    state: &mut ExecutionState,
+) -> Option<(NumericRunOutcome, bool)> {
+    // Keep the runtime kill switch authoritative for every native tier. This
+    // is also essential for trustworthy whole-server A/B diagnosis: the
+    // specialized field trace must not remain active in the "JIT disabled"
+    // process while the generic numeric tier is bypassed.
+    if std::env::var_os("DREAM64_DISABLE_JIT").is_some() {
+        return None;
+    }
+    if let Some(outcome) =
+        try_run_lumcount_jit(module, procedure, program, frame, remaining_steps, state)
+    {
+        return Some((outcome, true));
+    }
+    try_run_numeric_jit(module, procedure, program, frame, remaining_steps)
+        .map(|outcome| (outcome, false))
+}
+
+fn try_run_lumcount_jit(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+    frame: &mut CallFrame,
+    remaining_steps: u64,
+    state: &mut ExecutionState,
+) -> Option<NumericRunOutcome> {
+    // This batched trace intentionally runs atomically. Near a scheduler
+    // boundary the interpreter retains exact per-opcode yield points.
+    if remaining_steps < 48 {
+        return None;
+    }
+    let Value::Datum(src) = frame.src else {
+        return None;
+    };
+    let key = (module.identity.0, procedure);
+    LUMCOUNT_JIT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let trace = cache
+            .entry(key)
+            .or_insert_with(|| compile_lumcount_trace(program));
+        let trace = trace.as_ref()?;
+        let mut numeric_locals = SmallVec::<[f32; 8]>::new();
+        numeric_locals.resize(program.local_count, 0.0);
+        for (index, local) in frame.locals.iter().take(3).enumerate() {
+            numeric_locals[index] = local.as_number()?;
+        }
+        // The canonical procedure returns before observing src, fields, the
+        // lighting global, or its queue when every delta is zero. Preserve
+        // that ordering and avoid all heap guards/native entry on this very
+        // common no-op path.
+        if numeric_locals[..3].iter().all(|value| *value == 0.0) {
+            return Some(NumericRunOutcome::Returned {
+                value: 0.0,
+                steps: 13,
+            });
+        }
+        let field_values = trace
+            .fields
+            .iter()
+            .map(|field| datum_field_or_initial(state, src, field).ok()?.as_number())
+            .collect::<Option<SmallVec<[f32; 8]>>>()?;
+        let Value::Datum(lighting) = state.global(&trace.lighting_global)?.clone() else {
+            return None;
+        };
+        let Value::List(queue) =
+            datum_field_or_initial(state, lighting, &trace.queue_field).ok()?
+        else {
+            return None;
+        };
+        if state.heap.list(queue).is_err() {
+            return None;
+        }
+        if let Some(native) = frame.numeric_jit_state.as_mut() {
+            native.fields.copy_from_slice(&field_values);
+        } else {
+            frame.numeric_jit_state = trace
+                .compiled
+                .initial_state_with_fields(&numeric_locals, &field_values);
+        }
+        let budget = u32::try_from(remaining_steps).unwrap_or(u32::MAX);
+        let outcome = trace
+            .compiled
+            .run_budgeted(frame.numeric_jit_state.as_mut()?, budget)?;
+        let native = frame.numeric_jit_state.as_mut()?;
+        for (index, field) in trace.fields.iter().enumerate() {
+            if native.dirty_fields & (1_u64 << index) != 0 {
+                state
+                    .heap
+                    .set_datum_field(src, field.clone(), Value::number(native.fields[index]))
+                    .ok()?;
+            }
+        }
+        native.dirty_fields = 0;
+        if native.action_bits & 1 != 0 {
+            state.heap.list_mut(queue).ok()?.add(Value::Datum(src));
+        }
+        native.action_bits = 0;
+        let NumericRunOutcome::Returned { value, .. } = outcome else {
+            return None;
+        };
+        let first_truthy = numeric_locals[0] != 0.0;
+        let second_truthy = numeric_locals[1] != 0.0;
+        let third_truthy = numeric_locals[2] != 0.0;
+        let exact_steps = if first_truthy {
+            31 + u32::from(field_values[3] == 0.0) * 9
+        } else if second_truthy {
+            34 + u32::from(field_values[3] == 0.0) * 9
+        } else if third_truthy {
+            35 + u32::from(field_values[3] == 0.0) * 9
+        } else {
+            13
+        };
+        Some(NumericRunOutcome::Returned {
+            value,
+            steps: exact_steps,
+        })
+    })
+}
+
+fn compile_lumcount_trace(program: &Program) -> Option<LumcountTrace> {
+    let instructions = program.instructions.as_slice();
+    if program.local_count != 4 || instructions.len() != 48 {
+        return None;
+    }
+    let field_at = |index| match instructions.get(index)? {
+        Instruction::LoadField(field) | Instruction::StoreField(field) => Some(field.clone()),
+        _ => None,
+    };
+    let global_at = |index| match instructions.get(index)? {
+        Instruction::LoadGlobal(field) => Some(field.clone()),
+        _ => None,
+    };
+    let lum_r = field_at(17)?;
+    let lum_g = field_at(23)?;
+    let lum_b = field_at(29)?;
+    let needs_update = field_at(34)?;
+    let queue_field = field_at(42)?;
+    let lighting_global = global_at(40)?;
+    let canonical = matches!(instructions,
+        [Instruction::LoadLocal(0), Instruction::Duplicate, Instruction::JumpIfFalse(4), Instruction::Jump(6), Instruction::Pop,
+         Instruction::LoadLocal(1), Instruction::Duplicate, Instruction::JumpIfFalse(9), Instruction::Jump(11), Instruction::Pop,
+         Instruction::LoadLocal(2), Instruction::Not, Instruction::JumpIfFalse(15), Instruction::LoadResult, Instruction::Return,
+         Instruction::LoadSrc, Instruction::Duplicate, Instruction::LoadField(_), Instruction::LoadLocal(0), Instruction::CompoundAssignment(CompoundAssignmentOperator::Add), Instruction::StoreField(_),
+         Instruction::LoadSrc, Instruction::Duplicate, Instruction::LoadField(_), Instruction::LoadLocal(1), Instruction::CompoundAssignment(CompoundAssignmentOperator::Add), Instruction::StoreField(_),
+         Instruction::LoadSrc, Instruction::Duplicate, Instruction::LoadField(_), Instruction::LoadLocal(2), Instruction::CompoundAssignment(CompoundAssignmentOperator::Add), Instruction::StoreField(_),
+         Instruction::LoadSrc, Instruction::LoadField(_), Instruction::Not, Instruction::JumpIfFalse(46), Instruction::LoadSrc, Instruction::PushNumber(one), Instruction::StoreField(_),
+         Instruction::LoadGlobal(_), Instruction::Duplicate, Instruction::LoadField(_), Instruction::LoadSrc, Instruction::CompoundAssignment(CompoundAssignmentOperator::Add), Instruction::StoreField(_), Instruction::LoadResult, Instruction::Return]
+         if one.to_f32() == 1.0)
+        && field_at(20)? == lum_r
+        && field_at(26)? == lum_g
+        && field_at(32)? == lum_b
+        && field_at(39)? == needs_update
+        && field_at(45)? == queue_field;
+    if !canonical {
+        return None;
+    }
+    let native = vec![
+        NumericInstruction::LoadLocal(0),
+        NumericInstruction::Constant(0.0),
+        NumericInstruction::NotEqual,
+        NumericInstruction::JumpIfFalse(5),
+        NumericInstruction::Jump(14),
+        NumericInstruction::LoadLocal(1),
+        NumericInstruction::Constant(0.0),
+        NumericInstruction::NotEqual,
+        NumericInstruction::JumpIfFalse(10),
+        NumericInstruction::Jump(14),
+        NumericInstruction::LoadLocal(2),
+        NumericInstruction::Constant(0.0),
+        NumericInstruction::NotEqual,
+        NumericInstruction::JumpIfFalse(37),
+        NumericInstruction::LoadField(0),
+        NumericInstruction::LoadLocal(0),
+        NumericInstruction::Add,
+        NumericInstruction::StoreField(0),
+        NumericInstruction::LoadField(1),
+        NumericInstruction::LoadLocal(1),
+        NumericInstruction::Add,
+        NumericInstruction::StoreField(1),
+        NumericInstruction::LoadField(2),
+        NumericInstruction::LoadLocal(2),
+        NumericInstruction::Add,
+        NumericInstruction::StoreField(2),
+        NumericInstruction::LoadField(3),
+        NumericInstruction::Constant(0.0),
+        NumericInstruction::Equal,
+        NumericInstruction::JumpIfFalse(35),
+        NumericInstruction::Constant(1.0),
+        NumericInstruction::StoreField(3),
+        NumericInstruction::RaiseAction(0),
+        NumericInstruction::Constant(0.0),
+        NumericInstruction::Return,
+        NumericInstruction::Constant(0.0),
+        NumericInstruction::Return,
+        NumericInstruction::Constant(0.0),
+        NumericInstruction::Return,
+    ];
+    let compiled = compile_numeric_field_trace(&native, program.local_count, 4)
+        .inspect_err(|error| eprintln!("lumcount JIT compile rejected: {error}"))
+        .ok()?;
+    Some(LumcountTrace {
+        compiled,
+        fields: [lum_r, lum_g, lum_b, needs_update],
+        lighting_global,
+        queue_field,
+    })
+}
+
+fn try_run_numeric_jit(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+    frame: &mut CallFrame,
+    remaining_steps: u64,
+) -> Option<NumericRunOutcome> {
+    let key = (module.identity.0, procedure);
+    NUMERIC_JIT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let trace = cache.entry(key).or_insert_with(|| {
+            numeric_trace_instructions(program).and_then(|instructions| {
+                compile_numeric_trace(&instructions, program.local_count).ok()
+            })
+        });
+        let trace = trace.as_ref()?;
+        if frame.numeric_jit_state.is_none() {
+            let mut numeric_locals = vec![0.0; program.local_count];
+            for (index, local) in frame.locals.iter().enumerate() {
+                if let Some(value) = local.as_number() {
+                    numeric_locals[index] = value;
+                } else if !matches!(local, Value::Null)
+                    || index < declared_argument_count(program)
+                    || !local_is_definitely_initialized_before_load(program, index)
+                {
+                    return None;
+                }
+            }
+            frame.numeric_jit_state = trace.initial_state(&numeric_locals);
+        }
+        let budget = u32::try_from(remaining_steps).unwrap_or(u32::MAX);
+        trace.run_budgeted(frame.numeric_jit_state.as_mut()?, budget)
+    })
+}
+
+fn local_is_definitely_initialized_before_load(program: &Program, local: usize) -> bool {
+    let Some(first_load) = program.instructions.iter().position(
+        |instruction| matches!(instruction, Instruction::LoadLocal(slot) if usize::from(*slot) == local),
+    ) else {
+        return true;
+    };
+    let Some(first_store) = program.instructions[..first_load].iter().position(
+        |instruction| matches!(instruction, Instruction::StoreLocal(slot) if usize::from(*slot) == local),
+    ) else {
+        return false;
+    };
+    // No edge originating before the initializer may skip over it.
+    !program.instructions[..=first_store]
+        .iter()
+        .any(|instruction| {
+            matches!(instruction,
+            Instruction::Jump(target) | Instruction::JumpIfFalse(target) if *target > first_store)
+        })
+}
+
+fn numeric_trace_instructions(program: &Program) -> Option<Vec<NumericInstruction>> {
+    if program.instructions.is_empty()
+        || program.instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::MakeArgs | Instruction::AddressLocal(_)
+            )
+        })
+    {
+        return None;
+    }
+    let declared_arguments = declared_argument_count(program);
+    program
+        .instructions
+        .iter()
+        .map(|instruction| match instruction {
+            Instruction::PushNumber(number) => Some(NumericInstruction::Constant(number.to_f32())),
+            Instruction::LoadLocal(slot) => Some(NumericInstruction::LoadLocal(*slot)),
+            // Writing a declared argument is observable through the live args
+            // vector even when MakeArgs does not occur in this procedure. Keep
+            // those procedures in the reference interpreter.
+            Instruction::StoreLocal(slot) if usize::from(*slot) >= declared_arguments => {
+                Some(NumericInstruction::StoreLocal(*slot))
+            }
+            Instruction::Add => Some(NumericInstruction::Add),
+            Instruction::Subtract => Some(NumericInstruction::Subtract),
+            Instruction::Multiply => Some(NumericInstruction::Multiply),
+            Instruction::Divide => Some(NumericInstruction::Divide),
+            Instruction::Negate => Some(NumericInstruction::Negate),
+            Instruction::Equal => Some(NumericInstruction::Equal),
+            Instruction::NotEqual => Some(NumericInstruction::NotEqual),
+            Instruction::Less => Some(NumericInstruction::LessThan),
+            Instruction::LessEqual => Some(NumericInstruction::LessThanOrEqual),
+            Instruction::Greater => Some(NumericInstruction::GreaterThan),
+            Instruction::GreaterEqual => Some(NumericInstruction::GreaterThanOrEqual),
+            Instruction::Jump(target) => u32::try_from(*target).ok().map(NumericInstruction::Jump),
+            Instruction::JumpIfFalse(target) => u32::try_from(*target)
+                .ok()
+                .map(NumericInstruction::JumpIfFalse),
+            Instruction::Return => Some(NumericInstruction::Return),
+            _ => None,
+        })
+        .collect()
+}
+
 fn shuttle_trace_enabled() -> bool {
     true
 }
@@ -15547,12 +16757,14 @@ fn shuttle_trace_is_atmos_init(path: &str) -> bool {
 }
 
 fn shuttle_trace_matches_target(state: &ExecutionState, datum: DatumId) -> bool {
-    shuttle_trace_target_filter().as_ref().is_some_and(|target| {
-        state
-            .heap
-            .datum(datum)
-            .is_ok_and(|datum| datum.type_path().as_str().contains(target))
-    })
+    shuttle_trace_target_filter()
+        .as_ref()
+        .is_some_and(|target| {
+            state
+                .heap
+                .datum(datum)
+                .is_ok_and(|datum| datum.type_path().as_str().contains(target))
+        })
 }
 
 fn shuttle_trace_slot_from_value(value: &Value) -> Option<usize> {
@@ -15570,14 +16782,21 @@ fn shuttle_trace_slot_from_arguments(arguments: &[Value]) -> Option<usize> {
 
 fn shuttle_trace_turn_dir(direction: i32, angle: i32) -> i32 {
     const DIRECTIONS: [i32; 8] = [1, 9, 8, 10, 2, 6, 4, 5];
-    let Some(index) = DIRECTIONS.iter().position(|candidate| *candidate == direction) else {
+    let Some(index) = DIRECTIONS
+        .iter()
+        .position(|candidate| *candidate == direction)
+    else {
         return direction;
     };
     let steps = angle / 45;
     DIRECTIONS[(index as i32 + steps).rem_euclid(8) as usize]
 }
 
-fn shuttle_trace_expected_slot_direction(dir_value: f32, flipped: bool, slot: usize) -> Option<i32> {
+fn shuttle_trace_expected_slot_direction(
+    dir_value: f32,
+    flipped: bool,
+    slot: usize,
+) -> Option<i32> {
     if !dir_value.is_finite() {
         return None;
     }
@@ -15605,15 +16824,13 @@ fn shuttle_trace_list_len(state: &ExecutionState, list: Option<ListId>) -> usize
         .map_or(0, |list| list.len())
 }
 
-fn shuttle_trace_list_slot(state: &ExecutionState, list: Option<ListId>, slot: usize) -> Option<Value> {
+fn shuttle_trace_list_slot(
+    state: &ExecutionState,
+    list: Option<ListId>,
+    slot: usize,
+) -> Option<Value> {
     let list = list?;
-    state
-        .heap
-        .list(list)
-        .ok()?
-        .get(slot)
-        .ok()
-        .cloned()
+    state.heap.list(list).ok()?.get(slot).ok().cloned()
 }
 
 fn shuttle_trace_field_text(state: &ExecutionState, datum: DatumId, name: &str) -> String {
@@ -15715,8 +16932,7 @@ fn shuttle_trace_prepare_call(
     if shuttle_trace_is_nullify_node(path) {
         let slot = nullify_slot;
         shuttle_trace_emit_snapshot(state, shuttle_target, "nullify-node-before", slot);
-        target_frame.shuttle_trace_post_return =
-            Some(ShuttleTracePostReturn::NullifyNode { slot });
+        target_frame.shuttle_trace_post_return = Some(ShuttleTracePostReturn::NullifyNode { slot });
     }
     if shuttle_trace_is_atmos_init(path) {
         shuttle_trace_emit_snapshot(state, shuttle_target, "atmos-init-before", None);
@@ -15741,7 +16957,11 @@ fn shuttle_trace_emit_snapshot(
     let parents = shuttle_trace_list_field(state, component, "parents");
     let node_len = shuttle_trace_list_len(state, nodes);
     let parent_len = shuttle_trace_list_len(state, parents);
-    let slot_count = *[node_len, parent_len, device_type].iter().max().unwrap_or(&3).max(&1);
+    let slot_count = *[node_len, parent_len, device_type]
+        .iter()
+        .max()
+        .unwrap_or(&3)
+        .max(&1);
     let note = note.map_or_else(|| "n/a".to_owned(), |slot| slot.to_string());
     let target_location = shuttle_trace_field_text(state, component, "loc");
     let target_x = shuttle_trace_field_text(state, component, "x");
@@ -15867,6 +17087,7 @@ fn make_frame_owned(
         caller_result_override: None,
         shuttle_trace_target: None,
         shuttle_trace_post_return: None,
+        numeric_jit_state: None,
         static_locals: HashSet::new(),
         boot_trace_started: None,
         boot_trace_heap: None,
@@ -17166,7 +18387,6 @@ fn initialize_existing_datum(
     }
     if is_atom {
         let contents = FieldName::parse("contents").expect("built-in contents field");
-        state.ensure_contents(datum)?;
         if preserve_cell {
             return Ok(());
         }
@@ -17217,6 +18437,31 @@ fn is_turf_type_path(path: &TypePath) -> bool {
     path.as_str() == "/turf" || path.as_str().starts_with("/turf/")
 }
 
+fn is_area_type_path(path: &TypePath) -> bool {
+    path.as_str() == "/area" || path.as_str().starts_with("/area/")
+}
+
+/// BYOND exposes an area's spatial coordinates through one of its contained
+/// turfs. Areas do not own a single map cell, so the indexed world mapping is
+/// the authoritative source when no explicit coordinate override exists.
+fn area_coordinate_field(
+    state: &ExecutionState,
+    area: DatumId,
+    field: &FieldName,
+) -> Option<Value> {
+    let coordinate = state
+        .world_areas
+        .iter()
+        .find_map(|(coordinate, candidate)| (*candidate == area).then_some(*coordinate))?;
+    let component = match field.as_str() {
+        "x" => coordinate.0,
+        "y" => coordinate.1,
+        "z" => coordinate.2,
+        _ => return None,
+    };
+    Some(Value::number(component as f32))
+}
+
 fn is_map_cell_structural_field(field: &FieldName) -> bool {
     matches!(field.as_str(), "x" | "y" | "z" | "loc" | "contents")
 }
@@ -17227,11 +18472,13 @@ fn lazy_atom_list_field(
     field: &FieldName,
 ) -> Result<Option<Value>, String> {
     enum ListKind {
+        Contents,
         Ordinary,
         VisContents,
         VisLocs,
     }
     let kind = match field.as_str() {
+        "contents" => ListKind::Contents,
         "filters" | "overlays" | "underlays" | "verbs" => ListKind::Ordinary,
         "vis_contents" => ListKind::VisContents,
         "vis_locs" => ListKind::VisLocs,
@@ -17248,6 +18495,7 @@ fn lazy_atom_list_field(
         return Ok(None);
     }
     let list = match kind {
+        ListKind::Contents => state.ensure_contents(datum)?,
         ListKind::VisContents => state.ensure_visibility_list(datum, true)?,
         ListKind::VisLocs => state.ensure_visibility_list(datum, false)?,
         ListKind::Ordinary => {
@@ -17316,6 +18564,43 @@ fn world_contents_iteration_snapshot(
             .heap
             .list_mut(snapshot)
             .expect("newly allocated world iteration snapshot is live")
+            .add(value);
+    }
+    Ok(snapshot)
+}
+
+fn atom_contents_iteration_snapshot(
+    state: &mut ExecutionState,
+    owner: DatumId,
+    contents: ListId,
+) -> Result<ListId, String> {
+    let loc = FieldName::parse("loc").expect("built-in loc field is valid");
+    let values = state
+        .heap
+        .list(contents)
+        .map_err(|error| error.to_string())?
+        .positions()
+        .filter_map(|(_, value)| {
+            let Value::Datum(member) = value else {
+                return None;
+            };
+            let actual_owner = state
+                .heap
+                .datum_field(*member, &loc)
+                .ok()
+                .and_then(|value| match value {
+                    Value::Datum(location) => Some(*location),
+                    _ => None,
+                });
+            (actual_owner == Some(owner)).then(|| value.clone())
+        })
+        .collect::<Vec<_>>();
+    let snapshot = state.heap.allocate_list();
+    for value in values {
+        state
+            .heap
+            .list_mut(snapshot)
+            .expect("newly allocated atom contents snapshot is live")
             .add(value);
     }
     Ok(snapshot)
@@ -17892,9 +19177,12 @@ fn deterministic_unit(state: &mut u64) -> f32 {
 /// value goes toward positive infinity, as in `floor(A / B + 0.5)`.  A zero
 /// multiple follows the legacy floor form rather than dividing by zero.
 fn round_builtin(arguments: &[Value]) -> Result<f32, String> {
-    let value = arguments[0]
-        .as_number()
-        .ok_or_else(|| format!("round requires a number, received {}", arguments[0]))?;
+    let value = match &arguments[0] {
+        Value::Null => 0.0,
+        value => value
+            .as_number()
+            .ok_or_else(|| format!("round requires a number, received {value}"))?,
+    };
     if arguments.len() == 1 {
         return Ok(value.floor());
     }
@@ -18109,6 +19397,16 @@ pub(crate) fn get_step_builtin(
     let Value::Datum(source) = source else {
         return Ok(Value::Null);
     };
+    // BYOND's spatial builtins accept atoms, not arbitrary `/datum` values.
+    // `get_turf(component)` is commonly used defensively and returns null;
+    // it must not probe synthetic x/y/z fields on the component datum.
+    let source_datum = state
+        .heap()
+        .datum(*source)
+        .map_err(|error| error.to_string())?;
+    if !is_atom_type_path(source_datum.type_path()) {
+        return Ok(Value::Null);
+    }
     let Some(direction) = direction.as_number() else {
         return Ok(Value::Null);
     };
@@ -19016,8 +20314,7 @@ fn logical_or_empty_list_index(
                 .ok()
                 .and_then(|name| state.global(&name).cloned())
                 .unwrap_or(Value::Null),
-            _ => read_list_value(&state.heap, list, &key, false)
-                .unwrap_or(Value::Null),
+            _ => read_list_value(&state.heap, list, &key, false).unwrap_or(Value::Null),
         }
     } else if let Some(datum) = state.datum_vars_proxies.get(&list).copied() {
         match &key {
@@ -19042,8 +20339,7 @@ fn logical_or_empty_list_index(
                         .unwrap_or(Value::Null)
                 }
             }
-            _ => read_list_value(&state.heap, list, &key, false)
-                .unwrap_or(Value::Null),
+            _ => read_list_value(&state.heap, list, &key, false).unwrap_or(Value::Null),
         }
     } else {
         match read_list_value(&state.heap, list, &key, state.is_associative_list(list)) {
@@ -19642,9 +20938,13 @@ fn read_list_value<'heap>(
     let values = heap.list(list)?;
     if matches!(key, Value::Number(_)) && !associative {
         let index = value_to_list_index(key).map_err(ValueError::InvalidListIndex)?;
-        values.get(index).map(|value| canonicalize_value(heap, value))
+        values
+            .get(index)
+            .map(|value| canonicalize_value(heap, value))
     } else {
-        values.get_key(key).map(|value| canonicalize_value(heap, value))
+        values
+            .get_key(key)
+            .map(|value| canonicalize_value(heap, value))
     }
 }
 
@@ -19857,11 +21157,15 @@ const ENGINE_MOB_FIELDS: &[&str] = &[
     "sight",
 ];
 const ENGINE_CLIENT_FIELDS: &[&str] = &[
+    "address",
+    "ckey",
+    "computer_id",
     "control_freak",
     "dir",
     "eye",
     "gender",
     "inactivity",
+    "key",
     "mob",
     "mouse_pointer_icon",
     "perspective",
@@ -20212,6 +21516,10 @@ fn assign_datum_field(
             builtins::move_movable_to_turf(state, datum, new_loc.expect("turf loc exists"))?;
             return Ok(());
         }
+        if is_movable && let Some(new_loc) = new_loc {
+            builtins::move_movable_to_atom(state, datum, new_loc)?;
+            return Ok(());
+        }
         // `/image.loc` is only the visual context used for client rendering.
         // Images are not physical atoms/movables and must never enter the
         // target's `contents` list. OpenDream stores this in DreamObjectImage's
@@ -20337,6 +21645,11 @@ fn pop(stack: &mut Vec<Value>) -> Result<Value, String> {
     stack
         .pop()
         .ok_or_else(|| "bytecode stack underflow".to_owned())
+}
+
+fn pop_builtin_arguments(stack: &mut Vec<Value>, count: usize) -> SmallVec<[Value; 8]> {
+    let start = stack.len() - count;
+    stack.drain(start..).collect()
 }
 
 fn allocate_dm_array(heap: &mut ValueHeap, sizes: &[usize], depth: usize) -> ListId {
@@ -20602,13 +21915,14 @@ mod tests {
     use std::time::Instant;
 
     use dm_core::{DmNumberBits, SourceSpan};
+    use dm_dmf::{ControlTree, parse as parse_dmf};
     use dm_lexer::{SpannedToken, TokenKind, lex};
     use dm_syntax::{DefinitionKind, parse};
     use dm_value::{FieldName, ModifiedTypePath, TypePath, ValueError};
 
     use super::{
         CANONICAL_TYPE2PARENT_SOURCE, CompoundListIndexOperator, ExecutionContext, ExecutionLimits,
-        ExecutionState, InitializerBinding, InstanceInitializer, Instruction,
+        ExecutionState, InitializerBinding, InstanceInitializer, Instruction, LocalClientUiEvent,
         MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES,
         MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE, MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH,
         MAXIMUM_LOW_YIELD_COLLECTION_GROWTH, MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH,
@@ -22000,7 +23314,8 @@ mod tests {
         let atom =
             allocate_initialized_datum(&mut state, TypePath::parse("/obj/item/runtime").unwrap())
                 .expect("runtime atom should allocate");
-        let datum_contents = state.heap().datum_field(atom, &field("contents")).unwrap();
+        assert!(state.heap().datum_field(atom, &field("contents")).is_err());
+        let datum_contents = Value::List(state.ensure_contents(atom).unwrap());
 
         assert!(matches!(datum_contents, Value::List(_)));
         assert!(
@@ -26228,8 +27543,8 @@ mod tests {
 
         assert_eq!(
             state.heap().live_list_count(),
-            1,
-            "a new atom needs contents, but untouched visibility lists stay unallocated"
+            0,
+            "untouched native atom lists must remain unallocated"
         );
         assert!(
             state
@@ -26250,7 +27565,7 @@ mod tests {
         );
         assert_eq!(
             state.heap().live_list_count(),
-            2,
+            1,
             "the first vis_contents read materializes exactly one stable list"
         );
 
@@ -26267,7 +27582,7 @@ mod tests {
         );
         assert_eq!(
             state.heap().live_list_count(),
-            4,
+            3,
             "datum.vars and the first vis_locs access each materialize one list"
         );
 
@@ -26284,7 +27599,7 @@ mod tests {
         );
         assert_eq!(
             state.heap().live_list_count(),
-            8,
+            7,
             "four first accesses materialize overlays, underlays, filters, and verbs once"
         );
     }
@@ -26684,6 +27999,107 @@ mod tests {
     }
 
     #[test]
+    fn direct_loc_assignment_rejects_descendant_containment_cycles() {
+        let syntax =
+            parse("/proc/move(atom, target)\n\tatom.loc = target\n\treturn atom.loc\n").unwrap();
+        let program = compile_procedure(&syntax.definitions[0]).unwrap();
+        let mut state = ExecutionState::new();
+        let turf = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/turf/floor").unwrap());
+        let parent = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/storage").unwrap());
+        let child = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/item").unwrap());
+        for (name, value) in [("x", 1.0), ("y", 1.0), ("z", 1.0)] {
+            state
+                .heap_mut()
+                .set_datum_field(turf, field(name), Value::number(value))
+                .unwrap();
+        }
+        super::builtins::move_movable_to_atom(&mut state, parent, turf).unwrap();
+        super::builtins::move_movable_to_atom(&mut state, child, parent).unwrap();
+
+        assert_eq!(
+            execute_in_state(
+                &program,
+                &[Value::Datum(parent), Value::Datum(child)],
+                &mut state,
+            ),
+            Ok(Value::Datum(turf)),
+        );
+        assert_eq!(
+            state.heap().datum_field(parent, &field("loc")),
+            Ok(&Value::Datum(turf)),
+        );
+    }
+
+    #[test]
+    fn atom_contents_read_materializes_one_stable_list() {
+        let syntax = parse(
+            "/proc/read(atom/target)\n\tvar/list/first = target.contents\n\tvar/list/second = target.vars[\"contents\"]\n\treturn first == second\n",
+        )
+        .unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let mut state = ExecutionState::new();
+        let atom =
+            allocate_initialized_datum(&mut state, TypePath::parse("/obj/item").unwrap()).unwrap();
+        assert!(state.heap().datum_field(atom, &field("contents")).is_err());
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/read").unwrap(),
+                &[Value::Datum(atom)],
+                &mut state,
+            ),
+            Ok(Value::number(1.0)),
+        );
+        assert!(matches!(
+            state.heap().datum_field(atom, &field("contents")),
+            Ok(Value::List(_))
+        ));
+    }
+
+    #[test]
+    fn declared_field_read_is_null_for_runtime_incompatible_typed_value() {
+        let syntax = parse(
+            "/proc/read_typed(obj/item/clothing/suit/space/suit)\n\treturn suit.cell\n/proc/read_dynamic(suit)\n\treturn suit.cell\n",
+        )
+        .expect("typed-field compatibility fixture should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("typed-field compatibility fixture should compile");
+        let mut state = ExecutionState::new();
+        let explorer = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/item/clothing/suit/hooded/explorer").unwrap());
+
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/read_typed").unwrap(),
+                &[Value::Datum(explorer)],
+                &mut state,
+            ),
+            Ok(Value::Null),
+            "a field valid on the declared /space type reads null when an unrelated runtime value lacks it",
+        );
+        let error = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/read_dynamic").unwrap(),
+            &[Value::Datum(explorer)],
+            &mut state,
+        )
+        .expect_err("a genuinely dynamic missing field must remain an error");
+        assert!(
+            error
+                .message
+                .contains("field FieldName(\"cell\") is absent")
+        );
+    }
+
+    #[test]
     fn list_gc_roots_materialized_args_across_scheduler_yield() {
         let syntax = parse(concat!(
             "/proc/work(value)\n",
@@ -26706,6 +28122,123 @@ mod tests {
             advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
             Ok(vec![Value::number(7.0)]),
         );
+    }
+
+    #[test]
+    fn list_gc_roots_reused_argument_list_through_nested_calls_and_many_yields() {
+        let syntax = parse(concat!(
+            "/proc/init_atom(list/arguments)\n",
+            "\treturn consume(arglist(arguments))\n",
+            "/proc/consume(mapload)\n",
+            "\treturn mapload\n",
+            "/proc/create_atoms()\n",
+            "\tvar/list/mapload_arg = list(1)\n",
+            "\tvar/total = 0\n",
+            "\tfor(var/I in 1 to 40)\n",
+            "\t\tsleep(1)\n",
+            "\t\ttotal += init_atom(mapload_arg)\n",
+            "\treturn total\n",
+        ))
+        .expect("nested argument-list GC fixture should parse");
+        let module = compile_module(&syntax.definitions).expect("fixture should compile");
+        let entry = module.procedure_id("/proc/create_atoms").unwrap();
+        let mut state = ExecutionState::new();
+        state.next_list_collection = 1;
+
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::Null),
+        );
+        for tick in 1..40 {
+            assert!(
+                advance_scheduler(&module, tick, ExecutionLimits::default(), &mut state)
+                    .expect("continuation must retain its reusable argument list")
+                    .is_empty()
+            );
+            state.next_list_collection = 1;
+        }
+        state.next_list_collection = 1;
+        assert_eq!(
+            advance_scheduler(&module, 40, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::number(40.0)]),
+        );
+    }
+
+    #[test]
+    fn parallel_lowering_reassembles_results_and_errors_in_source_order() {
+        let values = crate::parallel_collect_ordered(257, |index| -> Result<usize, usize> {
+            // Perturb completion order without making the test timing-sensitive.
+            std::thread::yield_now();
+            Ok(index * 3)
+        })
+        .unwrap();
+        assert_eq!(values, (0..257).map(|index| index * 3).collect::<Vec<_>>());
+
+        let error = crate::parallel_collect_ordered(257, |index| {
+            if matches!(index, 17 | 201) {
+                Err(index)
+            } else {
+                Ok(index)
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error, 17, "the earliest source diagnostic must win");
+    }
+
+    #[test]
+    #[ignore = "manual multicore lowering throughput benchmark"]
+    fn benchmark_parallel_procedure_lowering() {
+        let source = (0..4_096)
+            .map(|index| {
+                format!(
+                    "/proc/worker_{index}(value)\n\tvar/total = 0\n\tfor(var/i in 1 to 20)\n\t\ttotal += value * i + {index}\n\treturn total\n"
+                )
+            })
+            .collect::<String>();
+        let syntax = parse(&source).expect("benchmark source should parse");
+        let started = Instant::now();
+        let module = compile_module(&syntax.definitions).expect("benchmark module should compile");
+        eprintln!(
+            "parallel-lowering-benchmark procedures={} elapsed_ms={} workers={}",
+            module.paths.len(),
+            started.elapsed().as_millis(),
+            std::thread::available_parallelism().map_or(1, usize::from),
+        );
+    }
+
+    #[test]
+    fn dynamic_new_resolves_a_registered_textual_type_path() {
+        let syntax = parse("/proc/build(kind)\n\treturn new kind\n")
+            .expect("textual dynamic-new fixture should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("textual dynamic-new fixture should compile");
+        let path = TypePath::parse("/obj/item/gun/ballistic/revolver/mateba").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_type_paths([path.clone()]);
+
+        let result = execute_in_state(&program, &[Value::text(path.as_str())], &mut state)
+            .expect("a registered textual type path should construct dynamically");
+        let Value::Datum(datum) = result else {
+            panic!("dynamic new should return a datum");
+        };
+        assert_eq!(state.heap().datum(datum).unwrap().type_path(), &path);
+    }
+
+    #[test]
+    fn dynamic_new_rejects_an_unknown_textual_type_path() {
+        let syntax = parse("/proc/build(kind)\n\treturn new kind\n")
+            .expect("unknown textual dynamic-new fixture should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("unknown textual dynamic-new fixture should compile");
+        let mut state = ExecutionState::new();
+
+        let error = execute_in_state(
+            &program,
+            &[Value::text("/obj/item/not_registered")],
+            &mut state,
+        )
+        .expect_err("an unknown textual type path must not synthesize a type");
+        assert!(error.message.contains("new requires a type path"));
     }
 
     #[test]
@@ -26733,10 +28266,9 @@ mod tests {
 
     #[test]
     fn stale_list_keep_assignments_match_null_receiver_behavior() {
-        let syntax = parse(
-            "/proc/run(list/targets)\n\tvar/value = (targets[1] = 7)\n\treturn value",
-        )
-        .expect("source should parse");
+        let syntax =
+            parse("/proc/run(list/targets)\n\tvar/value = (targets[1] = 7)\n\treturn value")
+                .expect("source should parse");
         let module = compile_module(&syntax.definitions).expect("module should compile");
         let entry = module
             .procedure_id("/proc/run")
@@ -26767,7 +28299,10 @@ mod tests {
         let error = execute_module_in_state(&module, entry, &[Value::List(stale_list)], &mut state)
             .unwrap_err();
 
-        assert_eq!(error.message, "list mutation requires a list, received null");
+        assert_eq!(
+            error.message,
+            "list mutation requires a list, received null"
+        );
         assert!(!error.message.contains("stale"));
     }
 
@@ -26783,8 +28318,9 @@ mod tests {
         let stale_list = state.heap_mut().allocate_list();
         state.heap_mut().destroy_list(stale_list).unwrap();
 
-        let result = execute_module_in_state(&module, entry, &[Value::List(stale_list)], &mut state)
-            .expect("stale list should execute as null in length checks");
+        let result =
+            execute_module_in_state(&module, entry, &[Value::List(stale_list)], &mut state)
+                .expect("stale list should execute as null in length checks");
 
         assert_eq!(result, Value::number(0.0));
     }
@@ -26801,8 +28337,9 @@ mod tests {
         let stale_list = state.heap_mut().allocate_list();
         state.heap_mut().destroy_list(stale_list).unwrap();
 
-        let result = execute_module_in_state(&module, entry, &[Value::List(stale_list)], &mut state)
-            .expect("stale list should execute as null iterable");
+        let result =
+            execute_module_in_state(&module, entry, &[Value::List(stale_list)], &mut state)
+                .expect("stale list should execute as null iterable");
 
         assert_eq!(result, Value::number(0.0));
     }
@@ -27206,6 +28743,56 @@ mod tests {
         assert_eq!(
             execute(&program, &[Value::number(9.0)]),
             Ok(Value::number(0.0))
+        );
+    }
+
+    #[test]
+    fn in_treats_an_atom_container_as_its_contents_list() {
+        let syntax = parse("/proc/probe(needle, container)\n\treturn needle in container\n")
+            .expect("atom membership fixture should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("atom membership fixture should compile");
+        let mut state = ExecutionState::new();
+        let turf = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/turf/floor").unwrap());
+        let present = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/machinery/atmospherics/pipe").unwrap());
+        let absent = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/machinery/atmospherics/pipe/absent").unwrap());
+        let contents = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(contents)
+            .unwrap()
+            .add(Value::Datum(present));
+        state
+            .heap_mut()
+            .set_datum_field(turf, field("contents"), Value::List(contents))
+            .unwrap();
+        state
+            .heap_mut()
+            .set_datum_field(present, field("loc"), Value::Datum(turf))
+            .unwrap();
+
+        assert_eq!(
+            execute_in_state(
+                &program,
+                &[Value::Datum(present), Value::Datum(turf)],
+                &mut state,
+            ),
+            Ok(Value::number(1.0)),
+            "an adjacent atmos node must be found in the turf returned by get_step",
+        );
+        assert_eq!(
+            execute_in_state(
+                &program,
+                &[Value::Datum(absent), Value::Datum(turf)],
+                &mut state,
+            ),
+            Ok(Value::number(0.0)),
         );
     }
 
@@ -29138,6 +30725,62 @@ mod tests {
     }
 
     #[test]
+    fn indexed_assignment_statement_evaluates_rhs_before_index() {
+        let source = "/proc/run()\n\tvar/list/output = list()\n\tvar/index = 1\n\toutput[\"[index - 1]\"] = ++index\n\treturn output[\"1\"]\n";
+        let syntax = parse(source).expect("RHS-first indexed assignment should parse");
+        let module = compile_module(&syntax.definitions)
+            .expect("RHS-first indexed assignment should compile");
+        assert_eq!(
+            execute_module(&module, module.procedure_id("/proc/run").unwrap(), &[]),
+            Ok(Value::number(2.0)),
+        );
+    }
+
+    #[test]
+    fn atom_iteration_ignores_entries_that_are_not_actually_located_in_the_owner() {
+        let syntax = parse(
+            "/proc/count(atom/container)\n\tvar/count = 0\n\tfor(var/atom/movable/item as anything in container)\n\t\tcount++\n\treturn count\n",
+        )
+        .unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let mut state = ExecutionState::new();
+        let owner = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/storage").unwrap());
+        let child = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/item").unwrap());
+        let contents = state.ensure_contents(owner).unwrap();
+        state
+            .heap_mut()
+            .set_datum_field(child, field("loc"), Value::Datum(owner))
+            .unwrap();
+        state
+            .heap_mut()
+            .list_mut(contents)
+            .unwrap()
+            .add(Value::Datum(child));
+        // A stale/self entry can otherwise make recursive contents notification
+        // call the same movable forever. Atom contents are defined by loc, so
+        // this entry is not observable as a member of owner.contents.
+        state
+            .heap_mut()
+            .list_mut(contents)
+            .unwrap()
+            .add(Value::Datum(owner));
+
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/count").unwrap(),
+                &[Value::Datum(owner)],
+                &mut state,
+            ),
+            Ok(Value::number(1.0)),
+        );
+    }
+
+    #[test]
     fn stale_datum_ref_reads_as_null_in_vars_and_list_elements() {
         let syntax = parse(
             "/proc/run(list/parents)\n\tvar/value = parents[1]\n\tvar/copy = value\n\tif(copy == null)\n\t\treturn 1\n\treturn 0\n",
@@ -29149,9 +30792,7 @@ mod tests {
         let parent = state
             .heap_mut()
             .allocate_datum(TypePath::parse("/datum/example").unwrap());
-        let parents = state
-            .heap_mut()
-            .allocate_list();
+        let parents = state.heap_mut().allocate_list();
         state
             .heap_mut()
             .list_mut(parents)
@@ -29177,9 +30818,7 @@ mod tests {
         let parent = state
             .heap_mut()
             .allocate_datum(TypePath::parse("/datum/example").unwrap());
-        let parents = state
-            .heap_mut()
-            .allocate_list();
+        let parents = state.heap_mut().allocate_list();
         state
             .heap_mut()
             .list_mut(parents)
@@ -29205,9 +30844,7 @@ mod tests {
         let parent = state
             .heap_mut()
             .allocate_datum(TypePath::parse("/datum/example").unwrap());
-        let parents = state
-            .heap_mut()
-            .allocate_list();
+        let parents = state.heap_mut().allocate_list();
         state
             .heap_mut()
             .list_mut(parents)
@@ -29215,7 +30852,8 @@ mod tests {
             .add(Value::Datum(parent));
         state.heap_mut().destroy_datum(parent).unwrap();
 
-        let error = execute_module_in_state(&module, entry, &[Value::List(parents)], &mut state).unwrap_err();
+        let error = execute_module_in_state(&module, entry, &[Value::List(parents)], &mut state)
+            .unwrap_err();
         assert!(error.message.contains("cannot call a procedure on null"));
         assert!(!error.message.contains("stale datum"));
     }
@@ -29232,9 +30870,7 @@ mod tests {
         let stale_parent = state
             .heap_mut()
             .allocate_datum(TypePath::parse("/datum/example").unwrap());
-        let parents = state
-            .heap_mut()
-            .allocate_list();
+        let parents = state.heap_mut().allocate_list();
         state
             .heap_mut()
             .list_mut(parents)
@@ -29275,12 +30911,8 @@ mod tests {
         state.heap_mut().destroy_datum(left_value).unwrap();
 
         assert!(
-            super::values_equivalent(
-                &Value::List(left),
-                &Value::List(right),
-                state.heap()
-            )
-            .expect("equivalence should be comparable"),
+            super::values_equivalent(&Value::List(left), &Value::List(right), state.heap())
+                .expect("equivalence should be comparable"),
             "stale key/value entries should be canonicalized to null"
         );
     }
@@ -29791,6 +31423,7 @@ mod tests {
             None,
         );
 
+        let lists_before_resize = state.heap().live_list_count();
         state
             .resize_world_geometry(world, (255, 255, 2))
             .expect("two full-size z levels should materialize compactly");
@@ -29801,7 +31434,12 @@ mod tests {
             .values()
             .map(|turf| state.heap().datum(*turf).unwrap().field_len())
             .sum::<usize>();
-        assert_eq!(materialized_fields, turf_count * 5);
+        assert_eq!(materialized_fields, turf_count * 4);
+        assert_eq!(
+            state.heap().live_list_count() - lists_before_resize,
+            1,
+            "world expansion allocates the shared area's contents only, saving one empty list per turf",
+        );
         let effective_fields_per_turf = 9 + 96;
         let field_slot_bytes = std::mem::size_of::<(FieldName, Value)>();
         let compact_field_bytes = materialized_fields * field_slot_bytes;
@@ -29816,7 +31454,7 @@ mod tests {
             state
                 .heap()
                 .datum(*turf)
-                .is_ok_and(|datum| datum.field_len() == 5)
+                .is_ok_and(|datum| datum.field_len() == 4)
         }));
 
         let cell = state.turf_at(255, 255, 2).expect("corner turf exists");
@@ -29847,7 +31485,8 @@ mod tests {
                 Value::text("compact"),
             ]
         );
-        assert_eq!(state.heap().datum(cell).unwrap().field_len(), 6);
+        assert_eq!(state.heap().datum(cell).unwrap().field_len(), 5);
+        state.ensure_contents(cell).unwrap();
 
         let structural_fields = ["x", "y", "z", "loc", "contents"];
         let structural_before = structural_fields.map(|name| {
@@ -31150,6 +32789,30 @@ mod tests {
     }
 
     #[test]
+    fn get_turf_of_arbitrary_datum_returns_null_without_coordinate_probe() {
+        let syntax = parse("/proc/turf_of(source)\n\treturn get_step(source, 0)\n")
+            .expect("get_turf-shaped source should parse");
+        let program = compile_procedure(&syntax.definitions[0])
+            .expect("get_turf-shaped source should compile");
+        let mut state = ExecutionState::new();
+        let component = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/component/burning").unwrap());
+        let parent = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/item/test").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(component, field("parent"), Value::Datum(parent))
+            .unwrap();
+
+        assert_eq!(
+            execute_in_state(&program, &[Value::Datum(component)], &mut state),
+            Ok(Value::Null),
+        );
+    }
+
+    #[test]
     fn get_turf_reads_sparse_runtime_coordinate_and_loc_defaults() {
         let syntax = parse("/proc/turf_of(atom/source)\n\treturn get_step(source, 0)\n")
             .expect("get_turf-shaped source should parse");
@@ -32077,6 +33740,45 @@ mod tests {
     }
 
     #[test]
+    fn area_coordinate_fields_come_from_contained_world_cells() {
+        let syntax = parse(
+            "/proc/read_z(area/place)\n\treturn place.z\n/proc/read_x(area/place)\n\treturn place.x\n",
+        )
+        .expect("area coordinate fixture should parse");
+        let module = compile_module(&syntax.definitions).expect("fixture should compile");
+        let mut state = ExecutionState::new();
+        let area = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/area/weather_target").unwrap());
+        state.world_areas.insert((7, 11, 5), area);
+        state.world_areas.insert((9, 12, 5), area);
+
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/read_z").unwrap(),
+                &[Value::Datum(area)],
+                &mut state,
+            ),
+            Ok(Value::number(5.0)),
+            "area.z must expose the z-level of a contained turf for areas_in_z registration",
+        );
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/read_x").unwrap(),
+                &[Value::Datum(area)],
+                &mut state,
+            ),
+            Ok(Value::number(7.0)),
+        );
+        assert_eq!(
+            crate::builtins::datum_coordinates(&state, &Value::Datum(area)),
+            Some((7.0, 11.0, 5.0)),
+        );
+    }
+
+    #[test]
     fn qdel_builtin_removes_a_datum_from_heap() {
         let syntax = parse("/proc/test(v)\n\tqdel(v)\n").expect("source should parse");
         let program = compile_procedure(&syntax.definitions[0]).expect("qdel call should compile");
@@ -32110,8 +33812,8 @@ mod tests {
 
     #[test]
     fn qdel_builtin_is_idempotent_on_stale_reference() {
-        let syntax = parse("/proc/test(v)\n\tqdel(v)\n\tqdel(v)\n\treturn 1")
-            .expect("source should parse");
+        let syntax =
+            parse("/proc/test(v)\n\tqdel(v)\n\tqdel(v)\n\treturn 1").expect("source should parse");
         let program = compile_procedure(&syntax.definitions[0]).expect("qdel call should compile");
         let mut state = ExecutionState::new();
         let target = state
@@ -32127,8 +33829,8 @@ mod tests {
 
     #[test]
     fn del_builtin_is_idempotent_on_stale_reference() {
-        let syntax = parse("/proc/test(v)\n\tdel(v)\n\tdel(v)\n\treturn 1")
-            .expect("source should parse");
+        let syntax =
+            parse("/proc/test(v)\n\tdel(v)\n\tdel(v)\n\treturn 1").expect("source should parse");
         let program = compile_procedure(&syntax.definitions[0]).expect("del call should compile");
         let mut state = ExecutionState::new();
         let target = state
@@ -33171,6 +34873,244 @@ mod tests {
     }
 
     #[test]
+    fn local_client_movement_commits_at_boundary_and_updates_snapshot() {
+        let mut state = ExecutionState::new();
+        let west = state
+            .heap
+            .allocate_datum(TypePath::parse("/turf/open/floor/west").unwrap());
+        let east = state
+            .heap
+            .allocate_datum(TypePath::parse("/turf/open/floor/east").unwrap());
+        for (turf, x) in [(west, 1), (east, 2)] {
+            for (name, value) in [("x", x), ("y", 1), ("z", 1)] {
+                state
+                    .heap
+                    .set_datum_field(turf, field(name), Value::number(value as f32))
+                    .unwrap();
+            }
+            state.ensure_contents(turf).unwrap();
+            state.world_turfs.insert((x, 1, 1), turf);
+        }
+        let attached = state.create_attached_local_client().unwrap();
+        let (client, mob) = (attached.client, attached.mob);
+        assert_eq!((attached.x, attached.y, attached.z), (1, 1, 1));
+        for (name, value) in [
+            ("icon", Value::file("icons/mob/player.dmi")),
+            ("icon_state", Value::text("idle")),
+            ("dir", Value::number(4.0)),
+            ("layer", Value::number(4.0)),
+            ("plane", Value::number(1.0)),
+            ("pixel_x", Value::number(3.0)),
+            ("alpha", Value::number(200.0)),
+        ] {
+            state.heap.set_datum_field(mob, field(name), value).unwrap();
+        }
+        let overlay = state
+            .heap
+            .allocate_datum(TypePath::parse("/mutable_appearance").unwrap());
+        for (name, value) in [
+            ("icon", Value::file("icons/effects/aura.dmi")),
+            ("icon_state", Value::text("glow")),
+            ("layer", Value::number(5.0)),
+        ] {
+            state
+                .heap
+                .set_datum_field(overlay, field(name), value)
+                .unwrap();
+        }
+        let overlays = state.heap.allocate_list();
+        state
+            .heap
+            .list_mut(overlays)
+            .unwrap()
+            .add(Value::Datum(overlay));
+        state
+            .heap
+            .set_datum_field(mob, field("overlays"), Value::List(overlays))
+            .unwrap();
+        let before = state.local_client_map_snapshot(1);
+        assert!(
+            before
+                .tiles
+                .iter()
+                .find(|tile| tile.x == 1)
+                .unwrap()
+                .occupants
+                .contains(&mob)
+        );
+        let mob_appearance = before
+            .tiles
+            .iter()
+            .find(|tile| tile.x == 1)
+            .unwrap()
+            .appearances
+            .iter()
+            .find(|appearance| appearance.datum == mob)
+            .unwrap();
+        assert_eq!(mob_appearance.icon.as_deref(), Some("icons/mob/player.dmi"));
+        assert_eq!(mob_appearance.icon_state.as_deref(), Some("idle"));
+        assert_eq!(
+            (
+                mob_appearance.dir,
+                mob_appearance.layer,
+                mob_appearance.plane
+            ),
+            (4, 4.0, 1.0)
+        );
+        assert_eq!((mob_appearance.pixel_x, mob_appearance.alpha), (3.0, 200.0));
+        assert_eq!(
+            mob_appearance.overlays[0].icon_state.as_deref(),
+            Some("glow")
+        );
+
+        state
+            .queue_local_movement(client, crate::LocalMovementDirection::East)
+            .unwrap();
+        assert_eq!(
+            state.local_client_state(client).unwrap().x,
+            1,
+            "queued input must not mutate before boundary"
+        );
+        assert_eq!(state.apply_local_client_commands().unwrap()[0].x, 2);
+
+        let after = state.local_client_map_snapshot(1);
+        assert!(
+            !after
+                .tiles
+                .iter()
+                .find(|tile| tile.x == 1)
+                .unwrap()
+                .occupants
+                .contains(&mob)
+        );
+        assert!(
+            after
+                .tiles
+                .iter()
+                .find(|tile| tile.x == 2)
+                .unwrap()
+                .occupants
+                .contains(&mob)
+        );
+        assert_eq!((after.width, after.height, after.z), (2, 1, 1));
+    }
+
+    #[test]
+    fn local_guest_new_observes_bound_identity_and_resumes_after_sleep() {
+        let syntax = parse(
+            "var/global/seen_key\nvar/global/seen_ckey\nvar/global/seen_mob\nvar/global/new_stage = 0\n/client/proc/New()\n\tseen_key = src.key\n\tseen_ckey = src.ckey\n\tseen_mob = src.mob\n\tnew_stage = 1\n\tsleep(1)\n\tnew_stage = 2\n",
+        )
+        .expect("client New fixture should parse");
+        let procedures = syntax
+            .definitions
+            .iter()
+            .filter(|definition| matches!(definition.kind, DefinitionKind::Procedure))
+            .cloned()
+            .collect::<Vec<_>>();
+        let globals = ["seen_key", "seen_ckey", "seen_mob", "new_stage"]
+            .into_iter()
+            .map(|name| (name.to_owned(), field(name)))
+            .collect();
+        let module = compile_module_with_global_fields(&procedures, &globals)
+            .expect("client New fixture should compile");
+        let mut state = ExecutionState::new();
+        for name in ["seen_key", "seen_ckey", "seen_mob", "new_stage"] {
+            state.set_global(field(name), Value::Null);
+        }
+        let turf = state
+            .heap
+            .allocate_datum(TypePath::parse("/turf/open/floor").unwrap());
+        for (name, value) in [("x", 1), ("y", 1), ("z", 1)] {
+            state
+                .heap
+                .set_datum_field(turf, field(name), Value::number(value as f32))
+                .unwrap();
+        }
+        state.ensure_contents(turf).unwrap();
+        state.world_turfs.insert((1, 1, 1), turf);
+
+        let attached = state.connect_local_guest(&module).unwrap();
+        assert_eq!(state.scheduled_task_count(), 1);
+        assert_eq!(state.global(&field("new_stage")), Some(&Value::Null));
+        advance_scheduler(&module, 0, ExecutionLimits::default(), &mut state).unwrap();
+        assert_eq!(
+            state.global(&field("seen_key")),
+            Some(&Value::text("Guest-1"))
+        );
+        assert_eq!(
+            state.global(&field("seen_ckey")),
+            Some(&Value::text("guest-1"))
+        );
+        assert_eq!(
+            state.global(&field("seen_mob")),
+            Some(&Value::Datum(attached.mob))
+        );
+        assert_eq!(state.global(&field("new_stage")), Some(&Value::number(1.0)));
+        assert_eq!(state.scheduled_task_count(), 1);
+        advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state).unwrap();
+        assert_eq!(state.global(&field("new_stage")), Some(&Value::number(2.0)));
+    }
+
+    #[test]
+    fn local_guest_installs_skin_before_new_and_emits_lobby_ui_in_order() {
+        let syntax = parse(
+            "/client/proc/New()\n\twinset(null, \"main\", \"title=Lobby\")\n\tsrc.mob << output(\"Welcome\", \"output\")\n\tsrc.mob << browse_rsc('oracle.txt', \"oracle.txt\")\n\tsrc.mob << browse(\"<h1>Lobby</h1>\", \"window=browser\")\n",
+        )
+        .expect("lobby client New fixture should parse");
+        let module = compile_module(&syntax.definitions).expect("lobby client New should compile");
+        let mut state = ExecutionState::new();
+        let skin = parse_dmf(
+            "window \"main\"\n\telem \"main\"\n\t\ttype = MAIN\n\telem \"browser\"\n\t\ttype = BROWSER\n\telem \"output\"\n\t\ttype = OUTPUT\n",
+        );
+        state.set_local_client_skin(ControlTree::from_document(&skin));
+        let root = std::env::temp_dir().join(format!("dream64-lobby-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("oracle.txt"), b"oracle bytes").unwrap();
+        state.set_project_root(root.clone());
+        let turf = state.heap.allocate_datum(TypePath::parse("/turf").unwrap());
+        for (name, value) in [("x", 1), ("y", 1), ("z", 1)] {
+            state
+                .heap
+                .set_datum_field(turf, field(name), Value::number(value as f32))
+                .unwrap();
+        }
+        state.ensure_contents(turf).unwrap();
+        state.world_turfs.insert((1, 1, 1), turf);
+
+        let attached = state.connect_local_guest(&module).unwrap();
+        let session = state.client_session(attached.client).unwrap();
+        assert!(session.ui().tree().control("main", "browser").is_some());
+        assert!(
+            state
+                .take_local_client_outbound_events(attached.client)
+                .is_empty()
+        );
+        advance_scheduler(&module, 0, ExecutionLimits::default(), &mut state).unwrap();
+        assert_eq!(
+            state.take_local_client_outbound_events(attached.client),
+            vec![
+                LocalClientUiEvent::Winset {
+                    control: "main".to_owned(),
+                    parameters: "title=Lobby".to_owned(),
+                },
+                LocalClientUiEvent::Output {
+                    control: "output".to_owned(),
+                    message: "Welcome".to_owned(),
+                },
+                LocalClientUiEvent::BrowseResource {
+                    name: "oracle.txt".to_owned(),
+                    bytes: b"oracle bytes".to_vec(),
+                },
+                LocalClientUiEvent::Browse {
+                    window: "browser".to_owned(),
+                    html: "<h1>Lobby</h1>".to_owned(),
+                },
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn eager_compact_control_and_expression_families_lower_together() {
         let source = concat!(
             "/proc/run(flag)\n",
@@ -33551,6 +35491,10 @@ mod tests {
             .heap_mut()
             .set_datum_field(turf, field("contents"), Value::List(contents))
             .unwrap();
+        state
+            .heap_mut()
+            .set_datum_field(synthesized, field("loc"), Value::Datum(turf))
+            .unwrap();
 
         assert_eq!(
             execute_module_in_context(
@@ -33774,6 +35718,361 @@ mod tests {
     }
 
     #[test]
+    fn numeric_jit_matches_interpreter_and_guards_dynamic_values() {
+        let syntax = parse("/proc/calculate(a, b)\n\treturn -(a * 2 + b)")
+            .expect("numeric JIT fixture parses");
+        let module = compile_module(&syntax.definitions).expect("numeric JIT fixture compiles");
+        let entry = module.procedure_id("/proc/calculate").unwrap();
+
+        // Numeric arguments select native execution when JIT is enabled.
+        assert_eq!(
+            execute_module(&module, entry, &[Value::number(3.0), Value::number(4.0)]),
+            Ok(Value::number(-10.0)),
+        );
+        // The same bytecode shape with a dynamic non-number must fall back to
+        // the interpreter instead of entering the numeric ABI.
+        assert!(execute_module(&module, entry, &[Value::text("3"), Value::number(4.0)]).is_err());
+    }
+
+    #[test]
+    fn numeric_jit_lowers_isolated_locals_and_cfg_conservatively() {
+        let syntax = parse(
+            "/proc/calculate(a, b)\n\tvar/result = a + b\n\tif(result > 10)\n\t\tresult = result * 2\n\treturn result",
+        )
+        .expect("numeric CFG fixture parses");
+        let module = compile_module(&syntax.definitions).expect("numeric CFG fixture compiles");
+        let entry = module.procedure_id("/proc/calculate").unwrap();
+        let program = &module.procedures[entry.index()];
+        let lowered = crate::numeric_trace_instructions(program).expect("safe numeric CFG lowers");
+        assert!(
+            lowered.iter().any(|instruction| matches!(
+                instruction,
+                dm_jit::NumericInstruction::StoreLocal(_)
+            ))
+        );
+        assert!(
+            lowered
+                .iter()
+                .any(|instruction| matches!(instruction, dm_jit::NumericInstruction::GreaterThan))
+        );
+        assert!(
+            lowered.iter().any(|instruction| matches!(
+                instruction,
+                dm_jit::NumericInstruction::JumpIfFalse(_)
+            ))
+        );
+        assert!(matches!(
+            lowered.last(),
+            Some(dm_jit::NumericInstruction::Return)
+        ));
+
+        // Updating a declared argument is observable through DM's live args
+        // semantics and must not enter this isolated-locals tier.
+        let syntax = parse("/proc/update(a)\n\ta = a + 1\n\treturn a").unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let entry = module.procedure_id("/proc/update").unwrap();
+        assert!(crate::numeric_trace_instructions(&module.procedures[entry.index()]).is_none());
+    }
+
+    #[test]
+    fn numeric_jit_loop_resumes_at_budget_safepoints() {
+        let source =
+            "/proc/count(limit)\n\tvar/i = 0\n\twhile(i < limit)\n\t\ti = i + 1\n\treturn i";
+        let syntax = parse(source).unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let entry = module.procedure_id("/proc/count").unwrap();
+        assert!(crate::numeric_trace_instructions(&module.procedures[entry.index()]).is_some());
+
+        // Force an equivalent copy through the interpreter by appending an
+        // unreachable unsupported opcode after Return. This avoids changing
+        // the process-wide JIT environment variable in a parallel test suite.
+        let syntax = parse(source).unwrap();
+        let mut reference = compile_module(&syntax.definitions).unwrap();
+        let reference_entry = reference.procedure_id("/proc/count").unwrap();
+        Arc::make_mut(&mut reference.procedures[reference_entry.index()])
+            .instructions
+            .push(Instruction::PushNull);
+        assert!(
+            crate::numeric_trace_instructions(&reference.procedures[reference_entry.index()])
+                .is_none()
+        );
+        assert_eq!(
+            execute_module(&reference, reference_entry, &[Value::number(25.0)]),
+            Ok(Value::number(25.0))
+        );
+
+        let mut frames = vec![crate::make_frame(
+            entry,
+            &module.procedures[entry.index()],
+            &[Value::number(25.0)],
+            &ExecutionContext::default(),
+        )];
+        let mut state = ExecutionState::new();
+        let limits = ExecutionLimits {
+            max_call_depth: 8,
+            max_steps: 5,
+        };
+        let mut native_continuation_seen = false;
+        loop {
+            match crate::run_frames(
+                &module,
+                frames,
+                limits,
+                crate::StepBudgetBehavior::YieldScheduledContinuation,
+                &mut state,
+            )
+            .unwrap()
+            {
+                crate::FrameRunOutcome::Yielded { frames: next, .. } => {
+                    native_continuation_seen |= next[0].numeric_jit_state.is_some();
+                    frames = next;
+                }
+                crate::FrameRunOutcome::Complete(value) => {
+                    assert_eq!(value, Value::number(25.0));
+                    break;
+                }
+            }
+        }
+        assert!(
+            native_continuation_seen,
+            "loop should yield from native execution"
+        );
+    }
+
+    #[test]
+    fn lumcount_field_jit_matches_interpreter_and_queue_action() {
+        let syntax = parse(concat!(
+            "/datum/lighting_corner/proc/update_lumcount(delta_r, delta_g, delta_b)\n",
+            "\tif(!(delta_r || delta_g || delta_b))\n\t\treturn\n",
+            "\tlum_r += delta_r\n\tlum_g += delta_g\n\tlum_b += delta_b\n",
+            "\tif(!needs_update)\n\t\tneeds_update = 1\n",
+            "\t\tSSlighting.corners_queue += src\n",
+        ))
+        .unwrap();
+        let module = compile_module_specs(&[ProcedureSpec {
+            path: "/datum/lighting_corner/proc/update_lumcount".to_owned(),
+            definition: &syntax.definitions[0],
+            parent: None,
+            static_calls: BTreeMap::new(),
+            src_fields: BTreeMap::from([
+                ("lum_r".to_owned(), field("lum_r")),
+                ("lum_g".to_owned(), field("lum_g")),
+                ("lum_b".to_owned(), field("lum_b")),
+                ("needs_update".to_owned(), field("needs_update")),
+            ]),
+            global_fields: BTreeMap::from([("SSlighting".to_owned(), field("SSlighting"))]),
+        }])
+        .unwrap();
+        let entry = module
+            .procedure_id("/datum/lighting_corner/proc/update_lumcount")
+            .unwrap();
+        assert!(
+            crate::compile_lumcount_trace(&module.procedures[entry.index()]).is_some(),
+            "locals={} len={} instructions={:#?}",
+            module.procedures[entry.index()].local_count,
+            module.procedures[entry.index()].instructions.len(),
+            module.procedures[entry.index()].instructions
+        );
+        let mut reference = module.clone();
+        reference.identity = crate::next_module_identity();
+        Arc::make_mut(&mut reference.procedures[entry.index()])
+            .instructions
+            .push(Instruction::PushNull);
+
+        let run = |module: &Module| {
+            let mut state = ExecutionState::new();
+            let corner = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/datum/lighting_corner").unwrap());
+            for (name, value) in [
+                ("lum_r", 1.0),
+                ("lum_g", 2.0),
+                ("lum_b", 3.0),
+                ("needs_update", 0.0),
+            ] {
+                state
+                    .heap_mut()
+                    .set_datum_field(corner, field(name), Value::number(value))
+                    .unwrap();
+            }
+            let lighting = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/datum/controller/subsystem/lighting").unwrap());
+            let queue = state.heap_mut().allocate_list();
+            state
+                .heap_mut()
+                .set_datum_field(lighting, field("corners_queue"), Value::List(queue))
+                .unwrap();
+            state.set_global(field("SSlighting"), Value::Datum(lighting));
+            let result = execute_module_in_context(
+                module,
+                entry,
+                &[Value::number(0.5), Value::number(1.0), Value::number(-0.5)],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(corner), Value::Null),
+            )
+            .unwrap();
+            let fields = ["lum_r", "lum_g", "lum_b", "needs_update"]
+                .map(|name| datum_field_or_initial(&state, corner, &field(name)).unwrap());
+            let queued = state
+                .heap()
+                .list(queue)
+                .unwrap()
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>();
+            (result, fields, queued)
+        };
+        let native = run(&module);
+        let interpreted = run(&reference);
+        assert_eq!(native, interpreted);
+        assert_eq!(native.0, Value::Null);
+        assert_eq!(
+            native.1,
+            [
+                Value::number(1.5),
+                Value::number(3.0),
+                Value::number(2.5),
+                Value::number(1.0)
+            ]
+        );
+        assert_eq!(native.2.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "local release microbenchmark"]
+    fn lumcount_jit_release_microbenchmark() {
+        const CALLS: usize = 100_000;
+        let syntax = parse(concat!(
+            "/datum/lighting_corner/proc/update_lumcount(delta_r, delta_g, delta_b)\n",
+            "\tif(!(delta_r || delta_g || delta_b))\n\t\treturn\n",
+            "\tlum_r += delta_r\n\tlum_g += delta_g\n\tlum_b += delta_b\n",
+            "\tif(!needs_update)\n\t\tneeds_update = 1\n",
+            "\t\tSSlighting.corners_queue += src\n",
+        ))
+        .unwrap();
+        let spec = || ProcedureSpec {
+            path: "/datum/lighting_corner/proc/update_lumcount".to_owned(),
+            definition: &syntax.definitions[0],
+            parent: None,
+            static_calls: BTreeMap::new(),
+            src_fields: BTreeMap::from([
+                ("lum_r".to_owned(), field("lum_r")),
+                ("lum_g".to_owned(), field("lum_g")),
+                ("lum_b".to_owned(), field("lum_b")),
+                ("needs_update".to_owned(), field("needs_update")),
+            ]),
+            global_fields: BTreeMap::from([("SSlighting".to_owned(), field("SSlighting"))]),
+        };
+        let module = compile_module_specs(&[spec()]).unwrap();
+        let entry = module
+            .procedure_id("/datum/lighting_corner/proc/update_lumcount")
+            .unwrap();
+        let mut reference = compile_module_specs(&[spec()]).unwrap();
+        Arc::make_mut(&mut reference.procedures[entry.index()])
+            .instructions
+            .push(Instruction::PushNull);
+
+        let setup = || {
+            let mut state = ExecutionState::new();
+            let corner = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/datum/lighting_corner").unwrap());
+            for name in ["lum_r", "lum_g", "lum_b"] {
+                state
+                    .heap_mut()
+                    .set_datum_field(corner, field(name), Value::number(0.0))
+                    .unwrap();
+            }
+            state
+                .heap_mut()
+                .set_datum_field(corner, field("needs_update"), Value::number(1.0))
+                .unwrap();
+            let lighting = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/datum/controller/subsystem/lighting").unwrap());
+            let queue = state.heap_mut().allocate_list();
+            state
+                .heap_mut()
+                .set_datum_field(lighting, field("corners_queue"), Value::List(queue))
+                .unwrap();
+            state.set_global(field("SSlighting"), Value::Datum(lighting));
+            (state, corner)
+        };
+        let arguments = [
+            Value::number(0.01),
+            Value::number(0.02),
+            Value::number(0.03),
+        ];
+        let (mut native_state, native_corner) = setup();
+        let native_context = ExecutionContext::new(Value::Datum(native_corner), Value::Null);
+        let started = Instant::now();
+        for _ in 0..CALLS {
+            execute_module_in_context(
+                &module,
+                entry,
+                &arguments,
+                &mut native_state,
+                &native_context,
+            )
+            .unwrap();
+        }
+        let native_elapsed = started.elapsed();
+
+        let (mut reference_state, reference_corner) = setup();
+        let reference_context = ExecutionContext::new(Value::Datum(reference_corner), Value::Null);
+        let started = Instant::now();
+        for _ in 0..CALLS {
+            execute_module_in_context(
+                &reference,
+                entry,
+                &arguments,
+                &mut reference_state,
+                &reference_context,
+            )
+            .unwrap();
+        }
+        let reference_elapsed = started.elapsed();
+        eprintln!(
+            "lumcount end-to-end calls={CALLS} jit_ms={} interpreter_ms={} speedup={:.2}",
+            native_elapsed.as_millis(),
+            reference_elapsed.as_millis(),
+            reference_elapsed.as_secs_f64() / native_elapsed.as_secs_f64(),
+        );
+        let zero_arguments = [Value::number(0.0), Value::number(0.0), Value::number(0.0)];
+        let started = Instant::now();
+        for _ in 0..CALLS {
+            execute_module_in_context(
+                &module,
+                entry,
+                &zero_arguments,
+                &mut native_state,
+                &native_context,
+            )
+            .unwrap();
+        }
+        let native_zero = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..CALLS {
+            execute_module_in_context(
+                &reference,
+                entry,
+                &zero_arguments,
+                &mut reference_state,
+                &reference_context,
+            )
+            .unwrap();
+        }
+        let reference_zero = started.elapsed();
+        eprintln!(
+            "lumcount zero-delta calls={CALLS} jit_ms={} interpreter_ms={} speedup={:.2}",
+            native_zero.as_millis(),
+            reference_zero.as_millis(),
+            reference_zero.as_secs_f64() / native_zero.as_secs_f64(),
+        );
+    }
+
+    #[test]
     #[ignore = "local release microbenchmark"]
     fn simple_for_field_assignment_release_microbenchmark() {
         const ITEMS: usize = 135_170;
@@ -33929,6 +36228,60 @@ mod tests {
         let result =
             execute_module_in_state(&module, entry, &[Value::List(stale)], &mut state).unwrap();
         assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn standard_builtin_arguments_stay_inline_and_preserve_stack_order() {
+        let mut stack = vec![
+            Value::text("sentinel"),
+            Value::number(1.0),
+            Value::number(2.0),
+            Value::number(3.0),
+        ];
+        let arguments = super::pop_builtin_arguments(&mut stack, 3);
+        assert!(
+            !arguments.spilled(),
+            "common builtin arities must not allocate"
+        );
+        assert_eq!(
+            arguments.as_slice(),
+            [Value::number(1.0), Value::number(2.0), Value::number(3.0)]
+        );
+        assert_eq!(stack, [Value::text("sentinel")]);
+    }
+
+    #[test]
+    #[ignore = "focused allocation microbenchmark; run explicitly with --release --ignored"]
+    fn benchmark_inline_builtin_arguments_against_split_off() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ITERATIONS: usize = 2_000_000;
+        let values = [Value::number(1.0), Value::number(2.0), Value::number(3.0)];
+
+        let mut old_stack = Vec::with_capacity(3);
+        let old_started = Instant::now();
+        for _ in 0..ITERATIONS {
+            old_stack.extend(values.iter().cloned());
+            let start = old_stack.len() - 3;
+            black_box(old_stack.split_off(start));
+        }
+        let old_elapsed = old_started.elapsed();
+
+        let mut inline_stack = Vec::with_capacity(3);
+        let inline_started = Instant::now();
+        for _ in 0..ITERATIONS {
+            inline_stack.extend(values.iter().cloned());
+            black_box(super::pop_builtin_arguments(&mut inline_stack, 3));
+        }
+        let inline_elapsed = inline_started.elapsed();
+
+        eprintln!(
+            "builtin-argument-benchmark iterations={ITERATIONS} split_off_ms={} inline_ms={} speedup={:.2}",
+            old_elapsed.as_millis(),
+            inline_elapsed.as_millis(),
+            old_elapsed.as_secs_f64() / inline_elapsed.as_secs_f64(),
+        );
     }
 
     #[test]
