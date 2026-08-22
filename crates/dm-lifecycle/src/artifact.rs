@@ -1297,7 +1297,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const PROJECT: [u8; 16] = [0x31; 16];
-    const ARTIFACT_ABI_CRATES: [&str; 15] = [
+    const COMPILER_INPUT_CRATES: [&str; 8] = [
         "dm-core",
         "dm-project",
         "dm-lexer",
@@ -1306,13 +1306,6 @@ mod tests {
         "dm-compiler",
         "dm-lowering",
         "dm-semantics",
-        "dm-value",
-        "dm-vm",
-        "dm-globals",
-        "dm-runtime",
-        "dm-map",
-        "dm-world",
-        "dm-lifecycle",
     ];
     static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1341,24 +1334,31 @@ mod tests {
     }
 
     #[test]
-    fn engine_fingerprint_routes_every_artifact_abi_crate_and_build_input() {
+    fn engine_fingerprint_routes_the_scoped_policy_and_vm_abi_revision() {
         let build_script = include_str!("../build.rs");
-        for crate_name in ARTIFACT_ABI_CRATES {
+        let policy = include_str!("../artifact_fingerprint_policy.rs");
+        assert!(
+            build_script.contains("mod artifact_fingerprint_policy"),
+            "engine fingerprint must load the shared policy"
+        );
+        assert!(
+            build_script.contains("COMPILER_INPUT_CRATES"),
+            "engine fingerprint must traverse compiler inputs"
+        );
+        assert!(
+            build_script.contains("VM_ARTIFACT_ABI_REVISION"),
+            "engine fingerprint must include the explicit VM ABI revision"
+        );
+        for crate_name in COMPILER_INPUT_CRATES {
             assert!(
-                build_script.contains(&format!("\"{crate_name}\"")),
-                "engine fingerprint omits {crate_name}"
+                policy.contains(&format!("\"{crate_name}\"")),
+                "engine fingerprint policy omits {crate_name}"
             );
         }
-        for identity in [
-            "dm-lifecycle/build.rs",
-            "workspace/Cargo.toml",
-            "workspace/Cargo.lock",
-        ] {
-            assert!(
-                build_script.contains(identity),
-                "engine fingerprint omits {identity}"
-            );
-        }
+        assert!(
+            policy.contains("dm-vm/artifact-abi-revision.txt"),
+            "engine fingerprint policy omits the VM ABI revision"
+        );
     }
 
     #[test]
