@@ -9,6 +9,55 @@ details, or promise compatibility from syntax acceptance alone. Compatibility
 is measured with public documentation and black-box fixtures that run through
 both Dream Maker/Dream Daemon and this engine.
 
+## Development status — August 2026
+
+Dream64 has moved beyond isolated language fixtures and is now booting the real
+MonkeStation 2.0 codebase far enough to attach its own native client. The client
+loads the project's DMF skin, exchanges sequenced UI and input messages with the
+server, fetches resources, decodes DMI sprites, and renders the first live lobby
+screen objects. This is engine output—not a screenshot or a BYOND client embedded
+inside Dream64.
+
+The current lobby is not release-complete. Its assets are present, but several
+BYOND-compatible composition rules still need work, including viewport scaling,
+screen-plane positioning, layer ordering, transforms, and browser/UI readiness.
+The result is recognizable and interactive at the protocol level, but some lobby
+elements are still misplaced, clipped, or missing.
+
+Current measured progress:
+
+- The complete MonkeStation source graph compiles into a reusable Dream64
+  artifact; a warm artifact load is currently about 9–10 seconds on the test
+  machine.
+- Compilation, structural seeding, and executable-bytecode sections are cached.
+  Their independent decode work now runs concurrently and rejoins in a fixed,
+  deterministic order.
+- The server and native client have a real loopback transport for attach,
+  ordered UI batches and acknowledgements, resource transfer, map/screen
+  appearances, input, and movement commands.
+- The VM has adaptive scheduling, retained client display state, indexed world
+  and associative-list lookups, cached initializer plans and DMI metadata, plus
+  an experimental Cranelift JIT path for compatible code shapes.
+- Expensive heap-independent atmosphere work has a worker lane. DM-visible
+  mutation remains on one authoritative owner thread so datum IDs, globals,
+  lists, RNG, constructors, and lifecycle ordering stay deterministic.
+- The present bottleneck is MonkeStation's dynamic map and subsystem
+  initialization. The latest bounded cold run reached its five-minute limit
+  before the global `Initialize()` phase, so the sub-five-minute boot goal is
+  **not achieved yet**.
+
+The immediate release path is:
+
+1. Finish BYOND-compatible lobby composition and browser-control readiness.
+2. Extract pure map preparation into parallel worker batches, followed by a
+   deterministic owner-thread commit.
+3. Specialize the hottest exact mapping loops without changing DM-visible
+   execution order.
+4. Reduce initialization memory and latency until a cold MonkeStation boot and
+   usable client consistently complete within five minutes.
+5. Package reproducible 64-bit server and client builds without redistributing
+   or loading proprietary BYOND DLLs.
+
 ## Current milestone
 
 - A 64-bit-only core with an explicit 32-bit DM number representation.
@@ -105,3 +154,26 @@ movables. The output is a deterministic startup summary and then enters an
 optional persistent scheduler loop for headless runtime work; set
 `DREAM64_BOOT_MAX_SLICES` to terminate the loop after a fixed number of
 iterations for deterministic smoke runs.
+
+Preview a compiled project's lobby through the loopback client protocol:
+
+```powershell
+target\release\dm-lifecycle.exe lobby-preview path\to\world.dme no-init
+target\release\dm-client.exe --skin path\to\skin.dmf
+```
+
+The client can capture that protocol session—including ordered UI commands,
+map/screen appearances, and fetched resources—and replay it later without a
+running world:
+
+```powershell
+target\release\dm-client.exe --skin path\to\skin.dmf `
+    --record-replay lobby.d64r
+
+target\release\dm-client.exe --skin path\to\skin.dmf `
+    --replay lobby.d64r
+```
+
+Replay files are local development artifacts. Playback validates required
+commands, serves recorded responses by command, and turns exhausted UI polling
+into an idle empty batch so a captured lobby remains open offline.
