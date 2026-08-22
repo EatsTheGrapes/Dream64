@@ -308,6 +308,12 @@ pub enum Instruction {
     /// This avoids materializing and validating the same live list once in
     /// `LoadLocal` and again in `IndexList`.
     IndexLocalList(u16),
+    /// Reads a local list's length without a separate `LoadLocal` dispatch.
+    ///
+    /// Iteration loops execute this operation for every condition check, so
+    /// retaining the local slot in the opcode avoids repeated stack traffic
+    /// while preserving [`Self::ListLength`] as the semantic implementation.
+    ListLengthLocal(u16),
     /// Pops a value, index/key, and list handle and updates that list.
     SetListIndex,
     /// Like [`Self::SetListIndex`], but leaves the stored value on the stack.
@@ -4141,13 +4147,7 @@ fn compile_for_in(
     push_instruction(
         instructions,
         source_spans,
-        Instruction::LoadLocal(list_slot),
-        line.span,
-    );
-    push_instruction(
-        instructions,
-        source_spans,
-        Instruction::ListLength,
+        Instruction::ListLengthLocal(list_slot),
         line.span,
     );
     push_instruction(
@@ -4167,19 +4167,13 @@ fn compile_for_in(
     push_instruction(
         instructions,
         source_spans,
-        Instruction::LoadLocal(list_slot),
-        line.span,
-    );
-    push_instruction(
-        instructions,
-        source_spans,
         Instruction::LoadLocal(index_slot),
         line.span,
     );
     push_instruction(
         instructions,
         source_spans,
-        Instruction::IndexList,
+        Instruction::IndexLocalList(list_slot),
         line.span,
     );
     push_instruction(
@@ -4342,8 +4336,7 @@ fn compile_for_assoc(
     let condition = instructions.len();
     for instruction in [
         Instruction::LoadLocal(index_slot),
-        Instruction::LoadLocal(list_slot),
-        Instruction::ListLength,
+        Instruction::ListLengthLocal(list_slot),
         Instruction::LessEqual,
     ] {
         push_instruction(instructions, source_spans, instruction, line.span);
@@ -4356,13 +4349,11 @@ fn compile_for_assoc(
         line.span,
     );
     for instruction in [
-        Instruction::LoadLocal(list_slot),
         Instruction::LoadLocal(index_slot),
-        Instruction::IndexList,
+        Instruction::IndexLocalList(list_slot),
         Instruction::StoreLocal(key_slot),
-        Instruction::LoadLocal(list_slot),
         Instruction::LoadLocal(key_slot),
-        Instruction::IndexList,
+        Instruction::IndexLocalList(list_slot),
         Instruction::StoreLocal(value_slot),
     ] {
         push_instruction(instructions, source_spans, instruction, line.span);
@@ -12982,6 +12973,7 @@ fn startup_instruction_category(instruction: &Instruction) -> usize {
         Instruction::IndexList
         | Instruction::IndexLocalList(_)
         | Instruction::ListLength
+        | Instruction::ListLengthLocal(_)
         | Instruction::Contains
         | Instruction::PrepareIteration => 0,
         Instruction::SetListIndex
@@ -13166,19 +13158,17 @@ fn simple_iteration_field_assignment(
     program: &Program,
     prepare: usize,
 ) -> Option<SimpleIterationFieldAssignment> {
-    let tail = program.instructions.get(prepare + 1..prepare + 21)?;
+    let tail = program.instructions.get(prepare + 1..prepare + 19)?;
     let [
         Instruction::StoreLocal(list_slot),
         Instruction::PushNumber(one),
         Instruction::StoreLocal(index_slot),
         Instruction::LoadLocal(condition_index),
-        Instruction::LoadLocal(condition_list),
-        Instruction::ListLength,
+        Instruction::ListLengthLocal(condition_list),
         Instruction::LessEqual,
         Instruction::JumpIfFalse(exit_instruction),
-        Instruction::LoadLocal(iteration_list),
         Instruction::LoadLocal(iteration_index),
-        Instruction::IndexList,
+        Instruction::IndexLocalList(iteration_list),
         Instruction::StoreLocal(item_slot),
         Instruction::LoadLocal(receiver_slot),
         value,
@@ -13193,7 +13183,7 @@ fn simple_iteration_field_assignment(
         return None;
     };
     let condition = prepare + 4;
-    let exit = prepare + 21;
+    let exit = prepare + 19;
     if one.to_f32() != 1.0
         || increment.to_f32() != 1.0
         || condition_index != index_slot
@@ -13227,7 +13217,7 @@ fn simple_iteration_field_assignment(
         item_slot: *item_slot,
         value,
         field: field.clone(),
-        store_instruction: prepare + 15,
+        store_instruction: prepare + 13,
         exit_instruction: exit,
     })
 }
@@ -14429,11 +14419,10 @@ fn run_frames(
             heartbeat = Instant::now();
         }
 
-        // A local-list index superinstruction keeps ordinary IndexList as the
-        // single semantic implementation. Materialize its two stack inputs
-        // here, but read the receiver without LoadLocal's redundant live-list
-        // canonicalization.
-        let fused_index_instruction;
+        // Local-list superinstructions keep ordinary IndexList and ListLength
+        // as their single semantic implementations. Materialize the receiver
+        // here without LoadLocal's redundant dispatch and canonicalization.
+        let fused_list_instruction;
         let instruction = if let Instruction::IndexLocalList(slot) = instruction {
             let key = pop(&mut frames[frame_index].stack)
                 .map_err(|message| execution_error(module, &frames, message))?;
@@ -14457,8 +14446,30 @@ fn run_frames(
             }
             frames[frame_index].stack.push(receiver);
             frames[frame_index].stack.push(key);
-            fused_index_instruction = Instruction::IndexList;
-            &fused_index_instruction
+            fused_list_instruction = Instruction::IndexList;
+            &fused_list_instruction
+        } else if let Instruction::ListLengthLocal(slot) = instruction {
+            let Some(mut receiver) = frames[frame_index].locals.get(usize::from(*slot)).cloned()
+            else {
+                return Err(execution_error(
+                    module,
+                    &frames,
+                    format!("invalid local slot {slot}"),
+                ));
+            };
+            if let Value::List(reference) = receiver
+                && state.reference_lists.contains(&reference)
+            {
+                receiver = state
+                    .heap
+                    .list(reference)
+                    .and_then(|values| values.get(1))
+                    .cloned()
+                    .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+            }
+            frames[frame_index].stack.push(receiver);
+            fused_list_instruction = Instruction::ListLength;
+            &fused_list_instruction
         } else {
             instruction
         };
@@ -16026,6 +16037,9 @@ fn run_frames(
             }
             Instruction::IndexLocalList(_) => {
                 unreachable!("local list indexing is normalized before dispatch")
+            }
+            Instruction::ListLengthLocal(_) => {
+                unreachable!("local list length is normalized before dispatch")
             }
             Instruction::SetListIndex => {
                 let value = match pop(&mut frames[frame_index].stack) {
@@ -33227,7 +33241,7 @@ mod tests {
             program
                 .instructions
                 .iter()
-                .any(|instruction| matches!(instruction, Instruction::ListLength))
+                .any(|instruction| matches!(instruction, Instruction::ListLengthLocal(_)))
         );
         assert_eq!(
             execute(&program, &[Value::Null]),
