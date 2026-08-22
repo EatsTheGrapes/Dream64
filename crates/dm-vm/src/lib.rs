@@ -14487,8 +14487,8 @@ fn run_frames(
         if trace_enabled {
             prior_instruction = Some((Instant::now(), procedure, instruction_index));
         }
-        if executed_steps.is_multiple_of(1_000_000)
-            && (trace_enabled || dashboard_enabled)
+        if (trace_enabled || dashboard_enabled)
+            && executed_steps.is_multiple_of(1_000_000)
             && heartbeat.elapsed().as_secs() >= 30
         {
             eprintln!(
