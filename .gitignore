@@ -1,5 +1,13 @@
 target/
 /conformance-results/
+/logs/
+
+# Generated Dream64/BYOND executables, resources, and replay captures.
+*.d64
+*.d64r
+*.dmb
+*.rsc
+*.pid
 
 # Local headless-boot traces and compiler audit reports.
 /monkestation-headless-boot-*.log
