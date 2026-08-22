@@ -49,6 +49,17 @@ impl TypePath {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Returns the process-local identity of this shared path allocation.
+    ///
+    /// This is an engine cache key only. Callers must retain a clone of the
+    /// path for as long as the key is stored so allocator address reuse cannot
+    /// alias an unrelated path.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn storage_identity(&self) -> usize {
+        self.0.as_ptr() as usize
+    }
 }
 
 impl Borrow<str> for TypePath {

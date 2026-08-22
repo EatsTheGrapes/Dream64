@@ -9683,6 +9683,11 @@ pub struct ExecutionState {
     // and failed parent-chain resolutions. The cache is cleared only by the host
     // APIs that replace the type-parent catalog.
     dynamic_receiver_targets: HashMap<(u64, TypePath), HashMap<String, Option<ProcedureId>>>,
+    // Static member-call sites overwhelmingly see the same concrete receiver
+    // types during atom initialization. Cache their resolved target without
+    // re-hashing full type-path and selector strings on every invocation. The
+    // retained TypePath keeps the process-local storage identity collision-free.
+    dynamic_callsite_targets: HashMap<(u64, ProcedureId, usize, usize), (TypePath, ProcedureId)>,
     initial_values: Arc<BTreeMap<TypePath, BTreeMap<FieldName, Value>>>,
     // The initial-value catalog is immutable but can contain millions of
     // scalar values. Derive the only heap handles it can retain when the
@@ -10058,6 +10063,7 @@ impl ExecutionState {
             type_parents: Arc::new(BTreeMap::new()),
             type_intervals: Arc::new(BTreeMap::new()),
             dynamic_receiver_targets: HashMap::new(),
+            dynamic_callsite_targets: HashMap::new(),
             initial_values: Arc::new(BTreeMap::new()),
             initial_value_datum_roots: Arc::default(),
             initial_value_list_roots: Arc::default(),
@@ -12129,6 +12135,7 @@ impl ExecutionState {
         self.type_intervals = Arc::new(build_type_intervals(&parents));
         self.type_parents = Arc::new(parents);
         self.dynamic_receiver_targets.clear();
+        self.dynamic_callsite_targets.clear();
         self.instance_initializer_plans.clear();
         self.clear_effective_initial_value_cache();
     }
@@ -12138,6 +12145,7 @@ impl ExecutionState {
         self.type_intervals = Arc::new(build_type_intervals(&parents));
         self.type_parents = parents;
         self.dynamic_receiver_targets.clear();
+        self.dynamic_callsite_targets.clear();
         self.instance_initializer_plans.clear();
         self.clear_effective_initial_value_cache();
     }
@@ -18360,13 +18368,16 @@ fn run_frames(
                     frames[frame_index].stack.push(result);
                 } else if matches!(receiver, Value::Datum(_))
                     && let Some(method) = selector_text
-                    && let Ok((target, context)) = dynamic_call_target_named(
+                    && let Ok((target, context)) = dynamic_call_target_named_at_callsite(
                         module,
                         state,
                         &receiver,
                         method,
                         &frame_context(&frames[frame_index]),
                         false,
+                        static_selector
+                            .is_some()
+                            .then_some((procedure, instruction_index)),
                     )
                 {
                     if frames.len() >= limits.max_call_depth {
@@ -23311,6 +23322,69 @@ fn dynamic_call_target_named(
         },
         |procedure| Ok((procedure, context)),
     )
+}
+
+fn dynamic_call_target_named_at_callsite(
+    module: &Module,
+    state: &mut ExecutionState,
+    receiver: &Value,
+    selector: &str,
+    caller_context: &ExecutionContext,
+    null_receiver_is_global: bool,
+    callsite: Option<(ProcedureId, usize)>,
+) -> Result<(ProcedureId, ExecutionContext), String> {
+    let Some((caller, instruction)) = callsite else {
+        return dynamic_call_target_named(
+            module,
+            state,
+            receiver,
+            selector,
+            caller_context,
+            null_receiver_is_global,
+        );
+    };
+    let Value::Datum(datum) = receiver else {
+        return dynamic_call_target_named(
+            module,
+            state,
+            receiver,
+            selector,
+            caller_context,
+            null_receiver_is_global,
+        );
+    };
+    let receiver_type = state
+        .heap
+        .datum(*datum)
+        .map_err(|_| "cannot call a procedure on null".to_owned())?
+        .type_path()
+        .clone();
+    let key = (
+        module.identity.0,
+        caller,
+        instruction,
+        receiver_type.storage_identity(),
+    );
+    if let Some((cached_type, target)) = state.dynamic_callsite_targets.get(&key)
+        && cached_type == &receiver_type
+    {
+        return Ok((
+            *target,
+            ExecutionContext::new(Value::Datum(*datum), caller_context.usr.clone()),
+        ));
+    }
+    let (target, context) = dynamic_call_target_named(
+        module,
+        state,
+        receiver,
+        selector,
+        caller_context,
+        null_receiver_is_global,
+    )?;
+    state
+        .dynamic_callsite_targets
+        .insert(key, (receiver_type, target));
+    Ok((target, context))
 }
 
 fn hascall_builtin(
@@ -29319,6 +29393,44 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_callsite_cache_retains_receiver_identity_and_invalidates_with_parents() {
+        let source = parse("/datum/base/proc/run()\n\treturn 7\n").unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+        let base = TypePath::parse("/datum/base").unwrap();
+        let child = TypePath::parse("/datum/child").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_type_parents(BTreeMap::from([(child.clone(), Some(base.clone()))]));
+        let receiver = Value::Datum(state.heap_mut().allocate_datum(child.clone()));
+        let context = ExecutionContext::default();
+        let caller = module.procedure_id_at(0).unwrap();
+
+        for _ in 0..2 {
+            let (target, _) = crate::dynamic_call_target_named_at_callsite(
+                &module,
+                &mut state,
+                &receiver,
+                "run",
+                &context,
+                false,
+                Some((caller, 17)),
+            )
+            .unwrap();
+            assert_eq!(module.procedure_path(target), Some("/datum/base/proc/run"));
+        }
+        assert_eq!(state.dynamic_callsite_targets.len(), 1);
+        let retained_path = &state
+            .dynamic_callsite_targets
+            .values()
+            .next()
+            .expect("callsite entry")
+            .0;
+        assert_eq!(retained_path, &child);
+
+        state.set_type_parents(BTreeMap::from([(child, Some(base))]));
+        assert!(state.dynamic_callsite_targets.is_empty());
+    }
+
+    #[test]
     #[ignore = "focused dynamic member-call cache-hit microbenchmark"]
     fn dynamic_member_named_cache_hit_avoids_selector_allocation_benchmark() {
         const ITERATIONS: usize = 2_000_000;
@@ -29361,11 +29473,30 @@ mod tests {
         }
         let borrowed = borrowed_started.elapsed();
 
+        let callsite_started = std::time::Instant::now();
+        let caller = module.procedure_id_at(0).unwrap();
+        for _ in 0..ITERATIONS {
+            std::hint::black_box(
+                crate::dynamic_call_target_named_at_callsite(
+                    &module,
+                    &mut state,
+                    &receiver,
+                    std::hint::black_box("run"),
+                    &context,
+                    false,
+                    Some((caller, 3)),
+                )
+                .unwrap(),
+            );
+        }
+        let callsite = callsite_started.elapsed();
+
         eprintln!(
-            "dynamic member cache hit allocated_selector_ms={} borrowed_selector_ms={} speedup={:.2}x",
+            "dynamic member cache hit allocated_selector_ms={} borrowed_selector_ms={} callsite_ms={} borrowed_to_callsite={:.2}x",
             allocated.as_millis(),
             borrowed.as_millis(),
-            allocated.as_secs_f64() / borrowed.as_secs_f64(),
+            callsite.as_millis(),
+            borrowed.as_secs_f64() / callsite.as_secs_f64(),
         );
     }
 
