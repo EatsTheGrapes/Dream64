@@ -4399,6 +4399,7 @@ fn findtext(
         } else {
             end as usize
         };
+        let haystack: Arc<str> = Arc::from(haystack);
         return regex_find(regex, &haystack, start, end, false, false, state);
     }
     let needle = strict_text(&arguments[1], state, "findtext needle")?;
@@ -4463,10 +4464,15 @@ pub(super) fn execute_regex_method(
     // `/regex.Find()` applies the same null-to-empty text coercion as the
     // global text-search procedures. In particular, this lets a parsed-map
     // reader finish cleanly after `file2text()` rejected a directory.
-    let haystack = if matches!(arguments[0], Value::Null) {
-        String::new()
-    } else {
-        strict_text(&arguments[0], state, "regex.Find haystack")?
+    let haystack: Arc<str> = match &arguments[0] {
+        Value::Null => Arc::from(""),
+        Value::Text(text) | Value::File(text) => Arc::clone(text),
+        _ => {
+            return Err(format!(
+                "regex.Find haystack requires text, received {}",
+                runtime_text(&arguments[0], state, "regex.Find haystack")?
+            ));
+        }
     };
     let supplied_start = arguments
         .get(1)
@@ -4483,7 +4489,7 @@ pub(super) fn execute_regex_method(
 
 fn regex_find(
     datum: DatumId,
-    haystack: &str,
+    haystack: &Arc<str>,
     requested_start: usize,
     requested_end: usize,
     method_call: bool,
@@ -4538,7 +4544,7 @@ fn regex_find(
         if method_call {
             state
                 .heap_mut()
-                .set_datum_field(datum, field("text"), Value::text(haystack))
+                .set_datum_field(datum, field("text"), Value::Text(Arc::clone(haystack)))
                 .map_err(|e| e.to_string())?;
         }
         return Ok(Value::number(0.0));
@@ -4561,13 +4567,13 @@ fn regex_find(
         ("index", Value::number((begin + 1) as f32)),
         ("group", Value::List(groups)),
         ("_dream64_cursor", Value::number(next as f32)),
-        ("_dream64_haystack", Value::text(haystack)),
+        ("_dream64_haystack", Value::Text(Arc::clone(haystack))),
     ];
     if global {
         fields.push(("next", Value::number((next + 1) as f32)));
     }
     if method_call {
-        fields.push(("text", Value::text(haystack)));
+        fields.push(("text", Value::Text(Arc::clone(haystack))));
     }
     for (name, value) in fields {
         state
