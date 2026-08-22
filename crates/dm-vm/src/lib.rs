@@ -14634,7 +14634,10 @@ fn run_frames(
                         ));
                     }
                 };
-                let arguments = stack[arguments_start..].to_vec();
+                let arguments = stack[arguments_start..]
+                    .iter()
+                    .cloned()
+                    .collect::<SmallVec<[Value; 8]>>();
                 stack.truncate(type_path_index);
                 let is_movable = builtins::is_movable_path(type_path.as_str());
                 let allocated = if type_path.as_str() == "/list" {
@@ -14726,19 +14729,20 @@ fn run_frames(
                         let constructor_program = module
                             .resolve_procedure(constructor)
                             .map_err(|message| execution_error(module, &frames, message))?;
-                        let mut constructor_frame = if let Some(names) = expanded_argument_names
+                        let constructor_names = expanded_argument_names
                             .as_deref()
-                            .or((!argument_names.is_empty()).then_some(argument_names.as_slice()))
+                            .unwrap_or(argument_names.as_slice());
+                        let mut constructor_frame = if constructor_names.iter().any(Option::is_some)
                         {
                             make_frame_named(
                                 constructor,
                                 constructor_program,
                                 &arguments,
-                                names,
+                                constructor_names,
                                 &context,
                             )
                         } else {
-                            make_frame(constructor, constructor_program, &arguments, &context)
+                            make_frame_owned(constructor, constructor_program, arguments, &context)
                         };
                         constructor_frame.caller_result_override = Some(allocated.clone());
                         mark_boot_trace_frame(
@@ -14779,7 +14783,10 @@ fn run_frames(
                     }
                 };
                 let arguments_start = frames[frame_index].stack.len() - count;
-                let arguments = frames[frame_index].stack[arguments_start..].to_vec();
+                let arguments = frames[frame_index].stack[arguments_start..]
+                    .iter()
+                    .cloned()
+                    .collect::<SmallVec<[Value; 8]>>();
                 frames[frame_index].stack.truncate(arguments_start);
                 let root_len = preserve_reentrant_frame_roots(state, &frames);
                 let allocated =
@@ -14813,18 +14820,18 @@ fn run_frames(
                     let constructor_program = module
                         .resolve_procedure(constructor)
                         .map_err(|message| execution_error(module, &frames, message))?;
-                    let mut constructor_frame =
-                        if let Some(names) = expanded_argument_names.as_deref() {
-                            make_frame_named(
-                                constructor,
-                                constructor_program,
-                                &arguments,
-                                names,
-                                &context,
-                            )
-                        } else {
-                            make_frame(constructor, constructor_program, &arguments, &context)
-                        };
+                    let constructor_names = expanded_argument_names.as_deref().unwrap_or(&[]);
+                    let mut constructor_frame = if constructor_names.iter().any(Option::is_some) {
+                        make_frame_named(
+                            constructor,
+                            constructor_program,
+                            &arguments,
+                            constructor_names,
+                            &context,
+                        )
+                    } else {
+                        make_frame_owned(constructor, constructor_program, arguments, &context)
+                    };
                     constructor_frame.caller_result_override = Some(Value::Datum(datum));
                     mark_boot_trace_frame(&mut constructor_frame, module, state, executed_steps);
                     frames.push(constructor_frame);
