@@ -1,0 +1,25 @@
+window "main"
+	elem "main"
+		type = MAIN
+		is-default = true
+		size = 640x480
+	elem "split"
+		type = CHILD
+		parent = "main"
+		anchor1 = 0,0
+		anchor2 = 100,100
+		type = SPLIT
+		left = "map"
+		right = "side"
+	elem "map"
+		type = MAP
+	elem "side"
+		type = CHILD
+		type = SPLIT
+		is-vertical = true
+		left = "browser"
+		right = "output"
+	elem "browser"
+		type = BROWSER
+	elem "output"
+		type = OUTPUT
