@@ -303,6 +303,11 @@ pub enum Instruction {
     LogicalOrEmptyListIndex,
     /// Pops a numeric 1-based index and a list handle, then pushes the entry.
     IndexList,
+    /// Pops an index/key and reads a list receiver directly from a local slot.
+    ///
+    /// This avoids materializing and validating the same live list once in
+    /// `LoadLocal` and again in `IndexList`.
+    IndexLocalList(u16),
     /// Pops a value, index/key, and list handle and updates that list.
     SetListIndex,
     /// Like [`Self::SetListIndex`], but leaves the stored value on the stack.
@@ -3917,7 +3922,7 @@ fn compile_for_to(
     };
     let current_slot = locals.declare_hidden()?;
     let end_slot = locals.declare_hidden()?;
-    let step_slot = locals.declare_hidden()?;
+    let step_slot = step.map(|_| locals.declare_hidden()).transpose()?;
 
     let initialization_start = instructions.len();
     compile_expression(start, locals, instructions, procedures)?;
@@ -3926,10 +3931,10 @@ fn compile_for_to(
     instructions.push(Instruction::StoreLocal(end_slot));
     if let Some(step) = step {
         compile_expression(step, locals, instructions, procedures)?;
-    } else {
-        instructions.push(Instruction::PushNumber(DmNumberBits::from_f32(1.0)));
+        instructions.push(Instruction::StoreLocal(
+            step_slot.expect("an explicit range step has a hidden slot"),
+        ));
     }
-    instructions.push(Instruction::StoreLocal(step_slot));
     source_spans.extend(std::iter::repeat_n(
         line.span,
         instructions.len() - initialization_start,
@@ -3940,24 +3945,34 @@ fn compile_for_to(
     // inclusive, just like BYOND: positive steps run while `i <= end` and
     // negative steps run while `i >= end`.  The step expression is evaluated
     // once at loop entry, rather than once per iteration.
-    for instruction in [
-        Instruction::LoadLocal(step_slot),
-        Instruction::PushNumber(DmNumberBits::from_f32(0.0)),
-        Instruction::GreaterEqual,
-        Instruction::LoadLocal(current_slot),
-        Instruction::LoadLocal(end_slot),
-        Instruction::LessEqual,
-        Instruction::And,
-        Instruction::LoadLocal(step_slot),
-        Instruction::PushNumber(DmNumberBits::from_f32(0.0)),
-        Instruction::Less,
-        Instruction::LoadLocal(current_slot),
-        Instruction::LoadLocal(end_slot),
-        Instruction::GreaterEqual,
-        Instruction::And,
-        Instruction::Or,
-    ] {
-        push_instruction(instructions, source_spans, instruction, line.span);
+    if let Some(step_slot) = step_slot {
+        for instruction in [
+            Instruction::LoadLocal(step_slot),
+            Instruction::PushNumber(DmNumberBits::from_f32(0.0)),
+            Instruction::GreaterEqual,
+            Instruction::LoadLocal(current_slot),
+            Instruction::LoadLocal(end_slot),
+            Instruction::LessEqual,
+            Instruction::And,
+            Instruction::LoadLocal(step_slot),
+            Instruction::PushNumber(DmNumberBits::from_f32(0.0)),
+            Instruction::Less,
+            Instruction::LoadLocal(current_slot),
+            Instruction::LoadLocal(end_slot),
+            Instruction::GreaterEqual,
+            Instruction::And,
+            Instruction::Or,
+        ] {
+            push_instruction(instructions, source_spans, instruction, line.span);
+        }
+    } else {
+        for instruction in [
+            Instruction::LoadLocal(current_slot),
+            Instruction::LoadLocal(end_slot),
+            Instruction::LessEqual,
+        ] {
+            push_instruction(instructions, source_spans, instruction, line.span);
+        }
     }
     let false_jump = instructions.len();
     push_instruction(
@@ -4035,8 +4050,12 @@ fn compile_for_to(
             line.span,
         );
     }
+    let increment = step_slot.map_or(
+        Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+        Instruction::LoadLocal,
+    );
     for instruction in [
-        Instruction::LoadLocal(step_slot),
+        increment,
         Instruction::Add,
         Instruction::StoreLocal(current_slot),
         Instruction::Jump(condition_target),
@@ -8874,9 +8893,16 @@ fn emit_expression(
                 emit_expression(index, locals, instructions, procedures)?;
                 instructions.push(Instruction::LoadDynamicField);
             } else {
-                emit_expression(list, locals, instructions, procedures)?;
-                emit_expression(index, locals, instructions, procedures)?;
-                instructions.push(Instruction::IndexList);
+                if let Expression::Local(name) = list.as_ref()
+                    && let Some(slot) = locals.get(name)
+                {
+                    emit_expression(index, locals, instructions, procedures)?;
+                    instructions.push(Instruction::IndexLocalList(slot));
+                } else {
+                    emit_expression(list, locals, instructions, procedures)?;
+                    emit_expression(index, locals, instructions, procedures)?;
+                    instructions.push(Instruction::IndexList);
+                }
             }
         }
         Expression::SafeIndex { list, index } => {
@@ -12954,6 +12980,7 @@ const STARTUP_INSTRUCTION_CATEGORY_COUNT: usize = 7;
 fn startup_instruction_category(instruction: &Instruction) -> usize {
     match instruction {
         Instruction::IndexList
+        | Instruction::IndexLocalList(_)
         | Instruction::ListLength
         | Instruction::Contains
         | Instruction::PrepareIteration => 0,
@@ -14133,6 +14160,8 @@ fn run_frames(
     let dashboard_enabled = boot_dashboard_enabled();
     let atoms_profiling_enabled = atoms_profile_enabled();
     let startup_profiling_enabled = startup_profile_enabled();
+    let ordinary_field_fast_path_enabled =
+        std::env::var_os("DREAM64_DISABLE_ORDINARY_FIELD_FAST_PATH").is_none();
     let mut remaining_steps = limits.max_steps;
     let mut executed_steps = 0u64;
     let mut heartbeat = Instant::now();
@@ -14399,6 +14428,40 @@ fn run_frames(
             );
             heartbeat = Instant::now();
         }
+
+        // A local-list index superinstruction keeps ordinary IndexList as the
+        // single semantic implementation. Materialize its two stack inputs
+        // here, but read the receiver without LoadLocal's redundant live-list
+        // canonicalization.
+        let fused_index_instruction;
+        let instruction = if let Instruction::IndexLocalList(slot) = instruction {
+            let key = pop(&mut frames[frame_index].stack)
+                .map_err(|message| execution_error(module, &frames, message))?;
+            let Some(mut receiver) = frames[frame_index].locals.get(usize::from(*slot)).cloned()
+            else {
+                return Err(execution_error(
+                    module,
+                    &frames,
+                    format!("invalid local slot {slot}"),
+                ));
+            };
+            if let Value::List(reference) = receiver
+                && state.reference_lists.contains(&reference)
+            {
+                receiver = state
+                    .heap
+                    .list(reference)
+                    .and_then(|values| values.get(1))
+                    .cloned()
+                    .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+            }
+            frames[frame_index].stack.push(receiver);
+            frames[frame_index].stack.push(key);
+            fused_index_instruction = Instruction::IndexList;
+            &fused_index_instruction
+        } else {
+            instruction
+        };
 
         match instruction {
             Instruction::PushNull => frames[frame_index].stack.push(Value::Null),
@@ -15839,7 +15902,13 @@ fn run_frames(
                     Ok(value) => value,
                     Err(message) => return Err(execution_error(module, &frames, message)),
                 };
-                let receiver = canonicalize_owned_value(&state.heap, receiver);
+                // Ordinary list reads validate the arena generation inside
+                // `read_list_value`; canonicalizing here performed the same
+                // heap lookup twice for every live mapping-list access.
+                let receiver = match receiver {
+                    Value::Datum(datum) if state.heap.datum(datum).is_err() => Value::Null,
+                    value => value,
+                };
                 if let Value::Text(text) = &receiver {
                     let index = value_to_list_index(&key)
                         .map_err(|message| execution_error(module, &frames, message))?;
@@ -15880,6 +15949,16 @@ fn run_frames(
                         ));
                     }
                 };
+                if (state.global_vars_proxy == Some(list)
+                    || state.datum_vars_proxies.contains_key(&list))
+                    && state.heap.list(list).is_err()
+                {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "list index operation received null",
+                    ));
+                }
                 let value = if state.global_vars_proxy == Some(list) {
                     match &key {
                         Value::Text(name) => FieldName::parse(name)
@@ -15924,12 +16003,22 @@ fn run_frames(
                         // Lazy-list idioms such as `lists[target] ||= list()` rely
                         // on this before inserting the new association.
                         Err(ValueError::MissingKey) => Value::Null,
+                        Err(ValueError::StaleList(_)) => {
+                            return Err(execution_error(
+                                module,
+                                &frames,
+                                "list index operation received null",
+                            ));
+                        }
                         Err(error) => {
                             return Err(execution_error(module, &frames, error.to_string()));
                         }
                     }
                 };
                 frames[frame_index].stack.push(value);
+            }
+            Instruction::IndexLocalList(_) => {
+                unreachable!("local list indexing is normalized before dispatch")
             }
             Instruction::SetListIndex => {
                 let value = match pop(&mut frames[frame_index].stack) {
@@ -16401,105 +16490,40 @@ fn run_frames(
                         Value::number(dm_list_length_number(len))
                     }
                     Value::Datum(datum) => {
-                        let runtime_type = match state.heap.datum(datum) {
-                            Ok(datum) => datum.type_path().clone(),
+                        let ordinary_value = match state.heap.datum(datum) {
+                            Ok(record)
+                                if ordinary_field_fast_path_enabled
+                                    && !datum_field_requires_special_read(
+                                        record.type_path(),
+                                        name,
+                                    ) =>
+                            {
+                                Some(datum_field_or_shared_record(state, record, name))
+                            }
+                            Ok(_) => None,
                             Err(error) => {
                                 return Err(execution_error(module, &frames, error.to_string()));
                             }
                         };
-                        if name.as_str() == "type" {
-                            Value::TypePath(runtime_type)
-                        } else if name.as_str() == "parent_type" {
-                            state
-                                .type_parent(&runtime_type)
-                                .cloned()
-                                .map_or(Value::Null, Value::TypePath)
-                        } else if name.as_str() == "appearance"
-                            && builtins::is_appearance_source(&runtime_type)
-                            && matches!(
-                                datum_field_or_initial(state, datum, &name),
-                                Ok(Value::Null) | Err(ValueError::MissingField(_))
-                            )
-                        {
-                            builtins::appearance_snapshot_builtin(datum, state)
-                                .map_err(|message| execution_error(module, &frames, message))?
-                        } else if name.as_str() == "transform"
-                            && builtins::is_appearance_source(&runtime_type)
-                            && matches!(
-                                datum_field_or_initial(state, datum, &name),
-                                Ok(Value::Null) | Err(ValueError::MissingField(_))
-                            )
-                        {
-                            Value::Datum(
-                                allocate_matrix([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], &mut state.heap)
-                                    .map_err(|message| execution_error(module, &frames, message))?,
-                            )
-                        } else if is_area_type_path(&runtime_type)
-                            && matches!(name.as_str(), "x" | "y" | "z")
-                            && let Some(coordinate) = area_coordinate_field(state, datum, &name)
-                        {
-                            coordinate
-                        } else if let Some(value) = lazy_atom_list_field(state, datum, &name)
-                            .map_err(|message| execution_error(module, &frames, message))?
-                        {
-                            value
-                        } else if runtime_type.as_str() == "/savefile"
-                            || runtime_type.as_str().starts_with("/savefile/")
-                        {
-                            match name.as_str() {
-                                "cd" => Value::text(
-                                    savefile_current_directory(
-                                        &state.savefiles.entry(datum).or_default().cd,
-                                    )
-                                    .to_owned(),
-                                ),
-                                "eof" => {
-                                    let savefile = state.savefiles.entry(datum).or_default();
-                                    let path = savefile_current_directory(&savefile.cd);
-                                    Value::number(if savefile.entries.contains_key(path) {
-                                        0.0
-                                    } else {
-                                        1.0
-                                    })
-                                }
-                                "dir" => {
-                                    let children = savefile_directory_entries(
-                                        state.savefiles.entry(datum).or_default(),
-                                    );
-                                    let list = state.heap.allocate_list();
-                                    let values = state.heap.list_mut(list).map_err(|error| {
-                                        execution_error(module, &frames, error.to_string())
-                                    })?;
-                                    for child in children {
-                                        values.add(Value::text(child));
-                                    }
-                                    Value::List(list)
-                                }
-                                _ => match state.heap.datum_field(datum, &name) {
-                                    Ok(value) => value.clone(),
-                                    Err(error) => {
-                                        return Err(execution_error(
-                                            module,
-                                            &frames,
-                                            error.to_string(),
-                                        ));
-                                    }
-                                },
-                            }
-                        } else {
-                            match datum_field_or_shared(state, datum, &name) {
+                        if let Some(value) = ordinary_value {
+                            match value {
                                 Ok(value) => value,
                                 Err(ValueError::MissingField(_)) if statically_declared => {
                                     Value::Null
                                 }
                                 Err(error) => {
                                     if matches!(error, ValueError::MissingField(_)) {
+                                        let runtime_type = state
+                                            .heap
+                                            .datum(datum)
+                                            .expect("live datum was validated above")
+                                            .type_path();
                                         eprintln!(
                                             "boot-vm: missing-field receiver_type={} field={} engine_roots={:?} canonical_default={:?}",
                                             runtime_type,
                                             name,
-                                            engine_root_paths(&runtime_type),
-                                            engine_builtin_initial_value(&runtime_type, &name),
+                                            engine_root_paths(runtime_type),
+                                            engine_builtin_initial_value(runtime_type, name),
                                         );
                                     }
                                     return Err(execution_error(
@@ -16507,6 +16531,124 @@ fn run_frames(
                                         &frames,
                                         error.to_string(),
                                     ));
+                                }
+                            }
+                        } else {
+                            let runtime_type = match state.heap.datum(datum) {
+                                Ok(datum) => datum.type_path().clone(),
+                                Err(error) => {
+                                    return Err(execution_error(
+                                        module,
+                                        &frames,
+                                        error.to_string(),
+                                    ));
+                                }
+                            };
+                            if name.as_str() == "type" {
+                                Value::TypePath(runtime_type)
+                            } else if name.as_str() == "parent_type" {
+                                state
+                                    .type_parent(&runtime_type)
+                                    .cloned()
+                                    .map_or(Value::Null, Value::TypePath)
+                            } else if name.as_str() == "appearance"
+                                && builtins::is_appearance_source(&runtime_type)
+                                && matches!(
+                                    datum_field_or_initial(state, datum, &name),
+                                    Ok(Value::Null) | Err(ValueError::MissingField(_))
+                                )
+                            {
+                                builtins::appearance_snapshot_builtin(datum, state)
+                                    .map_err(|message| execution_error(module, &frames, message))?
+                            } else if name.as_str() == "transform"
+                                && builtins::is_appearance_source(&runtime_type)
+                                && matches!(
+                                    datum_field_or_initial(state, datum, &name),
+                                    Ok(Value::Null) | Err(ValueError::MissingField(_))
+                                )
+                            {
+                                Value::Datum(
+                                    allocate_matrix(
+                                        [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                                        &mut state.heap,
+                                    )
+                                    .map_err(|message| execution_error(module, &frames, message))?,
+                                )
+                            } else if is_area_type_path(&runtime_type)
+                                && matches!(name.as_str(), "x" | "y" | "z")
+                                && let Some(coordinate) = area_coordinate_field(state, datum, &name)
+                            {
+                                coordinate
+                            } else if let Some(value) = lazy_atom_list_field(state, datum, &name)
+                                .map_err(|message| execution_error(module, &frames, message))?
+                            {
+                                value
+                            } else if runtime_type.as_str() == "/savefile"
+                                || runtime_type.as_str().starts_with("/savefile/")
+                            {
+                                match name.as_str() {
+                                    "cd" => Value::text(
+                                        savefile_current_directory(
+                                            &state.savefiles.entry(datum).or_default().cd,
+                                        )
+                                        .to_owned(),
+                                    ),
+                                    "eof" => {
+                                        let savefile = state.savefiles.entry(datum).or_default();
+                                        let path = savefile_current_directory(&savefile.cd);
+                                        Value::number(if savefile.entries.contains_key(path) {
+                                            0.0
+                                        } else {
+                                            1.0
+                                        })
+                                    }
+                                    "dir" => {
+                                        let children = savefile_directory_entries(
+                                            state.savefiles.entry(datum).or_default(),
+                                        );
+                                        let list = state.heap.allocate_list();
+                                        let values =
+                                            state.heap.list_mut(list).map_err(|error| {
+                                                execution_error(module, &frames, error.to_string())
+                                            })?;
+                                        for child in children {
+                                            values.add(Value::text(child));
+                                        }
+                                        Value::List(list)
+                                    }
+                                    _ => match state.heap.datum_field(datum, &name) {
+                                        Ok(value) => value.clone(),
+                                        Err(error) => {
+                                            return Err(execution_error(
+                                                module,
+                                                &frames,
+                                                error.to_string(),
+                                            ));
+                                        }
+                                    },
+                                }
+                            } else {
+                                match datum_field_or_shared(state, datum, &name) {
+                                    Ok(value) => value,
+                                    Err(ValueError::MissingField(_)) if statically_declared => {
+                                        Value::Null
+                                    }
+                                    Err(error) => {
+                                        if matches!(error, ValueError::MissingField(_)) {
+                                            eprintln!(
+                                                "boot-vm: missing-field receiver_type={} field={} engine_roots={:?} canonical_default={:?}",
+                                                runtime_type,
+                                                name,
+                                                engine_root_paths(&runtime_type),
+                                                engine_builtin_initial_value(&runtime_type, &name),
+                                            );
+                                        }
+                                        return Err(execution_error(
+                                            module,
+                                            &frames,
+                                            error.to_string(),
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -20819,6 +20961,30 @@ fn is_map_cell_structural_field(field: &FieldName) -> bool {
     matches!(field.as_str(), "x" | "y" | "z" | "loc" | "contents")
 }
 
+/// Returns whether a datum field needs type-specific engine behavior instead
+/// of the sparse instance/default/shared lookup used by ordinary DM members.
+fn datum_field_requires_special_read(runtime_type: &TypePath, field: &FieldName) -> bool {
+    let path = runtime_type.as_str();
+    (path == "/savefile" || path.starts_with("/savefile/"))
+        || matches!(
+            field.as_str(),
+            "type"
+                | "parent_type"
+                | "appearance"
+                | "transform"
+                | "x"
+                | "y"
+                | "z"
+                | "contents"
+                | "filters"
+                | "overlays"
+                | "underlays"
+                | "verbs"
+                | "vis_contents"
+                | "vis_locs"
+        )
+}
+
 fn lazy_atom_list_field(
     state: &mut ExecutionState,
     datum: DatumId,
@@ -22920,23 +23086,23 @@ fn dynamic_call_target_named(
     caller_context: &ExecutionContext,
     null_receiver_is_global: bool,
 ) -> Result<(ProcedureId, ExecutionContext), String> {
-    let receiver = state.heap().canonicalize_value(receiver);
     let (base_path, context) = match receiver {
         Value::Null if null_receiver_is_global => (None, caller_context.clone()),
         Value::Null => {
             return Err("cannot call a procedure on null".to_owned());
         }
-        Value::Datum(datum) => (
-            Some(
-                state
-                    .heap()
-                    .datum(datum)
-                    .map_err(|error| error.to_string())?
-                    .type_path()
-                    .clone(),
-            ),
-            ExecutionContext::new(receiver.clone(), caller_context.usr.clone()),
-        ),
+        Value::Datum(datum) => {
+            let Ok(record) = state.heap().datum(*datum) else {
+                return Err("cannot call a procedure on null".to_owned());
+            };
+            (
+                Some(record.type_path().clone()),
+                ExecutionContext::new(Value::Datum(*datum), caller_context.usr.clone()),
+            )
+        }
+        Value::List(list) if state.heap().list(*list).is_err() => {
+            return Err("cannot call a procedure on null".to_owned());
+        }
         Value::TypePath(path) => (Some(path.clone()), caller_context.clone()),
         _ => {
             return Err(format!(
@@ -23441,14 +23607,20 @@ fn datum_field_or_initial(
     datum: DatumId,
     field: &FieldName,
 ) -> Result<Value, ValueError> {
-    let runtime_type = state.heap.datum(datum)?.type_path().clone();
-    match state.heap.datum_field(datum, field) {
-        Ok(value) => Ok(value.clone()),
-        Err(error @ ValueError::MissingField(_)) => {
-            initial_value_or_engine_root(state, &runtime_type, field).ok_or(error)
-        }
-        Err(error) => Err(error),
+    let record = state.heap.datum(datum)?;
+    datum_field_or_initial_record(state, record, field)
+}
+
+fn datum_field_or_initial_record(
+    state: &ExecutionState,
+    record: &dm_value::Datum,
+    field: &FieldName,
+) -> Result<Value, ValueError> {
+    if let Some(value) = record.field_optional(field) {
+        return Ok(value.clone());
     }
+    initial_value_or_engine_root(state, record.type_path(), field)
+        .ok_or_else(|| ValueError::MissingField(field.clone()))
 }
 
 /// Returns the effective initial field catalog for an engine atom root.
@@ -23789,10 +23961,24 @@ fn datum_field_or_shared(
     datum: DatumId,
     field: &FieldName,
 ) -> Result<Value, ValueError> {
-    match datum_field_or_initial(state, datum, field) {
+    let record = state.heap.datum(datum)?;
+    datum_field_or_shared_record(state, record, field)
+}
+
+fn datum_field_or_shared_record(
+    state: &ExecutionState,
+    record: &dm_value::Datum,
+    field: &FieldName,
+) -> Result<Value, ValueError> {
+    match datum_field_or_initial_record(state, record, field) {
         Ok(value) => Ok(value),
         Err(error @ ValueError::MissingField(_)) => {
-            let Some(storage) = datum_shared_storage(state, datum, field) else {
+            let Some(storage) = state
+                .shared_fields
+                .get(record.type_path())
+                .and_then(|fields| fields.get(field))
+                .cloned()
+            else {
                 return Err(error);
             };
             Ok(state.global(&storage).cloned().unwrap_or(Value::Null))
@@ -31385,6 +31571,34 @@ mod tests {
     }
 
     #[test]
+    fn local_list_index_compiles_to_one_receiver_lookup_and_preserves_semantics() {
+        let syntax = parse("/proc/read(list/values, index)\n\treturn values[index]\n").unwrap();
+        let program = compile_procedure(&syntax.definitions[0]).unwrap();
+        assert!(
+            program
+                .instructions
+                .contains(&Instruction::IndexLocalList(0))
+        );
+        assert!(!program.instructions.contains(&Instruction::IndexList));
+
+        let mut state = ExecutionState::new();
+        let list = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(list)
+            .unwrap()
+            .add(Value::text("mapped"));
+        assert_eq!(
+            execute_in_state(
+                &program,
+                &[Value::List(list), Value::number(1.0)],
+                &mut state,
+            ),
+            Ok(Value::text("mapped"))
+        );
+    }
+
+    #[test]
     fn stale_list_indexing_maps_to_source_aware_runtime_error() {
         let program = manual_program(
             vec![
@@ -32889,6 +33103,19 @@ mod tests {
         let source = "/proc/sum(first, last)\n\tvar/total = 0\n\tfor(var/i in first to last)\n\t\tif(i == first)\n\t\t\tcontinue\n\t\ttotal += i\n\treturn total\n";
         let syntax = parse(source).expect("source should parse");
         let program = compile_procedure(&syntax.definitions[0]).expect("range loop should compile");
+        assert_eq!(
+            program
+                .instructions
+                .iter()
+                .filter(|instruction| matches!(instruction, Instruction::LessEqual))
+                .count(),
+            1,
+            "the implicit +1 step should compile to one inclusive comparison"
+        );
+        assert!(!program.instructions.iter().any(|instruction| matches!(
+            instruction,
+            Instruction::GreaterEqual | Instruction::Less | Instruction::And | Instruction::Or
+        )));
         assert_eq!(
             execute(&program, &[Value::number(2.0), Value::number(5.0)]),
             Ok(Value::number(12.0))

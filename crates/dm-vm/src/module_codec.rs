@@ -17,7 +17,7 @@ use crate::{
 const MAGIC: &[u8; 8] = b"DM64MOD\0";
 const VERSION: u16 = 4;
 #[cfg(test)]
-const INSTRUCTION_TAG_COUNT: u8 = 134;
+const INSTRUCTION_TAG_COUNT: u8 = 135;
 const MAX_ARTIFACT_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const MAX_PROCEDURES: usize = 1_000_000;
 const MAX_PROCEDURE_TYPES: usize = 1_000_000;
@@ -835,6 +835,7 @@ fn encode_instruction(
         }
         Instruction::LoadDynamicField => unit!(132),
         Instruction::StoreDynamicField => unit!(133),
+        Instruction::IndexLocalList(value) => one_u16!(134, value),
     }
     Ok(())
 }
@@ -1096,6 +1097,7 @@ fn decode_instruction(
         131 => Instruction::LoadDeclaredField(reader.field()?),
         132 => Instruction::LoadDynamicField,
         133 => Instruction::StoreDynamicField,
+        134 => Instruction::IndexLocalList(reader.u16("local slot")?),
         unknown => {
             return Err(ModuleCodecError::new(format!(
                 "unknown instruction tag {unknown}"
@@ -1616,6 +1618,7 @@ mod tests {
             ]),
             Instruction::MakeAssociativeListEntries(vec![ListEntryKind::Associative]),
             Instruction::IndexList,
+            Instruction::IndexLocalList(4),
             Instruction::SetListIndex,
             Instruction::SetListIndexKeep,
             Instruction::CompoundListIndex(CompoundListIndexOperator::Add),

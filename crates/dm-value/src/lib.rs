@@ -621,17 +621,20 @@ impl Datum {
     ///
     /// Returns [`ValueError::MissingField`] when `name` is not materialized.
     pub fn field(&self, name: &FieldName) -> Result<&Value, ValueError> {
+        self.field_optional(name)
+            .ok_or_else(|| ValueError::MissingField(name.clone()))
+    }
+
+    /// Reads a named field without allocating an error for an absent sparse slot.
+    #[must_use]
+    pub fn field_optional(&self, name: &FieldName) -> Option<&Value> {
         if let Some(field_index) = &self.field_index {
-            return field_index
-                .get(name)
-                .map(|&index| &self.fields[index].1)
-                .ok_or_else(|| ValueError::MissingField(name.clone()));
+            return field_index.get(name).map(|&index| &self.fields[index].1);
         }
         self.fields
             .iter()
             .find(|(candidate, _)| candidate == name)
             .map(|(_, value)| value)
-            .ok_or_else(|| ValueError::MissingField(name.clone()))
     }
 
     /// Inserts or updates a field while retaining first-insertion order.
@@ -2636,6 +2639,20 @@ impl ValueHeap {
         self.datum(id)?.field(name)
     }
 
+    /// Reads an optionally materialized field from a live datum.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValueError::StaleDatum`] for a stale identity. An absent field
+    /// returns `Ok(None)` without constructing a [`ValueError::MissingField`].
+    pub fn datum_field_optional(
+        &self,
+        id: DatumId,
+        name: &FieldName,
+    ) -> Result<Option<&Value>, ValueError> {
+        Ok(self.datum(id)?.field_optional(name))
+    }
+
     /// Replaces the runtime type of a live datum while preserving its stable
     /// identity. Engine-owned turf replacement uses this for one map cell.
     pub fn set_datum_type_path(
@@ -2837,6 +2854,30 @@ mod tests {
             Err(ValueError::MissingField(name))
         );
         assert_eq!(heap.datum(datum).unwrap().field_len(), 1);
+    }
+
+    #[test]
+    fn optional_datum_field_distinguishes_sparse_slots_from_stale_handles() {
+        let mut heap = ValueHeap::new();
+        let datum = heap.allocate_datum(TypePath::parse("/datum/example").unwrap());
+        let present = field("present");
+        let absent = field("absent");
+        heap.set_datum_field(datum, present.clone(), Value::number(7.0))
+            .unwrap();
+
+        assert_eq!(
+            heap.datum_field_optional(datum, &present)
+                .unwrap()
+                .and_then(Value::as_number),
+            Some(7.0)
+        );
+        assert_eq!(heap.datum_field_optional(datum, &absent), Ok(None));
+
+        heap.destroy_datum(datum).unwrap();
+        assert_eq!(
+            heap.datum_field_optional(datum, &present),
+            Err(ValueError::StaleDatum(datum))
+        );
     }
 
     #[test]
