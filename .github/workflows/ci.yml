@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  formatting:
+    name: Formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install repository Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+  engine:
+    name: Engine build and tests
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install repository Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Compile all targets
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run workspace tests
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run correctness lints
+        run: cargo clippy --workspace --all-targets --locked -- -A clippy::all -A clippy::pedantic -D clippy::correctness
