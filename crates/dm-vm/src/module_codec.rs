@@ -10,13 +10,14 @@ use dm_value::{FieldName, TypePath};
 
 use crate::{
     CompoundAssignmentOperator, CompoundListIndexOperator, Instruction, ListEntryKind, Module,
-    ProcedureId, Program, TypePredicateKind, dynamic_name_index, next_module_identity,
+    ProcedureId, Program, TypePredicateKind, VerbParameterType, dynamic_name_index,
+    next_module_identity,
 };
 
 const MAGIC: &[u8; 8] = b"DM64MOD\0";
-const VERSION: u16 = 1;
+const VERSION: u16 = 4;
 #[cfg(test)]
-const INSTRUCTION_TAG_COUNT: u8 = 132;
+const INSTRUCTION_TAG_COUNT: u8 = 134;
 const MAX_ARTIFACT_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const MAX_PROCEDURES: usize = 1_000_000;
 const MAX_PROCEDURE_TYPES: usize = 1_000_000;
@@ -243,6 +244,11 @@ fn validate_program(program: &Program, procedure_count: usize) -> Result<(), Mod
             "parameter name and parameter count differ",
         ));
     }
+    if program.verb_parameter_types.len() != program.parameter_count {
+        return Err(ModuleCodecError::new(
+            "verb parameter type and parameter count differ",
+        ));
+    }
     if program.parameter_count > program.local_count {
         return Err(ModuleCodecError::new(
             "parameter count exceeds local slot count",
@@ -319,6 +325,27 @@ fn encode_program(writer: &mut Writer, program: &Program) -> Result<(), ModuleCo
     for name in &program.parameter_names {
         writer.string(name)?;
     }
+    writer.len(
+        program.verb_parameter_types.len(),
+        u32::MAX as usize,
+        "verb parameter type count",
+    )?;
+    for parameter_type in &program.verb_parameter_types {
+        writer.u8(match parameter_type {
+            VerbParameterType::Unsupported => 0,
+            VerbParameterType::Text => 1,
+            VerbParameterType::Number => 2,
+            VerbParameterType::Message => 3,
+            VerbParameterType::Color => 4,
+            VerbParameterType::File => 5,
+            VerbParameterType::Anything => 6,
+            VerbParameterType::Atom(mask) => 0x80 | (mask & 0x0f),
+        });
+    }
+    writer.boolean(program.verb_name.is_some());
+    if let Some(name) = &program.verb_name {
+        writer.string(name)?;
+    }
     writer.u32(program.local_count as u32);
     writer.len(
         program.instructions.len(),
@@ -360,6 +387,35 @@ fn decode_program(
     for _ in 0..parameter_name_count {
         parameter_names.push(reader.string("parameter name")?);
     }
+    let verb_parameter_type_count =
+        reader.len_with_min(MAX_VECTOR_ELEMENTS, "verb parameter type count", 1)?;
+    if verb_parameter_type_count != parameter_count {
+        return Err(ModuleCodecError::new(
+            "verb parameter type and parameter count differ",
+        ));
+    }
+    let mut verb_parameter_types = Vec::with_capacity(verb_parameter_type_count);
+    for _ in 0..verb_parameter_type_count {
+        verb_parameter_types.push(match reader.u8("verb parameter type")? {
+            0 => VerbParameterType::Unsupported,
+            1 => VerbParameterType::Text,
+            2 => VerbParameterType::Number,
+            3 => VerbParameterType::Message,
+            4 => VerbParameterType::Color,
+            5 => VerbParameterType::File,
+            6 => VerbParameterType::Anything,
+            tag if tag & 0xf0 == 0x80 && tag & 0x0f != 0 => VerbParameterType::Atom(tag & 0x0f),
+            tag => {
+                return Err(ModuleCodecError::new(format!(
+                    "unknown verb parameter type tag {tag}",
+                )));
+            }
+        });
+    }
+    let verb_name = reader
+        .boolean("verb name presence")?
+        .then(|| reader.string("verb name"))
+        .transpose()?;
     let local_count = reader.u32("local count")? as usize;
     let instruction_count =
         reader.len_with_min(MAX_INSTRUCTIONS_PER_PROGRAM, "instruction count", 1)?;
@@ -387,6 +443,8 @@ fn decode_program(
         wait_for,
         parameter_count,
         parameter_names,
+        verb_parameter_types,
+        verb_name,
         local_count,
         instructions,
         source_spans,
@@ -775,6 +833,8 @@ fn encode_instruction(
             writer.u8(131);
             writer.string(value.as_str())?;
         }
+        Instruction::LoadDynamicField => unit!(132),
+        Instruction::StoreDynamicField => unit!(133),
     }
     Ok(())
 }
@@ -1034,6 +1094,8 @@ fn decode_instruction(
         129 => Instruction::PickExpandedArguments,
         130 => Instruction::PrepareRhsFirstIndexAssignment,
         131 => Instruction::LoadDeclaredField(reader.field()?),
+        132 => Instruction::LoadDynamicField,
+        133 => Instruction::StoreDynamicField,
         unknown => {
             return Err(ModuleCodecError::new(format!(
                 "unknown instruction tag {unknown}"
@@ -1529,6 +1591,8 @@ mod tests {
             Instruction::PickExpandedArguments,
             Instruction::PrepareRhsFirstIndexAssignment,
             Instruction::LoadDeclaredField(field("cell")),
+            Instruction::LoadDynamicField,
+            Instruction::StoreDynamicField,
             Instruction::Prob,
             Instruction::Round { argument_count: 2 },
             Instruction::Length,
@@ -1689,6 +1753,8 @@ mod tests {
                 wait_for: false,
                 parameter_count: 2,
                 parameter_names: vec!["first".to_owned(), "second".to_owned()],
+                verb_parameter_types: vec![VerbParameterType::Text, VerbParameterType::Number],
+                verb_name: None,
                 local_count: 5,
                 instructions,
                 source_spans: vec![SourceSpan::new(10, 20); instruction_count],
@@ -1717,6 +1783,14 @@ mod tests {
         for _ in 0..names {
             reader.string("name").unwrap();
         }
+        let parameter_types = reader.u32("verb parameter types").unwrap();
+        reader
+            .take(parameter_types as usize, "verb parameter type entries")
+            .unwrap();
+        let has_verb_name = reader.boolean("verb name presence").unwrap();
+        if has_verb_name {
+            reader.string("verb name").unwrap();
+        }
         reader.u32("locals").unwrap();
         reader.u32("instructions").unwrap();
         reader.position
@@ -1739,7 +1813,7 @@ mod tests {
         cache_polluted.names.clear();
         cache_polluted.dynamic_names.clear();
         cache_polluted.initializer_call_names = Some(crate::InitializerCallNameIndex {
-            names: HashMap::from([("stale".to_owned(), ProcedureId(0))]),
+            names: Arc::new(HashMap::from([("stale".to_owned(), ProcedureId(0))])),
             module_names_scanned: 99,
         });
         assert_eq!(cache_polluted.encode_portable().unwrap(), first);

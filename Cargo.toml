@@ -11,6 +11,7 @@ members = [
 	"crates/dm-lifecycle",
 	"crates/dm-lowering",
 	"crates/dm-map",
+	"crates/dm-mmap",
 	"crates/dm-object-tree",
 	"crates/dm-project",
 	"crates/dm-runtime",

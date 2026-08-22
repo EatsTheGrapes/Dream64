@@ -24,8 +24,9 @@ use dm_semantics::ProcedureRegistry;
 use dm_value::{DatumDefaults, DatumId, FieldName, TypePath, Value, ValueError, ValueHeap};
 use dm_vm::{
     ExecutionContext, ExecutionState, InitializerBinding, InitializerProgram, InstanceInitializer,
-    Module, RuntimeError, compile_initializer, compile_initializer_into_module,
-    execute_module_in_context,
+    Module, RuntimeError, append_initializer_program, compile_initializer,
+    compile_initializer_into_module, compile_initializer_program, execute_module_in_context,
+    initializer_compile_context,
 };
 
 /// A successfully materialized global or type-static variable.
@@ -108,7 +109,7 @@ fn builtin_mob_defaults() -> [(&'static str, Value); 9] {
     ]
 }
 
-fn builtin_client_defaults() -> [(&'static str, Value); 16] {
+fn builtin_client_defaults() -> [(&'static str, Value); 21] {
     [
         ("control_freak", Value::number(0.0)),
         ("dir", Value::number(2.0)),
@@ -119,6 +120,11 @@ fn builtin_client_defaults() -> [(&'static str, Value); 16] {
         ("ckey", Value::Null),
         ("address", Value::Null),
         ("computer_id", Value::Null),
+        ("connection", Value::Null),
+        ("byond_version", Value::Null),
+        ("byond_build", Value::Null),
+        ("fps", Value::number(10.0)),
+        ("view", Value::number(5.0)),
         ("mob", Value::Null),
         ("perspective", Value::number(0.0)),
         ("pixel_x", Value::number(0.0)),
@@ -446,6 +452,12 @@ fn materialize_builtin_world_defaults(
         ("time", Value::number(0.0)),
         ("timeofday", Value::number(clock.timeofday_deciseconds)),
         ("realtime", Value::number(clock.realtime_deciseconds)),
+        // Geometry handoff replaces these with the authoritative map extents.
+        // Keeping the slots present before that handoff matches BYOND's
+        // engine-owned world fields and lets early world initialization read 0.
+        ("maxx", Value::number(0.0)),
+        ("maxy", Value::number(0.0)),
+        ("maxz", Value::number(0.0)),
     ];
     for (name, value) in defaults {
         let name = FieldName::parse(name).expect("built-in world field is valid");
@@ -861,6 +873,183 @@ pub struct RuntimeImage {
     stats: RuntimeImageStats,
 }
 
+/// Immutable frontend-derived type inventory reusable across cold starts.
+///
+/// This seed deliberately excludes the value heap, materialized globals,
+/// scheduler state, and executed initializer results. It is consumed when a
+/// [`RuntimeImage`] is built, so decoded structural storage is not retained as
+/// a duplicate after construction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeStructuralSeed {
+    types: BTreeMap<TypePath, RuntimeType>,
+    world_name: String,
+}
+
+impl RuntimeStructuralSeed {
+    const MAGIC: &'static [u8; 16] = b"D64-RUNTIME-SEED";
+    const SCHEMA: u16 = 1;
+    const MAX_TYPES: usize = 4_000_000;
+    const MAX_TEXT: usize = 16 * 1024 * 1024;
+
+    /// Builds the deterministic structural inventory without materializing
+    /// globals or executing DM code.
+    pub fn build(compilation: &Compilation) -> Result<Self, RuntimeImageError> {
+        Ok(Self {
+            types: runtime_types(compilation)?,
+            world_name: compilation
+                .project()
+                .files
+                .first()
+                .and_then(|file| file.relative_path.file_stem())
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("world")
+                .to_owned(),
+        })
+    }
+
+    /// Encodes a bounded, versioned structural payload for a compiled artifact.
+    #[must_use]
+    pub fn encode_compiled_artifact(&self) -> Vec<u8> {
+        let mut output = Vec::new();
+        output.extend_from_slice(Self::MAGIC);
+        output.extend_from_slice(&Self::SCHEMA.to_le_bytes());
+        seed_write_text(&mut output, &self.world_name);
+        seed_write_u32(&mut output, self.types.len());
+        for runtime_type in self.types.values() {
+            seed_write_text(&mut output, runtime_type.path.as_str());
+            match &runtime_type.parent {
+                Some(parent) => {
+                    output.push(1);
+                    seed_write_text(&mut output, parent.as_str());
+                }
+                None => output.push(0),
+            }
+        }
+        let checksum = crc32fast::hash(&output);
+        output.extend_from_slice(&checksum.to_le_bytes());
+        output
+    }
+
+    /// Decodes and validates a structural seed from a compiled artifact section.
+    pub fn decode_compiled_artifact(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < Self::MAGIC.len() + 2 + 4 {
+            return Err("runtime structural seed is truncated".to_owned());
+        }
+        let body_length = bytes.len() - 4;
+        let expected = u32::from_le_bytes(bytes[body_length..].try_into().unwrap());
+        if crc32fast::hash(&bytes[..body_length]) != expected {
+            return Err("runtime structural seed checksum mismatch".to_owned());
+        }
+        let mut input = std::io::Cursor::new(&bytes[..body_length]);
+        let mut magic = [0; 16];
+        std::io::Read::read_exact(&mut input, &mut magic)
+            .map_err(|_| "runtime structural seed is truncated".to_owned())?;
+        if &magic != Self::MAGIC {
+            return Err("runtime structural seed has an unsupported header".to_owned());
+        }
+        let schema = seed_read_u16(&mut input)?;
+        if schema != Self::SCHEMA {
+            return Err(format!(
+                "runtime structural seed schema {schema} is unsupported"
+            ));
+        }
+        let world_name = seed_read_text(&mut input, Self::MAX_TEXT)?;
+        let count = seed_read_u32(&mut input)?;
+        if count > Self::MAX_TYPES {
+            return Err("runtime structural seed type count exceeds limit".to_owned());
+        }
+        let mut types = BTreeMap::new();
+        for _ in 0..count {
+            let path = TypePath::parse(&seed_read_text(&mut input, Self::MAX_TEXT)?)
+                .map_err(|error| error.to_string())?;
+            let parent = match seed_read_byte(&mut input)? {
+                0 => None,
+                1 => Some(
+                    TypePath::parse(&seed_read_text(&mut input, Self::MAX_TEXT)?)
+                        .map_err(|error| error.to_string())?,
+                ),
+                _ => return Err("runtime structural seed has invalid optional tag".to_owned()),
+            };
+            if types
+                .insert(
+                    path.clone(),
+                    RuntimeType {
+                        defaults: DatumDefaults::new(path.clone()),
+                        path,
+                        parent,
+                    },
+                )
+                .is_some()
+            {
+                return Err("runtime structural seed contains a duplicate type".to_owned());
+            }
+        }
+        if input.position() as usize != body_length {
+            return Err("runtime structural seed contains trailing bytes".to_owned());
+        }
+        if types.values().any(|runtime_type| {
+            runtime_type
+                .parent
+                .as_ref()
+                .is_some_and(|parent| !types.contains_key(parent))
+        }) {
+            return Err("runtime structural seed references an unknown parent".to_owned());
+        }
+        Ok(Self { types, world_name })
+    }
+}
+
+fn seed_write_u32(output: &mut Vec<u8>, value: usize) {
+    output.extend_from_slice(
+        &u32::try_from(value)
+            .expect("runtime structural seed count exceeds u32")
+            .to_le_bytes(),
+    );
+}
+
+fn seed_write_text(output: &mut Vec<u8>, value: &str) {
+    seed_write_u32(output, value.len());
+    output.extend_from_slice(value.as_bytes());
+}
+
+fn seed_read_byte(input: &mut std::io::Cursor<&[u8]>) -> Result<u8, String> {
+    let mut byte = [0];
+    std::io::Read::read_exact(input, &mut byte)
+        .map_err(|_| "runtime structural seed is truncated".to_owned())?;
+    Ok(byte[0])
+}
+
+fn seed_read_u16(input: &mut std::io::Cursor<&[u8]>) -> Result<u16, String> {
+    let mut bytes = [0; 2];
+    std::io::Read::read_exact(input, &mut bytes)
+        .map_err(|_| "runtime structural seed is truncated".to_owned())?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn seed_read_u32(input: &mut std::io::Cursor<&[u8]>) -> Result<usize, String> {
+    let mut bytes = [0; 4];
+    std::io::Read::read_exact(input, &mut bytes)
+        .map_err(|_| "runtime structural seed is truncated".to_owned())?;
+    Ok(u32::from_le_bytes(bytes) as usize)
+}
+
+fn seed_read_text(input: &mut std::io::Cursor<&[u8]>, maximum: usize) -> Result<String, String> {
+    let length = seed_read_u32(input)?;
+    if length > maximum
+        || length
+            > input
+                .get_ref()
+                .len()
+                .saturating_sub(input.position() as usize)
+    {
+        return Err("runtime structural seed text length exceeds bounds".to_owned());
+    }
+    let mut bytes = vec![0; length];
+    std::io::Read::read_exact(input, &mut bytes)
+        .map_err(|_| "runtime structural seed is truncated".to_owned())?;
+    String::from_utf8(bytes).map_err(|_| "runtime structural seed text is not UTF-8".to_owned())
+}
+
 /// Counts of rebuildable allocation caches released after bulk preflight and
 /// world materialization.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -929,24 +1118,61 @@ struct RuntimeBindingIndex {
     instance_fields: BTreeMap<String, BTreeMap<String, FieldName>>,
 }
 
+enum PreparedRuntimeBinding {
+    Global(String, FieldName),
+    Static(String, FieldName),
+    Instance(String, String, FieldName),
+    None,
+}
+
 impl RuntimeBindingIndex {
     fn build(registry: &VariableRegistry) -> Result<Self, RuntimeImageError> {
         let mut globals = BTreeMap::new();
         let mut statics = BTreeMap::new();
         let mut instance_fields = BTreeMap::<String, BTreeMap<String, FieldName>>::new();
-        for entry in registry.entries() {
-            let field = variable_field(&entry.path)?;
-            if entry.storage == StorageClass::Instance {
-                if let Some(owner) = &entry.owner {
-                    instance_fields
-                        .entry(owner.path.clone())
-                        .or_default()
-                        .insert(field.as_str().to_owned(), field);
+        let entries = registry.entries();
+        let prepared = parallel_collect_results_ordered(
+            entries.len(),
+            |index| -> Result<PreparedRuntimeBinding, RuntimeImageError> {
+                let entry = &entries[index];
+                let field = variable_field(&entry.path)?;
+                if entry.storage == StorageClass::Instance {
+                    if let Some(owner) = &entry.owner {
+                        return Ok(PreparedRuntimeBinding::Instance(
+                            owner.path.clone(),
+                            field.as_str().to_owned(),
+                            field,
+                        ));
+                    }
+                    Ok(PreparedRuntimeBinding::None)
+                } else if entry.storage == StorageClass::Global && entry.owner.is_none() {
+                    Ok(PreparedRuntimeBinding::Global(
+                        field.as_str().to_owned(),
+                        field,
+                    ))
+                } else {
+                    Ok(PreparedRuntimeBinding::Static(
+                        entry.path.clone(),
+                        FieldName::static_storage(&entry.path),
+                    ))
                 }
-            } else if entry.storage == StorageClass::Global && entry.owner.is_none() {
-                globals.insert(field.as_str().to_owned(), field);
-            } else {
-                statics.insert(entry.path.clone(), FieldName::static_storage(&entry.path));
+            },
+        );
+        for binding in prepared {
+            match binding? {
+                PreparedRuntimeBinding::Global(name, field) => {
+                    globals.insert(name, field);
+                }
+                PreparedRuntimeBinding::Static(path, field) => {
+                    statics.insert(path, field);
+                }
+                PreparedRuntimeBinding::Instance(owner, name, field) => {
+                    instance_fields
+                        .entry(owner)
+                        .or_default()
+                        .insert(name, field);
+                }
+                PreparedRuntimeBinding::None => {}
             }
         }
         Ok(Self {
@@ -955,6 +1181,36 @@ impl RuntimeBindingIndex {
             instance_fields,
         })
     }
+}
+
+fn parallel_collect_results_ordered<T, E, F>(len: usize, prepare: F) -> Vec<Result<T, E>>
+where
+    T: Send,
+    E: Send,
+    F: Fn(usize) -> Result<T, E> + Sync,
+{
+    const PARALLEL_THRESHOLD: usize = 4_096;
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(len.max(1));
+    if workers == 1 || len < PARALLEL_THRESHOLD {
+        return (0..len).map(prepare).collect();
+    }
+    std::thread::scope(|scope| {
+        let prepare = &prepare;
+        let handles = (0..workers)
+            .map(|worker| {
+                let start = len * worker / workers;
+                let end = len * (worker + 1) / workers;
+                scope.spawn(move || (start..end).map(prepare).collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>();
+        let mut output = Vec::with_capacity(len);
+        for handle in handles {
+            output.extend(handle.join().expect("runtime binding worker panicked"));
+        }
+        output
+    })
 }
 
 fn execution_metadata(
@@ -1405,7 +1661,17 @@ impl RuntimeImage {
         compilation: &Compilation,
         observer: impl FnMut(RuntimeImageConstructionEvent),
     ) -> Result<Self, RuntimeImageError> {
-        Self::from_compilation_internal(compilation, None, observer)
+        Self::from_compilation_internal(compilation, None, None, observer)
+    }
+
+    /// Materializes from a validated structural seed while reporting phases.
+    #[doc(hidden)]
+    pub fn from_compilation_with_seed(
+        compilation: &Compilation,
+        seed: RuntimeStructuralSeed,
+        observer: impl FnMut(RuntimeImageConstructionEvent),
+    ) -> Result<Self, RuntimeImageError> {
+        Self::from_compilation_internal(compilation, None, Some(seed), observer)
     }
 
     /// Materializes a frontend snapshot by appending initializer entries to an
@@ -1422,12 +1688,30 @@ impl RuntimeImage {
         module: &mut Module,
         observer: impl FnMut(RuntimeImageConstructionEvent),
     ) -> Result<Self, RuntimeImageError> {
-        Self::from_compilation_internal(compilation, Some((procedures, module)), observer)
+        Self::from_compilation_internal(compilation, Some((procedures, module)), None, observer)
+    }
+
+    /// Materializes with a prelinked module and a validated structural seed.
+    #[doc(hidden)]
+    pub fn from_compilation_with_prelinked_module_and_seed(
+        compilation: &Compilation,
+        procedures: &ProcedureRegistry,
+        module: &mut Module,
+        seed: RuntimeStructuralSeed,
+        observer: impl FnMut(RuntimeImageConstructionEvent),
+    ) -> Result<Self, RuntimeImageError> {
+        Self::from_compilation_internal(
+            compilation,
+            Some((procedures, module)),
+            Some(seed),
+            observer,
+        )
     }
 
     fn from_compilation_internal(
         compilation: &Compilation,
         mut prelinked: Option<(&ProcedureRegistry, &mut Module)>,
+        structural_seed: Option<RuntimeStructuralSeed>,
         mut observer: impl FnMut(RuntimeImageConstructionEvent),
     ) -> Result<Self, RuntimeImageError> {
         let phase = RuntimeImageConstructionPhase::VariableRegistry;
@@ -1444,7 +1728,13 @@ impl RuntimeImage {
 
         let phase = RuntimeImageConstructionPhase::TypeInventory;
         let phase_started = begin_runtime_phase(&mut observer, phase);
-        let mut types = runtime_types(compilation)?;
+        let (mut types, world_name) = match structural_seed {
+            Some(seed) => (seed.types, seed.world_name),
+            None => {
+                let seed = RuntimeStructuralSeed::build(compilation)?;
+                (seed.types, seed.world_name)
+            }
+        };
         // BYOND materializes every declared instance variable on every datum,
         // even when the declaration has no explicit initializer. Seed those
         // fields with null before applying constant/dynamic default layers;
@@ -1464,14 +1754,6 @@ impl RuntimeImage {
             }
         }
         let type_paths = Arc::new(types.keys().cloned().collect());
-        let world_name = compilation
-            .project()
-            .files
-            .first()
-            .and_then(|file| file.relative_path.file_stem())
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("world")
-            .to_owned();
         // Reflection of shared fields needs only the parent graph here. The
         // much larger inherited-initial-value snapshot is built once after
         // all compile-time instance constants have been applied.
@@ -2402,12 +2684,23 @@ impl RuntimeImage {
         &mut self,
         module: &mut Module,
     ) -> Result<BTreeMap<TypePath, Vec<InstanceInitializer>>, RuntimeImageError> {
-        let mut catalog = BTreeMap::<TypePath, Vec<InstanceInitializer>>::new();
+        struct Prepared {
+            owner: TypePath,
+            field: FieldName,
+            constant: Option<Value>,
+            dynamic: Option<(
+                String,
+                Vec<dm_lexer::SpannedToken>,
+                BTreeMap<String, InitializerBinding>,
+            )>,
+        }
+
         let ordered = self
             .instance_initializer_indices_by_owner
             .iter()
             .flat_map(|(owner, indices)| indices.iter().map(|index| (owner.clone(), *index)))
             .collect::<Vec<_>>();
+        let mut prepared = Vec::with_capacity(ordered.len());
         for (catalog_owner, index) in ordered {
             let candidate = self.instance_initializers[index].clone();
             let entry = candidate.entry;
@@ -2419,41 +2712,119 @@ impl RuntimeImage {
             let owner = parse_type_path(&owner.path)?;
             debug_assert_eq!(owner, catalog_owner);
             let field = variable_field(&path)?;
-            if let Some(value) = candidate.constant {
+            let dynamic = if candidate.constant.is_none() {
+                let initializer = entry
+                    .initializer
+                    .as_ref()
+                    .ok_or_else(|| RuntimeImageError::MissingInitializer(path.clone()))?;
+                let bindings = self.initializer_bindings(&entry).map_err(|failure| {
+                    RuntimeImageError::InstanceInitializer {
+                        path: path.clone(),
+                        message: failure.message,
+                    }
+                })?;
+                Some((path, initializer.tokens.clone(), bindings))
+            } else {
+                None
+            };
+            prepared.push(Prepared {
+                owner,
+                field,
+                constant: candidate.constant,
+                dynamic,
+            });
+        }
+
+        // Expression parsing, binding, and bytecode lowering are isolated from
+        // the VM module. Workers return indexed immutable programs; the owner
+        // thread appends them below in the original catalog order.
+        let context = initializer_compile_context(module);
+        let dynamic = prepared
+            .iter()
+            .enumerate()
+            .filter_map(|(index, prepared)| {
+                prepared
+                    .dynamic
+                    .as_ref()
+                    .map(|(_, tokens, bindings)| (index, tokens, bindings))
+            })
+            .collect::<Vec<_>>();
+        let workers = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(dynamic.len().max(1));
+        let chunk_size = dynamic.len().div_ceil(workers).max(1);
+        let mut compiled = std::thread::scope(|scope| {
+            let handles = dynamic
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    let context = context.clone();
+                    scope.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|(index, tokens, bindings)| {
+                                (
+                                    *index,
+                                    compile_initializer_program(tokens, bindings, &context),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("initializer worker must not panic"))
+                .collect::<Vec<_>>()
+        });
+        compiled.sort_by_key(|(index, _)| *index);
+        let mut compiled = compiled.into_iter().peekable();
+
+        let mut catalog = BTreeMap::<TypePath, Vec<InstanceInitializer>>::new();
+        for (index, prepared) in prepared.into_iter().enumerate() {
+            if let Some(value) = prepared.constant {
                 catalog
-                    .entry(owner)
+                    .entry(prepared.owner)
                     .or_default()
-                    .push(InstanceInitializer::Constant { field, value });
+                    .push(InstanceInitializer::Constant {
+                        field: prepared.field,
+                        value,
+                    });
                 continue;
             }
-            let initializer = entry
-                .initializer
-                .as_ref()
-                .ok_or_else(|| RuntimeImageError::MissingInitializer(path.clone()))?;
-            let bindings = self.initializer_bindings(&entry).map_err(|failure| {
+            let Some((compiled_index, program)) = compiled.next() else {
+                unreachable!("every dynamic initializer has one worker result")
+            };
+            debug_assert_eq!(compiled_index, index);
+            let program = match program {
+                Ok(program) => program,
+                Err(_error) => {
+                    #[cfg(test)]
+                    eprintln!(
+                        "skipped VM initializer {}: {}",
+                        prepared
+                            .dynamic
+                            .as_ref()
+                            .map_or("<missing>", |value| value.0.as_str()),
+                        _error.message
+                    );
+                    continue;
+                }
+            };
+            let entry = append_initializer_program(module, program).map_err(|error| {
                 RuntimeImageError::InstanceInitializer {
-                    path: path.clone(),
-                    message: failure.message,
+                    path: prepared
+                        .dynamic
+                        .as_ref()
+                        .map_or_else(|| "<missing>".to_owned(), |value| value.0.clone()),
+                    message: error.message,
                 }
             })?;
-            let program =
-                match compile_initializer_into_module(&initializer.tokens, &bindings, module) {
-                    Ok(program) => program,
-                    Err(_error) => {
-                        // Preserve lazy preflight behavior for invalid/unreachable
-                        // type defaults; the existing per-type plan reports the
-                        // source-mapped error when that type is requested.
-                        #[cfg(test)]
-                        eprintln!("skipped VM initializer {path}: {}", _error.message);
-                        continue;
-                    }
-                };
             catalog
-                .entry(owner)
+                .entry(prepared.owner)
                 .or_default()
                 .push(InstanceInitializer::Program {
-                    field,
-                    entry: program,
+                    field: prepared.field,
+                    entry,
                 });
         }
         Ok(catalog)
@@ -3280,8 +3651,8 @@ mod tests {
 
     use super::{
         ConstantFieldApplication, InitializerFailurePhase, InitializerProcedureFrontier,
-        RuntimeImage, RuntimeImageConstructionPhase, builtin_client_defaults, builtin_mob_defaults,
-        world_clock_values,
+        RuntimeImage, RuntimeImageConstructionPhase, RuntimeStructuralSeed,
+        builtin_client_defaults, builtin_mob_defaults, world_clock_values,
     };
 
     static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
@@ -5788,5 +6159,35 @@ mod tests {
         let mut frontier = InitializerProcedureFrontier::default();
         frontier.include(&compilation, entry);
         assert!(frontier.requires_complete_inventory);
+    }
+
+    #[test]
+    fn runtime_structural_seed_roundtrips_and_builds_identical_metadata() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "world.dme",
+            "/datum/base\n\tvar/value\n/datum/base/child\n\tvar/other = 3\n/var/global/datum/base/typed\n",
+        );
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.0.join("world.dme"))
+            .expect("fixture should compile");
+        let seed = RuntimeStructuralSeed::build(&compilation).unwrap();
+        let bytes = seed.encode_compiled_artifact();
+        let decoded = RuntimeStructuralSeed::decode_compiled_artifact(&bytes).unwrap();
+        assert_eq!(decoded, seed);
+
+        let ordinary = RuntimeImage::from_compilation(&compilation).unwrap();
+        let seeded =
+            RuntimeImage::from_compilation_with_seed(&compilation, decoded, |_| {}).unwrap();
+        assert_eq!(seeded.types, ordinary.types);
+        assert_eq!(seeded.type_parents, ordinary.type_parents);
+        assert_eq!(seeded.initial_values, ordinary.initial_values);
+        assert_eq!(seeded.shared_fields, ordinary.shared_fields);
+        assert_eq!(seeded.global_types, ordinary.global_types);
+        assert_eq!(seeded.variables, ordinary.variables);
+
+        let mut corrupt = bytes;
+        corrupt[20] ^= 0x40;
+        assert!(RuntimeStructuralSeed::decode_compiled_artifact(&corrupt).is_err());
     }
 }

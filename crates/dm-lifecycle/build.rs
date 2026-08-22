@@ -2,23 +2,11 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const ENGINE_CRATES: [&str; 15] = [
-    "dm-core",
-    "dm-project",
-    "dm-lexer",
-    "dm-syntax",
-    "dm-object-tree",
-    "dm-compiler",
-    "dm-lowering",
-    "dm-semantics",
-    "dm-value",
-    "dm-vm",
-    "dm-globals",
-    "dm-runtime",
-    "dm-map",
-    "dm-world",
-    "dm-lifecycle",
-];
+mod artifact_fingerprint_policy;
+
+use artifact_fingerprint_policy::{
+    COMPILER_INPUT_CRATES, VM_ARTIFACT_ABI_REVISION, fingerprint, is_scoped_identity,
+};
 
 fn main() {
     let manifest_dir = PathBuf::from(
@@ -28,43 +16,31 @@ fn main() {
         .parent()
         .expect("dm-lifecycle must live below the workspace crates directory");
     let mut inputs = Vec::new();
-    for crate_name in ENGINE_CRATES {
+    for crate_name in COMPILER_INPUT_CRATES {
         let engine_member_root = workspace_members_root.join(crate_name);
         collect_source_inputs(crate_name, &engine_member_root, &mut inputs);
     }
-    // Changes to the fingerprint routing itself and dependency resolution can
-    // alter the portable codec or compilation result without touching a crate
-    // source file. Include those inputs in the artifact ABI identity too.
-    let workspace_root = workspace_members_root
-        .parent()
-        .expect("workspace crates directory must have a workspace root");
-    inputs.extend([
-        (
-            "dm-lifecycle/build.rs".to_owned(),
-            manifest_dir.join("build.rs"),
-        ),
-        (
-            "workspace/Cargo.toml".to_owned(),
-            workspace_root.join("Cargo.toml"),
-        ),
-        (
-            "workspace/Cargo.lock".to_owned(),
-            workspace_root.join("Cargo.lock"),
-        ),
-    ]);
+    let revision = workspace_members_root.join(VM_ARTIFACT_ABI_REVISION);
+    inputs.push((VM_ARTIFACT_ABI_REVISION.to_owned(), revision));
+    debug_assert!(
+        inputs
+            .iter()
+            .all(|(identity, _)| is_scoped_identity(identity))
+    );
     inputs.sort_by(|left, right| left.0.cmp(&right.0));
 
-    let mut digest = md5::Context::new();
-    digest.consume(b"DREAM64-ENGINE-SEMANTICS\0\x01");
-    hash_u64(&mut digest, inputs.len() as u64);
+    let mut owned = Vec::with_capacity(inputs.len());
     for (identity, path) in &inputs {
         let bytes = fs::read(path)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-        hash_bytes(&mut digest, identity.as_bytes());
-        hash_bytes(&mut digest, &bytes);
+        owned.push((identity.as_str(), bytes));
         println!("cargo:rerun-if-changed={}", path.display());
     }
-    let fingerprint = digest.compute().0;
+    let fingerprint = fingerprint(
+        owned
+            .iter()
+            .map(|(identity, bytes)| (*identity, bytes.as_slice())),
+    );
     let generated = format!(
         "pub(crate) const GENERATED_ENGINE_SEMANTICS_FINGERPRINT: [u8; 16] = {fingerprint:?};\n"
     );
@@ -108,13 +84,4 @@ fn collect_rust_files(
             output.push((format!("{crate_name}/{relative}"), path));
         }
     }
-}
-
-fn hash_u64(context: &mut md5::Context, value: u64) {
-    context.consume(value.to_le_bytes());
-}
-
-fn hash_bytes(context: &mut md5::Context, bytes: &[u8]) {
-    hash_u64(context, bytes.len() as u64);
-    context.consume(bytes);
 }

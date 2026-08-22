@@ -2,22 +2,30 @@
 use crate::PrecompiledLifecycle;
 use dm_value::DatumId;
 use dm_vm::{
-    ExecutionState, LocalClientMapSnapshot, LocalClientState, LocalClientUiEvent,
-    LocalMovementDirection,
+    ExecutionState, LocalClientMapSnapshot, LocalClientPromptResponse, LocalClientState,
+    LocalClientUiEvent, LocalMovementDirection,
 };
 use std::{
     collections::BTreeMap,
     io::{self, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
-    sync::mpsc::{self, Receiver, Sender, SyncSender},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender, SyncSender},
+    },
     thread,
 };
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Command {
+    Ping,
     Attach,
     MapSnapshot {
+        session: String,
+    },
+    ScreenSnapshot {
         session: String,
     },
     Move {
@@ -30,6 +38,50 @@ enum Command {
     },
     UiEvents {
         session: String,
+    },
+    UiAck {
+        session: String,
+        sequence: u64,
+    },
+    SkinReady {
+        session: String,
+    },
+    ResourcesReady {
+        session: String,
+    },
+    InputReady {
+        session: String,
+    },
+    ScreenPointer {
+        session: String,
+        index: u32,
+        generation: u32,
+        event: dm_vm::LocalScreenPointerEvent,
+        location: String,
+        params: String,
+    },
+    MapPointer {
+        session: String,
+        index: u32,
+        generation: u32,
+        x: i32,
+        y: i32,
+        z: i32,
+        control: String,
+        params: String,
+    },
+    BrowserTopic {
+        session: String,
+        topic: String,
+    },
+    ClientCommand {
+        session: String,
+        command: String,
+    },
+    PromptResponse {
+        session: String,
+        id: u64,
+        response: LocalClientPromptResponse,
     },
 }
 struct Request {
@@ -44,19 +96,108 @@ pub struct LoopbackIpc {
     sessions: BTreeMap<String, DatumId>,
     next_session: u64,
     ui_sequences: BTreeMap<String, u64>,
+    retained_ui: BTreeMap<String, Vec<(u64, LocalClientUiEvent)>>,
+    readiness: BTreeMap<String, SessionReadiness>,
+    startup_gate: Option<Arc<StartupGate>>,
 }
+
+struct StartupGate {
+    accepting: AtomicBool,
+    interactive: AtomicBool,
+    phase: RwLock<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SessionReadiness {
+    skin: bool,
+    resources: bool,
+    input: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ReadinessPhase {
+    Skin,
+    Resources,
+    Input,
+}
+
+impl SessionReadiness {
+    const fn interactive(self) -> bool {
+        self.skin && self.resources && self.input
+    }
+
+    fn advance(&mut self, phase: ReadinessPhase) -> Result<(), &'static str> {
+        match phase {
+            ReadinessPhase::Skin => self.skin = true,
+            ReadinessPhase::Resources if self.skin => self.resources = true,
+            ReadinessPhase::Input if self.skin && self.resources => self.input = true,
+            ReadinessPhase::Resources => return Err("skin-not-ready"),
+            ReadinessPhase::Input => return Err("resources-not-ready"),
+        }
+        Ok(())
+    }
+}
+
 impl LoopbackIpc {
+    fn advance_readiness(
+        &mut self,
+        session: &str,
+        phase: ReadinessPhase,
+        state: &mut ExecutionState,
+    ) -> String {
+        let Some(client) = self.sessions.get(session).copied() else {
+            return "error unknown-session".into();
+        };
+        let readiness = self.readiness.entry(session.to_owned()).or_default();
+        if let Err(error) = readiness.advance(phase) {
+            return format!("error {error}");
+        }
+        if readiness.interactive() && self.startup_interactive() {
+            if let Err(error) = state.set_local_client_interactive(client, true) {
+                return format!("error {error}");
+            }
+        }
+        let phase = match phase {
+            ReadinessPhase::Skin => "skin_ready",
+            ReadinessPhase::Resources => "resources_ready",
+            ReadinessPhase::Input => "input_ready",
+        };
+        format!("ok {phase} protocol=7 session={session}")
+    }
+
     /// Binds a localhost listener and starts its framing thread.
     pub fn bind(address: SocketAddr) -> Result<Self, String> {
+        Self::bind_with_startup_gate(address, None)
+    }
+
+    /// Binds during host preflight, before the VM is ready to create clients.
+    /// Early attach attempts receive the current phase instead of blocking the
+    /// native client event loop on a scheduler boundary that does not yet exist.
+    pub fn bind_starting(address: SocketAddr, phase: &str) -> Result<Self, String> {
+        Self::bind_with_startup_gate(
+            address,
+            Some(Arc::new(StartupGate {
+                accepting: AtomicBool::new(false),
+                interactive: AtomicBool::new(false),
+                phase: RwLock::new(phase.to_owned()),
+            })),
+        )
+    }
+
+    fn bind_with_startup_gate(
+        address: SocketAddr,
+        startup_gate: Option<Arc<StartupGate>>,
+    ) -> Result<Self, String> {
         if !address.ip().is_loopback() {
             return Err("IPC listener must bind to a loopback address".into());
         }
         let listener = TcpListener::bind(address).map_err(|e| e.to_string())?;
         let address = listener.local_addr().map_err(|e| e.to_string())?;
         let (sender, requests) = mpsc::channel();
+        let serve_gate = startup_gate.clone();
         thread::Builder::new()
             .name("dream64-loopback-ipc".into())
-            .spawn(move || serve(listener, &sender))
+            .spawn(move || serve(listener, &sender, serve_gate.as_deref()))
             .map_err(|e| e.to_string())?;
         Ok(Self {
             address,
@@ -64,7 +205,54 @@ impl LoopbackIpc {
             sessions: BTreeMap::new(),
             next_session: 1,
             ui_sequences: BTreeMap::new(),
+            retained_ui: BTreeMap::new(),
+            readiness: BTreeMap::new(),
+            startup_gate,
         })
+    }
+
+    /// Updates the human-readable phase returned to clients during preflight.
+    pub fn set_startup_phase(&self, phase: &str) {
+        let Some(gate) = &self.startup_gate else {
+            return;
+        };
+        if let Ok(mut current) = gate.phase.write() {
+            *current = phase.to_owned();
+        }
+    }
+
+    /// Allows subsequent attach requests to enter the scheduler-owned VM.
+    pub fn accept_startup_clients(&self) {
+        if let Some(gate) = &self.startup_gate {
+            gate.interactive.store(true, Ordering::Release);
+            gate.accepting.store(true, Ordering::Release);
+        }
+    }
+
+    /// Exposes a read-only live lobby once Master begins subsystem work.
+    pub fn show_startup_lobby(&self) {
+        if let Some(gate) = &self.startup_gate {
+            gate.accepting.store(true, Ordering::Release);
+        }
+    }
+
+    /// Enables input for clients that attached to the read-only startup lobby.
+    pub fn enable_session_interaction(&self, state: &mut ExecutionState) {
+        for (session, client) in &self.sessions {
+            if self
+                .readiness
+                .get(session)
+                .is_some_and(|ready| ready.interactive())
+            {
+                let _ = state.set_local_client_interactive(*client, true);
+            }
+        }
+    }
+
+    fn startup_interactive(&self) -> bool {
+        self.startup_gate
+            .as_ref()
+            .is_none_or(|gate| gate.interactive.load(Ordering::Acquire))
     }
     /// Returns the actual bound loopback address.
     #[must_use]
@@ -82,6 +270,169 @@ impl LoopbackIpc {
         count
     }
 
+    /// Applies queued requests to an explicitly linked executable/state pair.
+    /// This is used by lightweight hosts which have run world initialization
+    /// without constructing the full map lifecycle wrapper.
+    pub fn apply_executable_tick_boundary(
+        &mut self,
+        executable: &dm_semantics::ExecutableProcedures,
+        state: &mut ExecutionState,
+    ) -> usize {
+        let mut count = 0;
+        while let Ok(request) = self.requests.try_recv() {
+            let response = match request.command {
+                Command::Attach => match state.connect_local_guest(executable.module()) {
+                    Ok(attached) => {
+                        if let Err(error) =
+                            state.set_local_client_interactive(attached.client, false)
+                        {
+                            let _ = request.response.send(format!("error {error}"));
+                            count += 1;
+                            continue;
+                        }
+                        let session = format!("s{}", self.next_session);
+                        self.next_session += 1;
+                        self.sessions.insert(session.clone(), attached.client);
+                        self.ui_sequences.insert(session.clone(), 1);
+                        self.retained_ui.insert(session.clone(), Vec::new());
+                        self.readiness
+                            .insert(session.clone(), SessionReadiness::default());
+                        eprintln!(
+                            "server-progress: client-attached session={} client={:?} pending={}",
+                            session,
+                            attached.client,
+                            state.scheduled_task_count()
+                        );
+                        format_state("attach", &session, &attached, state.scheduler_tick())
+                    }
+                    Err(error) => format!("error {error}"),
+                },
+                Command::ScreenPointer {
+                    session,
+                    index,
+                    generation,
+                    event,
+                    location,
+                    params,
+                } => {
+                    if !self.startup_interactive() {
+                        let _ = request
+                            .response
+                            .send("error server-starting-read-only".into());
+                        count += 1;
+                        continue;
+                    }
+                    let Some(client) = self.sessions.get(&session).copied() else {
+                        let _ = request.response.send("error unknown-session".into());
+                        count += 1;
+                        continue;
+                    };
+                    match state.queue_local_screen_pointer(
+                        executable.module(),
+                        client,
+                        index,
+                        generation,
+                        event,
+                        &location,
+                        &params,
+                    ) {
+                        Ok(()) => format!("ok screen_pointer protocol=3 client={session}"),
+                        Err(error) => format!("error {error}"),
+                    }
+                }
+                Command::MapPointer {
+                    session,
+                    index,
+                    generation,
+                    x,
+                    y,
+                    z,
+                    control,
+                    params,
+                } => {
+                    if !self.startup_interactive() {
+                        let _ = request
+                            .response
+                            .send("error server-starting-read-only".into());
+                        count += 1;
+                        continue;
+                    }
+                    let Some(client) = self.sessions.get(&session).copied() else {
+                        let _ = request.response.send("error unknown-session".into());
+                        count += 1;
+                        continue;
+                    };
+                    match state.queue_local_map_pointer(
+                        executable.module(),
+                        client,
+                        index,
+                        generation,
+                        x,
+                        y,
+                        z,
+                        &control,
+                        &params,
+                    ) {
+                        Ok(()) => format!("ok map_pointer protocol=6 client={session}"),
+                        Err(error) => format!("error {error}"),
+                    }
+                }
+                Command::BrowserTopic { session, topic } => {
+                    // Embedded browsers must complete their BYOND Topic
+                    // handshakes while the startup lobby is read-only. Monk's
+                    // media player queues every play call until its `ready`
+                    // topic is accepted, and the stat/output panels use the
+                    // same initialization channel. Pointer and verb input stay
+                    // gated until HeadlessReady.
+                    let Some(client) = self.sessions.get(&session).copied() else {
+                        let _ = request.response.send("error unknown-session".into());
+                        count += 1;
+                        continue;
+                    };
+                    match state.queue_local_browser_topic(executable.module(), client, &topic) {
+                        Ok(()) => {
+                            eprintln!(
+                                "server-progress: browser-topic session={} bytes={}",
+                                session,
+                                topic.len()
+                            );
+                            format!("ok browser_topic protocol=4 client={session}")
+                        }
+                        Err(error) => format!("error {error}"),
+                    }
+                }
+                Command::ClientCommand { session, command } => {
+                    if !self.startup_interactive() {
+                        let _ = request
+                            .response
+                            .send("error server-starting-read-only".into());
+                        count += 1;
+                        continue;
+                    }
+                    let Some(client) = self.sessions.get(&session).copied() else {
+                        let _ = request.response.send("error unknown-session".into());
+                        count += 1;
+                        continue;
+                    };
+                    match state.queue_local_client_command(executable.module(), client, &command) {
+                        Ok(()) => {
+                            eprintln!(
+                                "server-progress: client-command session={} command={:?}",
+                                session, command
+                            );
+                            format!("ok client_command protocol=5 client={session}")
+                        }
+                        Err(error) => format!("error {error}"),
+                    }
+                }
+                command => self.apply(command, state),
+            };
+            let _ = request.response.send(response);
+            count += 1;
+        }
+        count
+    }
+
     /// Applies queued requests to a booted lifecycle, allowing Attach to queue
     /// the project's `/client/New()` frame against its linked module.
     pub fn apply_lifecycle_tick_boundary(&mut self, lifecycle: &mut PrecompiledLifecycle) -> usize {
@@ -93,13 +444,91 @@ impl LoopbackIpc {
                         let session = format!("s{}", self.next_session);
                         self.next_session += 1;
                         self.sessions.insert(session.clone(), attached.client);
-                        let tick = lifecycle
-                            .persistent_state_mut()
-                            .map_or(0, |state| state.scheduler_tick());
+                        self.ui_sequences.insert(session.clone(), 1);
+                        self.retained_ui.insert(session.clone(), Vec::new());
+                        self.readiness
+                            .insert(session.clone(), SessionReadiness::default());
+                        let tick = match lifecycle.persistent_state_mut() {
+                            Some(state) => {
+                                if let Err(error) =
+                                    state.set_local_client_interactive(attached.client, false)
+                                {
+                                    let _ = request.response.send(format!("error {error}"));
+                                    count += 1;
+                                    continue;
+                                }
+                                state.scheduler_tick()
+                            }
+                            None => 0,
+                        };
                         format_state("attach", &session, &attached, tick)
                     }
                     Err(error) => format!("error {error}"),
                 },
+                Command::ScreenPointer {
+                    session,
+                    index,
+                    generation,
+                    event,
+                    location,
+                    params,
+                } => {
+                    let Some(client) = self.sessions.get(&session).copied() else {
+                        let _ = request.response.send("error unknown-session".into());
+                        count += 1;
+                        continue;
+                    };
+                    match lifecycle.queue_local_screen_pointer(
+                        client, index, generation, event, &location, &params,
+                    ) {
+                        Ok(()) => format!("ok screen_pointer protocol=3 client={session}"),
+                        Err(error) => format!("error {error}"),
+                    }
+                }
+                Command::MapPointer {
+                    session,
+                    index,
+                    generation,
+                    x,
+                    y,
+                    z,
+                    control,
+                    params,
+                } => {
+                    let Some(client) = self.sessions.get(&session).copied() else {
+                        let _ = request.response.send("error unknown-session".into());
+                        count += 1;
+                        continue;
+                    };
+                    match lifecycle.queue_local_map_pointer(
+                        client, index, generation, x, y, z, &control, &params,
+                    ) {
+                        Ok(()) => format!("ok map_pointer protocol=6 client={session}"),
+                        Err(error) => format!("error {error}"),
+                    }
+                }
+                Command::BrowserTopic { session, topic } => {
+                    let Some(client) = self.sessions.get(&session).copied() else {
+                        let _ = request.response.send("error unknown-session".into());
+                        count += 1;
+                        continue;
+                    };
+                    match lifecycle.queue_local_browser_topic(client, &topic) {
+                        Ok(()) => format!("ok browser_topic protocol=4 client={session}"),
+                        Err(error) => format!("error {error}"),
+                    }
+                }
+                Command::ClientCommand { session, command } => {
+                    let Some(client) = self.sessions.get(&session).copied() else {
+                        let _ = request.response.send("error unknown-session".into());
+                        count += 1;
+                        continue;
+                    };
+                    match lifecycle.queue_local_client_command(client, &command) {
+                        Ok(()) => format!("ok client_command protocol=5 client={session}"),
+                        Err(error) => format!("error {error}"),
+                    }
+                }
                 command => match lifecycle.persistent_state_mut() {
                     Some(state) => self.apply(command, state),
                     None => "error persistent world is not ready for clients".to_owned(),
@@ -112,12 +541,19 @@ impl LoopbackIpc {
     }
     fn apply(&mut self, command: Command, state: &mut ExecutionState) -> String {
         match command {
+            Command::Ping => "ok ping protocol=1".to_owned(),
             Command::Attach => match state.create_attached_local_client() {
                 Ok(attached) => {
+                    if let Err(error) = state.set_local_client_interactive(attached.client, false) {
+                        return format!("error {error}");
+                    }
                     let session = format!("s{}", self.next_session);
                     self.next_session += 1;
                     self.sessions.insert(session.clone(), attached.client);
                     self.ui_sequences.insert(session.clone(), 1);
+                    self.retained_ui.insert(session.clone(), Vec::new());
+                    self.readiness
+                        .insert(session.clone(), SessionReadiness::default());
                     format_state("attach", &session, &attached, state.scheduler_tick())
                 }
                 Err(error) => format!("error {error}"),
@@ -129,11 +565,24 @@ impl LoopbackIpc {
                 let Ok(attached) = state.local_client_state(client) else {
                     return "error stale-session".into();
                 };
-                encode_snapshot(
-                    &session,
-                    state.scheduler_tick(),
-                    state.local_client_map_snapshot(attached.z),
-                )
+                let snapshot = state.local_client_map_snapshot_for(Some(client), attached.z);
+                eprintln!(
+                    "server-progress: map-snapshot session={} tiles={} screen={}",
+                    session,
+                    snapshot.tiles.len(),
+                    snapshot.screen.len()
+                );
+                encode_snapshot(&session, state.scheduler_tick(), snapshot)
+            }
+            Command::ScreenSnapshot { session } => {
+                let Some(client) = self.sessions.get(&session).copied() else {
+                    return "error unknown-session".into();
+                };
+                // An impossible Z level skips expensive turf/occupant
+                // appearance expansion while retaining the attached client's
+                // authoritative screen list.
+                let snapshot = state.local_client_map_snapshot_for(Some(client), i32::MIN);
+                encode_snapshot(&session, state.scheduler_tick(), snapshot)
             }
             Command::Move { session, direction } => {
                 let Some(client) = self.sessions.get(&session).copied() else {
@@ -170,19 +619,87 @@ impl LoopbackIpc {
                 let Some(client) = self.sessions.get(&session).copied() else {
                     return "error unknown-session".into();
                 };
-                let events = state.take_local_client_outbound_events(client);
+                // Stop-and-wait bounds the transport-owned backlog and leaves
+                // newer VM events in the authoritative client queue until the
+                // current batch is acknowledged. Re-polls therefore replay an
+                // identical batch instead of growing an unbounded duplicate.
+                let retained = self.retained_ui.entry(session.clone()).or_default();
+                let events = if retained.is_empty() {
+                    state.take_local_client_outbound_events(client)
+                } else {
+                    Vec::new()
+                };
+                if !events.is_empty() {
+                    eprintln!(
+                        "server-progress: ui-events session={} count={}",
+                        session,
+                        events.len()
+                    );
+                }
                 let sequence = self.ui_sequences.entry(session.clone()).or_insert(1);
-                encode_ui_events(&session, sequence, events)
+                retained.extend(events.into_iter().map(|event| {
+                    let assigned = *sequence;
+                    *sequence = sequence.saturating_add(1);
+                    (assigned, event)
+                }));
+                encode_retained_ui_events(&session, retained)
+            }
+            Command::UiAck { session, sequence } => {
+                if !self.sessions.contains_key(&session) {
+                    return "error unknown-session".into();
+                }
+                let retained = self.retained_ui.entry(session.clone()).or_default();
+                retained.retain(|(event_sequence, _)| *event_sequence > sequence);
+                format!("ok ui_ack protocol=6 session={session} sequence={sequence}")
+            }
+            Command::SkinReady { session } => {
+                self.advance_readiness(&session, ReadinessPhase::Skin, state)
+            }
+            Command::ResourcesReady { session } => {
+                self.advance_readiness(&session, ReadinessPhase::Resources, state)
+            }
+            Command::InputReady { session } => {
+                self.advance_readiness(&session, ReadinessPhase::Input, state)
+            }
+            Command::ScreenPointer { .. } => {
+                "error screen pointer requires linked lifecycle".into()
+            }
+            Command::MapPointer { .. } => "error map pointer requires linked lifecycle".into(),
+            Command::BrowserTopic { .. } => "error browser topic requires linked lifecycle".into(),
+            Command::ClientCommand { .. } => {
+                "error client command requires linked lifecycle".into()
+            }
+            Command::PromptResponse {
+                session,
+                id,
+                response,
+            } => {
+                let Some(client) = self.sessions.get(&session).copied() else {
+                    return "error unknown-session".into();
+                };
+                match state.submit_local_prompt_response(client, id, response) {
+                    Ok(()) => format!("ok prompt_response protocol=7 client={session} id={id}"),
+                    Err(error) => format!("error {error}"),
+                }
             }
         }
     }
 }
 
-fn serve(listener: TcpListener, sender: &Sender<Request>) {
+fn serve(listener: TcpListener, sender: &Sender<Request>, startup_gate: Option<&StartupGate>) {
     for connection in listener.incoming() {
         let Ok(mut stream) = connection else { continue };
         while let Ok(frame) = read_frame(&mut stream) {
             let response = match parse_command(&frame) {
+                Ok(Command::Ping) => "ok ping protocol=1".to_owned(),
+                Ok(Command::Attach)
+                    if startup_gate.is_some_and(|gate| !gate.accepting.load(Ordering::Acquire)) =>
+                {
+                    let phase = startup_gate
+                        .and_then(|gate| gate.phase.read().ok().map(|phase| phase.clone()))
+                        .unwrap_or_else(|| "Starting server".to_owned());
+                    format!("error server-starting phasehex={}", hex(phase.as_bytes()))
+                }
                 Ok(command) => {
                     let (response, receive) = mpsc::sync_channel(1);
                     if sender.send(Request { command, response }).is_err() {
@@ -205,6 +722,7 @@ fn parse_command(frame: &[u8]) -> Result<Command, String> {
         .map_err(|_| "frame is not UTF-8".to_owned())?
         .split_ascii_whitespace();
     match p.next() {
+        Some("ping") if p.next().is_none() => Ok(Command::Ping),
         Some("attach") if p.next().is_none() => Ok(Command::Attach),
         Some("map_snapshot") => {
             let session = p
@@ -215,6 +733,17 @@ fn parse_command(frame: &[u8]) -> Result<Command, String> {
                 Err("map_snapshot has trailing arguments".into())
             } else {
                 Ok(Command::MapSnapshot { session })
+            }
+        }
+        Some("screen_snapshot") => {
+            let session = p
+                .next()
+                .ok_or("screen_snapshot session is missing")?
+                .to_owned();
+            if p.next().is_some() {
+                Err("screen_snapshot has trailing arguments".into())
+            } else {
+                Ok(Command::ScreenSnapshot { session })
             }
         }
         Some("move") => {
@@ -250,6 +779,186 @@ fn parse_command(frame: &[u8]) -> Result<Command, String> {
                 Ok(Command::UiEvents { session })
             }
         }
+        Some("ui_ack") => {
+            let session = p.next().ok_or("ui_ack session is missing")?.to_owned();
+            let sequence = p
+                .next()
+                .ok_or("ui_ack sequence is missing")?
+                .parse()
+                .map_err(|_| "ui_ack sequence is invalid")?;
+            if p.next().is_some() {
+                Err("ui_ack has trailing arguments".into())
+            } else {
+                Ok(Command::UiAck { session, sequence })
+            }
+        }
+        Some(command @ ("skin_ready" | "resources_ready" | "input_ready")) => {
+            let session = p.next().ok_or("readiness session is missing")?.to_owned();
+            if p.next().is_some() {
+                return Err("readiness command has trailing arguments".into());
+            }
+            Ok(match command {
+                "skin_ready" => Command::SkinReady { session },
+                "resources_ready" => Command::ResourcesReady { session },
+                "input_ready" => Command::InputReady { session },
+                _ => unreachable!(),
+            })
+        }
+        Some("screen_pointer") => {
+            let session = p
+                .next()
+                .ok_or("screen_pointer session is missing")?
+                .to_owned();
+            let target = p.next().ok_or("screen_pointer target is missing")?;
+            let (index, generation) = target
+                .split_once(':')
+                .ok_or("screen_pointer target is invalid")?;
+            let index =
+                u32::from_str_radix(index, 16).map_err(|_| "screen_pointer index is invalid")?;
+            let generation = u32::from_str_radix(generation, 16)
+                .map_err(|_| "screen_pointer generation is invalid")?;
+            let event = match p.next() {
+                Some("entered") => dm_vm::LocalScreenPointerEvent::Entered,
+                Some("exited") => dm_vm::LocalScreenPointerEvent::Exited,
+                Some("click") => dm_vm::LocalScreenPointerEvent::Click,
+                _ => return Err("screen_pointer event is invalid".into()),
+            };
+            let decode_text = |value: &str| -> Result<String, String> {
+                let bytes = if value == "-" {
+                    Vec::new()
+                } else {
+                    unhex(value)?
+                };
+                String::from_utf8(bytes).map_err(|_| "screen_pointer field is not UTF-8".into())
+            };
+            let location = decode_text(p.next().ok_or("screen_pointer location is missing")?)?;
+            let params = decode_text(p.next().ok_or("screen_pointer params are missing")?)?;
+            if p.next().is_some() {
+                return Err("screen_pointer has trailing arguments".into());
+            }
+            Ok(Command::ScreenPointer {
+                session,
+                index,
+                generation,
+                event,
+                location,
+                params,
+            })
+        }
+        Some("map_pointer") => {
+            let session = p.next().ok_or("map_pointer session is missing")?.to_owned();
+            let target = p.next().ok_or("map_pointer target is missing")?;
+            let (index, generation) = target
+                .split_once(':')
+                .ok_or("map_pointer target is invalid")?;
+            let index =
+                u32::from_str_radix(index, 16).map_err(|_| "map_pointer index is invalid")?;
+            let generation = u32::from_str_radix(generation, 16)
+                .map_err(|_| "map_pointer generation is invalid")?;
+            let x = p
+                .next()
+                .ok_or("map_pointer x is missing")?
+                .parse()
+                .map_err(|_| "map_pointer x is invalid")?;
+            let y = p
+                .next()
+                .ok_or("map_pointer y is missing")?
+                .parse()
+                .map_err(|_| "map_pointer y is invalid")?;
+            let z = p
+                .next()
+                .ok_or("map_pointer z is missing")?
+                .parse()
+                .map_err(|_| "map_pointer z is invalid")?;
+            let decode_text = |value: &str| -> Result<String, String> {
+                let bytes = if value == "-" {
+                    Vec::new()
+                } else {
+                    unhex(value)?
+                };
+                String::from_utf8(bytes).map_err(|_| "map_pointer field is not UTF-8".into())
+            };
+            let control = decode_text(p.next().ok_or("map_pointer control is missing")?)?;
+            let params = decode_text(p.next().ok_or("map_pointer params are missing")?)?;
+            if p.next().is_some() {
+                return Err("map_pointer has trailing arguments".into());
+            }
+            Ok(Command::MapPointer {
+                session,
+                index,
+                generation,
+                x,
+                y,
+                z,
+                control,
+                params,
+            })
+        }
+        Some("browser_topic") => {
+            let session = p
+                .next()
+                .ok_or("browser_topic session is missing")?
+                .to_owned();
+            let topic = p.next().ok_or("browser_topic payload is missing")?;
+            if p.next().is_some() {
+                return Err("browser_topic has trailing arguments".into());
+            }
+            let topic = String::from_utf8(unhex(topic)?)
+                .map_err(|_| "browser_topic payload is not UTF-8".to_owned())?;
+            Ok(Command::BrowserTopic { session, topic })
+        }
+        Some("client_command") => {
+            let session = p
+                .next()
+                .ok_or("client_command session is missing")?
+                .to_owned();
+            let command = p.next().ok_or("client_command payload is missing")?;
+            if p.next().is_some() {
+                return Err("client_command has trailing arguments".into());
+            }
+            let command = String::from_utf8(unhex(command)?)
+                .map_err(|_| "client_command payload is not UTF-8".to_owned())?;
+            Ok(Command::ClientCommand { session, command })
+        }
+        Some("prompt_response") => {
+            let session = p
+                .next()
+                .ok_or("prompt_response session is missing")?
+                .to_owned();
+            let id = p
+                .next()
+                .ok_or("prompt_response id is missing")?
+                .parse()
+                .map_err(|_| "prompt_response id is invalid")?;
+            let kind = p.next().ok_or("prompt_response kind is missing")?;
+            let payload = p.next().ok_or("prompt_response payload is missing")?;
+            if p.next().is_some() {
+                return Err("prompt_response has trailing arguments".into());
+            }
+            let response = match kind {
+                "null" if payload == "-" => LocalClientPromptResponse::Null,
+                "text" => LocalClientPromptResponse::Text(
+                    String::from_utf8(unhex(payload)?)
+                        .map_err(|_| "prompt_response text is not UTF-8")?,
+                ),
+                "number" => LocalClientPromptResponse::Number(
+                    payload
+                        .parse()
+                        .map_err(|_| "prompt_response number is invalid")?,
+                ),
+                "choice" => LocalClientPromptResponse::Choice(
+                    payload
+                        .parse()
+                        .map_err(|_| "prompt_response choice is invalid")?,
+                ),
+                _ => return Err("prompt_response kind is invalid".into()),
+            };
+            Ok(Command::PromptResponse {
+                session,
+                id,
+                response,
+            })
+        }
         Some(_) => Err("unknown command".into()),
         None => Err("empty command".into()),
     }
@@ -265,11 +974,12 @@ fn format_state(kind: &str, session: &str, state: &LocalClientState, tick: u64) 
 }
 fn encode_snapshot(session: &str, tick: u64, snapshot: LocalClientMapSnapshot) -> String {
     let mut out = format!(
-        "ok map_snapshot protocol=2 session={session} tick={tick} width={} height={} z={} tiles={}\n",
+        "ok map_snapshot protocol=3 session={session} tick={tick} width={} height={} z={} tiles={} screen={}\n",
         snapshot.width,
         snapshot.height,
         snapshot.z,
-        snapshot.tiles.len()
+        snapshot.tiles.len(),
+        snapshot.screen.len()
     );
     for tile in snapshot.tiles {
         use std::fmt::Write as _;
@@ -294,6 +1004,19 @@ fn encode_snapshot(session: &str, tick: u64, snapshot: LocalClientMapSnapshot) -
             encode_appearance(&mut out, appearance);
         }
     }
+    for screen in snapshot.screen {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            out,
+            "S {:x}:{:x} {} {} {}",
+            screen.appearance.datum.index(),
+            screen.appearance.datum.generation(),
+            screen.insertion,
+            optional_hex(screen.map_control.as_deref()),
+            optional_hex(Some(screen.screen_loc.as_str()))
+        );
+        encode_appearance(&mut out, &screen.appearance);
+    }
     out
 }
 
@@ -301,7 +1024,7 @@ fn encode_appearance(out: &mut String, appearance: &dm_vm::LocalClientAppearance
     use std::fmt::Write as _;
     let _ = writeln!(
         out,
-        "A {:x}:{:x} {} {} {} {} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {} {:08x} {} {}",
+        "A {:x}:{:x} {} {} {} {} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {} {:08x} {} {} {} {:08x} {:08x} {:08x} {:08x}",
         appearance.datum.index(),
         appearance.datum.generation(),
         hex(appearance.type_path.as_bytes()),
@@ -318,6 +1041,11 @@ fn encode_appearance(out: &mut String, appearance: &dm_vm::LocalClientAppearance
         appearance.alpha.to_bits(),
         appearance.underlays.len(),
         appearance.overlays.len(),
+        optional_hex(appearance.maptext.as_deref()),
+        appearance.maptext_width.to_bits(),
+        appearance.maptext_height.to_bits(),
+        appearance.maptext_x.to_bits(),
+        appearance.maptext_y.to_bits(),
     );
     for child in &appearance.underlays {
         encode_appearance(out, child);
@@ -389,20 +1117,14 @@ fn read_project_resource(state: &ExecutionState, path: &str) -> Result<Vec<u8>, 
     std::fs::read(target).map_err(|error| error.to_string())
 }
 
-fn encode_ui_events(
-    session: &str,
-    next_sequence: &mut u64,
-    events: Vec<LocalClientUiEvent>,
-) -> String {
+fn encode_retained_ui_events(session: &str, events: &[(u64, LocalClientUiEvent)]) -> String {
     use std::fmt::Write as _;
     let mut output = format!(
-        "ok ui_events protocol=2 client={session} count={}\n",
+        "ok ui_events protocol=6 client={session} count={}\n",
         events.len()
     );
-    for event in events {
-        let sequence = *next_sequence;
-        *next_sequence = next_sequence.saturating_add(1);
-        match event {
+    for (sequence, event) in events {
+        match event.clone() {
             LocalClientUiEvent::Winset {
                 control,
                 parameters,
@@ -436,6 +1158,60 @@ fn encode_ui_events(
                     "U {sequence} browse {} {}",
                     required_hex(window.as_bytes()),
                     required_hex(html.as_bytes())
+                );
+            }
+            LocalClientUiEvent::Prompt {
+                id,
+                kind,
+                title,
+                message,
+                default,
+                choices,
+                can_cancel,
+            } => {
+                let kind = match kind {
+                    dm_vm::LocalClientPromptKind::Text => "text",
+                    dm_vm::LocalClientPromptKind::Message => "message",
+                    dm_vm::LocalClientPromptKind::Number => "number",
+                    dm_vm::LocalClientPromptKind::Color => "color",
+                    dm_vm::LocalClientPromptKind::File => "file",
+                    dm_vm::LocalClientPromptKind::List => "list",
+                    dm_vm::LocalClientPromptKind::Alert => "alert",
+                };
+                let choices = if choices.is_empty() {
+                    "-".to_owned()
+                } else {
+                    choices
+                        .iter()
+                        .map(|choice| required_hex(choice.as_bytes()))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                let _ = writeln!(
+                    output,
+                    "U {sequence} prompt {id} {kind} {} {} {} {} {}",
+                    u8::from(can_cancel),
+                    required_hex(title.as_bytes()),
+                    required_hex(message.as_bytes()),
+                    required_hex(default.as_bytes()),
+                    choices,
+                );
+            }
+            LocalClientUiEvent::Sound {
+                file,
+                channel,
+                repeat,
+                volume,
+                frequency,
+                pan,
+            } => {
+                let path = file
+                    .as_deref()
+                    .map_or_else(|| "-".to_owned(), |path| required_hex(path.as_bytes()));
+                let _ = writeln!(
+                    output,
+                    "U {sequence} sound {channel} {} {volume} {frequency} {pan} {path}",
+                    u8::from(repeat),
                 );
             }
         }
@@ -507,10 +1283,89 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_command(b"ui_ack s1 47"),
+            Ok(Command::UiAck {
+                session: "s1".into(),
+                sequence: 47,
+            })
+        );
+        assert_eq!(
+            parse_command(b"skin_ready s1"),
+            Ok(Command::SkinReady {
+                session: "s1".into()
+            })
+        );
+        assert_eq!(
+            parse_command(b"resources_ready s1"),
+            Ok(Command::ResourcesReady {
+                session: "s1".into()
+            })
+        );
+        assert_eq!(
+            parse_command(b"input_ready s1"),
+            Ok(Command::InputReady {
+                session: "s1".into()
+            })
+        );
+        assert_eq!(
             parse_command(b"move s1 east"),
             Ok(Command::Move {
                 session: "s1".into(),
                 direction: LocalMovementDirection::East
+            })
+        );
+        assert_eq!(
+            parse_command(b"screen_pointer s1 a:2 click - 6d6f7573652d783d31"),
+            Ok(Command::ScreenPointer {
+                session: "s1".into(),
+                index: 10,
+                generation: 2,
+                event: dm_vm::LocalScreenPointerEvent::Click,
+                location: String::new(),
+                params: "mouse-x=1".into(),
+            })
+        );
+        assert_eq!(
+            parse_command(b"map_pointer s1 a:2 5 7 1 - 6c6566743d31"),
+            Ok(Command::MapPointer {
+                session: "s1".into(),
+                index: 10,
+                generation: 2,
+                x: 5,
+                y: 7,
+                z: 1,
+                control: String::new(),
+                params: "left=1".into(),
+            })
+        );
+        assert_eq!(
+            parse_command(b"browser_topic s1 62796f6e643a2f2f3f616374696f6e3d7265616479"),
+            Ok(Command::BrowserTopic {
+                session: "s1".into(),
+                topic: "byond://?action=ready".into(),
+            })
+        );
+        assert_eq!(
+            parse_command(b"client_command s1 726566726573682d7467756920226c6f626279206e6f7722"),
+            Ok(Command::ClientCommand {
+                session: "s1".into(),
+                command: "refresh-tgui \"lobby now\"".into(),
+            })
+        );
+        assert_eq!(
+            parse_command(b"prompt_response s1 9 text 68656c6c6f"),
+            Ok(Command::PromptResponse {
+                session: "s1".into(),
+                id: 9,
+                response: LocalClientPromptResponse::Text("hello".into()),
+            })
+        );
+        assert_eq!(
+            parse_command(b"prompt_response s1 10 choice 2"),
+            Ok(Command::PromptResponse {
+                session: "s1".into(),
+                id: 10,
+                response: LocalClientPromptResponse::Choice(2),
             })
         );
     }
@@ -539,7 +1394,60 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_v2_hex_encodes_nested_production_fields() {
+    fn ping_bypasses_scheduler_boundary_during_long_vm_slice() {
+        let _ipc = LoopbackIpc::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut stream = TcpStream::connect(_ipc.local_addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let started = Instant::now();
+        for _ in 0..100 {
+            write_frame(&mut stream, b"ping").unwrap();
+            assert_eq!(read_frame(&mut stream).unwrap(), b"ok ping protocol=1");
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "transport-only ping waited behind an absent scheduler boundary: {elapsed:?}"
+        );
+        eprintln!(
+            "loopback-ping count=100 elapsed={elapsed:?} average_us={}",
+            elapsed.as_micros() / 100
+        );
+    }
+
+    #[test]
+    fn starting_listener_reports_phase_without_waiting_for_scheduler() {
+        let ipc = LoopbackIpc::bind_starting(
+            "127.0.0.1:0".parse().unwrap(),
+            "Preflighting subsystem plans",
+        )
+        .unwrap();
+        let mut stream = TcpStream::connect(ipc.local_addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        write_frame(&mut stream, b"attach").unwrap();
+        assert_eq!(
+            String::from_utf8(read_frame(&mut stream).unwrap()).unwrap(),
+            format!(
+                "error server-starting phasehex={}",
+                hex(b"Preflighting subsystem plans")
+            )
+        );
+        ipc.set_startup_phase("Allocating map world");
+        write_frame(&mut stream, b"attach").unwrap();
+        assert_eq!(
+            String::from_utf8(read_frame(&mut stream).unwrap()).unwrap(),
+            format!(
+                "error server-starting phasehex={}",
+                hex(b"Allocating map world")
+            )
+        );
+    }
+
+    #[test]
+    fn snapshot_v3_hex_encodes_map_and_screen_appearance_trees() {
         let mut state = ExecutionState::new();
         let datum = state
             .heap_mut()
@@ -558,6 +1466,11 @@ mod tests {
             pixel_z: 4.0,
             color: Some("#ff00ff".into()),
             alpha: 127.5,
+            maptext: None,
+            maptext_width: 0.0,
+            maptext_height: 0.0,
+            maptext_x: 0.0,
+            maptext_y: 0.0,
             underlays: vec![],
             overlays: vec![],
         };
@@ -577,6 +1490,11 @@ mod tests {
                 pixel_z: 0.0,
                 color: None,
                 alpha: 255.0,
+                maptext: None,
+                maptext_width: 0.0,
+                maptext_height: 0.0,
+                maptext_x: 0.0,
+                maptext_y: 0.0,
                 underlays: vec![],
                 overlays: vec![],
             }
@@ -593,15 +1511,43 @@ mod tests {
                 occupants: vec![datum],
                 appearances: vec![parent],
             }],
+            screen: vec![dm_vm::LocalClientScreenAppearance {
+                map_control: Some("map".into()),
+                screen_loc: "CENTER,CENTER".into(),
+                insertion: 0,
+                appearance: dm_vm::LocalClientAppearance {
+                    datum,
+                    type_path: "/obj/screen".into(),
+                    icon: None,
+                    icon_state: Some("lobby".into()),
+                    dir: 2,
+                    layer: 20.0,
+                    plane: 20.0,
+                    pixel_x: 0.0,
+                    pixel_y: 0.0,
+                    pixel_w: 0.0,
+                    pixel_z: 0.0,
+                    color: None,
+                    alpha: 255.0,
+                    maptext: None,
+                    maptext_width: 0.0,
+                    maptext_height: 0.0,
+                    maptext_x: 0.0,
+                    maptext_y: 0.0,
+                    underlays: vec![],
+                    overlays: vec![],
+                },
+            }],
         };
         let encoded = encode_snapshot("s1", 9, snapshot);
-        assert!(encoded.starts_with("ok map_snapshot protocol=2"));
+        assert!(encoded.starts_with("ok map_snapshot protocol=3"));
+        assert!(encoded.lines().any(|line| line.starts_with("S ")));
         assert_eq!(
             encoded
                 .lines()
                 .filter(|line| line.starts_with("A "))
                 .count(),
-            2
+            3
         );
         assert!(!encoded.contains("unsafe"));
         assert_eq!(String::from_utf8(unhex("e99baa").unwrap()).unwrap(), "雪");
@@ -633,37 +1579,121 @@ mod tests {
 
     #[test]
     fn ui_event_batch_preserves_type_order_payloads_and_sequence() {
-        let mut sequence = 41;
-        let encoded = encode_ui_events(
-            "s7",
-            &mut sequence,
-            vec![
-                LocalClientUiEvent::Winset {
-                    control: "main.output".into(),
-                    parameters: "text=hello\nworld".into(),
-                },
-                LocalClientUiEvent::Output {
-                    control: "output".into(),
-                    message: "雪".into(),
-                },
-                LocalClientUiEvent::BrowseResource {
-                    name: "empty.bin".into(),
-                    bytes: vec![],
-                },
-                LocalClientUiEvent::Browse {
-                    window: "status".into(),
-                    html: "<b>ready</b>".into(),
-                },
-            ],
-        );
+        let events = vec![
+            LocalClientUiEvent::Winset {
+                control: "main.output".into(),
+                parameters: "text=hello\nworld".into(),
+            },
+            LocalClientUiEvent::Output {
+                control: "output".into(),
+                message: "雪".into(),
+            },
+            LocalClientUiEvent::BrowseResource {
+                name: "empty.bin".into(),
+                bytes: vec![],
+            },
+            LocalClientUiEvent::Browse {
+                window: "status".into(),
+                html: "<b>ready</b>".into(),
+            },
+            LocalClientUiEvent::Prompt {
+                id: 7,
+                kind: dm_vm::LocalClientPromptKind::List,
+                title: "Choose".into(),
+                message: "Role".into(),
+                default: "Engineer".into(),
+                choices: vec!["Engineer".into(), "Doctor".into()],
+                can_cancel: true,
+            },
+            LocalClientUiEvent::Sound {
+                file: Some("sound/lobby.ogg".into()),
+                channel: 7,
+                repeat: true,
+                volume: 80.0,
+                frequency: 22050.0,
+                pan: -25.0,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| (41 + index as u64, event))
+        .collect::<Vec<_>>();
+        let encoded = encode_retained_ui_events("s7", &events);
         let lines = encoded.lines().collect::<Vec<_>>();
-        assert_eq!(lines[0], "ok ui_events protocol=2 client=s7 count=4");
+        assert_eq!(lines[0], "ok ui_events protocol=6 client=s7 count=6");
         assert!(lines[1].starts_with("U 41 winset "));
         assert!(lines[2].starts_with("U 42 output "));
         assert!(lines[3].ends_with(" browse_resource 656d7074792e62696e -"));
         assert!(lines[4].starts_with("U 44 browse "));
-        assert_eq!(sequence, 45);
+        assert_eq!(
+            lines[5],
+            "U 45 prompt 7 list 1 43686f6f7365 526f6c65 456e67696e656572 456e67696e656572,446f63746f72"
+        );
+        assert_eq!(
+            lines[6],
+            "U 46 sound 7 1 80 22050 -25 736f756e642f6c6f6262792e6f6767"
+        );
         assert!(!encoded.contains("hello\nworld"));
         assert!(!encoded.contains('雪'));
+    }
+
+    #[test]
+    fn retained_ui_replays_identically_until_acknowledged() {
+        let mut retained = vec![
+            (
+                11,
+                LocalClientUiEvent::Output {
+                    control: "output".into(),
+                    message: "first".into(),
+                },
+            ),
+            (
+                12,
+                LocalClientUiEvent::Browse {
+                    window: "status".into(),
+                    html: "<b>second</b>".into(),
+                },
+            ),
+        ];
+        let initial = encode_retained_ui_events("s1", &retained);
+        assert_eq!(encode_retained_ui_events("s1", &retained), initial);
+
+        retained.retain(|(sequence, _)| *sequence > 11);
+        let after_partial_ack = encode_retained_ui_events("s1", &retained);
+        assert!(!after_partial_ack.contains("U 11 "));
+        assert!(after_partial_ack.contains("U 12 browse "));
+
+        retained.retain(|(sequence, _)| *sequence > 12);
+        assert_eq!(
+            encode_retained_ui_events("s1", &retained),
+            "ok ui_events protocol=6 client=s1 count=0\n"
+        );
+    }
+
+    #[test]
+    fn readiness_requires_skin_then_resources_then_input() {
+        let mut readiness = SessionReadiness::default();
+        assert_eq!(
+            readiness.advance(ReadinessPhase::Resources),
+            Err("skin-not-ready")
+        );
+        assert_eq!(
+            readiness.advance(ReadinessPhase::Input),
+            Err("resources-not-ready")
+        );
+        assert!(!readiness.interactive());
+
+        readiness.advance(ReadinessPhase::Skin).unwrap();
+        assert!(!readiness.interactive());
+        readiness.advance(ReadinessPhase::Resources).unwrap();
+        assert!(!readiness.interactive());
+        readiness.advance(ReadinessPhase::Input).unwrap();
+        assert!(readiness.interactive());
+
+        // Readiness notifications are idempotent across harmless retries.
+        readiness.advance(ReadinessPhase::Skin).unwrap();
+        readiness.advance(ReadinessPhase::Resources).unwrap();
+        readiness.advance(ReadinessPhase::Input).unwrap();
+        assert!(readiness.interactive());
     }
 }

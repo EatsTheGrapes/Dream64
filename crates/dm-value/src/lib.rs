@@ -13,6 +13,7 @@
 
 #![cfg_attr(not(test), deny(missing_docs))]
 
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -47,6 +48,12 @@ impl TypePath {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl Borrow<str> for TypePath {
+    fn borrow(&self) -> &str {
+        self.as_str()
     }
 }
 
@@ -1004,6 +1011,15 @@ impl DmList {
     const ASSOCIATIVE_INDEX_THRESHOLD: usize = 8;
     const POSITIONAL_REMOVE_INDEX_THRESHOLD: usize = 64;
 
+    /// Reserves capacity for positional values without changing list length.
+    ///
+    /// This is an engine allocation hint only; DM ordering and indexing remain
+    /// unchanged.
+    pub fn reserve_positional(&mut self, additional: usize) {
+        self.positional.reserve(additional);
+        self.order.reserve(additional);
+    }
+
     fn should_compact_prefix_for_gc(&self) -> bool {
         let head = self.prefix_head;
         if head < GC_LIST_PREFIX_MIN_ENTRIES {
@@ -1827,6 +1843,16 @@ impl DmList {
     /// Returns whether an iteration entry is semantically equal to `value`.
     #[must_use]
     pub fn contains(&self, value: &Value) -> bool {
+        if let (Some(index), Some(key)) = (&self.associative_index, semantic_key(value)) {
+            if index.contains_key(&key) {
+                return true;
+            }
+            // Indexed associative keys cannot equal a semantic key missing
+            // from the index. Only ordinary positional values remain.
+            return self.positional[self.prefix_head..]
+                .iter()
+                .any(|candidate| candidate.semantic_eq(value));
+        }
         self.positions()
             .any(|(_, candidate)| candidate.semantic_eq(value))
     }
@@ -3192,6 +3218,46 @@ mod tests {
         list.add(Value::number(7.0));
         assert!(list.storage.is_some());
         assert!(list.get(1).unwrap().semantic_eq(&Value::number(7.0)));
+    }
+
+    #[test]
+    fn indexed_contains_preserves_mixed_list_semantics_and_avoids_key_scans() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let mut list = DmList::default();
+        list.add(text("ordinary"));
+        for index in 0..4_096 {
+            list.set_key(
+                Value::text(format!("signal-{index}")),
+                Value::number(index as f32),
+            );
+        }
+        assert!(list.associative_index.is_some());
+        assert!(list.contains(&text("ordinary")));
+        assert!(list.contains(&text("signal-4095")));
+        assert!(!list.contains(&text("missing")));
+
+        let needle = text("signal-4095");
+        let iterations = 10_000;
+        let indexed_started = Instant::now();
+        for _ in 0..iterations {
+            black_box(list.contains(black_box(&needle)));
+        }
+        let indexed = indexed_started.elapsed();
+
+        let linear_started = Instant::now();
+        for _ in 0..iterations {
+            black_box(
+                list.positions()
+                    .any(|(_, candidate)| candidate.semantic_eq(black_box(&needle))),
+            );
+        }
+        let linear = linear_started.elapsed();
+        eprintln!(
+            "list-contains iterations={iterations} indexed={indexed:?} linear={linear:?} speedup={:.2}x",
+            linear.as_secs_f64() / indexed.as_secs_f64()
+        );
     }
 
     #[test]
@@ -4772,5 +4838,50 @@ mod tests {
         heap.destroy_datum(stale_key).unwrap();
         let lookup = Value::Datum(stale_key);
         assert_eq!(heap.list(list).unwrap().get_key(&lookup), Ok(&stored_value));
+    }
+
+    #[test]
+    fn positional_reservation_preserves_list_semantics() {
+        let mut list = DmList::default();
+        list.reserve_positional(4);
+        list.add(Value::number(1.0));
+        list.add(Value::number(2.0));
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.get(1), Ok(&Value::number(1.0)));
+        assert_eq!(list.get(2), Ok(&Value::number(2.0)));
+    }
+
+    #[test]
+    #[ignore = "release-only full-z block list allocation benchmark"]
+    fn positional_reservation_benchmark() {
+        const CELLS: usize = 255 * 255 * 2;
+        const ROUNDS: usize = 16;
+        let started = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            let mut list = DmList::default();
+            for index in 0..CELLS {
+                list.add(Value::number(index as f32));
+            }
+            std::hint::black_box(list);
+        }
+        let unreserved = started.elapsed();
+        let started = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            let mut list = DmList::default();
+            list.reserve_positional(CELLS);
+            for index in 0..CELLS {
+                list.add(Value::number(index as f32));
+            }
+            std::hint::black_box(list);
+        }
+        let reserved = started.elapsed();
+        eprintln!(
+            "full-z-list-cells={} rounds={} unreserved_ms={} reserved_ms={} speedup={:.2}",
+            CELLS,
+            ROUNDS,
+            unreserved.as_millis(),
+            reserved.as_millis(),
+            unreserved.as_secs_f64() / reserved.as_secs_f64(),
+        );
     }
 }

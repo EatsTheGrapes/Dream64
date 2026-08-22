@@ -26,6 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dm_dmf::UiCommand;
 use dm_value::{DatumId, FieldName, ListId, TypePath, Value};
+use smallvec::SmallVec;
 
 use super::{
     CompoundAssignmentOperator, ExecutionState, LocalClientUiEvent, NativeWalk, NativeWalkKind,
@@ -37,6 +38,24 @@ use crate::worker_lane::{
 
 fn atmos_field(name: &str) -> FieldName {
     FieldName::parse(name).expect("atmos built-in field is valid")
+}
+
+fn builtin_loc_field() -> &'static FieldName {
+    static FIELD: OnceLock<FieldName> = OnceLock::new();
+    FIELD.get_or_init(|| FieldName::parse("loc").expect("built-in loc field is valid"))
+}
+
+fn builtin_contents_field() -> &'static FieldName {
+    static FIELD: OnceLock<FieldName> = OnceLock::new();
+    FIELD.get_or_init(|| FieldName::parse("contents").expect("built-in contents field is valid"))
+}
+
+fn builtin_coordinate_fields() -> &'static [FieldName; 3] {
+    static FIELDS: OnceLock<[FieldName; 3]> = OnceLock::new();
+    FIELDS.get_or_init(|| {
+        ["x", "y", "z"]
+            .map(|name| FieldName::parse(name).expect("built-in coordinate field is valid"))
+    })
 }
 
 fn atmos_setup_differences(
@@ -966,41 +985,12 @@ fn format_memory_size(bytes: u64) -> String {
 
 #[cfg(windows)]
 fn current_process_resident_bytes() -> Option<u64> {
-    let pid = std::process::id().to_string();
-    let query = format!("(Get-Process -Id {pid}).WorkingSet64");
-    if let Ok(output) = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &query])
-        .output()
-        && output.status.success()
-        && let Ok(bytes) = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<u64>()
-    {
-        return Some(bytes);
-    }
-
-    // PowerShell can be removed on a deliberately minimal Windows host. Keep
-    // the inbox task-list tool as a best-effort fallback; failure simply makes
-    // the report say that the host aggregate is unavailable.
-    let output = Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let line = String::from_utf8_lossy(&output.stdout);
-    let memory_kib = line
-        .trim()
-        .trim_end_matches('"')
-        .rsplit_once("\",\"")?
-        .1
-        .chars()
-        .filter(char::is_ascii_digit)
-        .collect::<String>()
-        .parse::<u64>()
-        .ok()?;
-    memory_kib.checked_mul(1_024)
+    // There is no safe standard-library API for the Windows working set, and
+    // this crate deliberately forbids unsafe host calls. Spawning PowerShell
+    // or tasklist here delayed Monkestation startup by 0.5-1.3 seconds. Keep
+    // the compatibility report truthful and non-blocking; process telemetry
+    // belongs in the lifecycle host where it can be sampled asynchronously.
+    None
 }
 
 #[cfg(unix)]
@@ -1170,7 +1160,7 @@ fn rust_g_poisson_noise(arguments: &[Value], state: &ExecutionState) -> Result<V
     Ok(Value::text(output))
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct DmiMetadata {
     width: u32,
     height: u32,
@@ -1189,7 +1179,7 @@ impl DmiMetadata {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct DmiState {
     name: String,
     dirs: u32,
@@ -1229,7 +1219,56 @@ impl DmiState {
     }
 }
 
+#[derive(Clone)]
+struct CachedDmiMetadata {
+    len: u64,
+    modified: Option<SystemTime>,
+    metadata: DmiMetadata,
+}
+
+const MAX_DMI_METADATA_CACHE_ENTRIES: usize = 4_096;
+static DMI_METADATA_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedDmiMetadata>>> = OnceLock::new();
+#[cfg(test)]
+static DMI_METADATA_PHYSICAL_READS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+
 fn read_dmi_metadata(path: &std::path::Path) -> Result<DmiMetadata, String> {
+    let file = fs::metadata(path).map_err(|error| error.to_string())?;
+    let len = file.len();
+    let modified = file.modified().ok();
+    let cache = DMI_METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock()
+        && let Some(entry) = cache.get(path)
+        && entry.len == len
+        && entry.modified == modified
+    {
+        return Ok(entry.metadata.clone());
+    }
+
+    let metadata = read_dmi_metadata_uncached(path)?;
+    if let Ok(mut cache) = cache.lock() {
+        if cache.len() >= MAX_DMI_METADATA_CACHE_ENTRIES && !cache.contains_key(path) {
+            cache.clear();
+        }
+        cache.insert(
+            path.to_path_buf(),
+            CachedDmiMetadata {
+                len,
+                modified,
+                metadata: metadata.clone(),
+            },
+        );
+    }
+    Ok(metadata)
+}
+
+fn read_dmi_metadata_uncached(path: &std::path::Path) -> Result<DmiMetadata, String> {
+    #[cfg(test)]
+    if let Ok(mut reads) = DMI_METADATA_PHYSICAL_READS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        *reads.entry(path.to_path_buf()).or_default() += 1;
+    }
     let png = fs::read(path).map_err(|error| error.to_string())?;
     if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Err("resource is not a PNG-backed DMI".to_owned());
@@ -3082,7 +3121,10 @@ fn list2params(arguments: &[Value], state: &ExecutionState) -> Result<Value, Str
     Ok(Value::text(pairs.join("&")))
 }
 
-fn params2list(arguments: &[Value], state: &mut ExecutionState) -> Result<Value, String> {
+pub(crate) fn params2list(
+    arguments: &[Value],
+    state: &mut ExecutionState,
+) -> Result<Value, String> {
     let params = strict_text(&arguments[0], state, "params2list")?;
     let result = state.heap.allocate_list();
     for part in params.split(['&', ';']) {
@@ -3346,10 +3388,10 @@ fn qdel_value(value: &Value, state: &mut ExecutionState) -> Result<(), String> {
 }
 
 fn unregister_runtime_datum(state: &mut ExecutionState, datum: DatumId) -> Result<(), String> {
-    let loc = FieldName::parse("loc").expect("built-in loc field");
+    let loc = builtin_loc_field();
     let old_loc = state
         .heap
-        .datum_field(datum, &loc)
+        .datum_field(datum, loc)
         .ok()
         .and_then(|value| match value {
             Value::Datum(loc) => Some(*loc),
@@ -3358,14 +3400,14 @@ fn unregister_runtime_datum(state: &mut ExecutionState, datum: DatumId) -> Resul
     synchronize_moved_atom_contents(state, datum, old_loc, None)?;
 
     let world = FieldName::parse("world").expect("built-in world global");
-    let contents = FieldName::parse("contents").expect("built-in contents field");
+    let contents = builtin_contents_field();
     let world_contents = state
         .global(&world)
         .and_then(|value| match value {
             Value::Datum(world) => Some(*world),
             _ => None,
         })
-        .and_then(|world| state.heap.datum_field(world, &contents).ok())
+        .and_then(|world| state.heap.datum_field(world, contents).ok())
         .and_then(|value| match value {
             Value::List(list) => Some(*list),
             _ => None,
@@ -3826,11 +3868,29 @@ fn headless_winset(
     state: &mut ExecutionState,
     usr: &Value,
 ) -> Result<Value, String> {
-    let Some(client) = arguments
-        .first()
-        .and_then(|value| local_client_for_value(state, value))
-        .or_else(|| local_client_for_value(state, usr))
-    else {
+    // Preserve UI state on an explicit headless /client even before a native
+    // session is attached. Session lookup is intentionally stricter because
+    // mob/client forwarding only makes sense for a registered local client.
+    let explicit_headless_client = arguments.first().and_then(|value| {
+        let Value::Datum(datum) = value else {
+            return None;
+        };
+        state
+            .heap
+            .datum(*datum)
+            .ok()
+            .is_some_and(|value| {
+                let path = value.type_path().as_str();
+                path == "/client" || path.starts_with("/client/")
+            })
+            .then_some(*datum)
+    });
+    let Some(client) = explicit_headless_client.or_else(|| {
+        arguments
+            .first()
+            .and_then(|value| local_client_for_value(state, value))
+            .or_else(|| local_client_for_value(state, usr))
+    }) else {
         // BYOND accepts null when no client is available; a headless server
         // has no window to mutate in that case.
         return Ok(Value::Null);
@@ -4016,11 +4076,10 @@ fn headless_winexists(arguments: &[Value], state: &ExecutionState) -> Result<Val
         arguments.get(1).and_then(value_text),
         state.client_session(*client),
     ) {
-        return Ok(Value::number(if session.ui().winexists(control) {
-            1.0
-        } else {
-            0.0
-        }));
+        // BYOND returns the matching control's type, not merely a boolean.
+        // Monkestation's media player relies on `winexists(...) == "BROWSER"`
+        // to select the embedded-browser output address used for lobby music.
+        return Ok(Value::text(session.ui().winexists_type(control)));
     }
     let control = arguments.get(1).cloned().unwrap_or(Value::Null);
     let exists = state
@@ -4161,7 +4220,7 @@ fn text2num(arguments: &[Value], _state: &ExecutionState) -> Result<Value, Strin
     let text = match &arguments[0] {
         Value::Number(number) => return Ok(Value::Number(*number)),
         Value::Null => return Ok(Value::Null),
-        Value::Text(text) => text.to_string(),
+        Value::Text(text) => text.as_ref(),
         _ => return Ok(Value::Null),
     };
     let radix = if let Some(radix) = arguments.get(1) {
@@ -4237,8 +4296,7 @@ fn text2path(arguments: &[Value], state: &ExecutionState) -> Result<Value, Strin
     };
     Ok(state
         .type_paths
-        .iter()
-        .find(|path| path.as_str() == text.as_ref())
+        .get(text.as_ref())
         .cloned()
         .map_or(Value::Null, Value::TypePath))
 }
@@ -4700,10 +4758,48 @@ fn splittext(
         .heap
         .list_mut(list)
         .map_err(|error| error.to_string())?;
+    entries.reserve_positional(output.len());
     for item in output {
         entries.add(Value::text(item));
     }
     Ok(Value::List(list))
+}
+
+#[cfg(test)]
+mod splittext_allocation_tests {
+    use super::*;
+
+    #[test]
+    fn splittext_presizing_preserves_empty_and_trailing_lines() {
+        let mut state = ExecutionState::new();
+        let Value::List(lines) = splittext(
+            &[
+                Value::text("/turf/open,\n\ticon_state = \"floor\";\n\n"),
+                Value::text("\n"),
+            ],
+            &mut state,
+            false,
+        )
+        .unwrap() else {
+            panic!("splittext should return a list")
+        };
+        let values = state
+            .heap()
+            .list(lines)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                Value::text("/turf/open,"),
+                Value::text("\ticon_state = \"floor\";"),
+                Value::text(""),
+                Value::text(""),
+            ]
+        );
+    }
 }
 
 fn jointext(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
@@ -4803,31 +4899,29 @@ pub(super) fn datum_coordinates(state: &ExecutionState, value: &Value) -> Option
     // fields may still contain zero or a stale former turf coordinate. Follow
     // loc links exactly as get_step(atom, 0) does, while retaining the
     // original datum as the fallback for lightweight uncontained fixtures.
-    let loc = FieldName::parse("loc").expect("built-in loc field");
+    let loc = builtin_loc_field();
     let mut coordinate_source = *original;
     let mut current = *original;
-    let mut visited = HashSet::new();
-    while visited.insert(current) {
+    let mut visited = SmallVec::<[DatumId; 8]>::new();
+    while !visited.contains(&current) {
+        visited.push(current);
         let datum = state.heap.datum(current).ok()?;
         if super::is_turf_type_path(datum.type_path()) {
             coordinate_source = current;
             break;
         }
-        let Ok(Value::Datum(parent)) = super::datum_field_or_initial(state, current, &loc) else {
+        let Ok(Value::Datum(parent)) = super::datum_field_or_initial(state, current, loc) else {
             break;
         };
         current = parent;
     }
-    let coordinate = |name: &str| {
-        super::datum_field_or_initial(
-            state,
-            coordinate_source,
-            &FieldName::parse(name).expect("coordinate name is valid"),
-        )
-        .ok()?
-        .as_number()
+    let coordinate = |field: &FieldName| {
+        super::datum_field_or_initial(state, coordinate_source, field)
+            .ok()?
+            .as_number()
     };
-    Some((coordinate("x")?, coordinate("y")?, coordinate("z")?))
+    let [x, y, z] = builtin_coordinate_fields();
+    Some((coordinate(x)?, coordinate(y)?, coordinate(z)?))
 }
 
 /// Adds one turf followed by its direct movable contents, matching the cell
@@ -4836,29 +4930,28 @@ pub(super) fn datum_coordinates(state: &ExecutionState, value: &Value) -> Option
 fn append_spatial_cell(
     state: &ExecutionState,
     turf: DatumId,
-    expected_coordinate: (i32, i32, i32),
     seen: &mut HashSet<DatumId>,
     output: &mut Vec<DatumId>,
 ) {
-    let Some((x, y, z)) = datum_coordinates(state, &Value::Datum(turf)) else {
-        return;
-    };
-    let (expected_x, expected_y, expected_z) = expected_coordinate;
-    if (x, y, z) != (expected_x as f32, expected_y as f32, expected_z as f32)
-        || !state
-            .heap
-            .datum(turf)
-            .is_ok_and(|datum| super::is_turf_type_path(datum.type_path()))
+    // `world_turfs` is the authoritative geometry index. Its keys are updated
+    // together with turf allocation/movement, so re-reading x/y/z here only
+    // repeats three dynamic field lookups for every cell in every view().
+    // Retain the liveness/type check at this boundary so a corrupt or stale
+    // handle can never escape through the spatial builtin.
+    if !state
+        .heap
+        .datum(turf)
+        .is_ok_and(|datum| super::is_turf_type_path(datum.type_path()))
         || !seen.insert(turf)
     {
         return;
     }
     output.push(turf);
 
-    let contents = FieldName::parse("contents").expect("built-in contents field");
+    let contents = builtin_contents_field();
     let members = state
         .heap
-        .datum_field(turf, &contents)
+        .datum_field(turf, contents)
         .ok()
         .and_then(|value| match value {
             Value::List(list) => state.heap.list(*list).ok(),
@@ -4936,6 +5029,7 @@ fn indexed_spatial_candidates(
     center_z: f32,
     distance_x: f32,
     distance_y: f32,
+    exclude_center: bool,
 ) -> Vec<DatumId> {
     let integral_coordinate = |value: f32| -> Option<i32> {
         (value.is_finite()
@@ -5025,7 +5119,10 @@ fn indexed_spatial_candidates(
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
     for ((x, y), turf) in ordered_turfs {
-        append_spatial_cell(state, turf, (x, y, center_z), &mut seen, &mut candidates);
+        if exclude_center && x == center_x && y == center_y {
+            continue;
+        }
+        append_spatial_cell(state, turf, &mut seen, &mut candidates);
     }
     candidates
 }
@@ -5284,7 +5381,15 @@ fn spatial_query(
         // without constructing canonical world geometry.
         state.heap.datums().map(|(id, _)| id).collect::<Vec<_>>()
     } else {
-        indexed_spatial_candidates(state, center_x, center_y, center_z, distance_x, distance_y)
+        indexed_spatial_candidates(
+            state,
+            center_x,
+            center_y,
+            center_z,
+            distance_x,
+            distance_y,
+            exclude_center,
+        )
     };
     let matching = candidates
         .into_iter()
@@ -5297,14 +5402,21 @@ fn spatial_query(
             if mobs_only && path != "/mob" && !path.starts_with("/mob/") {
                 return None;
             }
-            let (x, y, z) = datum_coordinates(state, &Value::Datum(id))?;
-            if exclude_center && x == center_x && y == center_y && z == center_z {
-                return None;
+            if state.world_turfs.is_empty() {
+                let (x, y, z) = datum_coordinates(state, &Value::Datum(id))?;
+                if exclude_center && x == center_x && y == center_y && z == center_z {
+                    return None;
+                }
+                return (z == center_z
+                    && (x - center_x).abs() <= distance_x
+                    && (y - center_y).abs() <= distance_y)
+                    .then_some(id);
             }
-            (z == center_z
-                && (x - center_x).abs() <= distance_x
-                && (y - center_y).abs() <= distance_y)
-                .then_some(id)
+            // Indexed candidates already came from cells inside the exact
+            // requested rectangle and Z level. Center-cell exclusion was
+            // applied while walking those cells, before their contents were
+            // appended. Avoid resolving loc/x/y/z for every result again.
+            Some(id)
         })
         .collect::<Vec<_>>();
     let list = state
@@ -5697,8 +5809,8 @@ pub(super) fn synchronize_moved_atom_contents(
     old_loc: Option<DatumId>,
     new_loc: Option<DatumId>,
 ) -> Result<(), String> {
-    let contents = FieldName::parse("contents").expect("built-in contents field");
-    let loc = FieldName::parse("loc").expect("built-in loc field");
+    let contents = builtin_contents_field();
+    let loc = builtin_loc_field();
     let enclosing_area = |state: &ExecutionState, turf: DatumId| {
         if !state
             .heap
@@ -5709,7 +5821,7 @@ pub(super) fn synchronize_moved_atom_contents(
         }
         state
             .heap
-            .datum_field(turf, &loc)
+            .datum_field(turf, loc)
             .ok()
             .and_then(|value| match value {
                 Value::Datum(area) => Some(*area),
@@ -5721,7 +5833,7 @@ pub(super) fn synchronize_moved_atom_contents(
     let contents_list = |state: &ExecutionState, container: DatumId| {
         state
             .heap
-            .datum_field(container, &contents)
+            .datum_field(container, contents)
             .ok()
             .and_then(|value| match value {
                 Value::List(list) => Some(*list),
@@ -6391,17 +6503,16 @@ pub(super) fn move_movable_to_turf(
     movable: DatumId,
     turf: DatumId,
 ) -> Result<(), String> {
-    let loc = FieldName::parse("loc").expect("built-in loc field");
+    let loc = builtin_loc_field();
     let old_loc = state
         .heap
-        .datum_field(movable, &loc)
+        .datum_field(movable, loc)
         .ok()
         .and_then(|value| match value {
             Value::Datum(datum) => Some(*datum),
             _ => None,
         });
-    let coordinates =
-        ["x", "y", "z"].map(|name| FieldName::parse(name).expect("built-in coordinate field"));
+    let coordinates = builtin_coordinate_fields();
     let values = coordinates
         .iter()
         .map(|field| {
@@ -6414,9 +6525,9 @@ pub(super) fn move_movable_to_turf(
         .collect::<Vec<_>>();
     state
         .heap
-        .set_datum_field(movable, loc, Value::Datum(turf))
+        .set_datum_field(movable, loc.clone(), Value::Datum(turf))
         .map_err(|error| error.to_string())?;
-    for (field, value) in coordinates.into_iter().zip(values) {
+    for (field, value) in coordinates.iter().cloned().zip(values) {
         state
             .heap
             .set_datum_field(movable, field, value)
@@ -6436,16 +6547,17 @@ pub(super) fn move_movable_to_atom(
     // BYOND does not permit a movable to contain itself, directly or through
     // one of its descendants. Besides corrupting contents, such a cycle makes
     // recursive movement notifications recurse forever.
-    let loc = FieldName::parse("loc").expect("built-in loc field");
+    let loc = builtin_loc_field();
     let mut cursor = Some(location);
-    let mut visited = HashSet::new();
+    let mut visited = SmallVec::<[DatumId; 8]>::new();
     while let Some(container) = cursor {
-        if container == movable || !visited.insert(container) {
+        if container == movable || visited.contains(&container) {
             return Ok(());
         }
+        visited.push(container);
         cursor = state
             .heap
-            .datum_field(container, &loc)
+            .datum_field(container, loc)
             .ok()
             .and_then(|value| match value {
                 Value::Datum(parent) => Some(*parent),
@@ -6463,7 +6575,7 @@ pub(super) fn move_movable_to_atom(
 
     let old_loc = state
         .heap
-        .datum_field(movable, &loc)
+        .datum_field(movable, loc)
         .ok()
         .and_then(|value| match value {
             Value::Datum(datum) => Some(*datum),
@@ -6471,7 +6583,7 @@ pub(super) fn move_movable_to_atom(
         });
     state
         .heap
-        .set_datum_field(movable, loc, Value::Datum(location))
+        .set_datum_field(movable, loc.clone(), Value::Datum(location))
         .map_err(|error| error.to_string())?;
     if old_loc != Some(location) {
         synchronize_moved_atom_contents(state, movable, old_loc, Some(location))?;
@@ -6484,11 +6596,11 @@ fn move_turf_to_area(
     turf: DatumId,
     new_area: DatumId,
 ) -> Result<(), String> {
-    let loc = FieldName::parse("loc").expect("built-in loc field");
-    let contents = FieldName::parse("contents").expect("built-in contents field");
+    let loc = builtin_loc_field();
+    let contents = builtin_contents_field();
     let old_area = state
         .heap
-        .datum_field(turf, &loc)
+        .datum_field(turf, loc)
         .ok()
         .and_then(|value| match value {
             Value::Datum(area) => Some(*area),
@@ -6499,7 +6611,7 @@ fn move_turf_to_area(
     }
     let contained = state
         .heap
-        .datum_field(turf, &contents)
+        .datum_field(turf, contents)
         .ok()
         .and_then(|value| match value {
             Value::List(list) => state.heap.list(*list).ok(),
@@ -6512,7 +6624,7 @@ fn move_turf_to_area(
         })
         .unwrap_or_default();
     if let Some(old_area) = old_area
-        && let Ok(Value::List(list)) = state.heap.datum_field(old_area, &contents)
+        && let Ok(Value::List(list)) = state.heap.datum_field(old_area, contents)
     {
         let list = *list;
         let values = std::iter::once(Value::Datum(turf)).chain(contained.iter().cloned());
@@ -6538,7 +6650,7 @@ fn move_turf_to_area(
     }
     state
         .heap
-        .set_datum_field(turf, loc, Value::Datum(new_area))
+        .set_datum_field(turf, loc.clone(), Value::Datum(new_area))
         .map_err(|error| error.to_string())?;
     state.note_turf_area(turf, new_area);
     Ok(())
@@ -7146,10 +7258,12 @@ fn text2file(arguments: &[Value], state: &ExecutionState) -> Result<Value, Strin
 }
 
 fn fcopy(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
-    let mut source = arguments
-        .first()
-        .cloned()
-        .ok_or_else(|| "fcopy source requires text, received null".to_owned())?;
+    let Some(mut source) = arguments.first().cloned() else {
+        return Ok(Value::number(0.0));
+    };
+    if matches!(source, Value::Null) {
+        return Ok(Value::number(0.0));
+    }
     if let Value::Datum(_) = source {
         source = icon_backing_resource(&source, state, 0)?;
     }
@@ -7157,7 +7271,7 @@ fn fcopy(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
         Value::Text(_) | Value::File(_) => {
             relaxed_resolved_file_path(&[source], state, "fcopy source")?
         }
-        Value::Null => return Err("fcopy source requires text, received null".to_owned()),
+        Value::Null => return Ok(Value::number(0.0)),
         value => {
             return Err(format!(
                 "fcopy source requires text, received {}",
@@ -7215,6 +7329,47 @@ pub(super) fn execute_output(
 ) -> Result<(), String> {
     if let Value::Datum(target) = target {
         let routed_client = local_client_for_value(state, &Value::Datum(*target));
+        if let Some(target) = routed_client
+            && let Value::Datum(descriptor) = value
+            && state.heap.datum(*descriptor).is_ok_and(|datum| {
+                let path = datum.type_path().as_str();
+                path == "/sound" || path.starts_with("/sound/")
+            })
+        {
+            let field = |name: &str| {
+                super::datum_field_or_initial(
+                    state,
+                    *descriptor,
+                    &FieldName::parse(name).expect("sound field is valid"),
+                )
+                .map_err(|error| error.to_string())
+            };
+            let file = match field("file")? {
+                Value::Null => None,
+                Value::File(path) | Value::Text(path) => Some(path.to_string()),
+                other => {
+                    return Err(format!(
+                        "sound file requires a resource path or null, received {other}"
+                    ));
+                }
+            };
+            let numeric = |name: &str, default: f32| -> Result<f32, String> {
+                let value = field(name)?;
+                Ok(value.as_number().unwrap_or(default))
+            };
+            state.emit_local_client_ui_event(
+                target,
+                LocalClientUiEvent::Sound {
+                    file,
+                    channel: numeric("channel", 0.0)? as i32,
+                    repeat: truthy(&field("repeat")?),
+                    volume: numeric("volume", 100.0)?.clamp(0.0, 100.0),
+                    frequency: numeric("frequency", 0.0)?,
+                    pan: numeric("pan", 0.0)?.clamp(-100.0, 100.0),
+                },
+            );
+            return Ok(());
+        }
         if let Some(target) = routed_client
             && let Value::Datum(descriptor) = value
             && state.heap.datum(*descriptor).is_ok_and(|datum| {
@@ -8019,6 +8174,12 @@ mod color_text_file_tests {
             "a missing source is an ordinary failed copy, not a runtime error",
         );
         assert_eq!(
+            fcopy(&[Value::Null, Value::text("tmp/null-copy.txt")], &state),
+            Ok(Value::number(0.0)),
+            "BYOND reports an invalid/null source as an unsuccessful copy",
+        );
+        assert!(!root.join("tmp/null-copy.txt").exists());
+        assert_eq!(
             text2file(
                 &[
                     Value::text("written"),
@@ -8614,7 +8775,25 @@ mod color_text_file_tests {
         text.extend_from_slice(&compressed);
         push_chunk(b"zTXt", &text);
         push_chunk(b"IEND", &[]);
-        fs::write(root.join("icons/test.dmi"), png).unwrap();
+        let dmi_path = root.join("icons/test.dmi");
+        fs::write(&dmi_path, png).unwrap();
+
+        for _ in 0..100 {
+            let metadata = read_dmi_metadata(&dmi_path).unwrap();
+            assert_eq!((metadata.width, metadata.height), (480, 480));
+        }
+        let physical_reads = DMI_METADATA_PHYSICAL_READS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get(&dmi_path)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            physical_reads, 1,
+            "unchanged DMI metadata should be parsed once across repeated greyscale/icon queries"
+        );
 
         let mut state = ExecutionState::new();
         state.set_project_root(root);
@@ -8672,6 +8851,22 @@ mod color_text_file_tests {
                 .datum_field(icon, &FieldName::parse("_dream64_height").unwrap()),
             Ok(&Value::number(480.0)),
         );
+
+        let mut changed = fs::read(&dmi_path).unwrap();
+        changed.push(0);
+        fs::write(&dmi_path, changed).unwrap();
+        assert_eq!(read_dmi_metadata(&dmi_path).unwrap().width, 480);
+        assert_eq!(
+            DMI_METADATA_PHYSICAL_READS
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get(&dmi_path)
+                .copied(),
+            Some(2),
+            "length-changing replacement must invalidate cached metadata"
+        );
     }
 
     #[test]
@@ -8687,6 +8882,55 @@ mod color_text_file_tests {
             Ok(Value::number(12.0)),
         );
         assert_eq!(text2num(&[Value::text("bad")], &state), Ok(Value::Null),);
+    }
+
+    #[test]
+    #[ignore = "local allocation-focused release benchmark"]
+    fn text2num_borrowed_text_release_benchmark() {
+        let input = Value::text("  -12345.75 trailing map constant");
+        let iterations = 2_000_000;
+        let parse = |text: &str| {
+            let text = text.trim_start();
+            let bytes = text.as_bytes();
+            let mut end = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+            let mut saw_digit = false;
+            let mut saw_dot = false;
+            while let Some(byte) = bytes.get(end).copied() {
+                if byte.is_ascii_digit() {
+                    saw_digit = true;
+                    end += 1;
+                } else if byte == b'.' && !saw_dot {
+                    saw_dot = true;
+                    end += 1;
+                } else {
+                    break;
+                }
+            }
+            saw_digit.then(|| text[..end].parse::<f32>().ok()).flatten()
+        };
+
+        let old_started = std::time::Instant::now();
+        for _ in 0..iterations {
+            let Value::Text(text) = std::hint::black_box(&input) else {
+                unreachable!()
+            };
+            let owned = text.to_string();
+            std::hint::black_box(parse(&owned));
+        }
+        let old = old_started.elapsed();
+
+        let borrowed_started = std::time::Instant::now();
+        for _ in 0..iterations {
+            let Value::Text(text) = std::hint::black_box(&input) else {
+                unreachable!()
+            };
+            std::hint::black_box(parse(text));
+        }
+        let borrowed = borrowed_started.elapsed();
+        eprintln!(
+            "text2num iterations={iterations} owned={old:?} borrowed={borrowed:?} speedup={:.2}x",
+            old.as_secs_f64() / borrowed.as_secs_f64()
+        );
     }
 
     #[test]
@@ -8710,6 +8954,38 @@ mod color_text_file_tests {
             text2path(&[Value::text("/datum/not_real")], &state),
             Ok(Value::Null),
         );
+    }
+
+    #[test]
+    #[ignore = "release-only TGM text2path lookup benchmark"]
+    fn tgm_text2path_catalog_lookup_benchmark() {
+        const PATHS: usize = 10_000;
+        const ROUNDS: usize = 2_000;
+        let catalog = (0..PATHS)
+            .map(|index| TypePath::parse(&format!("/obj/generated/path_{index:05}")).unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        let needle = "/obj/generated/path_09999";
+        let run = |indexed: bool| {
+            let started = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                let found = if indexed {
+                    catalog.get(needle)
+                } else {
+                    catalog.iter().find(|path| path.as_str() == needle)
+                };
+                std::hint::black_box(found);
+            }
+            started.elapsed()
+        };
+        let linear = run(false);
+        let indexed = run(true);
+        eprintln!(
+            "tgm-text2path paths={PATHS} rounds={ROUNDS} linear_ms={} indexed_ms={} speedup={:.2}",
+            linear.as_millis(),
+            indexed.as_millis(),
+            linear.as_secs_f64() / indexed.as_secs_f64(),
+        );
+        assert!(indexed < linear);
     }
 
     #[test]
@@ -9237,6 +9513,8 @@ mod atmos_batch_tests {
 #[cfg(test)]
 mod spatial_tests {
     use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
 
     #[test]
     fn list_union_does_not_propagate_destroyed_object_handles_as_null() {
@@ -9298,6 +9576,105 @@ mod spatial_tests {
             .expect("indexed fixture turf contents should materialize");
         state.world_turfs.insert((x, y, 1), turf);
         turf
+    }
+
+    #[test]
+    fn indexed_view_uses_authoritative_cell_membership_without_rewalking_coordinates() {
+        let mut state = ExecutionState::new();
+        let center = place_world_turf(&mut state, 5, 5);
+        let east = place_world_turf(&mut state, 6, 5);
+        let member = state
+            .heap
+            .allocate_datum(TypePath::parse("/obj/item/indexed").unwrap());
+        move_movable_to_turf(&mut state, member, east).unwrap();
+        // x/y/z on a contained movable are derived from loc. Bogus direct
+        // fields must not cause a second geometry pass to reject it.
+        for (name, value) in [("x", 900.0), ("y", 901.0), ("z", 7.0)] {
+            state
+                .heap
+                .set_datum_field(
+                    member,
+                    FieldName::parse(name).unwrap(),
+                    Value::number(value),
+                )
+                .unwrap();
+        }
+
+        assert!(
+            spatial_result(
+                &mut state,
+                &[Value::number(1.0), Value::Datum(center)],
+                false,
+                false,
+            )
+            .contains(&member)
+        );
+        assert!(
+            !spatial_result(
+                &mut state,
+                &[Value::number(1.0), Value::Datum(east)],
+                false,
+                true,
+            )
+            .contains(&member)
+        );
+    }
+
+    #[test]
+    #[ignore = "release-only bounded spatial-index benchmark"]
+    fn benchmark_indexed_view_skips_redundant_coordinate_resolution() {
+        let mut state = ExecutionState::new();
+        let side = 31_i32;
+        for x in 1..=side {
+            for y in 1..=side {
+                let turf = place_world_turf(&mut state, x, y);
+                for _ in 0..3 {
+                    let member = state
+                        .heap
+                        .allocate_datum(TypePath::parse("/obj/effect/view_bench").unwrap());
+                    move_movable_to_turf(&mut state, member, turf).unwrap();
+                }
+            }
+        }
+        let center = state.turf_at(16, 16, 1).unwrap();
+        let iterations = 2_000;
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            black_box(
+                spatial_query(
+                    &[Value::number(7.0), Value::Datum(center)],
+                    &mut state,
+                    &Value::Null,
+                    false,
+                    false,
+                )
+                .unwrap(),
+            );
+        }
+        let optimized = optimized_started.elapsed();
+
+        let reference_started = Instant::now();
+        for _ in 0..iterations {
+            let candidates = indexed_spatial_candidates(&state, 16.0, 16.0, 1.0, 7.0, 7.0, false);
+            let output = state.heap.allocate_list();
+            for id in &candidates {
+                if let Some((x, y, z)) = datum_coordinates(&state, &Value::Datum(*id))
+                    && z == 1.0
+                    && (x - 16.0).abs() <= 7.0
+                    && (y - 16.0).abs() <= 7.0
+                {
+                    state.heap.list_mut(output).unwrap().add(Value::Datum(*id));
+                }
+            }
+            black_box(output);
+        }
+        let redundant_validation = reference_started.elapsed();
+        eprintln!(
+            "indexed-view-benchmark iterations={iterations} optimized_ms={} reference_ms={}",
+            optimized.as_millis(),
+            redundant_validation.as_millis(),
+        );
     }
 
     fn spatial_result(
@@ -9871,7 +10248,7 @@ mod spatial_tests {
                 &[Value::Datum(client), Value::text("main.status")],
                 &mut state,
             ),
-            Ok(Value::number(1.0))
+            Ok(Value::text("LABEL"))
         );
     }
 

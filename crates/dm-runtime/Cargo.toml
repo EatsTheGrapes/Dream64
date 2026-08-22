@@ -7,6 +7,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+crc32fast = "1.5"
 dm-compiler = { path = "../dm-compiler" }
 dm-core = { path = "../dm-core" }
 dm-globals = { path = "../dm-globals" }

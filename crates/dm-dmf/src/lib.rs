@@ -233,6 +233,8 @@ pub fn parse(source: &str) -> Document {
 pub struct ControlTree {
     /// Named windows in source order.
     pub windows: Vec<WindowNode>,
+    /// Named elements from macro and menu sections in source order.
+    pub auxiliary: Vec<WindowNode>,
     /// Diagnostics produced while resolving controls.
     pub diagnostics: Vec<ControlTreeDiagnostic>,
 }
@@ -248,6 +250,41 @@ impl ControlTree {
         let mut tree = Self::default();
         for section in &document.sections {
             let Section::Window(window) = section else {
+                let (kind, name, span, elements): (&str, &str, SourceSpan, Vec<_>) = match section {
+                    Section::MacroSet(macros) => (
+                        "macro",
+                        &macros.name,
+                        macros.span,
+                        macros
+                            .macros
+                            .iter()
+                            .map(|entry| (entry.id.clone(), entry.span, entry.properties.clone()))
+                            .collect(),
+                    ),
+                    Section::Menu(menu) => (
+                        "menu",
+                        &menu.name,
+                        menu.span,
+                        menu.entries
+                            .iter()
+                            .map(|entry| (entry.id.clone(), entry.span, entry.properties.clone()))
+                            .collect(),
+                    ),
+                    Section::Window(_) => unreachable!(),
+                };
+                tree.auxiliary.push(WindowNode {
+                    id: format!("{kind}:{name}"),
+                    span,
+                    controls: elements
+                        .into_iter()
+                        .map(|(id, span, properties)| ControlNode {
+                            id,
+                            span,
+                            control_type: ControlType::Unknown,
+                            properties,
+                        })
+                        .collect(),
+                });
                 continue;
             };
             let mut node = WindowNode {
@@ -300,6 +337,21 @@ impl ControlTree {
             .controls
             .iter()
             .find(|control| control.id.as_deref() == Some(control_id))
+    }
+
+    fn addressable_control(&self, namespace: &str, control_id: &str) -> Option<&ControlNode> {
+        self.control(namespace, control_id).or_else(|| {
+            self.auxiliary
+                .iter()
+                .find(|section| {
+                    section.id == namespace
+                        || section.id.strip_prefix("macro:") == Some(namespace)
+                        || section.id.strip_prefix("menu:") == Some(namespace)
+                })?
+                .controls
+                .iter()
+                .find(|control| control.id.as_deref() == Some(control_id))
+        })
     }
 }
 
@@ -501,8 +553,52 @@ impl UiState {
     ///
     /// Returns an error when the control cannot be resolved or an assignment is malformed.
     pub fn winset(&mut self, control: &str, parameters: &str) -> Result<(), UiStateError> {
-        let (window_id, control_id) = self.resolve_control(control)?;
         let assignments = parse_assignments(parameters)?;
+        let (window_id, control_id) = match self.resolve_control(control) {
+            Ok(resolved) => resolved,
+            Err(UiStateError::UnknownControl(_)) => {
+                let parent = assignments
+                    .iter()
+                    .find(|(property, _)| property.eq_ignore_ascii_case("parent"))
+                    .map(|(_, value)| value.as_str())
+                    .filter(|parent| !parent.is_empty())
+                    .ok_or_else(|| UiStateError::UnknownControl(control.to_owned()))?;
+                let parent_window = self
+                    .tree
+                    .windows
+                    .iter()
+                    .chain(self.tree.auxiliary.iter())
+                    .find(|window| {
+                        window.id == parent
+                            || window.id.strip_prefix("macro:") == Some(parent)
+                            || window.id.strip_prefix("menu:") == Some(parent)
+                    })
+                    .map(|window| window.id.clone())
+                    .or_else(|| self.resolve_control(parent).ok().map(|(window, _)| window))
+                    .ok_or_else(|| UiStateError::UnknownControl(parent.to_owned()))?;
+                let (window_id, control_id) = control.split_once('.').map_or_else(
+                    || (parent_window.clone(), control.to_owned()),
+                    |(window, child)| {
+                        let window = self
+                            .tree
+                            .auxiliary
+                            .iter()
+                            .find(|section| {
+                                section.id == window
+                                    || section.id.strip_prefix("macro:") == Some(window)
+                                    || section.id.strip_prefix("menu:") == Some(window)
+                            })
+                            .map_or_else(|| window.to_owned(), |section| section.id.clone());
+                        (window, child.to_owned())
+                    },
+                );
+                if window_id != parent_window || control_id.is_empty() {
+                    return Err(UiStateError::UnknownControl(control.to_owned()));
+                }
+                (window_id, control_id)
+            }
+            Err(error) => return Err(error),
+        };
         let overrides = self.overrides_mut(&window_id, &control_id);
         for (property, value) in assignments {
             if let Some(existing) = overrides
@@ -527,6 +623,53 @@ impl UiState {
     ///
     /// Returns an error when the control cannot be resolved.
     pub fn winget(&self, control: &str, property: &str) -> Result<String, UiStateError> {
+        if control.contains(';') {
+            return control
+                .split(';')
+                .map(str::trim)
+                .filter(|control| !control.is_empty())
+                .map(|control| {
+                    self.winget(control, property)
+                        .map(|value| format!("{control}.{property}={value}"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(|entries| entries.join(";"));
+        }
+        if let Some(namespace) = control.strip_suffix(".*") {
+            let section = self
+                .tree
+                .windows
+                .iter()
+                .chain(self.tree.auxiliary.iter())
+                .find(|section| {
+                    section.id == namespace
+                        || section.id.strip_prefix("macro:") == Some(namespace)
+                        || section.id.strip_prefix("menu:") == Some(namespace)
+                })
+                .ok_or_else(|| UiStateError::UnknownControl(control.to_owned()))?;
+            let mut ids = section
+                .controls
+                .iter()
+                .filter_map(|node| node.id.clone())
+                .collect::<Vec<_>>();
+            ids.extend(
+                self.overrides
+                    .iter()
+                    .filter(|override_| override_.window_id == section.id)
+                    .map(|override_| override_.control_id.clone()),
+            );
+            ids.sort();
+            ids.dedup();
+            return ids
+                .into_iter()
+                .map(|id| {
+                    let address = format!("{namespace}.{id}");
+                    self.winget(&address, property)
+                        .map(|value| format!("{address}.{property}={value}"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(|entries| entries.join(";"));
+        }
         let (window_id, control_id) = self.resolve_control(control)?;
         if let Some(value) = self
             .overrides
@@ -546,7 +689,7 @@ impl UiState {
         }
         let value = self
             .tree
-            .control(&window_id, &control_id)
+            .addressable_control(&window_id, &control_id)
             .and_then(|node| {
                 node.properties
                     .iter()
@@ -555,6 +698,43 @@ impl UiState {
             })
             .map_or_else(String::new, |entry| entry.value.decoded.clone());
         Ok(value)
+    }
+
+    /// Returns every declared and overridden property for a control.
+    ///
+    /// Runtime values replace skin defaults case-insensitively. This is the
+    /// object form returned by BYOND's browser-side `winget(id, "*")` API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the control cannot be resolved.
+    pub fn winget_all(
+        &self,
+        control: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, UiStateError> {
+        let (window_id, control_id) = self.resolve_control(control)?;
+        let mut properties = std::collections::BTreeMap::<String, (String, String)>::new();
+        if let Some(node) = self.tree.addressable_control(&window_id, &control_id) {
+            for property in &node.properties {
+                properties.insert(
+                    property.key.to_ascii_lowercase(),
+                    (property.key.clone(), property.value.decoded.clone()),
+                );
+            }
+        }
+        if let Some(override_) = self.overrides.iter().find(|override_| {
+            override_.window_id == window_id && override_.control_id == control_id
+        }) {
+            for property in &override_.properties {
+                properties.insert(
+                    property.name.to_ascii_lowercase(),
+                    (property.name.clone(), property.value.clone()),
+                );
+            }
+        }
+        Ok(properties
+            .into_values()
+            .collect::<std::collections::BTreeMap<_, _>>())
     }
 
     /// Sets a control's `is-visible` runtime property.
@@ -579,6 +759,29 @@ impl UiState {
         self.resolve_control(control).is_ok()
     }
 
+    /// Returns the BYOND control-type name for a named control, or an empty
+    /// string when the control is absent.
+    #[must_use]
+    pub fn winexists_type(&self, control: &str) -> String {
+        let Ok((window_id, control_id)) = self.resolve_control(control) else {
+            return String::new();
+        };
+        self.tree
+            .addressable_control(&window_id, &control_id)
+            .map(|control| match control.control_type {
+                ControlType::Main => "MAIN",
+                ControlType::Map => "MAP",
+                ControlType::Browser => "BROWSER",
+                ControlType::Input => "INPUT",
+                ControlType::Output => "OUTPUT",
+                ControlType::Label => "LABEL",
+                ControlType::Button => "BUTTON",
+                ControlType::Unknown => "UNKNOWN",
+            })
+            .unwrap_or_default()
+            .to_owned()
+    }
+
     /// Copies runtime overrides from one control to another.
     ///
     /// # Errors
@@ -601,10 +804,11 @@ impl UiState {
 
     fn resolve_control(&self, address: &str) -> Result<(String, String), UiStateError> {
         let Some((window_id, control_id)) = address.split_once('.') else {
-            let matches: Vec<_> = self
+            let mut matches: Vec<_> = self
                 .tree
                 .windows
                 .iter()
+                .chain(self.tree.auxiliary.iter())
                 .filter_map(|window| {
                     window
                         .controls
@@ -613,6 +817,14 @@ impl UiState {
                         .then_some((window.id.as_str(), address))
                 })
                 .collect();
+            matches.extend(
+                self.overrides
+                    .iter()
+                    .filter(|override_| override_.control_id == address)
+                    .map(|override_| (override_.window_id.as_str(), address)),
+            );
+            matches.sort_unstable();
+            matches.dedup();
             return match matches.as_slice() {
                 [(window_id, control_id)] => {
                     Ok(((*window_id).to_owned(), (*control_id).to_owned()))
@@ -621,10 +833,23 @@ impl UiState {
                 _ => Err(UiStateError::AmbiguousControl(address.to_owned())),
             };
         };
-        self.tree
-            .control(window_id, control_id)
-            .map(|_| (window_id.to_owned(), control_id.to_owned()))
-            .ok_or_else(|| UiStateError::UnknownControl(address.to_owned()))
+        if let Some(override_) = self.overrides.iter().find(|override_| {
+            (override_.window_id == window_id
+                || override_.window_id.strip_prefix("macro:") == Some(window_id)
+                || override_.window_id.strip_prefix("menu:") == Some(window_id))
+                && override_.control_id == control_id
+        }) {
+            return Ok((override_.window_id.clone(), control_id.to_owned()));
+        }
+        if self
+            .tree
+            .addressable_control(window_id, control_id)
+            .is_some()
+        {
+            Ok((window_id.to_owned(), control_id.to_owned()))
+        } else {
+            Err(UiStateError::UnknownControl(address.to_owned()))
+        }
     }
 
     fn overrides_mut(&mut self, window_id: &str, control_id: &str) -> &mut ControlOverride {
@@ -880,11 +1105,15 @@ pub enum BrowserBridgeError {
 /// The host must serialize requests as JSON and route them through
 /// [`ClientSession::handle_browser_message`]. The bridge intentionally exposes
 /// no filesystem, process, or arbitrary native APIs.
-pub const WEBVIEW2_BYOND_BRIDGE_BOOTSTRAP: &str = r#"window.Byond = Object.freeze({
-  command(command) { window.chrome.webview.postMessage({ kind: "command", command }); },
-  topic(topic) { window.chrome.webview.postMessage({ kind: "topic", topic }); },
-  ui(command) { window.chrome.webview.postMessage({ kind: "ui", command }); }
-});"#;
+pub const WEBVIEW2_BYOND_BRIDGE_BOOTSTRAP: &str = r#"(() => {
+  const send = message => window.ipc.postMessage(JSON.stringify(message));
+  window.cef_to_byond = url => send({ kind: "byond", url: String(url) });
+  window.Byond = Object.freeze({
+    command(command) { send({ kind: "command", command }); },
+    topic(topic) { send({ kind: "topic", topic }); },
+    ui(command) { send({ kind: "ui", command }); }
+  });
+})();"#;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ControlOverride {
@@ -1668,8 +1897,72 @@ mod tests {
 
         assert_eq!(state.winget("chat", "text"), Ok("hello; world".to_owned()));
         assert_eq!(state.winget("chat", "is-visible"), Ok("false".to_owned()));
+        let all = state.winget_all("chat").unwrap();
+        assert_eq!(all["text"], "hello; world");
+        assert_eq!(all["is-visible"], "false");
+        assert_eq!(all["type"], "OUTPUT");
         assert!(state.winexists("main.chat"));
         assert!(!state.winexists("main.missing"));
+        assert_eq!(state.winexists_type("main.chat"), "OUTPUT");
+        assert_eq!(state.winexists_type("main.missing"), "");
+    }
+
+    #[test]
+    fn monkestation_right_click_macro_elements_are_winset_targets() {
+        let document = parse(
+            "macro \"default\"\n\telem \"Shift\"\n\t\tname = \"SHIFT\"\n\t\tcommand = \".winset :map.right-click=false\"\n\telem \"ShiftUp\"\n\t\tname = \"SHIFT+UP\"\n\t\tcommand = \".winset :map.right-click=true\"\nwindow \"mapwindow\"\n\telem \"map\"\n\t\ttype = MAP\n\t\tright-click = true\n",
+        );
+        let tree = ControlTree::from_document(&document);
+        assert_eq!(tree.auxiliary.len(), 1);
+        let mut state = super::UiState::new(tree);
+
+        for (target, parameters) in [
+            ("mapwindow.map", "right-click=false"),
+            ("ShiftUp", "command=\".winset :map.right-click=false\""),
+            ("Shift", "command=\".winset :map.right-click=true\""),
+            ("ShiftUp", "command=\".winset :map.right-click=true\""),
+            ("Shift", "command=\".winset :map.right-click=false\""),
+        ] {
+            state
+                .winset(target, parameters)
+                .unwrap_or_else(|error| panic!("{target} must resolve like BYOND: {error:?}"));
+        }
+        assert_eq!(
+            state.winget("ShiftUp", "command"),
+            Ok(".winset :map.right-click=true".to_owned())
+        );
+        assert_eq!(
+            state.winget("Shift", "command"),
+            Ok(".winset :map.right-click=false".to_owned())
+        );
+    }
+
+    #[test]
+    fn winset_parent_creates_dynamic_macro_element() {
+        let document = parse(
+            "macro \"default\"\n\telem \"North\"\n\t\tname = \"W\"\n\t\tcommand = \".north\"\n",
+        );
+        let mut state = super::UiState::new(ControlTree::from_document(&document));
+
+        state
+            .winset("default-", "parent=default;name=T;command=.tgui-say say")
+            .expect("parent=default creates a runtime macro element");
+
+        assert!(state.winexists("default-"));
+        assert_eq!(state.winget("default-", "parent"), Ok("default".to_owned()));
+        assert_eq!(state.winget("default-", "name"), Ok("T".to_owned()));
+        assert_eq!(
+            state.winget("default.default-", "command"),
+            Ok(".tgui-say say".to_owned())
+        );
+        assert_eq!(
+            state.winget("default.*", "command"),
+            Ok(concat!(
+                "default.North.command=.north;",
+                "default.default-.command=.tgui-say say"
+            )
+            .to_owned())
+        );
     }
 
     #[test]
@@ -1690,6 +1983,18 @@ mod tests {
             Ok("runtime".to_owned())
         );
         assert_eq!(state.winget("main.source", "type"), Ok("LABEL".to_owned()));
+    }
+
+    #[test]
+    fn winget_semicolon_control_list_returns_byond_keyed_params() {
+        let document = parse(
+            "window \"main\"\n\telem \"split\"\n\t\ttype = CHILD\n\t\tsize = 1920x1030\nwindow \"mapwindow\"\n\telem \"mapwindow\"\n\t\ttype = MAIN\n\t\tsize = 1248x1030\n",
+        );
+        let state = super::UiState::new(ControlTree::from_document(&document));
+        assert_eq!(
+            state.winget("main.split;mapwindow", "size"),
+            Ok("main.split.size=1920x1030;mapwindow.size=1248x1030".to_owned())
+        );
     }
 
     #[test]

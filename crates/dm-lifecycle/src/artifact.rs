@@ -21,6 +21,7 @@ const SECTION_TABLE_ENTRY_LENGTH: usize = 24;
 const HEADER_CHECKSUM_LENGTH: usize = 4;
 const FOOTER_LENGTH: usize = 32;
 const MAX_TARGET_LENGTH: usize = 255;
+const DEFAULT_MMAP_THRESHOLD: u64 = 1024 * 1024;
 
 /// Current on-disk artifact schema.
 pub const ARTIFACT_SCHEMA: u16 = 1;
@@ -62,6 +63,11 @@ enum ArtifactPayload {
         offset: usize,
         length: usize,
     },
+    Mapped {
+        backing: Arc<dm_mmap::ReadOnlyMapping>,
+        offset: usize,
+        length: usize,
+    },
 }
 
 impl ArtifactSection {
@@ -90,6 +96,11 @@ impl ArtifactSection {
                 offset,
                 length,
             } => &backing[*offset..*offset + *length],
+            ArtifactPayload::Mapped {
+                backing,
+                offset,
+                length,
+            } => &backing[*offset..*offset + *length],
         }
     }
 
@@ -103,6 +114,11 @@ impl ArtifactSection {
                 offset,
                 length,
             } => backing[offset..offset + length].to_vec(),
+            ArtifactPayload::Mapped {
+                backing,
+                offset,
+                length,
+            } => backing[offset..offset + length].to_vec(),
         }
     }
 
@@ -110,6 +126,22 @@ impl ArtifactSection {
         Self {
             id,
             payload: ArtifactPayload::Shared {
+                backing,
+                offset,
+                length,
+            },
+        }
+    }
+
+    fn from_mapped(
+        id: u32,
+        backing: Arc<dm_mmap::ReadOnlyMapping>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self {
+            id,
+            payload: ArtifactPayload::Mapped {
                 backing,
                 offset,
                 length,
@@ -145,6 +177,21 @@ pub struct ArtifactStorageStats {
     pub backing_bytes: usize,
     /// Number of distinct backing allocations.
     pub backing_allocations: usize,
+    /// Distinct retained read-only file mappings.
+    pub mapped_backings: usize,
+    /// Distinct retained heap buffers shared by sections.
+    pub buffered_backings: usize,
+}
+
+/// File-read policy for compiled artifacts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactReadMode {
+    /// Map files at least 1 MiB and buffer smaller files.
+    Auto,
+    /// Always use the bounded buffered path.
+    Buffered,
+    /// Attempt a read-only mapping regardless of size, with buffered fallback.
+    PreferMapped,
 }
 
 /// Bounded-memory characteristics of one atomic artifact installation.
@@ -224,6 +271,15 @@ impl CompiledArtifact {
                         stats.backing_bytes =
                             stats.backing_bytes.saturating_add(backing.capacity());
                         stats.backing_allocations += 1;
+                        stats.buffered_backings += 1;
+                    }
+                }
+                ArtifactPayload::Mapped { backing, .. } => {
+                    let identity = Arc::as_ptr(backing) as usize;
+                    if shared.insert(identity) {
+                        stats.backing_bytes = stats.backing_bytes.saturating_add(backing.len());
+                        stats.backing_allocations += 1;
+                        stats.mapped_backings += 1;
                     }
                 }
             }
@@ -271,24 +327,32 @@ impl CompiledArtifact {
         path: impl AsRef<Path>,
         expected_project_fingerprint: [u8; 16],
     ) -> Result<Self, ArtifactError> {
-        let path = path.as_ref();
-        let metadata = fs::metadata(path).map_err(|source| ArtifactError::Io {
-            operation: "inspect",
-            path: path.to_path_buf(),
-            source,
-        })?;
-        if metadata.len() > MAX_ARTIFACT_LENGTH {
-            return Err(ArtifactError::ArtifactTooLarge {
-                actual: metadata.len(),
-                maximum: MAX_ARTIFACT_LENGTH,
-            });
-        }
-        let bytes = fs::read(path).map_err(|source| ArtifactError::Io {
-            operation: "read",
-            path: path.to_path_buf(),
-            source,
-        })?;
-        decode_owned_artifact(bytes, expected_project_fingerprint)
+        Self::read_from_with_mode(path, expected_project_fingerprint, ArtifactReadMode::Auto)
+    }
+
+    /// Reads with an explicit mapping/buffering policy for diagnostics and
+    /// reproducible benchmarks. Mapping errors always fall back to buffering.
+    pub fn read_from_with_mode(
+        path: impl AsRef<Path>,
+        expected_project_fingerprint: [u8; 16],
+        mode: ArtifactReadMode,
+    ) -> Result<Self, ArtifactError> {
+        read_from_with_mapper(
+            path.as_ref(),
+            expected_project_fingerprint,
+            mode,
+            dm_mmap::ReadOnlyMapping::map,
+        )
+    }
+
+    #[cfg(test)]
+    fn read_from_with_mapper_for_test(
+        path: &Path,
+        expected_project_fingerprint: [u8; 16],
+        mode: ArtifactReadMode,
+        mapper: impl FnOnce(&File) -> io::Result<dm_mmap::ReadOnlyMapping>,
+    ) -> Result<Self, ArtifactError> {
+        read_from_with_mapper(path, expected_project_fingerprint, mode, mapper)
     }
 
     /// Atomically installs a fully committed artifact at `path`.
@@ -806,6 +870,69 @@ fn decode_owned_artifact(
     })
 }
 
+fn decode_mapped_artifact(
+    backing: dm_mmap::ReadOnlyMapping,
+    expected_project_fingerprint: [u8; 16],
+) -> Result<CompiledArtifact, ArtifactError> {
+    let validated = validate_artifact(&backing, expected_project_fingerprint)?;
+    let backing = Arc::new(backing);
+    let sections = validated
+        .sections
+        .into_iter()
+        .map(|section| {
+            ArtifactSection::from_mapped(
+                section.id,
+                Arc::clone(&backing),
+                section.offset,
+                section.length,
+            )
+        })
+        .collect();
+    Ok(CompiledArtifact {
+        project_fingerprint: validated.project_fingerprint,
+        sections,
+    })
+}
+
+fn read_from_with_mapper(
+    path: &Path,
+    expected_project_fingerprint: [u8; 16],
+    mode: ArtifactReadMode,
+    mapper: impl FnOnce(&File) -> io::Result<dm_mmap::ReadOnlyMapping>,
+) -> Result<CompiledArtifact, ArtifactError> {
+    let file = File::open(path).map_err(|source| ArtifactError::Io {
+        operation: "open",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let metadata = file.metadata().map_err(|source| ArtifactError::Io {
+        operation: "inspect",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.len() > MAX_ARTIFACT_LENGTH {
+        return Err(ArtifactError::ArtifactTooLarge {
+            actual: metadata.len(),
+            maximum: MAX_ARTIFACT_LENGTH,
+        });
+    }
+    let should_map = match mode {
+        ArtifactReadMode::Auto => metadata.len() >= DEFAULT_MMAP_THRESHOLD,
+        ArtifactReadMode::Buffered => false,
+        ArtifactReadMode::PreferMapped => true,
+    };
+    if should_map && let Ok(mapping) = mapper(&file) {
+        return decode_mapped_artifact(mapping, expected_project_fingerprint);
+    }
+    drop(file);
+    let bytes = fs::read(path).map_err(|source| ArtifactError::Io {
+        operation: "read",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    decode_owned_artifact(bytes, expected_project_fingerprint)
+}
+
 #[allow(clippy::too_many_lines)]
 fn validate_artifact(
     bytes: &[u8],
@@ -1250,6 +1377,7 @@ mod tests {
         let first_backing = match &decoded.section(7).unwrap().payload {
             ArtifactPayload::Shared { backing, .. } => Arc::downgrade(backing),
             ArtifactPayload::Owned(_) => panic!("file payload should share its input buffer"),
+            ArtifactPayload::Mapped { .. } => panic!("small fixture should use buffered storage"),
         };
         let retained_section = decoded.sections.remove(0);
         assert_eq!(retained_section.payload(), b"module bytecode");
@@ -1268,6 +1396,90 @@ mod tests {
                 region: ChecksumRegion::Body,
             })
         ));
+    }
+
+    #[test]
+    fn mapped_and_buffered_reads_are_equivalent_and_mapping_owns_sections() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("mapped.d64");
+        fixture().write_atomic(&path).unwrap();
+        let buffered =
+            CompiledArtifact::read_from_with_mode(&path, PROJECT, ArtifactReadMode::Buffered)
+                .unwrap();
+        let mut mapped =
+            CompiledArtifact::read_from_with_mode(&path, PROJECT, ArtifactReadMode::PreferMapped)
+                .unwrap();
+        assert_eq!(mapped, buffered);
+        assert_eq!(mapped.storage_stats().mapped_backings, 1);
+        assert_eq!(buffered.storage_stats().buffered_backings, 1);
+        let owner = match &mapped.section(7).unwrap().payload {
+            ArtifactPayload::Mapped { backing, .. } => Arc::downgrade(backing),
+            _ => panic!("forced mapped read should retain a mapping"),
+        };
+        let section = mapped.sections.remove(0);
+        drop(mapped);
+        assert!(owner.upgrade().is_some());
+        assert_eq!(section.payload(), b"module bytecode");
+        drop(section);
+        assert!(owner.upgrade().is_none());
+
+        // Windows cannot replace/delete a file while a live mapping owns it.
+        // Once the decoded artifact is dropped, normal atomic rebuild works.
+        fixture().write_atomic(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn mapping_failure_falls_back_and_mapped_corruption_is_rejected() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("fallback.d64");
+        let mut encoded = fixture().encode().unwrap();
+        fs::write(&path, &encoded).unwrap();
+        let fallback = CompiledArtifact::read_from_with_mapper_for_test(
+            &path,
+            PROJECT,
+            ArtifactReadMode::PreferMapped,
+            |_| Err(io::Error::other("injected mapping failure")),
+        )
+        .unwrap();
+        assert_eq!(fallback, fixture());
+        assert_eq!(fallback.storage_stats().buffered_backings, 1);
+
+        let payload_offset = usize::try_from(read_u32(&encoded, 28).unwrap()).unwrap();
+        encoded[payload_offset] ^= 0x40;
+        fs::write(&path, encoded).unwrap();
+        assert!(matches!(
+            CompiledArtifact::read_from_with_mode(&path, PROJECT, ArtifactReadMode::PreferMapped,),
+            Err(ArtifactError::ChecksumMismatch {
+                region: ChecksumRegion::Body,
+            })
+        ));
+    }
+
+    #[test]
+    #[ignore = "manual artifact read microbenchmark"]
+    fn benchmark_mmap_vs_buffered_artifact_load() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("benchmark.d64");
+        let artifact = CompiledArtifact::new(
+            PROJECT,
+            vec![ArtifactSection::new(1, vec![0x5a; 32 * 1024 * 1024])],
+        )
+        .unwrap();
+        artifact.write_atomic(&path).unwrap();
+        for mode in [ArtifactReadMode::Buffered, ArtifactReadMode::PreferMapped] {
+            let started = std::time::Instant::now();
+            let mut checksum = 0usize;
+            for _ in 0..10 {
+                let loaded = CompiledArtifact::read_from_with_mode(&path, PROJECT, mode).unwrap();
+                checksum ^= loaded.section(1).unwrap().payload()[0] as usize;
+            }
+            eprintln!(
+                "artifact-read-benchmark mode={mode:?} iterations=10 bytes={} elapsed_ms={} checksum={checksum}",
+                fs::metadata(&path).unwrap().len(),
+                started.elapsed().as_millis(),
+            );
+        }
     }
 
     #[test]

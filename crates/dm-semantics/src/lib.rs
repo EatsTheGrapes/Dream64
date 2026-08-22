@@ -13,6 +13,8 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use dm_compiler::Compilation;
 use dm_core::{FileId, SourceSpan};
@@ -25,7 +27,7 @@ use dm_value::{FieldName, TypePath};
 const STANDARD_BUILTINS: &str = concat!(
     // Headless servers have no authenticated BYOND membership session.
     // Preserve the engine query as a callable predicate with a false result.
-    "/proc/IsByondMember()\n\treturn 0\n",
+    "/client/proc/IsByondMember()\n\treturn 0\n",
     "/proc/isarea(...)\n",
     "\tfor(var/location in args)\n",
     "\t\tif(!istype(location, /area))\n",
@@ -257,6 +259,11 @@ pub struct ProcedureRegistry {
     by_path: BTreeMap<CodePath, ProcedureId>,
     by_owner_name: BTreeMap<(Option<NodeId>, String), ProcedureId>,
     dynamic_targets: BTreeMap<String, Vec<ProcedureImplementationId>>,
+    dependencies: OnceLock<ProcedureDependencies>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ProcedureDependencies {
     static_selectors: BTreeMap<ProcedureImplementationId, BTreeSet<String>>,
     dynamic_selectors: BTreeMap<ProcedureImplementationId, BTreeSet<String>>,
     exact_member_targets: BTreeMap<ProcedureImplementationId, BTreeSet<ProcedureImplementationId>>,
@@ -581,9 +588,122 @@ fn executable_artifact_read_string(input: &mut Cursor<&[u8]>) -> Result<String, 
 }
 
 impl ProcedureRegistry {
+    /// Builds stable procedure identities and dispatch inventory without
+    /// analyzing individual bodies. Dependency closure and linking methods
+    /// initialize the exact eager dependency indexes on first use.
+    #[must_use]
+    pub fn build_lazy(compilation: &Compilation) -> Self {
+        let tree = compilation.code_tree();
+        let procedure_nodes: Vec<_> = tree
+            .nodes()
+            .iter()
+            .filter(|node| matches!(node.kind, NodeKind::Procedure | NodeKind::Verb))
+            .collect();
+        let by_node: BTreeMap<_, _> = procedure_nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.id, procedure_id(index)))
+            .collect();
+        let by_path = procedure_nodes
+            .iter()
+            .map(|node| (node.path.clone(), by_node[&node.id]))
+            .collect();
+        let mut procedures: Vec<_> = procedure_nodes
+            .into_iter()
+            .map(|node| {
+                let id = by_node[&node.id];
+                let implementations = node
+                    .declarations
+                    .iter()
+                    .filter_map(|declaration_id| tree.declaration(*declaration_id))
+                    .filter_map(|declaration| {
+                        let kind = match declaration.kind {
+                            DefinitionKind::Procedure | DefinitionKind::Verb => {
+                                ProcedureImplementationKind::Declaration
+                            }
+                            DefinitionKind::ProcedureOverride => {
+                                ProcedureImplementationKind::Override
+                            }
+                            _ => return None,
+                        };
+                        Some((declaration, kind))
+                    })
+                    .enumerate()
+                    .map(|(index, (declaration, kind))| ProcedureImplementation {
+                        id: implementation_id(id, index),
+                        file_id: declaration.file_id,
+                        definition_index: declaration.definition_index,
+                        ordinal: declaration.ordinal,
+                        span: declaration.span,
+                        kind,
+                        parent_target: None,
+                    })
+                    .collect::<Vec<_>>();
+                Procedure {
+                    id,
+                    node: node.id,
+                    path: node.path.clone(),
+                    owner_type: node.owner_type,
+                    inherited_procedure: node
+                        .inherited_member
+                        .and_then(|parent| by_node.get(&parent).copied()),
+                    effective_target: implementations.last().map(|body| body.id),
+                    implementations,
+                }
+            })
+            .collect();
+        for procedure_index in 0..procedures.len() {
+            let inherited_target = procedures[procedure_index]
+                .inherited_procedure
+                .and_then(|parent| effective_target(&procedures, parent));
+            for implementation_index in 0..procedures[procedure_index].implementations.len() {
+                procedures[procedure_index].implementations[implementation_index].parent_target =
+                    if implementation_index == 0 {
+                        inherited_target
+                    } else {
+                        Some(implementation_id(
+                            procedures[procedure_index].id,
+                            implementation_index - 1,
+                        ))
+                    };
+            }
+        }
+        let by_owner_name = procedures
+            .iter()
+            .filter_map(|procedure| {
+                procedure
+                    .path
+                    .segments()
+                    .last()
+                    .map(|name| ((procedure.owner_type, name.clone()), procedure.id))
+            })
+            .collect();
+        let mut dynamic_targets = BTreeMap::<String, Vec<_>>::new();
+        for procedure in &procedures {
+            if let (Some(name), Some(target)) =
+                (procedure.path.segments().last(), procedure.effective_target)
+            {
+                dynamic_targets
+                    .entry(name.clone())
+                    .or_default()
+                    .push(target);
+            }
+        }
+        Self {
+            procedures,
+            by_node,
+            by_path,
+            by_owner_name,
+            dynamic_targets,
+            dependencies: OnceLock::new(),
+        }
+    }
+
     /// Builds a registry from the compiler's accepted canonical declarations.
     #[must_use]
     pub fn build(compilation: &Compilation) -> Self {
+        let profile = std::env::var_os("DREAM64_PROFILE_REGISTRY").is_some();
+        let build_started = Instant::now();
         let tree = compilation.code_tree();
         let procedure_nodes: Vec<_> = tree
             .nodes()
@@ -694,18 +814,56 @@ impl ProcedureRegistry {
         let mut dynamic_selectors = BTreeMap::new();
         let mut exact_member_targets = BTreeMap::new();
         let mut typed_virtual_targets = BTreeMap::new();
+        let base_index_elapsed = build_started.elapsed();
+        let phase = Instant::now();
         let global_types = declared_global_types(compilation);
+        let global_types_elapsed = phase.elapsed();
+        let phase = Instant::now();
         let field_types = declared_field_types(compilation);
+        let field_types_elapsed = phase.elapsed();
+        let phase = Instant::now();
         let new_targets_by_ancestor =
             constructor_targets_by_ancestor(compilation, &procedures, &by_owner_name);
+        let constructors_index_elapsed = phase.elapsed();
+        // Index exact `/owner/proc` families once. Re-scanning a production
+        // procedure table for every `typesof(/owner/proc)` made warm registry
+        // construction quadratic. Target vectors retain canonical order.
+        let mut procedure_family_targets = BTreeMap::<Vec<String>, Vec<_>>::new();
+        for candidate in &procedures {
+            let segments = candidate.path.segments();
+            if segments.len() >= 2
+                && segments[segments.len() - 2] == "proc"
+                && let Some(target) = candidate.effective_target
+            {
+                procedure_family_targets
+                    .entry(segments[..segments.len() - 1].to_vec())
+                    .or_default()
+                    .push(target);
+            }
+        }
         let mut build_stats = ProcedureRegistryBuildStats::default();
+        let dependency_started = Instant::now();
+        let mut dependency_bodies = 0_usize;
+        let mut static_selector_elapsed = Duration::ZERO;
+        let mut member_dependency_elapsed = Duration::ZERO;
+        let mut static_reference_elapsed = Duration::ZERO;
+        let mut family_elapsed = Duration::ZERO;
+        let mut dynamic_selector_elapsed = Duration::ZERO;
+        let mut construction_elapsed = Duration::ZERO;
         for procedure in &procedures {
             for implementation in &procedure.implementations {
                 if let Some(definition) = compilation
                     .syntax(implementation.file_id)
                     .and_then(|syntax| syntax.definitions.get(implementation.definition_index))
                 {
-                    static_selectors.insert(implementation.id, static_call_selectors(definition));
+                    dependency_bodies += 1;
+                    let phase = profile.then(Instant::now);
+                    let selectors = static_call_selectors(definition);
+                    if let Some(phase) = phase {
+                        static_selector_elapsed += phase.elapsed();
+                    }
+                    static_selectors.insert(implementation.id, selectors);
+                    let phase = profile.then(Instant::now);
                     let (mut member_targets, virtual_targets, unresolved_members) =
                         member_call_dependencies(
                             definition,
@@ -717,6 +875,10 @@ impl ProcedureRegistry {
                             &dynamic_targets,
                             &procedures,
                         );
+                    if let Some(phase) = phase {
+                        member_dependency_elapsed += phase.elapsed();
+                    }
+                    let phase = profile.then(Instant::now);
                     for referenced_path in static_proc_reference_paths(definition, &procedure.path)
                     {
                         build_stats.static_proc_reference_index_lookups += 1;
@@ -727,6 +889,9 @@ impl ProcedureRegistry {
                             member_targets.insert(target);
                         }
                     }
+                    if let Some(phase) = phase {
+                        static_reference_elapsed += phase.elapsed();
+                    }
                     // `typesof(/owner/proc)` materializes procedure paths which
                     // are commonly fed straight into `call(src, path)()`.  The
                     // selector is intentionally runtime data, but the family is
@@ -734,17 +899,21 @@ impl ProcedureRegistry {
                     // procedure-type path must be present in the symbolic
                     // module.  In particular, tgstation's generated
                     // `InitGlobal*` procedures are discovered this way.
+                    let phase = profile.then(Instant::now);
                     for family in static_procedure_type_families(definition) {
-                        member_targets.extend(procedures.iter().filter_map(|candidate| {
-                            candidate
-                                .path
-                                .segments()
-                                .starts_with(&family)
-                                .then_some(candidate.effective_target)
-                                .flatten()
-                        }));
+                        if let Some(targets) = procedure_family_targets.get(&family) {
+                            member_targets.extend(targets.iter().copied());
+                        }
                     }
+                    if let Some(phase) = phase {
+                        family_elapsed += phase.elapsed();
+                    }
+                    let phase = profile.then(Instant::now);
                     let mut dynamic = dynamic_call_literal_selectors(definition);
+                    if let Some(phase) = phase {
+                        dynamic_selector_elapsed += phase.elapsed();
+                    }
+                    let phase = profile.then(Instant::now);
                     let construction = construction_dependencies(
                         definition,
                         compilation,
@@ -752,6 +921,9 @@ impl ProcedureRegistry {
                         &by_owner_name,
                         &new_targets_by_ancestor,
                     );
+                    if let Some(phase) = phase {
+                        construction_elapsed += phase.elapsed();
+                    }
                     member_targets.extend(construction.targets);
                     if construction.unbounded {
                         dynamic.insert("New".to_owned());
@@ -763,17 +935,38 @@ impl ProcedureRegistry {
                 }
             }
         }
+        if profile {
+            eprintln!(
+                "procedure-registry-profile: procedures={} bodies={} total_ms={} base_index_ms={} global_types_ms={} field_types_ms={} constructor_index_ms={} dependencies_ms={} static_selectors_ms={} member_dependencies_ms={} static_references_ms={} procedure_families_ms={} dynamic_selectors_ms={} construction_dependencies_ms={}",
+                procedures.len(),
+                dependency_bodies,
+                build_started.elapsed().as_millis(),
+                base_index_elapsed.as_millis(),
+                global_types_elapsed.as_millis(),
+                field_types_elapsed.as_millis(),
+                constructors_index_elapsed.as_millis(),
+                dependency_started.elapsed().as_millis(),
+                static_selector_elapsed.as_millis(),
+                member_dependency_elapsed.as_millis(),
+                static_reference_elapsed.as_millis(),
+                family_elapsed.as_millis(),
+                dynamic_selector_elapsed.as_millis(),
+                construction_elapsed.as_millis(),
+            );
+        }
         Self {
             procedures,
             by_node,
             by_path,
             by_owner_name,
             dynamic_targets,
-            static_selectors,
-            dynamic_selectors,
-            exact_member_targets,
-            typed_virtual_targets,
-            build_stats,
+            dependencies: OnceLock::from(ProcedureDependencies {
+                static_selectors,
+                dynamic_selectors,
+                exact_member_targets,
+                typed_virtual_targets,
+                build_stats,
+            }),
         }
     }
 
@@ -785,8 +978,29 @@ impl ProcedureRegistry {
 
     /// Returns deterministic procedure-index construction counters.
     #[must_use]
-    pub const fn build_stats(&self) -> &ProcedureRegistryBuildStats {
-        &self.build_stats
+    pub fn build_stats(&self) -> &ProcedureRegistryBuildStats {
+        static EMPTY: ProcedureRegistryBuildStats = ProcedureRegistryBuildStats {
+            static_proc_reference_index_lookups: 0,
+        };
+        self.dependencies
+            .get()
+            .map_or(&EMPTY, |dependencies| &dependencies.build_stats)
+    }
+
+    fn dependencies(&self, compilation: &Compilation) -> &ProcedureDependencies {
+        self.dependencies.get_or_init(|| {
+            ProcedureRegistry::build(compilation)
+                .dependencies
+                .into_inner()
+                .expect("eager registry initializes procedure dependencies")
+        })
+    }
+
+    /// Whether per-body dependency analysis has run for this registry.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn dependencies_initialized(&self) -> bool {
+        self.dependencies.get().is_some()
     }
 
     /// Looks up a canonical procedure by registry identity.
@@ -1053,19 +1267,20 @@ impl ProcedureRegistry {
         compilation: &Compilation,
         implementations: impl IntoIterator<Item = ProcedureImplementationId>,
     ) -> BTreeSet<ProcedureImplementationId> {
+        let dependencies = self.dependencies(compilation);
         let mut selected = implementations.into_iter().collect::<BTreeSet<_>>();
         let mut pending = selected.iter().copied().collect::<Vec<_>>();
         while let Some(implementation) = pending.pop() {
             let parent = self
                 .implementation(implementation)
                 .and_then(|body| body.parent_target);
-            let exact = self
+            let exact = dependencies
                 .exact_member_targets
                 .get(&implementation)
                 .into_iter()
                 .flatten()
                 .copied();
-            let static_targets = self
+            let static_targets = dependencies
                 .static_selectors
                 .get(&implementation)
                 .into_iter()
@@ -1101,6 +1316,7 @@ impl ProcedureRegistry {
         compilation: &Compilation,
         implementations: impl IntoIterator<Item = ProcedureImplementationId>,
     ) -> (BTreeSet<ProcedureImplementationId>, ProcedureClosureStats) {
+        let dependencies = self.dependencies(compilation);
         let mut stats = ProcedureClosureStats::default();
         let mut selected: BTreeSet<_> = implementations.into_iter().collect();
         let mut pending: Vec<_> = selected.iter().copied().collect();
@@ -1115,7 +1331,7 @@ impl ProcedureRegistry {
                 pending.push(parent);
             }
 
-            for &target in self
+            for &target in dependencies
                 .exact_member_targets
                 .get(&implementation)
                 .into_iter()
@@ -1126,7 +1342,7 @@ impl ProcedureRegistry {
                 }
             }
 
-            for &target in self
+            for &target in dependencies
                 .typed_virtual_targets
                 .get(&implementation)
                 .into_iter()
@@ -1137,7 +1353,7 @@ impl ProcedureRegistry {
                 }
             }
 
-            for selector in self
+            for selector in dependencies
                 .dynamic_selectors
                 .get(&implementation)
                 .into_iter()
@@ -1158,7 +1374,7 @@ impl ProcedureRegistry {
                     }
                 }
             }
-            for selector in self
+            for selector in dependencies
                 .static_selectors
                 .get(&implementation)
                 .into_iter()
@@ -1320,6 +1536,7 @@ impl ProcedureRegistry {
         include_parent_targets: bool,
         eager_implementations: Option<&BTreeSet<ProcedureImplementationId>>,
     ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
+        let dependencies = self.dependencies(compilation);
         let selected: BTreeSet<_> = selected.into_iter().collect();
         let mut ordered = Vec::with_capacity(selected.len());
         let mut deferred_validation_errors =
@@ -1457,7 +1674,7 @@ impl ProcedureRegistry {
                 } else {
                     None
                 };
-                let selectors = self
+                let selectors = dependencies
                     .static_selectors
                     .get(&implementation.id)
                     .cloned()
@@ -1624,10 +1841,9 @@ impl ProcedureRegistry {
                 })
             })
             .collect::<Result<_, dm_vm::CompileError>>()?;
-        for (offset, definition) in builtin_syntax.definitions.iter().enumerate() {
-            let name = &builtin_names[offset];
+        for definition in &builtin_syntax.definitions {
             specs.push(dm_vm::ProcedureSpec {
-                path: format!("/proc/{}@dream64_builtin", name),
+                path: format!("{}@dream64_builtin", definition.path),
                 definition,
                 parent: None,
                 static_calls: BTreeMap::new(),
@@ -4987,6 +5203,7 @@ pub fn standard_instance_field_names(path: &str) -> &'static [&'static str] {
             "byond_version",
             "key",
             "eye",
+            "fps",
             "images",
             "inactivity",
             "mob",
@@ -6620,6 +6837,76 @@ GLOBAL_REAL(Master, /datum/controller/master)
     }
 
     #[test]
+    fn typesof_procedure_family_index_ignores_large_unrelated_registry() {
+        let mut source = String::from(concat!(
+            "/datum/target/proc/first()\n",
+            "/datum/target/proc/second()\n",
+            "/datum/target/proc/Initialize()\n",
+            "\tfor(var/path in typesof(/datum/target/proc))\n",
+            "\t\tcall(src, path)()\n",
+        ));
+        for index in 0..2_048 {
+            source.push_str(&format!(
+                "/datum/unrelated_{index}/proc/run()\n\treturn {index}\n"
+            ));
+        }
+        let compilation = TestProject::compile(&source);
+        let registry = ProcedureRegistry::build(&compilation);
+        let initialize = procedure_by_path(&registry, "/datum/target/proc/Initialize")
+            .effective_target
+            .unwrap();
+        let closure = registry.implementation_closure(&compilation, [initialize]);
+        for path in ["/datum/target/proc/first", "/datum/target/proc/second"] {
+            assert!(
+                closure.contains(&procedure_by_path(&registry, path).effective_target.unwrap()),
+                "indexed family omitted {path}",
+            );
+        }
+        assert!(
+            !closure.contains(
+                &procedure_by_path(&registry, "/datum/unrelated_2047/proc/run")
+                    .effective_target
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn lazy_registry_matches_eager_dependencies_and_defers_body_analysis() {
+        let compilation = TestProject::compile(concat!(
+            "/datum/base/proc/New()\n",
+            "/datum/base/proc/ping()\n\treturn 1\n",
+            "/datum/base/child/New()\n\t..()\n",
+            "/datum/base/child/ping()\n\treturn 2\n",
+            "/datum/runner/proc/run(datum/base/value)\n",
+            "\tfor(var/path in typesof(/datum/base/proc))\n",
+            "\t\tcall(value, path)()\n",
+            "\tvar/datum/base/child/item = new\n",
+            "\treturn item.ping()\n",
+        ));
+        let eager = ProcedureRegistry::build(&compilation);
+        let lazy = ProcedureRegistry::build_lazy(&compilation);
+        assert!(!lazy.dependencies_initialized());
+        assert_eq!(lazy.procedures(), eager.procedures());
+        let root = procedure_by_path(&eager, "/datum/runner/proc/run")
+            .effective_target
+            .unwrap();
+        assert_eq!(
+            lazy.implementation_closure_with_stats(&compilation, [root]),
+            eager.implementation_closure_with_stats(&compilation, [root]),
+        );
+        assert!(lazy.dependencies_initialized());
+        assert_eq!(lazy.build_stats(), eager.build_stats());
+        assert_eq!(
+            lazy.compile_vm_implementations_symbolic_dynamic(&compilation, [root])
+                .map(|executable| executable.stats().clone()),
+            eager
+                .compile_vm_implementations_symbolic_dynamic(&compilation, [root])
+                .map(|executable| executable.stats().clone()),
+        );
+    }
+
+    #[test]
     fn managed_global_macro_retains_underscore_named_initializer() {
         let compilation = TestProject::compile(concat!(
             "#define GLOBAL_MANAGED(X, InitValue) /datum/controller/global_vars/proc/InitGlobal##X(){ X = InitValue; }\n",
@@ -8029,16 +8316,43 @@ GLOBAL_REAL(Master, /datum/controller/master)
 
     #[test]
     fn headless_byond_membership_query_is_callable_and_false() {
-        let compilation =
-            TestProject::compile("/client/proc/check_member()\n\treturn IsByondMember()\n");
+        let compilation = TestProject::compile(
+            "/client/proc/check_member()\n\treturn IsByondMember() || src.IsByondMember()\n",
+        );
         let registry = ProcedureRegistry::build(&compilation);
         let procedure = procedure_by_path(&registry, "/client/proc/check_member");
-        registry
-            .compile_vm_implementations(
-                &compilation,
-                [procedure.effective_target.expect("procedure body")],
-            )
+        let target = procedure.effective_target.expect("procedure body");
+        let executable = registry
+            .compile_vm_implementations(&compilation, [target])
             .expect("the engine membership query should link in headless mode");
+        let entry = executable
+            .implementation(target)
+            .expect("check_member linked");
+        let mut state = ExecutionState::new();
+        state.set_type_parents(
+            [
+                (TypePath::parse("/datum").unwrap(), None),
+                (
+                    TypePath::parse("/client").unwrap(),
+                    Some(TypePath::parse("/datum").unwrap()),
+                ),
+            ]
+            .into(),
+        );
+        let client = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/client").unwrap());
+        assert_eq!(
+            execute_module_in_context(
+                executable.module(),
+                entry,
+                &[],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(client), Value::Null),
+            )
+            .expect("membership query should execute"),
+            Value::number(0.0),
+        );
     }
 
     #[test]

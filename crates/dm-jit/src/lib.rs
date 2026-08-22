@@ -11,6 +11,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 use smallvec::SmallVec;
+use std::ffi::c_void;
 /// One operation in a verified binary32 procedure.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NumericInstruction {
@@ -172,6 +173,226 @@ impl NumericExecutionState {
 pub enum NumericRunOutcome {
     Returned { value: f32, steps: u32 },
     BudgetExhausted { instruction: u32, steps: u32 },
+}
+
+/// One VM-owned rooted-value block dispatcher. Native code never interprets
+/// the values behind slot IDs and never retains a heap pointer across exit.
+pub type RootedBlockDispatcher = unsafe extern "C" fn(
+    context: *mut c_void,
+    roots: *mut u32,
+    root_count: u32,
+    stack: *mut u32,
+    stack_len: *mut u32,
+    stack_capacity: u32,
+    start_pc: u32,
+    budget: u32,
+) -> u64;
+
+/// Exact result of a rooted-value block. The dispatcher materializes roots and
+/// operand-stack slot IDs before returning every status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootedBlockOutcome {
+    Completed { instruction: u32, steps: u16 },
+    BudgetExhausted { instruction: u32, steps: u16 },
+    SideExit { instruction: u32, steps: u16 },
+    RuntimeError { instruction: u32, steps: u16 },
+}
+
+type RootedBlockEntry =
+    unsafe extern "C" fn(*mut c_void, *mut u32, u32, *mut u32, *mut u32, u32, u32, u32) -> u64;
+
+/// Cranelift entry stub for one VM-verified rooted-value basic block. The
+/// dispatcher processes the whole block in one call; this is deliberately not
+/// a per-op callback trampoline.
+pub struct CompiledRootedBlock {
+    module: JITModule,
+    entry: RootedBlockEntry,
+}
+
+type SafeRootedCallback<'a> =
+    dyn FnMut(&mut [u32], &mut [u32], &mut usize, u32, u32) -> RootedBlockOutcome + 'a;
+
+struct SafeRootedDispatch<'a> {
+    callback: &'a mut SafeRootedCallback<'a>,
+}
+
+impl CompiledRootedBlock {
+    /// Runs one native batch entry while keeping all raw-pointer handling in
+    /// this backend crate. The VM sees only rooted slot slices and a fixed
+    /// stack buffer plus its initialized length, so dispatch cannot reallocate
+    /// storage behind the native entry's pointer.
+    pub fn run_with<'a>(
+        &self,
+        roots: &mut [u32],
+        stack: &mut Vec<u32>,
+        start_pc: u32,
+        budget: u32,
+        dispatch: &'a mut (
+                    dyn FnMut(&mut [u32], &mut [u32], &mut usize, u32, u32) -> RootedBlockOutcome
+                        + 'a
+                ),
+    ) -> RootedBlockOutcome {
+        let mut context = SafeRootedDispatch { callback: dispatch };
+        // SAFETY: `safe_rooted_dispatch` interprets this context as the exact
+        // local `SafeDispatch` type and the call cannot outlive this frame.
+        unsafe {
+            self.run(
+                (&mut context as *mut SafeRootedDispatch<'_>).cast(),
+                roots,
+                stack,
+                start_pc,
+                budget,
+            )
+        }
+    }
+
+    /// Executes with externally rooted slots and a materialized operand stack.
+    ///
+    /// # Safety
+    /// `context` must satisfy the dispatcher contract supplied at compilation.
+    pub unsafe fn run(
+        &self,
+        context: *mut c_void,
+        roots: &mut [u32],
+        stack: &mut Vec<u32>,
+        start_pc: u32,
+        budget: u32,
+    ) -> RootedBlockOutcome {
+        let _keep_code_alive = &self.module;
+        let mut stack_len = u32::try_from(stack.len()).unwrap_or(u32::MAX);
+        let packed = unsafe {
+            (self.entry)(
+                context,
+                roots.as_mut_ptr(),
+                u32::try_from(roots.len()).unwrap_or(u32::MAX),
+                stack.as_mut_ptr(),
+                &mut stack_len,
+                u32::try_from(stack.capacity()).unwrap_or(u32::MAX),
+                start_pc,
+                budget,
+            )
+        };
+        let new_len = usize::try_from(stack_len).unwrap_or(stack.capacity());
+        assert!(
+            new_len <= stack.capacity(),
+            "rooted dispatcher exceeded stack capacity"
+        );
+        unsafe { stack.set_len(new_len) };
+        let instruction = packed as u32;
+        let steps = (packed >> 32) as u16;
+        match (packed >> 56) as u8 {
+            0 => RootedBlockOutcome::Completed { instruction, steps },
+            1 => RootedBlockOutcome::BudgetExhausted { instruction, steps },
+            2 => RootedBlockOutcome::SideExit { instruction, steps },
+            _ => RootedBlockOutcome::RuntimeError { instruction, steps },
+        }
+    }
+}
+
+unsafe extern "C" fn safe_rooted_dispatch(
+    context: *mut c_void,
+    roots: *mut u32,
+    root_count: u32,
+    stack: *mut u32,
+    stack_len: *mut u32,
+    stack_capacity: u32,
+    start_pc: u32,
+    budget: u32,
+) -> u64 {
+    let context = unsafe { &mut *context.cast::<SafeRootedDispatch<'_>>() };
+    let roots = unsafe { std::slice::from_raw_parts_mut(roots, root_count as usize) };
+    let len = unsafe { *stack_len } as usize;
+    let capacity = stack_capacity as usize;
+    if len > capacity {
+        return (3_u64 << 56) | start_pc as u64;
+    }
+    let materialized = unsafe { std::slice::from_raw_parts_mut(stack, capacity) };
+    let mut new_len = len;
+    let outcome = (context.callback)(roots, materialized, &mut new_len, start_pc, budget);
+    if new_len > capacity {
+        return (3_u64 << 56) | start_pc as u64;
+    }
+    unsafe {
+        *stack_len = new_len as u32;
+    }
+    let (status, instruction, steps) = match outcome {
+        RootedBlockOutcome::Completed { instruction, steps } => (0, instruction, steps),
+        RootedBlockOutcome::BudgetExhausted { instruction, steps } => (1, instruction, steps),
+        RootedBlockOutcome::SideExit { instruction, steps } => (2, instruction, steps),
+        RootedBlockOutcome::RuntimeError { instruction, steps } => (3, instruction, steps),
+    };
+    (status << 56) | (u64::from(steps) << 32) | u64::from(instruction)
+}
+
+/// Compiles a rooted block whose dispatcher is supplied safely at execution.
+pub fn compile_safe_rooted_block() -> Result<CompiledRootedBlock, CompileError> {
+    compile_rooted_block(safe_rooted_dispatch)
+}
+
+/// Compiles a single-call native block entry around a VM-owned batch dispatcher.
+/// The callback must materialize state on every return and charge before each
+/// logical operation.
+pub fn compile_rooted_block(
+    dispatcher: RootedBlockDispatcher,
+) -> Result<CompiledRootedBlock, CompileError> {
+    let mut builder = JITBuilder::new(cranelift_module::default_libcall_names())
+        .map_err(|error| CompileError::Backend(error.to_string()))?;
+    builder.symbol("dream64_rooted_block_dispatch", dispatcher as *const u8);
+    let mut module = JITModule::new(builder);
+    let mut dispatcher_signature = module.make_signature();
+    for ty in [
+        types::I64,
+        types::I64,
+        types::I32,
+        types::I64,
+        types::I64,
+        types::I32,
+        types::I32,
+        types::I32,
+    ] {
+        dispatcher_signature.params.push(AbiParam::new(ty));
+    }
+    dispatcher_signature.returns.push(AbiParam::new(types::I64));
+    let dispatcher_id = module
+        .declare_function(
+            "dream64_rooted_block_dispatch",
+            Linkage::Import,
+            &dispatcher_signature,
+        )
+        .map_err(|error| CompileError::Backend(error.to_string()))?;
+    let mut context = module.make_context();
+    context.func.signature = dispatcher_signature;
+    let function_id = module
+        .declare_function(
+            "dream64_rooted_block",
+            Linkage::Local,
+            &context.func.signature,
+        )
+        .map_err(|error| CompileError::Backend(error.to_string()))?;
+    let dispatcher_ref = module.declare_func_in_func(dispatcher_id, &mut context.func);
+    let mut frontend_context = FunctionBuilderContext::new();
+    {
+        let mut function = FunctionBuilder::new(&mut context.func, &mut frontend_context);
+        let block = function.create_block();
+        function.append_block_params_for_function_params(block);
+        function.switch_to_block(block);
+        let args = function.block_params(block).to_vec();
+        let call = function.ins().call(dispatcher_ref, &args);
+        let result = function.inst_results(call)[0];
+        function.ins().return_(&[result]);
+        function.seal_all_blocks();
+        function.finalize();
+    }
+    module
+        .define_function(function_id, &mut context)
+        .map_err(|error| CompileError::Backend(error.to_string()))?;
+    module.clear_context(&mut context);
+    module
+        .finalize_definitions()
+        .map_err(|error| CompileError::Backend(error.to_string()))?;
+    let entry = module.get_finalized_function(function_id);
+    let entry = unsafe { std::mem::transmute::<*const u8, RootedBlockEntry>(entry) };
+    Ok(CompiledRootedBlock { module, entry })
 }
 
 /// Executable native code for one verified numeric trace.
@@ -1052,5 +1273,105 @@ mod tests {
             "materialized-field calls={CALLS} native={native_elapsed:?} rust={rust_elapsed:?}"
         );
         assert_eq!(native.fields[0], rust_field);
+    }
+
+    #[repr(C)]
+    struct RootedFixture {
+        calls: u32,
+    }
+
+    unsafe extern "C" fn rooted_fixture_dispatch(
+        context: *mut std::ffi::c_void,
+        roots: *mut u32,
+        root_count: u32,
+        stack: *mut u32,
+        stack_len: *mut u32,
+        stack_capacity: u32,
+        start_pc: u32,
+        budget: u32,
+    ) -> u64 {
+        let fixture = unsafe { &mut *context.cast::<RootedFixture>() };
+        fixture.calls += 1;
+        if budget == 0 {
+            return (1_u64 << 56) | u64::from(start_pc);
+        }
+        if root_count == 0 || unsafe { *stack_len } >= stack_capacity {
+            return (2_u64 << 56) | (1_u64 << 32) | u64::from(start_pc + 1);
+        }
+        unsafe {
+            let len = *stack_len as usize;
+            *stack.add(len) = *roots;
+            *stack_len += 1;
+        }
+        (1_u64 << 32) | u64::from(start_pc + 1)
+    }
+
+    #[test]
+    fn rooted_block_materializes_stack_and_exact_budget_exit() {
+        let trace = super::compile_rooted_block(rooted_fixture_dispatch).unwrap();
+        let mut fixture = RootedFixture { calls: 0 };
+        let mut roots = [73_u32];
+        let mut stack = Vec::with_capacity(2);
+        assert_eq!(
+            unsafe {
+                trace.run(
+                    (&mut fixture as *mut RootedFixture).cast(),
+                    &mut roots,
+                    &mut stack,
+                    9,
+                    0,
+                )
+            },
+            super::RootedBlockOutcome::BudgetExhausted {
+                instruction: 9,
+                steps: 0
+            },
+        );
+        assert!(stack.is_empty());
+        assert_eq!(
+            unsafe {
+                trace.run(
+                    (&mut fixture as *mut RootedFixture).cast(),
+                    &mut roots,
+                    &mut stack,
+                    9,
+                    1,
+                )
+            },
+            super::RootedBlockOutcome::Completed {
+                instruction: 10,
+                steps: 1
+            },
+        );
+        assert_eq!(stack, [73]);
+        assert_eq!(fixture.calls, 2);
+    }
+
+    #[test]
+    #[ignore = "local release microbenchmark"]
+    fn rooted_block_batch_entry_microbenchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        const CALLS: usize = 500_000;
+        let trace = super::compile_rooted_block(rooted_fixture_dispatch).unwrap();
+        let mut fixture = RootedFixture { calls: 0 };
+        let mut roots = [1_u32];
+        let started = Instant::now();
+        for _ in 0..CALLS {
+            let mut stack = Vec::with_capacity(1);
+            black_box(unsafe {
+                trace.run(
+                    (&mut fixture as *mut RootedFixture).cast(),
+                    &mut roots,
+                    &mut stack,
+                    0,
+                    1,
+                )
+            });
+        }
+        eprintln!(
+            "rooted-block batch calls={CALLS} elapsed={:?}",
+            started.elapsed()
+        );
     }
 }

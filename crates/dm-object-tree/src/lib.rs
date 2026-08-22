@@ -44,6 +44,13 @@ pub struct DefinitionUnit<'syntax> {
 pub struct NodeId(u32);
 
 impl NodeId {
+    /// Reconstructs an identity from a validated node-table index.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_index(index: usize) -> Self {
+        Self(u32::try_from(index).expect("object-tree node index exceeds u32"))
+    }
+
     /// Returns the node-table index represented by this identity.
     #[must_use]
     pub const fn index(self) -> usize {

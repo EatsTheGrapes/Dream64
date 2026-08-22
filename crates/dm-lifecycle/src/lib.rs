@@ -10,6 +10,7 @@ pub mod ipc;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 
 use dm_compiler::Compilation;
 use dm_core::{FileId, SourceSpan};
@@ -633,6 +634,61 @@ pub struct SchedulerDrainLimits {
     pub max_rounds: usize,
 }
 
+/// Adaptive instruction budget for latency-sensitive persistent host slices.
+///
+/// The VM remains single-owner. This controller only changes how frequently
+/// execution returns to the host so sockets, timers, and completed immutable
+/// worker jobs can be serviced.
+#[derive(Clone, Debug)]
+pub struct HostSliceBudget {
+    current_steps: u64,
+    minimum_steps: u64,
+    maximum_steps: u64,
+    target: Duration,
+}
+
+impl HostSliceBudget {
+    /// Creates a bounded controller, clamping the initial budget into range.
+    #[must_use]
+    pub fn new(
+        initial_steps: u64,
+        minimum_steps: u64,
+        maximum_steps: u64,
+        target: Duration,
+    ) -> Self {
+        let minimum_steps = minimum_steps.max(1);
+        let maximum_steps = maximum_steps.max(minimum_steps);
+        Self {
+            current_steps: initial_steps.clamp(minimum_steps, maximum_steps),
+            minimum_steps,
+            maximum_steps,
+            target: target.max(Duration::from_micros(1)),
+        }
+    }
+
+    /// Instruction ceiling for the next persistent scheduler round.
+    #[must_use]
+    pub const fn steps(&self) -> u64 {
+        self.current_steps
+    }
+
+    /// Records VM wall time and adjusts the following instruction ceiling.
+    ///
+    /// An over-target slice halves immediately. Sustained slices below half
+    /// the target recover gradually, avoiding oscillation around the target.
+    pub fn observe(&mut self, elapsed: Duration) {
+        if elapsed > self.target {
+            self.current_steps = (self.current_steps / 2).max(self.minimum_steps);
+        } else if elapsed <= self.target / 2 {
+            let growth = (self.current_steps / 4).max(1);
+            self.current_steps = self
+                .current_steps
+                .saturating_add(growth)
+                .min(self.maximum_steps);
+        }
+    }
+}
+
 /// Explicit runtime state which proves a persistent server finished startup.
 ///
 /// The probe begins at a global and may follow datum fields before comparing
@@ -729,6 +785,16 @@ impl PrecompiledLifecycle {
         self.persistent_state.as_mut()
     }
 
+    /// Returns bounded suspended-DM telemetry for controlled host shutdown.
+    #[must_use]
+    pub fn bounded_scheduler_progress(&self) -> Vec<String> {
+        self.persistent_state
+            .as_ref()
+            .map_or_else(Vec::new, |state| {
+                state.bounded_scheduler_progress(self.executable.module())
+            })
+    }
+
     /// Installs a loopback guest in the persistent world and queues the
     /// project's effective `/client/New()` hook on the world scheduler.
     ///
@@ -742,6 +808,92 @@ impl PrecompiledLifecycle {
             .as_mut()
             .ok_or_else(|| "persistent world is not ready for clients".to_owned())?;
         state.connect_local_guest(self.executable.module())
+    }
+
+    /// Queues one command through the connected client's effective verb set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when startup is incomplete or command resolution fails.
+    pub fn queue_local_client_command(
+        &mut self,
+        client: DatumId,
+        command: &str,
+    ) -> Result<(), String> {
+        let state = self
+            .persistent_state
+            .as_mut()
+            .ok_or_else(|| "persistent world is not ready for clients".to_owned())?;
+        state.queue_local_client_command(self.executable.module(), client, command)
+    }
+
+    /// Queues one browser topic against the connected client's `Topic()`.
+    pub fn queue_local_browser_topic(
+        &mut self,
+        client: DatumId,
+        topic: &str,
+    ) -> Result<(), String> {
+        let state = self
+            .persistent_state
+            .as_mut()
+            .ok_or_else(|| "persistent world is not ready for clients".to_owned())?;
+        state.queue_local_browser_topic(self.executable.module(), client, topic)
+    }
+
+    /// Queues one pointer event for a session-owned screen object.
+    #[allow(clippy::too_many_arguments)]
+    pub fn queue_local_screen_pointer(
+        &mut self,
+        client: DatumId,
+        index: u32,
+        generation: u32,
+        event: dm_vm::LocalScreenPointerEvent,
+        location: &str,
+        params: &str,
+    ) -> Result<(), String> {
+        let state = self
+            .persistent_state
+            .as_mut()
+            .ok_or_else(|| "persistent world is not ready for clients".to_owned())?;
+        state.queue_local_screen_pointer(
+            self.executable.module(),
+            client,
+            index,
+            generation,
+            event,
+            location,
+            params,
+        )
+    }
+
+    /// Queues one click for an atom rendered in a session-visible map cell.
+    #[allow(clippy::too_many_arguments)]
+    pub fn queue_local_map_pointer(
+        &mut self,
+        client: DatumId,
+        index: u32,
+        generation: u32,
+        x: i32,
+        y: i32,
+        z: i32,
+        control: &str,
+        params: &str,
+    ) -> Result<(), String> {
+        let state = self
+            .persistent_state
+            .as_mut()
+            .ok_or_else(|| "persistent world is not ready for clients".to_owned())?;
+        state.queue_local_map_pointer(
+            self.executable.module(),
+            client,
+            index,
+            generation,
+            x,
+            y,
+            z,
+            control,
+            params,
+        )
     }
 }
 
@@ -777,14 +929,27 @@ pub fn precompile_lifecycle_for_world(
 /// the caller-supplied executable is moved directly into the boot state.
 #[must_use]
 pub fn precompile_lifecycle_for_world_with_executable(
-    compilation: &Compilation,
-    procedures: &ProcedureRegistry,
+    _compilation: &Compilation,
+    _procedures: &ProcedureRegistry,
     index: &LifecycleIndex,
     world: &WorldPlan,
     executable: dm_semantics::ExecutableProcedures,
 ) -> PrecompiledLifecycle {
     let targets = lifecycle_targets_for_world(index, world);
-    precompiled_lifecycle_from_executable(compilation, procedures, &targets, executable)
+    // An artifact-backed executable already contains the complete linked
+    // procedure inventory. Rebuilding the compiler's transitive dependency
+    // closure here cannot alter executable contents or runtime dispatch; it
+    // previously spent tens of seconds solely to populate diagnostic counters.
+    // Keep exact target cardinality and report the resident executable body
+    // count while leaving closure counters empty on this runtime-only path.
+    let reachable_bodies = executable.stats().procedures;
+    PrecompiledLifecycle {
+        executable,
+        persistent_state: None,
+        targets: targets.len(),
+        reachable_bodies,
+        closure: dm_semantics::ProcedureClosureStats::default(),
+    }
 }
 
 fn lifecycle_targets_for_world(
@@ -1321,6 +1486,7 @@ pub fn execute_initialization_plan_with_scheduler_policy(
         None,
         false,
         false,
+        None,
     )
 }
 
@@ -1355,6 +1521,7 @@ pub fn execute_initialization_plan_with_precompiled(
             Some(&mut precompiled.persistent_state),
             false,
             false,
+            None,
         )
     } else {
         execute_initialization_plan_with_executable(
@@ -1368,6 +1535,7 @@ pub fn execute_initialization_plan_with_precompiled(
             None,
             false,
             false,
+            None,
         )
     }
 }
@@ -1407,6 +1575,51 @@ pub fn execute_boot_initialization_plan_with_precompiled(
         readiness.map(|_| &mut precompiled.persistent_state),
         false,
         true,
+        None,
+    )
+}
+
+/// Executes production boot while servicing a local client endpoint during
+/// the startup scheduler drain. This allows clients to attach after
+/// `world/New()` has returned while Master continues bringing subsystems to
+/// authoritative readiness.
+///
+/// # Errors
+///
+/// Returns the same failures as [`execute_boot_initialization_plan_with_precompiled`].
+#[allow(clippy::too_many_arguments)]
+pub fn execute_boot_initialization_plan_with_precompiled_and_startup_service(
+    index: &LifecycleIndex,
+    plan: &InitializationPlan,
+    allocation: &WorldAllocation,
+    runtime: &mut RuntimeImage,
+    scheduler_limits: SchedulerDrainLimits,
+    readiness: Option<&HeadlessReadinessProbe>,
+    precompiled: &mut PrecompiledLifecycle,
+    startup_service: &mut dyn FnMut(
+        &dm_semantics::ExecutableProcedures,
+        &mut dm_vm::ExecutionState,
+    ),
+) -> Result<InitializationExecution, InitializationExecutionError> {
+    eprintln!(
+        "boot-progress: using precompiled lifecycle targets={} bodies={} procedures={} deferred={}",
+        precompiled.targets,
+        precompiled.reachable_bodies,
+        precompiled.module_procedures(),
+        precompiled.deferred_procedures(),
+    );
+    execute_initialization_plan_with_executable(
+        index,
+        plan,
+        allocation,
+        runtime,
+        scheduler_limits,
+        readiness,
+        &mut precompiled.executable,
+        readiness.map(|_| &mut precompiled.persistent_state),
+        false,
+        true,
+        Some(startup_service),
     )
 }
 
@@ -1443,6 +1656,7 @@ pub fn audit_initialization_plan_with_precompiled(
         None,
         true,
         false,
+        None,
     )
 }
 
@@ -1458,6 +1672,9 @@ fn execute_initialization_plan_with_executable(
     persistent_state: Option<&mut Option<dm_vm::ExecutionState>>,
     collect_runtime_errors: bool,
     release_runtime_metadata: bool,
+    startup_service: Option<
+        &mut dyn FnMut(&dm_semantics::ExecutableProcedures, &mut dm_vm::ExecutionState),
+    >,
 ) -> Result<InitializationExecution, InitializationExecutionError> {
     eprintln!("boot-progress: selecting lifecycle targets");
     let bindings = map_datum_bindings(plan, allocation, runtime);
@@ -1669,8 +1886,13 @@ fn execute_initialization_plan_with_executable(
             let released = state.release_host_value_roots();
             eprintln!("boot-progress: released consumed host result roots={released}");
         }
-        result.scheduler =
-            drain_startup_scheduler(executable.module(), &mut state, scheduler_limits, readiness)?;
+        result.scheduler = drain_startup_scheduler(
+            executable,
+            &mut state,
+            scheduler_limits,
+            readiness,
+            startup_service,
+        )?;
         Ok(result)
     })();
     if execution.is_ok()
@@ -1684,10 +1906,13 @@ fn execute_initialization_plan_with_executable(
 }
 
 fn drain_startup_scheduler(
-    module: &dm_vm::Module,
+    executable: &dm_semantics::ExecutableProcedures,
     state: &mut dm_vm::ExecutionState,
     limits: SchedulerDrainLimits,
     readiness: Option<&HeadlessReadinessProbe>,
+    mut startup_service: Option<
+        &mut dyn FnMut(&dm_semantics::ExecutableProcedures, &mut dm_vm::ExecutionState),
+    >,
 ) -> Result<SchedulerDrain, InitializationExecutionError> {
     let start_tick = state.scheduler_tick();
     let tick_limit = start_tick.saturating_add(limits.max_ticks);
@@ -1695,7 +1920,13 @@ fn drain_startup_scheduler(
         final_tick: start_tick,
         ..SchedulerDrain::default()
     };
-    while state.scheduled_task_count() != 0 {
+    loop {
+        if let Some(service) = startup_service.as_deref_mut() {
+            service(executable, state);
+        }
+        if state.scheduled_task_count() == 0 {
+            break;
+        }
         if readiness.is_some_and(|probe| readiness_probe_matches(state, probe)) {
             drain.termination = SchedulerDrainTermination::HeadlessReady;
             break;
@@ -1712,7 +1943,12 @@ fn drain_startup_scheduler(
             break;
         }
         let advance = next_tick.saturating_sub(state.scheduler_tick());
-        match advance_scheduler(module, advance, ExecutionLimits::default(), state) {
+        match advance_scheduler(
+            executable.module(),
+            advance,
+            ExecutionLimits::default(),
+            state,
+        ) {
             Ok(completed) => {
                 drain.rounds += 1;
                 drain.completed_tasks += completed.len();
@@ -1756,6 +1992,11 @@ fn drain_startup_scheduler(
         drain.completed_tasks,
         drain.pending_tasks
     );
+    if drain.termination == SchedulerDrainTermination::RoundLimit {
+        for line in state.bounded_scheduler_progress(executable.module()) {
+            eprintln!("boot-progress: bounded-dm-frame {line}");
+        }
+    }
     Ok(drain)
 }
 
@@ -1779,7 +2020,38 @@ pub fn advance_persistent_scheduler(
         .persistent_state
         .take()
         .expect("persistent scheduler requires completed precompiled lifecycle execution");
-    let result = drain_persistent_scheduler(precompiled.executable.module(), &mut state, limits);
+    let result = drain_persistent_scheduler(
+        precompiled.executable.module(),
+        &mut state,
+        limits,
+        ExecutionLimits::default(),
+    );
+    precompiled.persistent_state = Some(state);
+    Ok(result)
+}
+
+/// Advances persistent work with an instruction-bounded cooperative dispatch.
+/// Budget exhaustion retains the scheduled continuation at the same tick, so
+/// the host can service transport queues before resuming exact VM state.
+pub fn advance_persistent_scheduler_responsive(
+    precompiled: &mut PrecompiledLifecycle,
+    _runtime: &mut RuntimeImage,
+    limits: SchedulerDrainLimits,
+    max_steps_per_round: u64,
+) -> Result<SchedulerDrain, InitializationExecutionError> {
+    let mut state = precompiled
+        .persistent_state
+        .take()
+        .expect("persistent scheduler requires completed precompiled lifecycle execution");
+    let result = drain_persistent_scheduler(
+        precompiled.executable.module(),
+        &mut state,
+        limits,
+        ExecutionLimits {
+            max_steps: max_steps_per_round.max(1),
+            ..ExecutionLimits::default()
+        },
+    );
     precompiled.persistent_state = Some(state);
     Ok(result)
 }
@@ -1788,6 +2060,7 @@ fn drain_persistent_scheduler(
     module: &dm_vm::Module,
     state: &mut dm_vm::ExecutionState,
     limits: SchedulerDrainLimits,
+    execution_limits: ExecutionLimits,
 ) -> SchedulerDrain {
     let start_tick = state.scheduler_tick();
     let tick_limit = start_tick.saturating_add(limits.max_ticks);
@@ -1810,7 +2083,7 @@ fn drain_persistent_scheduler(
         }
         let advance = next_tick.saturating_sub(state.scheduler_tick());
         drain.rounds = drain.rounds.saturating_add(1);
-        match advance_scheduler(module, advance, ExecutionLimits::default(), state) {
+        match advance_scheduler(module, advance, execution_limits, state) {
             Ok(completed) => {
                 drain.completed_tasks = drain.completed_tasks.saturating_add(completed.len());
                 drop(completed);
@@ -1842,7 +2115,7 @@ fn drain_persistent_scheduler(
         let completed = advance_scheduler(
             module,
             tick_limit.saturating_sub(state.scheduler_tick()),
-            ExecutionLimits::default(),
+            execution_limits,
             state,
         )
         .expect("no scheduled task is due before the validated persistent tick boundary");
@@ -2506,21 +2779,25 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     use dm_compiler::{Compilation, CompilerDatabase};
     use dm_map::parse;
     use dm_runtime::RuntimeImage;
-    use dm_semantics::ProcedureRegistry;
+    use dm_semantics::{ExecutableProcedures, ProcedureRegistry};
     use dm_value::{FieldName, TypePath, Value};
-    use dm_vm::{ExecutionContext, execute_module_in_context, execute_module_in_state};
+    use dm_vm::{
+        ExecutionContext, ExecutionState, execute_module_in_context, execute_module_in_state,
+    };
     use dm_world::{WorldCoordinate, allocate_world, build_plan};
 
     use super::{
-        EventSubject, HeadlessReadinessProbe, InitializationEvent, InitializationExecutionError,
-        LifecycleIndex, LifecycleKind, LifecycleResolution, SchedulerDrainLimits,
-        SchedulerDrainTermination, advance_persistent_scheduler,
+        EventSubject, HeadlessReadinessProbe, HostSliceBudget, InitializationEvent,
+        InitializationExecutionError, LifecycleIndex, LifecycleKind, LifecycleResolution,
+        SchedulerDrainLimits, SchedulerDrainTermination, advance_persistent_scheduler,
         audit_initialization_plan_with_precompiled, build_initialization_plan, construct_datum,
-        delete_datum, execute_initialization_plan, execute_initialization_plan_with_precompiled,
+        delete_datum, execute_boot_initialization_plan_with_precompiled_and_startup_service,
+        execute_initialization_plan, execute_initialization_plan_with_precompiled,
         precompile_lifecycle_for_world, sweep_lifecycle_compatibility,
     };
 
@@ -2550,6 +2827,56 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).expect("fixture should be removed");
         }
+    }
+
+    #[test]
+    fn cached_lobby_lifecycle_index_does_not_force_procedure_dependencies() {
+        let (_fixture, compilation) = Fixture::compile(concat!(
+            "/world/New()\n\treturn ..()\n",
+            "/client/New()\n\treturn ..()\n",
+            "/datum/example/proc/run()\n\treturn 1\n",
+        ));
+        let procedures = ProcedureRegistry::build_lazy(&compilation);
+        assert!(!procedures.dependencies_initialized());
+        let index = LifecycleIndex::build_compile_only(&compilation, &procedures);
+        assert!(index.find_path("/world").is_some());
+        assert!(!procedures.dependencies_initialized());
+    }
+
+    #[test]
+    fn artifact_backed_precompile_does_not_rebuild_procedure_dependencies() {
+        let (_fixture, compilation) = Fixture::compile(concat!(
+            "/world/New()\n\treturn ..()\n",
+            "/area/test\n/turf/test\n/obj/test\n\tNew()\n\t\treturn ..()\n",
+        ));
+        let eager = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/obj/test, /turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .expect("map should parse");
+        let world = build_plan(&map, &compilation);
+        let eager_index = LifecycleIndex::build_compile_only(&compilation, &eager);
+        let roots = crate::lifecycle_targets_for_world(&eager_index, &world);
+        let executable = eager
+            .compile_vm_all_symbolic_with_eager_roots(&compilation, roots.iter().copied())
+            .expect("fixture executable should link");
+
+        let lazy = ProcedureRegistry::build_lazy(&compilation);
+        let lazy_index = LifecycleIndex::build_compile_only(&compilation, &lazy);
+        assert!(!lazy.dependencies_initialized());
+        let precompiled = crate::precompile_lifecycle_for_world_with_executable(
+            &compilation,
+            &lazy,
+            &lazy_index,
+            &world,
+            executable,
+        );
+        assert!(!lazy.dependencies_initialized());
+        assert_eq!(
+            precompiled.reachable_bodies(),
+            precompiled.module_procedures()
+        );
     }
 
     fn index(source: &str) -> (Fixture, Compilation, RuntimeImage, LifecycleIndex) {
@@ -3346,6 +3673,74 @@ mod tests {
     }
 
     #[test]
+    fn startup_service_attaches_client_before_readiness_and_preserves_session() {
+        let source = concat!(
+            "var/global/ready = 0\nvar/global/client_started = 0\n",
+            "/world/New()\n\tset waitfor = FALSE\n\tsleep(2)\n\tglobal.ready = 1\n",
+            "/client/New()\n\tglobal.client_started = 1\n",
+            "/area/test\n/turf/test\n",
+        );
+        let (_fixture, compilation) = Fixture::compile(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .unwrap();
+        let world = build_plan(&map, &compilation);
+        let compile_index = LifecycleIndex::build_compile_only(&compilation, &procedures);
+        let mut precompiled =
+            precompile_lifecycle_for_world(&compilation, &procedures, &compile_index, &world)
+                .unwrap();
+        let mut runtime = RuntimeImage::from_compilation(&compilation).unwrap();
+        let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
+        let plan = build_initialization_plan(&runtime, &index, &world, "test.dmm");
+        let allocation = allocate_world(&world, &mut runtime).unwrap();
+        let readiness = HeadlessReadinessProbe {
+            qualified_storage: None,
+            global: FieldName::parse("ready").unwrap(),
+            fields: vec![],
+            expected: Value::number(1.0),
+        };
+        let mut attached = None;
+        let mut service = |executable: &ExecutableProcedures, state: &mut ExecutionState| {
+            if attached.is_none() {
+                attached = Some(state.connect_local_guest(executable.module()).unwrap());
+            }
+        };
+        let execution = execute_boot_initialization_plan_with_precompiled_and_startup_service(
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+            SchedulerDrainLimits {
+                max_ticks: 10,
+                max_rounds: 20,
+            },
+            Some(&readiness),
+            &mut precompiled,
+            &mut service,
+        )
+        .unwrap();
+        drop(service);
+
+        assert_eq!(
+            execution.scheduler.termination,
+            SchedulerDrainTermination::HeadlessReady
+        );
+        let attached = attached.expect("startup service attached a client");
+        let state = precompiled
+            .persistent_state
+            .as_ref()
+            .expect("ready boot preserves persistent state");
+        assert_eq!(
+            state.global(&FieldName::parse("client_started").unwrap()),
+            Some(&Value::number(1.0))
+        );
+        assert!(state.local_client_state(attached.client).is_ok());
+    }
+
+    #[test]
     fn persistent_idle_slices_keep_the_server_clock_advancing() {
         let source = concat!(
             "var/global/ready = 0\n",
@@ -3994,5 +4389,34 @@ mod tests {
             error,
             InitializationExecutionError::AuditFailures { failures: 2 }
         ));
+    }
+
+    #[test]
+    fn host_slice_budget_reacts_quickly_and_recovers_gradually() {
+        let mut budget = HostSliceBudget::new(100_000, 1_000, 100_000, Duration::from_millis(10));
+
+        budget.observe(Duration::from_millis(11));
+        assert_eq!(budget.steps(), 50_000);
+        budget.observe(Duration::from_millis(20));
+        assert_eq!(budget.steps(), 25_000);
+
+        budget.observe(Duration::from_millis(5));
+        assert_eq!(budget.steps(), 31_250);
+        budget.observe(Duration::from_millis(8));
+        assert_eq!(budget.steps(), 31_250);
+    }
+
+    #[test]
+    fn host_slice_budget_never_leaves_configured_bounds() {
+        let mut budget = HostSliceBudget::new(999_999, 1_000, 100_000, Duration::from_millis(10));
+        assert_eq!(budget.steps(), 100_000);
+        for _ in 0..16 {
+            budget.observe(Duration::from_secs(1));
+        }
+        assert_eq!(budget.steps(), 1_000);
+        for _ in 0..32 {
+            budget.observe(Duration::ZERO);
+        }
+        assert_eq!(budget.steps(), 100_000);
     }
 }

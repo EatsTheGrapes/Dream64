@@ -4,10 +4,14 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// One server-owned appearance ready for client composition.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Appearance {
+    /// Root atom represented by this flattened appearance tree.
+    pub datum_index: u32,
+    pub datum_generation: u32,
     pub resource: PathBuf,
     pub state: String,
     pub direction: u8,
@@ -18,6 +22,11 @@ pub(crate) struct Appearance {
     pub pixel_y: i32,
     pub color: [u8; 3],
     pub alpha: u8,
+    pub maptext: Option<String>,
+    pub maptext_width: i32,
+    pub maptext_height: i32,
+    pub maptext_x: i32,
+    pub maptext_y: i32,
 }
 
 /// Decoded RGBA sprite sheet and DMI state layout.
@@ -36,28 +45,96 @@ struct DmiState {
     dirs: u32,
     frames: u32,
     first_cell: u32,
+    delays: Vec<f32>,
+    loop_count: u32,
+    rewind: bool,
 }
 
 /// Resource cache shared by every rendered map frame.
-#[derive(Default)]
 pub(crate) struct SpriteCache {
     sheets: HashMap<PathBuf, Result<DmiSheet, String>>,
+    animation_epoch: Instant,
+    has_animations: bool,
+}
+
+impl Default for SpriteCache {
+    fn default() -> Self {
+        Self {
+            sheets: HashMap::new(),
+            animation_epoch: Instant::now(),
+            has_animations: false,
+        }
+    }
 }
 
 impl SpriteCache {
     pub(crate) fn insert(&mut self, path: PathBuf, bytes: &[u8]) {
-        self.sheets
-            .entry(path)
-            .or_insert_with(|| DmiSheet::decode(bytes));
+        let decoded = DmiSheet::decode(bytes);
+        self.has_animations |= decoded.as_ref().is_ok_and(DmiSheet::has_animations);
+        // Server-delivered bytes are authoritative. A startup replay can ask
+        // us to draw a relative resource before the live transport attaches,
+        // which caches a file-not-found result. Replace that stale failure
+        // when the live snapshot subsequently supplies the actual DMI.
+        self.sheets.insert(path, decoded);
     }
 
     pub(crate) fn load(&mut self, path: &Path) -> Result<&DmiSheet, String> {
-        let entry = self
-            .sheets
-            .entry(path.to_owned())
-            .or_insert_with(|| DmiSheet::load(path));
+        let entry = self.sheets.entry(path.to_owned()).or_insert_with(|| {
+            let decoded = DmiSheet::load(path);
+            self.has_animations |= decoded.as_ref().is_ok_and(DmiSheet::has_animations);
+            decoded
+        });
         entry.as_ref().map_err(Clone::clone)
     }
+
+    pub(crate) const fn has_animations(&self) -> bool {
+        self.has_animations
+    }
+
+    fn animation_elapsed(&self) -> f32 {
+        self.animation_epoch.elapsed().as_secs_f32()
+    }
+}
+
+/// Returns whether one appearance contributes a visible pixel at tile-local
+/// framebuffer coordinates. This mirrors `composite_tile`'s DMI selection,
+/// offsets, tint alpha, and top-down Y convention without allocating a tile.
+pub(crate) fn appearance_hit(
+    cache: &mut SpriteCache,
+    appearance: &Appearance,
+    x: u32,
+    y: u32,
+) -> Result<bool, String> {
+    if appearance.resource.as_os_str().is_empty() {
+        return Ok(false);
+    }
+    let elapsed = cache.animation_elapsed();
+    let sheet = cache.load(&appearance.resource)?;
+    let Some((source_x, source_y)) = sheet.cell(
+        &appearance.state,
+        appearance.direction,
+        appearance.frame,
+        elapsed,
+    ) else {
+        return Ok(false);
+    };
+    let source_x_in_cell = i64::from(x) - i64::from(appearance.pixel_x);
+    let source_y_in_cell = i64::from(y) + i64::from(appearance.pixel_y);
+    if source_x_in_cell < 0
+        || source_y_in_cell < 0
+        || source_x_in_cell >= i64::from(sheet.width)
+        || source_y_in_cell >= i64::from(sheet.height)
+    {
+        return Ok(false);
+    }
+    let source_index = usize::try_from(
+        ((source_y + u32::try_from(source_y_in_cell).unwrap()) * sheet.image_width
+            + source_x
+            + u32::try_from(source_x_in_cell).unwrap())
+            * 4,
+    )
+    .map_err(|_| "DMI pixel offset overflow")?;
+    Ok(sheet.rgba[source_index + 3] != 0 && appearance.alpha != 0)
 }
 
 impl DmiSheet {
@@ -107,20 +184,62 @@ impl DmiSheet {
         })
     }
 
-    fn cell(&self, state: &str, direction: u8, frame: u32) -> Option<(u32, u32)> {
+    fn has_animations(&self) -> bool {
+        self.states.iter().any(|state| state.frames > 1)
+    }
+
+    fn cell(&self, state: &str, direction: u8, frame: u32, elapsed: f32) -> Option<(u32, u32)> {
         let state = self
             .states
             .iter()
             .find(|candidate| candidate.name == state)
             .or_else(|| self.states.first())?;
         let dir = direction_index(direction, state.dirs);
-        let frame = frame.saturating_sub(1).min(state.frames.saturating_sub(1));
+        let frame = if state.frames > 1 {
+            state.frame_at(elapsed)
+        } else {
+            frame.saturating_sub(1).min(state.frames.saturating_sub(1))
+        };
         let cell = state.first_cell + frame * state.dirs + dir;
         let columns = self.image_width / self.width;
         (columns > 0).then_some((
             (cell % columns) * self.width,
             (cell / columns) * self.height,
         ))
+    }
+}
+
+impl DmiState {
+    fn frame_at(&self, elapsed: f32) -> u32 {
+        let mut sequence = (0..self.frames).collect::<Vec<_>>();
+        if self.rewind && self.frames > 2 {
+            sequence.extend((1..self.frames - 1).rev());
+        }
+        let duration = |frame: u32| {
+            self.delays
+                .get(frame as usize)
+                .copied()
+                .unwrap_or(1.0)
+                .max(0.1)
+                * 0.1
+        };
+        let cycle = sequence.iter().map(|frame| duration(*frame)).sum::<f32>();
+        if cycle <= 0.0 {
+            return 0;
+        }
+        let cycles_elapsed = (elapsed / cycle).floor() as u32;
+        if self.loop_count > 0 && cycles_elapsed >= self.loop_count {
+            return *sequence.last().unwrap_or(&0);
+        }
+        let mut within = elapsed % cycle;
+        for frame in sequence {
+            let delay = duration(frame);
+            if within < delay {
+                return frame;
+            }
+            within -= delay;
+        }
+        0
     }
 }
 
@@ -144,10 +263,17 @@ pub(crate) fn composite_tile(
             .map_err(|_| "tile dimensions overflow")?
     ];
     for (_, appearance) in ordered {
+        if appearance.resource.as_os_str().is_empty() {
+            continue;
+        }
+        let elapsed = cache.animation_elapsed();
         let sheet = cache.load(&appearance.resource)?;
-        let Some((source_x, source_y)) =
-            sheet.cell(&appearance.state, appearance.direction, appearance.frame)
-        else {
+        let Some((source_x, source_y)) = sheet.cell(
+            &appearance.state,
+            appearance.direction,
+            appearance.frame,
+            elapsed,
+        ) else {
             continue;
         };
         for sy in 0..sheet.height {
@@ -177,6 +303,51 @@ pub(crate) fn composite_tile(
         }
     }
     Ok(output)
+}
+
+/// Composites a screen appearance group at its native DMI cell extent.
+pub(crate) fn composite_native(
+    cache: &mut SpriteCache,
+    appearances: &[Appearance],
+) -> Result<(u32, u32, Vec<u32>), String> {
+    let mut width = 1_u32;
+    let mut height = 1_u32;
+    for appearance in appearances {
+        if appearance.resource.as_os_str().is_empty() {
+            continue;
+        }
+        let sheet = cache.load(&appearance.resource)?;
+        width = width.max(
+            sheet
+                .width
+                .saturating_add(appearance.pixel_x.unsigned_abs()),
+        );
+        height = height.max(
+            sheet
+                .height
+                .saturating_add(appearance.pixel_y.unsigned_abs()),
+        );
+    }
+    composite_tile(cache, appearances, width, height).map(|pixels| (width, height, pixels))
+}
+
+/// Renders one world appearance at its native DMI cell extent. Pixel offsets
+/// are intentionally not applied here: world rendering uses them to position
+/// the native-sized image relative to its owning turf, allowing it to extend
+/// across neighboring turfs instead of clipping it to one tile.
+pub(crate) fn rasterize_world_appearance(
+    cache: &mut SpriteCache,
+    appearance: &Appearance,
+) -> Result<(u32, u32, Vec<u32>), String> {
+    if appearance.resource.as_os_str().is_empty() {
+        return Ok((0, 0, Vec::new()));
+    }
+    let sheet = cache.load(&appearance.resource)?;
+    let (width, height) = (sheet.width, sheet.height);
+    let mut local = appearance.clone();
+    local.pixel_x = 0;
+    local.pixel_y = 0;
+    composite_tile(cache, &[local], width, height).map(|pixels| (width, height, pixels))
 }
 
 fn blend_argb(destination: u32, source: [u32; 3], alpha: u32) -> u32 {
@@ -254,12 +425,15 @@ fn parse_description(
                 dirs: 1,
                 frames: 1,
                 first_cell: 0,
+                delays: Vec::new(),
+                loop_count: 0,
+                rewind: false,
             }],
         ));
     };
     let mut width = image_width;
     let mut height = image_height;
-    let mut raw = Vec::<(String, u32, u32)>::new();
+    let mut raw = Vec::<(String, u32, u32, Vec<f32>, u32, bool)>::new();
     for line in description.lines().map(str::trim) {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -267,7 +441,14 @@ fn parse_description(
         match key.trim() {
             "width" => width = value.trim().parse().map_err(|_| "invalid DMI width")?,
             "height" => height = value.trim().parse().map_err(|_| "invalid DMI height")?,
-            "state" => raw.push((value.trim().trim_matches('"').to_owned(), 1, 1)),
+            "state" => raw.push((
+                value.trim().trim_matches('"').to_owned(),
+                1,
+                1,
+                Vec::new(),
+                0,
+                false,
+            )),
             "dirs" => {
                 if let Some(state) = raw.last_mut() {
                     state.1 = value.trim().parse().map_err(|_| "invalid DMI dirs")?;
@@ -278,21 +459,43 @@ fn parse_description(
                     state.2 = value.trim().parse().map_err(|_| "invalid DMI frames")?;
                 }
             }
+            "delay" => {
+                if let Some(state) = raw.last_mut() {
+                    state.3 = value
+                        .split(',')
+                        .map(str::trim)
+                        .map(|delay| delay.parse().map_err(|_| "invalid DMI delay"))
+                        .collect::<Result<Vec<_>, _>>()?;
+                }
+            }
+            "loop" => {
+                if let Some(state) = raw.last_mut() {
+                    state.4 = value.trim().parse().map_err(|_| "invalid DMI loop")?;
+                }
+            }
+            "rewind" => {
+                if let Some(state) = raw.last_mut() {
+                    state.5 = value.trim() != "0";
+                }
+            }
             _ => {}
         }
     }
     if raw.is_empty() {
-        raw.push((String::new(), 1, 1));
+        raw.push((String::new(), 1, 1, Vec::new(), 0, false));
     }
     let mut first = 0;
     let states = raw
         .into_iter()
-        .map(|(name, dirs, frames)| {
+        .map(|(name, dirs, frames, delays, loop_count, rewind)| {
             let state = DmiState {
                 name,
                 dirs: dirs.max(1),
                 frames: frames.max(1),
                 first_cell: first,
+                delays,
+                loop_count,
+                rewind,
             };
             first += state.dirs * state.frames;
             state
@@ -317,9 +520,59 @@ mod tests {
             .unwrap();
     }
 
+    fn fixture_png_sized(path: &Path, width: u32, height: u32, rgba: [u8; 4]) {
+        let file = fs::File::create(path).unwrap();
+        let mut encoder = png::Encoder::new(file, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..width * height {
+            pixels.extend_from_slice(&rgba);
+        }
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&pixels)
+            .unwrap();
+    }
+
+    #[test]
+    fn world_raster_preserves_dmi_dimensions_larger_than_a_tile() {
+        let root =
+            std::env::temp_dir().join(format!("dream64-large-world-sprite-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.dmi");
+        fixture_png_sized(&path, 64, 48, [12, 34, 56, 255]);
+        let appearance = Appearance {
+            datum_index: 1,
+            datum_generation: 0,
+            resource: path,
+            state: String::new(),
+            direction: 2,
+            frame: 1,
+            plane: 0.0,
+            layer: 0.0,
+            pixel_x: 17,
+            pixel_y: -9,
+            color: [255; 3],
+            alpha: 255,
+            maptext: None,
+            maptext_width: 0,
+            maptext_height: 0,
+            maptext_x: 0,
+            maptext_y: 0,
+        };
+        let (width, height, pixels) =
+            rasterize_world_appearance(&mut SpriteCache::default(), &appearance).unwrap();
+        assert_eq!((width, height), (64, 48));
+        assert_eq!(pixels.len(), 64 * 48);
+        assert!(pixels.iter().all(|pixel| *pixel == 0xff0c_2238));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn dmi_description_tracks_state_cell_offsets_dirs_and_frames() {
-        let description = "# BEGIN DMI\nversion = 4.0\nwidth = 32\nheight = 32\nstate = \"idle\"\ndirs = 4\nframes = 2\nstate = \"walk\"\ndirs = 1\nframes = 3\n# END DMI\n";
+        let description = "# BEGIN DMI\nversion = 4.0\nwidth = 32\nheight = 32\nstate = \"idle\"\ndirs = 4\nframes = 2\ndelay = 1,2\nloop = 3\nstate = \"walk\"\ndirs = 1\nframes = 3\nrewind = 1\n# END DMI\n";
         let (width, height, states) = parse_description(Some(description), 256, 32).unwrap();
         assert_eq!((width, height), (32, 32));
         assert_eq!(
@@ -330,6 +583,37 @@ mod tests {
             (states[1].first_cell, states[1].dirs, states[1].frames),
             (8, 1, 3)
         );
+        assert_eq!(states[0].delays, [1.0, 2.0]);
+        assert_eq!(states[0].loop_count, 3);
+        assert!(states[1].rewind);
+        assert_eq!(states[0].frame_at(0.05), 0);
+        assert_eq!(states[0].frame_at(0.15), 1);
+        assert_eq!(
+            states[1].frame_at(0.35),
+            1,
+            "rewind returns through frame 2"
+        );
+    }
+
+    #[test]
+    fn authoritative_insert_replaces_cached_relative_path_failure() {
+        let root =
+            std::env::temp_dir().join(format!("dream64-sprite-recovery-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let fixture = root.join("fixture.dmi");
+        let missing = root.join("icons/hud/lobby/join.dmi");
+        fixture_png(&fixture, [31, 127, 255, 255]);
+        let bytes = fs::read(&fixture).unwrap();
+
+        let mut cache = SpriteCache::default();
+        assert!(cache.load(&missing).is_err());
+        cache.insert(missing.clone(), &bytes);
+        let recovered = cache
+            .load(&missing)
+            .expect("live server bytes replace the replay-time filesystem failure");
+        assert_eq!((recovered.width, recovered.height), (1, 1));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -341,6 +625,8 @@ mod tests {
         fixture_png(&red, [255, 0, 0, 255]);
         fixture_png(&white, [255, 255, 255, 255]);
         let appearance = |resource: PathBuf, plane, layer, pixel_x, color, alpha| Appearance {
+            datum_index: 1,
+            datum_generation: 0,
             resource,
             state: String::new(),
             direction: 2,
@@ -351,6 +637,11 @@ mod tests {
             pixel_y: 0,
             color,
             alpha,
+            maptext: None,
+            maptext_width: 0,
+            maptext_height: 0,
+            maptext_x: 0,
+            maptext_y: 0,
         };
         let appearances = vec![
             appearance(red, 0.0, 0.0, 0, [255; 3], 255),

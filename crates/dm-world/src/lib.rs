@@ -14,11 +14,13 @@ use dm_map::{Map, MapVariableAssignment};
 use dm_object_tree::{CodeTree, NodeId, NodeKind};
 
 mod allocation;
+mod cache;
 
 pub use allocation::{
     CoordinateDatumSnapshot, WorldAllocation, WorldAllocationError, WorldAllocationStats,
     WorldAllocationWorkItem, WorldAllocationWorkKind, allocate_world, materialize_world_map_state,
 };
+pub use cache::{MapPlanCacheError, MapPlanCacheStats, load_or_build_cached_plan};
 
 /// One stable integer world coordinate.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

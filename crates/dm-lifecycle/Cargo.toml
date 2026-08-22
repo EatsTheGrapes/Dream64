@@ -11,6 +11,7 @@ crc32fast = "1.5"
 dm-compiler = { path = "../dm-compiler" }
 dm-core = { path = "../dm-core" }
 dm-map = { path = "../dm-map" }
+dm-mmap = { path = "../dm-mmap" }
 dm-object-tree = { path = "../dm-object-tree" }
 dm-project = { path = "../dm-project" }
 dm-runtime = { path = "../dm-runtime" }
@@ -20,6 +21,9 @@ dm-vm = { path = "../dm-vm" }
 dm-world = { path = "../dm-world" }
 
 [build-dependencies]
+md5 = "0.7"
+
+[dev-dependencies]
 md5 = "0.7"
 
 [lints.rust]

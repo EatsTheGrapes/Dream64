@@ -82,6 +82,30 @@ fn run() -> Result<(), String> {
         "parsed-map-smoke: linked deferred={}",
         executable.module().deferred_procedure_count(),
     );
+    if let Some(path) = env::var_os("DREAM64_DUMP_PROC") {
+        let path = path.to_string_lossy();
+        let target = effective_target(&procedures, &path)?;
+        let entry = executable
+            .implementation(target)
+            .ok_or_else(|| format!("linked VM entry is missing: {path}"))?;
+        let program = executable
+            .module()
+            .procedure(entry)
+            .ok_or_else(|| format!("compiled VM body is missing: {path}"))?;
+        eprintln!(
+            "production-bytecode: path={path} parameters={:?} locals={} instructions={}",
+            program.parameter_names,
+            program.local_count,
+            program.instructions.len(),
+        );
+        for (index, instruction) in program.instructions.iter().enumerate() {
+            eprintln!(
+                "production-bytecode: {index:03} {instruction:?} span={:?}",
+                program.source_spans.get(index),
+            );
+        }
+        return Ok(());
+    }
 
     let mut runtime = RuntimeImage::from_compilation(&compilation)
         .map_err(|error| format!("runtime image construction failed: {error}"))?;

@@ -7,6 +7,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+crc32fast = "1.5"
 dm-compiler = { path = "../dm-compiler" }
 dm-core = { path = "../dm-core" }
 dm-globals = { path = "../dm-globals" }
@@ -15,6 +16,7 @@ dm-object-tree = { path = "../dm-object-tree" }
 dm-runtime = { path = "../dm-runtime" }
 dm-value = { path = "../dm-value" }
 dm-vm = { path = "../dm-vm" }
+md5 = "0.7"
 
 [lints]
 workspace = true

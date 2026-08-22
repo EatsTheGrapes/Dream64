@@ -185,67 +185,59 @@ impl VariableRegistry {
         let declared_storage = declared_storage(compilation);
         let declared_modifiers = declared_modifiers(compilation);
         let declared_types = declared_types(compilation);
-        let entries = compilation
-            .declarations()
-            .iter()
-            .filter_map(|declaration| {
-                let syntax = compilation.syntax(declaration.file_id)?;
-                let definition = syntax.definitions.get(declaration.definition_index)?;
-                if !matches!(
-                    definition.kind,
-                    DefinitionKind::Variable | DefinitionKind::VariableOverride
-                ) {
-                    return None;
-                }
-                let tree_node = compilation.code_tree().node(declaration.node)?;
-                let storage = declared_storage
-                    .get(&declaration.node)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        classify_storage(definition, tree_node.owner_type.is_none())
-                    });
-                let owner = tree_node.owner_type.and_then(|owner| {
-                    compilation
-                        .code_tree()
-                        .node(owner)
-                        .map(|node| VariableOwner {
-                            node: owner,
-                            path: node.path.to_string(),
-                        })
-                });
-                let initializer =
-                    initializer(compilation, declaration.file_id, definition).map(|initializer| {
-                        normalize_initializer_paths(
-                            compilation,
-                            owner.as_ref(),
-                            effective_declared_type(compilation, &declared_types, declaration.node),
-                            initializer,
-                        )
-                    });
-                Some(VariableEntry {
-                    ordinal: declaration.ordinal,
-                    node: declaration.node,
-                    path: tree_node.path.to_string(),
-                    storage,
-                    assignment: if definition.kind == DefinitionKind::VariableOverride {
-                        AssignmentKind::Override
-                    } else {
-                        AssignmentKind::Declaration
-                    },
-                    modifiers: effective_modifiers(
+        let declarations = compilation.declarations();
+        let entries = parallel_filter_map_ordered(declarations.len(), |index| {
+            let declaration = &declarations[index];
+            let syntax = compilation.syntax(declaration.file_id)?;
+            let definition = syntax.definitions.get(declaration.definition_index)?;
+            if !matches!(
+                definition.kind,
+                DefinitionKind::Variable | DefinitionKind::VariableOverride
+            ) {
+                return None;
+            }
+            let tree_node = compilation.code_tree().node(declaration.node)?;
+            let storage = declared_storage
+                .get(&declaration.node)
+                .copied()
+                .unwrap_or_else(|| classify_storage(definition, tree_node.owner_type.is_none()));
+            let owner = tree_node.owner_type.and_then(|owner| {
+                compilation
+                    .code_tree()
+                    .node(owner)
+                    .map(|node| VariableOwner {
+                        node: owner,
+                        path: node.path.to_string(),
+                    })
+            });
+            let initializer =
+                initializer(compilation, declaration.file_id, definition).map(|initializer| {
+                    normalize_initializer_paths(
                         compilation,
-                        &declared_modifiers,
-                        declaration.node,
+                        owner.as_ref(),
+                        effective_declared_type(compilation, &declared_types, declaration.node),
+                        initializer,
                     )
+                });
+            Some(VariableEntry {
+                ordinal: declaration.ordinal,
+                node: declaration.node,
+                path: tree_node.path.to_string(),
+                storage,
+                assignment: if definition.kind == DefinitionKind::VariableOverride {
+                    AssignmentKind::Override
+                } else {
+                    AssignmentKind::Declaration
+                },
+                modifiers: effective_modifiers(compilation, &declared_modifiers, declaration.node)
                     .unwrap_or_else(|| classify_modifiers(definition)),
-                    owner,
-                    file_id: declaration.file_id,
-                    definition_index: declaration.definition_index,
-                    span: declaration.span,
-                    initializer,
-                })
+                owner,
+                file_id: declaration.file_id,
+                definition_index: declaration.definition_index,
+                span: declaration.span,
+                initializer,
             })
-            .collect();
+        });
         Self { entries }
     }
 
@@ -361,6 +353,35 @@ impl VariableRegistry {
             type_defaults,
         }
     }
+}
+
+fn parallel_filter_map_ordered<T, F>(len: usize, prepare: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize) -> Option<T> + Sync,
+{
+    const PARALLEL_THRESHOLD: usize = 4_096;
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(len.max(1));
+    if workers == 1 || len < PARALLEL_THRESHOLD {
+        return (0..len).filter_map(prepare).collect();
+    }
+    std::thread::scope(|scope| {
+        let prepare = &prepare;
+        let handles = (0..workers)
+            .map(|worker| {
+                let start = len * worker / workers;
+                let end = len * (worker + 1) / workers;
+                scope.spawn(move || (start..end).filter_map(prepare).collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>();
+        let mut output = Vec::new();
+        for handle in handles {
+            output.extend(handle.join().expect("variable preparation worker panicked"));
+        }
+        output
+    })
 }
 
 fn normalize_initializer_paths(
@@ -776,6 +797,7 @@ mod tests {
     use super::{
         AssignmentKind, ConstantEvaluation, ConstantListEntry, ConstantValue, InitializerClass,
         RuntimeBlocker, StorageClass, UnsupportedCategory, VariableRegistry, evaluate_constant,
+        parallel_filter_map_ordered,
     };
 
     static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
@@ -818,6 +840,43 @@ mod tests {
             panic!("{source:?} should evaluate to a number");
         };
         number.bits()
+    }
+
+    #[test]
+    fn parallel_variable_preparation_filters_in_original_ordinal_order() {
+        let values = parallel_filter_map_ordered(20_000, |index| (index % 7 != 0).then_some(index));
+        let expected = (0..20_000)
+            .filter(|index| index % 7 != 0)
+            .collect::<Vec<_>>();
+        assert_eq!(values, expected);
+    }
+
+    #[test]
+    #[ignore = "multicore variable preparation microbenchmark"]
+    fn parallel_variable_preparation_benchmark() {
+        const ITEMS: usize = 100_000;
+        let prepare = |index| {
+            let mut value = index as u64;
+            for _ in 0..256 {
+                value = value
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+            }
+            Some(value)
+        };
+        let started = std::time::Instant::now();
+        let sequential = (0..ITEMS).filter_map(prepare).collect::<Vec<_>>();
+        let sequential_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        let parallel = parallel_filter_map_ordered(ITEMS, prepare);
+        let parallel_elapsed = started.elapsed();
+        assert_eq!(parallel, sequential);
+        eprintln!(
+            "variable-prepare items={ITEMS} sequential_ms={} parallel_ms={} speedup={:.2}",
+            sequential_elapsed.as_millis(),
+            parallel_elapsed.as_millis(),
+            sequential_elapsed.as_secs_f64() / parallel_elapsed.as_secs_f64(),
+        );
     }
 
     #[test]

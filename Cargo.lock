@@ -813,7 +813,9 @@ dependencies = [
  "dm-vm",
  "dm-world",
  "flate2",
+ "font8x8",
  "png",
+ "serde_json",
  "softbuffer",
  "winit",
  "wry",
@@ -890,6 +892,7 @@ dependencies = [
  "dm-compiler",
  "dm-core",
  "dm-map",
+ "dm-mmap",
  "dm-object-tree",
  "dm-project",
  "dm-runtime",
@@ -918,6 +921,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dm-mmap"
+version = "0.1.0"
+dependencies = [
+ "memmap2",
+]
+
+[[package]]
 name = "dm-object-tree"
 version = "0.1.0"
 dependencies = [
@@ -938,6 +948,7 @@ dependencies = [
 name = "dm-runtime"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "dm-compiler",
  "dm-core",
  "dm-globals",
@@ -1001,6 +1012,7 @@ dependencies = [
 name = "dm-world"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "dm-compiler",
  "dm-core",
  "dm-globals",
@@ -1009,6 +1021,7 @@ dependencies = [
  "dm-runtime",
  "dm-value",
  "dm-vm",
+ "md5",
 ]
 
 [[package]]
@@ -1214,6 +1227,12 @@ dependencies = [
  "crc32fast",
  "miniz_oxide",
 ]
+
+[[package]]
+name = "font8x8"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
 
 [[package]]
 name = "foreign-types"
