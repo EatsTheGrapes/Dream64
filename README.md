@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/branding/dream64-banner.jpg" alt="Dream64 — SS13 Engine Reimagined" width="100%">
+</p>
+
 # Dream64 engine
 
 This directory is the clean-room implementation workspace for a 64-bit,
