@@ -14281,6 +14281,57 @@ fn run_frames(
                 *profile.frame_entries.entry(key).or_default() += 1;
             }
         }
+        // Canonical camera chunk lookup tier. The plane-offset branch contains
+        // world-coordinate resolution and stays in bytecode; the ordinary
+        // branch is pure coordinate bucketing plus one associative lookup.
+        if instruction_index == 0
+            && let Some(accounted_steps) = try_run_camera_chunk_fast_path(
+                module,
+                procedure,
+                program,
+                &mut frames[frame_index],
+                remaining_steps,
+                state,
+            )
+        {
+            let scheduler_batches_before = executed_steps / 4_096;
+            remaining_steps = remaining_steps.saturating_sub(accounted_steps);
+            executed_steps += accounted_steps;
+            for _ in scheduler_batches_before..(executed_steps / 4_096) {
+                account_scheduler_tick_usage(state);
+            }
+            if let Some(profile) = &mut state.atoms_profile {
+                profile.total_instructions =
+                    profile.total_instructions.saturating_add(accounted_steps);
+            }
+            continue;
+        }
+        // Canonical DCS registration tier: batch the first-registration case
+        // that dominates atom initialization. The helper side-exits before
+        // mutation for every override or warning
+        // path, leaving those cases to the reference bytecode interpreter.
+        if instruction_index == 0
+            && let Some(accounted_steps) = try_run_register_signal_fast_path(
+                module,
+                procedure,
+                program,
+                &mut frames[frame_index],
+                remaining_steps,
+                state,
+            )
+        {
+            let scheduler_batches_before = executed_steps / 4_096;
+            remaining_steps = remaining_steps.saturating_sub(accounted_steps);
+            executed_steps += accounted_steps;
+            for _ in scheduler_batches_before..(executed_steps / 4_096) {
+                account_scheduler_tick_usage(state);
+            }
+            if let Some(profile) = &mut state.atoms_profile {
+                profile.total_instructions =
+                    profile.total_instructions.saturating_add(accounted_steps);
+            }
+            continue;
+        }
         // Rooted-value tier: execute one prevalidated list-heavy basic block
         // atomically, leaving Return to the ordinary interpreter machinery.
         if instruction_index == 0
@@ -18703,6 +18754,434 @@ thread_local! {
         RefCell::new(HashMap::new());
     static ROOTED_LIST_JIT_CACHE: RefCell<HashMap<(u64, ProcedureId), Option<RootedListTrace>>> =
         RefCell::new(HashMap::new());
+    static REGISTER_SIGNAL_FAST_CACHE: RefCell<HashMap<(u64, ProcedureId), Option<RegisterSignalTrace>>> =
+        RefCell::new(HashMap::new());
+    static CAMERA_CHUNK_FAST_CACHE: RefCell<HashMap<(u64, ProcedureId), Option<CameraChunkTrace>>> =
+        RefCell::new(HashMap::new());
+}
+
+struct CameraChunkTrace {
+    mapping_global: FieldName,
+    plane_offset: FieldName,
+    chunks: FieldName,
+}
+
+fn compile_camera_chunk_trace(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+) -> Option<CameraChunkTrace> {
+    let canonical_path = module.procedure_path(procedure)?.split('@').next()?;
+    if canonical_path != "/datum/cameranet/proc/get_camera_chunk"
+        || program.parameter_count != 3
+        || program.local_count != 5
+        || program.instructions.len() != 55
+    {
+        return None;
+    }
+    let instructions = program.instructions.as_slice();
+    let Instruction::LoadGlobal(mapping_global) = &instructions[18] else {
+        return None;
+    };
+    let Instruction::LoadDeclaredField(plane_offset) = &instructions[19] else {
+        return None;
+    };
+    let Instruction::LoadField(chunks) = &instructions[47] else {
+        return None;
+    };
+    let number_at = |index| match &instructions[index] {
+        Instruction::PushNumber(number) => Some(number.to_f32()),
+        _ => None,
+    };
+    let call_at = |index| match &instructions[index] {
+        Instruction::Call {
+            procedure,
+            argument_count: 2,
+            ..
+        } => Some(*procedure),
+        _ => None,
+    };
+    let max_target = call_at(7)?;
+    let max_program = module.resolve_procedure(max_target).ok()?;
+    let canonical = number_at(1) == Some(8.0)
+        && number_at(4) == Some(8.0)
+        && number_at(6) == Some(1.0)
+        && number_at(10) == Some(8.0)
+        && number_at(13) == Some(8.0)
+        && number_at(15) == Some(1.0)
+        && number_at(26) == Some(0.0)
+        && number_at(27) == Some(0.0)
+        && call_at(16) == Some(max_target)
+        && canonical_static_native_builtin(module, max_target, max_program) == Some("max")
+        && matches!(instructions[0], Instruction::LoadLocal(0))
+        && matches!(instructions[2], Instruction::Divide)
+        && matches!(instructions[3], Instruction::Round { argument_count: 1 })
+        && matches!(instructions[5], Instruction::Multiply)
+        && matches!(
+            instructions[7],
+            Instruction::Call {
+                argument_count: 2,
+                ..
+            }
+        )
+        && matches!(instructions[8], Instruction::StoreLocal(0))
+        && matches!(instructions[9], Instruction::LoadLocal(1))
+        && matches!(instructions[11], Instruction::Divide)
+        && matches!(instructions[12], Instruction::Round { argument_count: 1 })
+        && matches!(instructions[14], Instruction::Multiply)
+        && matches!(
+            instructions[16],
+            Instruction::Call {
+                argument_count: 2,
+                ..
+            }
+        )
+        && matches!(instructions[17], Instruction::StoreLocal(1))
+        && matches!(instructions[20], Instruction::JumpIfFalse(26))
+        && matches!(instructions[28], Instruction::NotEqual)
+        && matches!(instructions[29], Instruction::JumpIfFalse(46))
+        && matches!(&instructions[48], Instruction::PushText(template) if template.as_ref() == "[],[],[]")
+        && matches!(instructions[49], Instruction::LoadLocal(0))
+        && matches!(instructions[50], Instruction::LoadLocal(1))
+        && matches!(instructions[51], Instruction::LoadLocal(2))
+        && matches!(&instructions[52], Instruction::StandardBuiltin { name, argument_count: 4, .. } if name == "text")
+        && matches!(instructions[53], Instruction::IndexList)
+        && matches!(instructions[54], Instruction::Return);
+    canonical.then(|| CameraChunkTrace {
+        mapping_global: mapping_global.clone(),
+        plane_offset: plane_offset.clone(),
+        chunks: chunks.clone(),
+    })
+}
+
+fn try_run_camera_chunk_fast_path(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+    frame: &mut CallFrame,
+    remaining_steps: u64,
+    state: &mut ExecutionState,
+) -> Option<u64> {
+    if remaining_steps < 33
+        || program.instructions.len() != 55
+        || program.parameter_count != 3
+        || program.local_count != 5
+        || !frame.stack.is_empty()
+    {
+        return None;
+    }
+    let Value::Datum(src) = frame.src else {
+        return None;
+    };
+    let x = frame.locals.first()?.as_number()?;
+    let y = frame.locals.get(1)?.as_number()?;
+    let z = frame.locals.get(2)?.as_number()?;
+    if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+        return None;
+    }
+    let key = (module.identity.0, procedure);
+    CAMERA_CHUNK_FAST_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let trace = cache
+            .entry(key)
+            .or_insert_with(|| compile_camera_chunk_trace(module, procedure, program))
+            .as_ref()?;
+        let Value::Datum(mapping) = state.global(&trace.mapping_global)?.clone() else {
+            return None;
+        };
+        let plane_offset = datum_field_or_initial(state, mapping, &trace.plane_offset).ok()?;
+        if runtime_truthy(&state.heap, &plane_offset).ok()? {
+            return None;
+        }
+        let Value::List(chunks) = datum_field_or_shared(state, src, &trace.chunks).ok()? else {
+            return None;
+        };
+        if state.heap.list(chunks).is_err()
+            || state.global_vars_proxy == Some(chunks)
+            || state.datum_vars_proxies.contains_key(&chunks)
+        {
+            return None;
+        }
+        let x = ((x / 8.0).floor() * 8.0).max(1.0);
+        let y = ((y / 8.0).floor() * 8.0).max(1.0);
+        let key = Value::text(format!(
+            "{},{},{}",
+            Value::number(x),
+            Value::number(y),
+            Value::number(z)
+        ));
+        let result =
+            match read_list_value(&state.heap, chunks, &key, state.is_associative_list(chunks)) {
+                Ok(value) => value,
+                Err(ValueError::MissingKey) => Value::Null,
+                Err(_) => return None,
+            };
+        frame.locals[0] = Value::number(x);
+        frame.locals[1] = Value::number(y);
+        frame.stack.push(result);
+        frame.instruction = 54;
+        Some(33)
+    })
+}
+
+struct RegisterSignalTrace {
+    gc_destroyed: FieldName,
+    signal_procs: FieldName,
+    listen_lookup: FieldName,
+}
+
+fn compile_register_signal_trace(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+) -> Option<RegisterSignalTrace> {
+    let canonical_path = module.procedure_path(procedure)?.split('@').next()?;
+    if canonical_path != "/datum/proc/RegisterSignal"
+        || program.parameter_count != 4
+        || program.local_count != 14
+        || program.instructions.len() != 140
+    {
+        return None;
+    }
+    let instructions = program.instructions.as_slice();
+    let Instruction::LoadField(gc_destroyed) = &instructions[10] else {
+        return None;
+    };
+    let Instruction::LoadDeclaredField(target_gc_destroyed) = &instructions[22] else {
+        return None;
+    };
+    let Instruction::LogicalOrEmptyListField(signal_procs) = &instructions[70] else {
+        return None;
+    };
+    let Instruction::LogicalOrEmptyListField(listen_lookup) = &instructions[77] else {
+        return None;
+    };
+    if gc_destroyed != target_gc_destroyed
+        || gc_destroyed.as_str() != "gc_destroyed"
+        || signal_procs.as_str() != "_signal_procs"
+        || listen_lookup.as_str() != "_listen_lookup"
+        || !matches!(instructions[26], Instruction::LoadLocal(1))
+        || !matches!(
+            instructions[27],
+            Instruction::TypePredicate {
+                kind: TypePredicateKind::IsList,
+                argument_count: 1
+            }
+        )
+        || !matches!(instructions[74], Instruction::LogicalOrEmptyListIndex)
+        || !matches!(instructions[80], Instruction::IndexLocalList(9))
+        || !matches!(instructions[86], Instruction::SetListIndex)
+        || !matches!(instructions[111], Instruction::IndexLocalList(10))
+        || !matches!(
+            instructions[114],
+            Instruction::TypePredicate {
+                kind: TypePredicateKind::IsNull,
+                argument_count: 1
+            }
+        )
+        || !matches!(instructions[121], Instruction::SetListIndex)
+        || !matches!(instructions[138], Instruction::LoadResult)
+        || !matches!(instructions[139], Instruction::Return)
+    {
+        return None;
+    }
+    Some(RegisterSignalTrace {
+        gc_destroyed: gc_destroyed.clone(),
+        signal_procs: signal_procs.clone(),
+        listen_lookup: listen_lookup.clone(),
+    })
+}
+
+fn try_run_register_signal_fast_path(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+    frame: &mut CallFrame,
+    remaining_steps: u64,
+    state: &mut ExecutionState,
+) -> Option<u64> {
+    // This is the overwhelmingly common first-registration path. Overrides,
+    // list promotion, warning behavior, and unusual receivers stay in the
+    // bytecode interpreter before any mutation occurs.
+    if remaining_steps < 54
+        || program.instructions.len() != 140
+        || program.parameter_count != 4
+        || program.local_count != 14
+        || !frame.stack.is_empty()
+    {
+        return None;
+    }
+    let override_supplied = frame.supplied_parameters.get(3).copied().unwrap_or(false)
+        && !matches!(frame.locals.get(3), None | Some(Value::Null));
+    let accounted_steps = if override_supplied { 54 } else { 56 };
+    if remaining_steps < accounted_steps {
+        return None;
+    }
+    let Value::Datum(src) = frame.src else {
+        return None;
+    };
+    let Value::Datum(target) = frame.locals.first()?.clone() else {
+        return None;
+    };
+    let signal_type = frame.locals.get(1)?.clone();
+    let proctype = frame.locals.get(2)?.clone();
+    // Signals are canonically text. Restricting the native path here retains
+    // the interpreter's exact coercion/error behavior for every odd key type.
+    if !matches!(signal_type, Value::Text(_)) {
+        return None;
+    }
+    let key = (module.identity.0, procedure);
+    REGISTER_SIGNAL_FAST_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let trace = cache
+            .entry(key)
+            .or_insert_with(|| compile_register_signal_trace(module, procedure, program))
+            .as_ref()?;
+        let src_destroyed = datum_field_or_initial(state, src, &trace.gc_destroyed).ok()?;
+        let target_destroyed = datum_field_or_initial(state, target, &trace.gc_destroyed).ok()?;
+        if runtime_truthy(&state.heap, &src_destroyed).ok()?
+            || runtime_truthy(&state.heap, &target_destroyed).ok()?
+        {
+            return None;
+        }
+        let ordinary_list = |state: &ExecutionState, list: ListId| {
+            !state.reference_lists.contains(&list)
+                && !state.is_visibility_list(list)
+                && state.global_vars_proxy != Some(list)
+                && !state.datum_vars_proxies.contains_key(&list)
+                && state.heap.list(list).is_ok()
+        };
+        let procs_value = datum_field_or_shared(state, src, &trace.signal_procs).ok()?;
+        let procs = if runtime_truthy(&state.heap, &procs_value).ok()? {
+            let Value::List(procs) = procs_value else {
+                return None;
+            };
+            ordinary_list(state, procs).then_some(procs)
+        } else {
+            None
+        };
+        let lookup_value = datum_field_or_shared(state, target, &trace.listen_lookup).ok()?;
+        let lookup = if runtime_truthy(&state.heap, &lookup_value).ok()? {
+            let Value::List(lookup) = lookup_value else {
+                return None;
+            };
+            ordinary_list(state, lookup).then_some(lookup)
+        } else {
+            None
+        };
+        if matches!(procs, None) && runtime_truthy(&state.heap, &procs_value).ok()?
+            || matches!(lookup, None) && runtime_truthy(&state.heap, &lookup_value).ok()?
+        {
+            return None;
+        }
+        let target_procs = if let Some(procs) = procs {
+            let current = match read_list_value(
+                &state.heap,
+                procs,
+                &Value::Datum(target),
+                state.is_associative_list(procs),
+            ) {
+                Ok(value) => value,
+                Err(ValueError::MissingKey) => Value::Null,
+                Err(_) => return None,
+            };
+            if runtime_truthy(&state.heap, &current).ok()? {
+                let Value::List(target_procs) = current else {
+                    return None;
+                };
+                if !ordinary_list(state, target_procs) {
+                    return None;
+                }
+                Some(target_procs)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(target_procs) = target_procs {
+            let existing = match read_list_value(
+                &state.heap,
+                target_procs,
+                &signal_type,
+                state.is_associative_list(target_procs),
+            ) {
+                Ok(value) => value,
+                Err(ValueError::MissingKey) => Value::Null,
+                Err(_) => return None,
+            };
+            if runtime_truthy(&state.heap, &existing).ok()? {
+                return None;
+            }
+        }
+        if let Some(lookup) = lookup {
+            let looked_up = match read_list_value(
+                &state.heap,
+                lookup,
+                &signal_type,
+                state.is_associative_list(lookup),
+            ) {
+                Ok(value) => value,
+                Err(ValueError::MissingKey) => Value::Null,
+                Err(_) => return None,
+            };
+            if !matches!(looked_up, Value::Null) {
+                return None;
+            }
+        }
+
+        // Every fallible read and shape guard is complete. Materialize the
+        // exact `||= list()` chain, then perform the two canonical associations.
+        let procs = if let Some(procs) = procs {
+            procs
+        } else {
+            let procs = state.heap.allocate_list();
+            assign_datum_or_shared_field(
+                state,
+                src,
+                trace.signal_procs.clone(),
+                Value::List(procs),
+            )
+            .ok()?;
+            procs
+        };
+        let target_procs = if let Some(target_procs) = target_procs {
+            target_procs
+        } else {
+            let target_procs = state.heap.allocate_list();
+            state
+                .heap
+                .list_mut(procs)
+                .ok()?
+                .set_key(Value::Datum(target), Value::List(target_procs));
+            target_procs
+        };
+        let lookup = if let Some(lookup) = lookup {
+            lookup
+        } else {
+            let lookup = state.heap.allocate_list();
+            assign_datum_or_shared_field(
+                state,
+                target,
+                trace.listen_lookup.clone(),
+                Value::List(lookup),
+            )
+            .ok()?;
+            lookup
+        };
+        state
+            .heap
+            .list_mut(target_procs)
+            .ok()?
+            .set_key(signal_type.clone(), proctype);
+        state
+            .heap
+            .list_mut(lookup)
+            .ok()?
+            .set_key(signal_type, Value::Datum(src));
+        frame.instruction = 138;
+        Some(accounted_steps)
+    })
 }
 
 struct RootedListTrace {
