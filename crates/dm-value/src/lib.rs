@@ -437,20 +437,84 @@ fn gc_index_ratio_bin(len: usize, capacity: usize) -> usize {
 
 type DatumFieldIndex = HashMap<FieldName, usize>;
 
+const DATUM_LAYOUT_CACHE_MAX_ENTRIES: usize = 65_536;
+const DATUM_LAYOUT_CACHE_MAX_VARIANTS_PER_TYPE: usize = 8;
+
+#[derive(Clone)]
+struct CachedDatumLayout {
+    names: Arc<[FieldName]>,
+    field_index: Option<Arc<DatumFieldIndex>>,
+}
+
+/// Retains the stable field shape shared by newly initialized datums.
+///
+/// GC-time interning is still required for shapes produced by arbitrary DM
+/// mutation, but waiting for GC leaves every startup datum's wide
+/// `(FieldName, Value)` vector live at once. This bounded cache moves the
+/// compaction boundary to the end of instance initialization so those wide
+/// temporary vectors can be reused immediately instead of defining the
+/// process peak.
+#[derive(Default)]
+struct DatumLayoutCache {
+    by_type: HashMap<TypePath, Vec<CachedDatumLayout>>,
+    entries: usize,
+}
+
+impl DatumLayoutCache {
+    fn compact(&mut self, datum: &mut Datum) {
+        if datum.fields.is_empty() || matches!(datum.fields, DatumFields::Shared { .. }) {
+            return;
+        }
+
+        if let Some(layouts) = self.by_type.get(datum.type_path())
+            && let Some(layout) = layouts.iter().find(|layout| {
+                layout.names.len() == datum.fields.len()
+                    && layout
+                        .names
+                        .iter()
+                        .zip(datum.fields.names())
+                        .all(|(left, right)| left == right)
+            })
+        {
+            datum.field_index = layout.field_index.clone();
+            datum.fields.share_names(Arc::clone(&layout.names));
+            return;
+        }
+
+        let names: Arc<[FieldName]> = datum.fields.names().cloned().collect();
+        let layout = CachedDatumLayout {
+            names: Arc::clone(&names),
+            field_index: datum.field_index.clone(),
+        };
+        datum.fields.share_names(names);
+
+        let layouts = self.by_type.entry(datum.type_path.clone()).or_default();
+        if self.entries < DATUM_LAYOUT_CACHE_MAX_ENTRIES
+            && layouts.len() < DATUM_LAYOUT_CACHE_MAX_VARIANTS_PER_TYPE
+        {
+            layouts.push(layout);
+            self.entries += 1;
+        }
+    }
+}
+
 #[derive(Default)]
 struct FieldIndexInterner {
     by_layout: HashMap<(u64, u64), Arc<DatumFieldIndex>>,
     by_pointer: HashMap<usize, Arc<DatumFieldIndex>>,
+    names_by_index: HashMap<usize, Arc<[FieldName]>>,
+    unindexed_names_by_layout: HashMap<(u64, u64), Arc<[FieldName]>>,
+    unindexed_names_by_pointer: HashMap<usize, Arc<[FieldName]>>,
 }
 
 impl FieldIndexInterner {
-    fn layout_fingerprint(fields: &[(FieldName, Value)]) -> (u64, u64) {
+    fn layout_fingerprint(fields: &DatumFields) -> (u64, u64) {
         let mut first = DefaultHasher::new();
         let mut second = DefaultHasher::new();
         fields.len().hash(&mut first);
         0x9e37_79b9_7f4a_7c15u64.hash(&mut second);
         fields.len().hash(&mut second);
-        for (position, (name, _)) in fields.iter().enumerate() {
+        for (position, name) in fields.names().enumerate() {
             name.hash(&mut first);
             position.hash(&mut second);
             name.hash(&mut second);
@@ -458,12 +522,12 @@ impl FieldIndexInterner {
         (first.finish(), second.finish())
     }
 
-    fn matches_layout(index: &DatumFieldIndex, fields: &[(FieldName, Value)]) -> bool {
+    fn matches_layout(index: &DatumFieldIndex, fields: &DatumFields) -> bool {
         index.len() == fields.len()
             && fields
-                .iter()
+                .names()
                 .enumerate()
-                .all(|(position, (name, _))| index.get(name) == Some(&position))
+                .all(|(position, name)| index.get(name) == Some(&position))
     }
 
     fn redirect(
@@ -489,16 +553,17 @@ impl FieldIndexInterner {
 
     fn intern(
         &mut self,
-        fields: &[(FieldName, Value)],
+        fields: &DatumFields,
         index: &mut Arc<DatumFieldIndex>,
         aggregate: &mut DatumStorageStats,
-    ) -> bool {
+    ) -> (bool, Arc<[FieldName]>) {
         let source_pointer = Arc::as_ptr(index) as usize;
-        if let Some(existing) = self.by_pointer.get(&source_pointer) {
+        if let Some(existing) = self.by_pointer.get(&source_pointer).cloned() {
             aggregate.field_index_pointer_cache_hits =
                 aggregate.field_index_pointer_cache_hits.saturating_add(1);
-            Self::redirect(index, existing, aggregate);
-            return false;
+            Self::redirect(index, &existing, aggregate);
+            let names = self.canonical_names(fields, index);
+            return (false, names);
         }
 
         aggregate.field_index_fingerprints_computed = aggregate
@@ -515,7 +580,8 @@ impl FieldIndexInterner {
                 let canonical = Arc::clone(existing);
                 Self::redirect(index, &canonical, aggregate);
                 self.by_pointer.insert(source_pointer, canonical);
-                return false;
+                let names = self.canonical_names(fields, index);
+                return (false, names);
             }
             // An exact fingerprint collision must never merge unlike layouts.
             // It is too rare to justify retaining an allocation-heavy collision
@@ -524,12 +590,81 @@ impl FieldIndexInterner {
                 .field_index_fingerprint_collisions
                 .saturating_add(1);
             self.by_pointer.insert(source_pointer, Arc::clone(index));
-            return true;
+            let names = self.canonical_names(fields, index);
+            return (true, names);
         }
         let canonical = Arc::clone(index);
         self.by_layout.insert(fingerprint, Arc::clone(&canonical));
         self.by_pointer.insert(source_pointer, canonical);
-        true
+        let names = self.canonical_names(fields, index);
+        (true, names)
+    }
+
+    fn canonical_names(
+        &mut self,
+        fields: &DatumFields,
+        index: &Arc<DatumFieldIndex>,
+    ) -> Arc<[FieldName]> {
+        let pointer = Arc::as_ptr(index) as usize;
+        if let Some(names) = self.names_by_index.get(&pointer) {
+            return Arc::clone(names);
+        }
+        let names: Arc<[FieldName]> = match fields {
+            DatumFields::Shared { names, .. } => Arc::clone(names),
+            DatumFields::Owned(_) => fields.names().cloned().collect(),
+        };
+        self.names_by_index.insert(pointer, Arc::clone(&names));
+        names
+    }
+
+    fn intern_unindexed_names(&mut self, fields: &DatumFields) -> Arc<[FieldName]> {
+        if let DatumFields::Shared { names, .. } = fields {
+            let pointer = Arc::as_ptr(names) as *const FieldName as usize;
+            if let Some(existing) = self.unindexed_names_by_pointer.get(&pointer) {
+                return Arc::clone(existing);
+            }
+        }
+        let fingerprint = Self::layout_fingerprint(fields);
+        if let Some(existing) = self.unindexed_names_by_layout.get(&fingerprint)
+            && existing.len() == fields.len()
+            && existing
+                .iter()
+                .zip(fields.names())
+                .all(|(left, right)| left == right)
+        {
+            let existing = Arc::clone(existing);
+            if let DatumFields::Shared { names, .. } = fields {
+                let pointer = Arc::as_ptr(names) as *const FieldName as usize;
+                self.unindexed_names_by_pointer
+                    .insert(pointer, Arc::clone(&existing));
+            }
+            return existing;
+        }
+        let names: Arc<[FieldName]> = match fields {
+            DatumFields::Shared { names, .. } => Arc::clone(names),
+            DatumFields::Owned(_) => fields.names().cloned().collect(),
+        };
+        self.unindexed_names_by_layout
+            .entry(fingerprint)
+            .or_insert_with(|| Arc::clone(&names));
+        let pointer = Arc::as_ptr(&names) as *const FieldName as usize;
+        self.unindexed_names_by_pointer
+            .insert(pointer, Arc::clone(&names));
+        names
+    }
+
+    fn shared_name_layouts(&self) -> usize {
+        self.names_by_index
+            .len()
+            .saturating_add(self.unindexed_names_by_layout.len())
+    }
+
+    fn shared_name_slots(&self) -> usize {
+        self.names_by_index
+            .values()
+            .chain(self.unindexed_names_by_layout.values())
+            .map(|names| names.len())
+            .sum()
     }
 }
 
@@ -540,6 +675,16 @@ pub struct DatumStorageStats {
     pub field_len: usize,
     /// Allocated datum field-vector capacity.
     pub field_capacity: usize,
+    /// Live datums using a shared immutable field-name layout.
+    pub shared_field_name_datums: usize,
+    /// Logical field-name slots represented by those shared layouts.
+    pub shared_field_name_logical_slots: usize,
+    /// Distinct immutable field-name layouts retained after interning.
+    pub shared_field_name_layouts: usize,
+    /// Physical field-name slots across the distinct shared layouts.
+    pub shared_field_name_physical_slots: usize,
+    /// Duplicate field-name handle bytes avoided by layout sharing.
+    pub shared_field_name_bytes_saved: usize,
     /// Field vectors whose significant excess capacity was released.
     pub shrunk_field_vectors: usize,
     /// Field-vector capacity bytes returned to the allocator.
@@ -586,9 +731,184 @@ pub struct DatumStorageStats {
 #[derive(Clone)]
 pub struct Datum {
     type_path: TypePath,
-    fields: Vec<(FieldName, Value)>,
+    fields: DatumFields,
     field_index: Option<Arc<DatumFieldIndex>>,
 }
+
+#[derive(Clone)]
+enum DatumFields {
+    Owned(Vec<(FieldName, Value)>),
+    Shared {
+        names: Arc<[FieldName]>,
+        values: Vec<Value>,
+    },
+}
+
+impl fmt::Debug for DatumFields {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl PartialEq for DatumFields {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && self
+                .iter()
+                .zip(other.iter())
+                .all(|(left, right)| left == right)
+    }
+}
+
+impl Default for DatumFields {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
+impl DatumFields {
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(fields) => fields.len(),
+            Self::Shared { values, .. } => values.len(),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Owned(fields) => fields.capacity(),
+            Self::Shared { values, .. } => values.capacity(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[cfg(test)]
+    fn truncate(&mut self, len: usize) {
+        self.materialize_owned().truncate(len);
+    }
+
+    fn value(&self, index: usize) -> &Value {
+        match self {
+            Self::Owned(fields) => &fields[index].1,
+            Self::Shared { values, .. } => &values[index],
+        }
+    }
+
+    fn value_mut(&mut self, index: usize) -> &mut Value {
+        match self {
+            Self::Owned(fields) => &mut fields[index].1,
+            Self::Shared { values, .. } => &mut values[index],
+        }
+    }
+
+    fn position(&self, name: &FieldName) -> Option<usize> {
+        match self {
+            Self::Owned(fields) => fields.iter().position(|(candidate, _)| candidate == name),
+            Self::Shared { names, .. } => names.iter().position(|candidate| candidate == name),
+        }
+    }
+
+    fn names(&self) -> impl ExactSizeIterator<Item = &FieldName> {
+        enum Names<'a> {
+            Owned(std::slice::Iter<'a, (FieldName, Value)>),
+            Shared(std::slice::Iter<'a, FieldName>),
+        }
+        impl<'a> Iterator for Names<'a> {
+            type Item = &'a FieldName;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                match self {
+                    Self::Owned(fields) => fields.next().map(|(name, _)| name),
+                    Self::Shared(names) => names.next(),
+                }
+            }
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                match self {
+                    Self::Owned(fields) => fields.size_hint(),
+                    Self::Shared(names) => names.size_hint(),
+                }
+            }
+        }
+        impl ExactSizeIterator for Names<'_> {}
+
+        match self {
+            Self::Owned(fields) => Names::Owned(fields.iter()),
+            Self::Shared { names, .. } => Names::Shared(names.iter()),
+        }
+    }
+
+    fn iter(&self) -> DatumFieldsIter<'_> {
+        DatumFieldsIter {
+            fields: self,
+            index: 0,
+        }
+    }
+
+    fn materialize_owned(&mut self) -> &mut Vec<(FieldName, Value)> {
+        if let Self::Shared { names, values } = self {
+            let fields = names.iter().cloned().zip(std::mem::take(values)).collect();
+            *self = Self::Owned(fields);
+        }
+        let Self::Owned(fields) = self else {
+            unreachable!("shared datum fields were materialized")
+        };
+        fields
+    }
+
+    fn share_names(&mut self, names: Arc<[FieldName]>) {
+        if let Self::Shared { names: current, .. } = self {
+            *current = names;
+            return;
+        }
+        let Self::Owned(fields) = std::mem::take(self) else {
+            unreachable!("owned datum fields were selected")
+        };
+        debug_assert_eq!(fields.len(), names.len());
+        // Do not let Vec's in-place collect specialization reuse the wider
+        // `(FieldName, Value)` allocation for the narrower value vector. That
+        // would preserve the old byte capacity and defeat the compaction.
+        let mut values = Vec::with_capacity(fields.len());
+        values.extend(fields.into_iter().map(|(_, value)| value));
+        *self = Self::Shared { names, values };
+    }
+
+    fn shrink_values_for_gc(&mut self) -> usize {
+        match self {
+            Self::Owned(fields) => gc_shrink_vector(fields),
+            Self::Shared { values, .. } => gc_shrink_vector(values),
+        }
+    }
+}
+
+struct DatumFieldsIter<'a> {
+    fields: &'a DatumFields,
+    index: usize,
+}
+
+impl<'a> Iterator for DatumFieldsIter<'a> {
+    type Item = (&'a FieldName, &'a Value);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let index = self.index;
+        let item = match self.fields {
+            DatumFields::Owned(fields) => fields.get(index).map(|(name, value)| (name, value)),
+            DatumFields::Shared { names, values } => names.get(index).zip(values.get(index)),
+        }?;
+        self.index += 1;
+        Some(item)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.fields.len().saturating_sub(self.index);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for DatumFieldsIter<'_> {}
 
 #[allow(clippy::missing_fields_in_debug)] // the cache is not logical datum state
 impl fmt::Debug for Datum {
@@ -640,12 +960,11 @@ impl Datum {
     #[must_use]
     pub fn field_optional(&self, name: &FieldName) -> Option<&Value> {
         if let Some(field_index) = &self.field_index {
-            return field_index.get(name).map(|&index| &self.fields[index].1);
+            return field_index.get(name).map(|&index| self.fields.value(index));
         }
         self.fields
-            .iter()
-            .find(|(candidate, _)| candidate == name)
-            .map(|(_, value)| value)
+            .position(name)
+            .map(|index| self.fields.value(index))
     }
 
     /// Inserts or updates a field while retaining first-insertion order.
@@ -655,18 +974,19 @@ impl Datum {
             .as_ref()
             .and_then(|field_index| field_index.get(&name).copied())
         {
-            return Some(std::mem::replace(&mut self.fields[index].1, value));
+            return Some(std::mem::replace(self.fields.value_mut(index), value));
         }
 
         if let Some(field_index) = &mut self.field_index {
             let index = self.fields.len();
-            self.fields.push((name.clone(), value));
+            self.fields.materialize_owned().push((name.clone(), value));
             let previous = Arc::make_mut(field_index).insert(name, index);
             debug_assert!(previous.is_none());
             return None;
         }
 
-        let previous = set_named_field(&mut self.fields, name, value);
+        let fields = self.fields.materialize_owned();
+        let previous = set_named_field(fields, name, value);
         if previous.is_none() && self.fields.len() == DATUM_FIELD_INDEX_THRESHOLD {
             self.build_field_index();
         }
@@ -682,18 +1002,17 @@ impl Datum {
                 debug_assert_eq!(removed, Some(index));
                 index
             }
-            None => self
-                .fields
-                .iter()
-                .position(|(candidate, _)| candidate == name)?,
+            None => self.fields.position(name)?,
         };
-        let value = self.fields.remove(index).1;
+        let value = self.fields.materialize_owned().remove(index).1;
 
         if self.fields.len() < DATUM_FIELD_INDEX_THRESHOLD {
             self.field_index = None;
         } else if let Some(field_index) = &mut self.field_index {
             let field_index = Arc::make_mut(field_index);
-            for (offset, (shifted_name, _)) in self.fields[index..].iter().enumerate() {
+            for (offset, (shifted_name, _)) in
+                self.fields.materialize_owned()[index..].iter().enumerate()
+            {
                 let _ = field_index.insert(shifted_name.clone(), index + offset);
             }
         }
@@ -716,16 +1035,16 @@ impl Datum {
     /// Iterates materialized fields in stable first-declaration order.
     #[must_use]
     pub fn fields(&self) -> impl ExactSizeIterator<Item = (&FieldName, &Value)> {
-        self.fields.iter().map(|(name, value)| (name, value))
+        self.fields.iter()
     }
 
     fn build_field_index(&mut self) {
         debug_assert!(self.fields.len() >= DATUM_FIELD_INDEX_THRESHOLD);
         self.field_index = Some(Arc::new(
             self.fields
-                .iter()
+                .names()
                 .enumerate()
-                .map(|(index, (name, _))| (name.clone(), index))
+                .map(|(index, name)| (name.clone(), index))
                 .collect(),
         ));
     }
@@ -735,7 +1054,7 @@ impl Datum {
         aggregate: &mut DatumStorageStats,
         field_indexes: &mut FieldIndexInterner,
     ) {
-        let reclaimed = gc_shrink_vector(&mut self.fields);
+        let reclaimed = self.fields.shrink_values_for_gc();
         aggregate.shrunk_field_vectors = aggregate
             .shrunk_field_vectors
             .saturating_add(usize::from(reclaimed > 0));
@@ -770,7 +1089,8 @@ impl Datum {
                         reclaimed.saturating_mul(std::mem::size_of::<(FieldName, usize)>()),
                     );
             }
-            let physical_is_new = field_indexes.intern(&self.fields, index, aggregate);
+            let (physical_is_new, names) = field_indexes.intern(&self.fields, index, aggregate);
+            self.fields.share_names(names);
             aggregate.field_index_len = aggregate.field_index_len.saturating_add(index.len());
             aggregate.field_index_capacity = aggregate
                 .field_index_capacity
@@ -785,6 +1105,16 @@ impl Datum {
                     .physical_field_index_capacity
                     .saturating_add(index.capacity());
             }
+        } else if !self.fields.is_empty() {
+            let names = field_indexes.intern_unindexed_names(&self.fields);
+            self.fields.share_names(names);
+        }
+        if matches!(self.fields, DatumFields::Shared { .. }) {
+            aggregate.shared_field_name_datums =
+                aggregate.shared_field_name_datums.saturating_add(1);
+            aggregate.shared_field_name_logical_slots = aggregate
+                .shared_field_name_logical_slots
+                .saturating_add(self.fields.len());
         }
     }
 }
@@ -2191,6 +2521,7 @@ impl<T> Arena<T> {
 pub struct ValueHeap {
     datums: Arena<Datum>,
     lists: Arena<DmList>,
+    datum_layouts: DatumLayoutCache,
 }
 
 /// Results and storage telemetry from one combined datum/list collection.
@@ -2523,6 +2854,12 @@ impl ValueHeap {
         let reclaimed_datums = self.datums.sweep_unmarked_with(&marked_datums, |datum| {
             datum.compact_and_measure_for_gc(&mut datum_storage, &mut field_indexes);
         });
+        datum_storage.shared_field_name_layouts = field_indexes.shared_name_layouts();
+        datum_storage.shared_field_name_physical_slots = field_indexes.shared_name_slots();
+        datum_storage.shared_field_name_bytes_saved = datum_storage
+            .shared_field_name_logical_slots
+            .saturating_sub(datum_storage.shared_field_name_physical_slots)
+            .saturating_mul(std::mem::size_of::<FieldName>());
         HeapCollectionStats {
             reclaimed_datums,
             reclaimed_lists,
@@ -2589,7 +2926,7 @@ impl ValueHeap {
     pub fn allocate_datum(&mut self, type_path: TypePath) -> DatumId {
         let (index, generation) = self.datums.insert(Datum {
             type_path,
-            fields: Vec::new(),
+            fields: DatumFields::default(),
             field_index: None,
         });
         DatumId { index, generation }
@@ -2608,14 +2945,34 @@ impl ValueHeap {
     ) -> DatumId {
         let mut datum = Datum {
             type_path,
-            fields: Vec::new(),
+            fields: DatumFields::default(),
             field_index: None,
         };
         for layer in defaults {
             datum.apply_defaults(layer);
         }
+        self.datum_layouts.compact(&mut datum);
         let (index, generation) = self.datums.insert(datum);
         DatumId { index, generation }
+    }
+
+    /// Shares an initialized datum's immutable field-name layout while
+    /// retaining a distinct mutable value vector for the datum.
+    ///
+    /// Call this after engine-owned defaults and map overrides have been
+    /// materialized. Later insertion or deletion detaches only that datum;
+    /// ordinary value mutation remains compact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValueError::StaleDatum`] for a stale identity.
+    pub fn compact_datum_layout(&mut self, id: DatumId) -> Result<(), ValueError> {
+        let datum = self
+            .datums
+            .get_mut(id.index, id.generation)
+            .ok_or(ValueError::StaleDatum(id))?;
+        self.datum_layouts.compact(datum);
+        Ok(())
     }
 
     /// Returns a live datum.
@@ -2896,8 +3253,8 @@ mod tests {
         assert_eq!(
             std::mem::size_of::<Datum>(),
             std::mem::size_of::<TypePath>()
-                + std::mem::size_of::<Vec<(FieldName, Value)>>()
-                + std::mem::size_of::<Option<Box<HashMap<FieldName, usize>>>>(),
+                + std::mem::size_of::<DatumFields>()
+                + std::mem::size_of::<Option<Arc<HashMap<FieldName, usize>>>>(),
         );
         assert_eq!(
             std::mem::size_of::<Option<Box<HashMap<FieldName, usize>>>>(),
@@ -4434,6 +4791,58 @@ mod tests {
     }
 
     #[test]
+    fn initialized_datums_share_layouts_before_gc_and_detach_on_growth() {
+        let mut heap = ValueHeap::new();
+        let path = TypePath::parse("/datum/birth_layout").unwrap();
+        let mut defaults = DatumDefaults::new(path.clone());
+        for index in 0..32 {
+            defaults.set(
+                field(&format!("field_{index:02}")),
+                Value::number(index as f32),
+            );
+        }
+
+        let left = heap.allocate_datum_with_defaults(path.clone(), &[defaults.clone()]);
+        let right = heap.allocate_datum_with_defaults(path, &[defaults]);
+        let left_datum = heap.datum(left).unwrap();
+        let right_datum = heap.datum(right).unwrap();
+        let DatumFields::Shared {
+            names: left_names, ..
+        } = &left_datum.fields
+        else {
+            panic!("initialized fields should be compact before GC")
+        };
+        let DatumFields::Shared {
+            names: right_names, ..
+        } = &right_datum.fields
+        else {
+            panic!("repeated initialized fields should be compact before GC")
+        };
+        assert!(Arc::ptr_eq(left_names, right_names));
+        assert!(Arc::ptr_eq(
+            left_datum.field_index.as_ref().unwrap(),
+            right_datum.field_index.as_ref().unwrap(),
+        ));
+
+        heap.set_datum_field(left, field("field_07"), Value::number(700.0))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            heap.datum(left).unwrap().field_index.as_ref().unwrap(),
+            heap.datum(right).unwrap().field_index.as_ref().unwrap(),
+        ));
+        heap.set_datum_field(left, field("dynamic"), Value::number(1.0))
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            heap.datum(left).unwrap().field_index.as_ref().unwrap(),
+            heap.datum(right).unwrap().field_index.as_ref().unwrap(),
+        ));
+        assert_eq!(
+            heap.datum(right).unwrap().field(&field("field_07")),
+            Ok(&Value::number(7.0)),
+        );
+    }
+
+    #[test]
     fn gc_shares_identical_field_layout_indexes_and_detaches_only_for_layout_changes() {
         let mut heap = ValueHeap::new();
         let left = heap.allocate_datum(TypePath::parse("/datum/layout_left").unwrap());
@@ -4463,6 +4872,27 @@ mod tests {
         assert_eq!(stats.datum_storage.field_index_pointer_cache_hits, 0);
         assert_eq!(stats.datum_storage.field_index_exact_layout_comparisons, 1);
         assert!(stats.datum_storage.deduplicated_field_index_bytes > 0);
+        assert_eq!(stats.datum_storage.shared_field_name_datums, 2);
+        assert_eq!(stats.datum_storage.shared_field_name_logical_slots, 128);
+        assert_eq!(stats.datum_storage.shared_field_name_layouts, 1);
+        assert_eq!(stats.datum_storage.shared_field_name_physical_slots, 64);
+        assert_eq!(
+            stats.datum_storage.shared_field_name_bytes_saved,
+            64 * std::mem::size_of::<FieldName>(),
+        );
+        let DatumFields::Shared {
+            names: left_names, ..
+        } = &heap.datum(left).unwrap().fields
+        else {
+            panic!("left layout should be compacted")
+        };
+        let DatumFields::Shared {
+            names: right_names, ..
+        } = &heap.datum(right).unwrap().fields
+        else {
+            panic!("right layout should be compacted")
+        };
+        assert!(Arc::ptr_eq(left_names, right_names));
         assert_eq!(
             heap.datum(left).unwrap().field(&field("field_07")),
             Ok(&Value::number(7.0)),
@@ -4525,6 +4955,51 @@ mod tests {
         assert_eq!(
             repeated.datum_storage.field_index_exact_layout_comparisons,
             0,
+        );
+    }
+
+    #[test]
+    fn gc_shares_small_linear_field_names_and_detaches_on_layout_growth() {
+        let mut heap = ValueHeap::new();
+        let left = heap.allocate_datum(TypePath::parse("/datum/small_left").unwrap());
+        let right = heap.allocate_datum(TypePath::parse("/datum/small_right").unwrap());
+        for datum in [left, right] {
+            heap.set_datum_field(datum, field("name"), Value::text("value"))
+                .unwrap();
+            heap.set_datum_field(datum, field("count"), Value::number(2.0))
+                .unwrap();
+        }
+        let owned_snapshot = heap.datum(left).unwrap().clone();
+
+        let stats = heap.collect_unreachable_values_from_ids_with_stats(&[left, right], &[]);
+        assert_eq!(heap.datum(left).unwrap(), &owned_snapshot);
+        assert_eq!(stats.datum_storage.shared_field_name_datums, 2);
+        assert_eq!(stats.datum_storage.shared_field_name_layouts, 1);
+        assert_eq!(stats.datum_storage.shared_field_name_logical_slots, 4);
+        assert_eq!(stats.datum_storage.shared_field_name_physical_slots, 2);
+        let DatumFields::Shared {
+            names: left_names, ..
+        } = &heap.datum(left).unwrap().fields
+        else {
+            panic!("left layout should be compacted")
+        };
+        let DatumFields::Shared {
+            names: right_names, ..
+        } = &heap.datum(right).unwrap().fields
+        else {
+            panic!("right layout should be compacted")
+        };
+        assert!(Arc::ptr_eq(left_names, right_names));
+
+        heap.set_datum_field(left, field("extra"), Value::number(3.0))
+            .unwrap();
+        assert_eq!(
+            heap.datum(left).unwrap().field(&field("extra")),
+            Ok(&Value::number(3.0)),
+        );
+        assert_eq!(
+            heap.datum(right).unwrap().field(&field("extra")),
+            Err(ValueError::MissingField(field("extra"))),
         );
     }
 

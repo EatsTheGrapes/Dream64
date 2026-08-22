@@ -542,6 +542,11 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
                 }
             }
         }
+        // Map allocation materializes coordinates and source overrides after
+        // the VM's inherited defaults. Seal the resulting shape now so the
+        // wide temporary name/value pairs do not remain live until the first
+        // startup GC across the entire world.
+        self.state.heap_mut().compact_datum_layout(datum)?;
         Ok(datum)
     }
 

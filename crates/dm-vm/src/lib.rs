@@ -12601,7 +12601,7 @@ impl ExecutionState {
             let datums = collection.datum_arena;
             let list_arena = collection.list_arena;
             eprintln!(
-                "boot-vm: heap-gc datums_before={before_datums} datums_after={after_datums} datums_reclaimed={reclaimed_datums} lists_before={before_lists} lists_after={after_lists} lists_reclaimed={reclaimed_lists} growth={growth} next={} elapsed_ms={elapsed_ms} list_storage_allocated={} list_payload_len={} list_payload_cap={} list_order_len={} list_order_cap={} list_prefix_retained={} list_prefix_compacted={} list_prefix_entries_compacted={} list_vectors_shrunk={} list_capacity_bytes_reclaimed={} list_shared_shrink_candidates={} list_assoc_indexes={} list_assoc_index_len={} list_assoc_index_cap={} list_assoc_index_ratio_bins={:?} list_assoc_indexes_shrunk={} list_assoc_index_cap_reclaimed={} list_assoc_index_bytes_reclaimed={} list_remove_indexes={} list_remove_key_len={} list_remove_key_cap={} list_remove_position_len={} list_remove_position_cap={} list_remove_removed_len={} list_remove_removed_cap={} list_remove_indexes_dropped={} list_shared_derived_candidates={} datum_field_len={} datum_field_cap={} datum_field_vectors_shrunk={} datum_capacity_bytes_reclaimed={} datum_field_indexes={} datum_field_index_len={} datum_field_index_cap={} datum_field_index_ratio_bins={:?} datum_field_indexes_shrunk={} datum_field_index_cap_reclaimed={} datum_field_index_bytes_reclaimed={} datum_field_indexes_deduplicated={} datum_field_index_dedupe_bytes_reclaimed={} datum_field_physical_indexes={} datum_field_physical_index_len={} datum_field_physical_index_cap={} datum_field_index_fingerprint_collisions={} datum_field_index_fingerprints_computed={} datum_field_index_pointer_cache_hits={} datum_field_index_exact_layout_comparisons={} datum_arena_live={} datum_arena_slots={} datum_arena_free={} datum_arena_chunks={} datum_arena_reserved={} list_arena_live={} list_arena_slots={} list_arena_free={} list_arena_chunks={} list_arena_reserved={}",
+                "boot-vm: heap-gc datums_before={before_datums} datums_after={after_datums} datums_reclaimed={reclaimed_datums} lists_before={before_lists} lists_after={after_lists} lists_reclaimed={reclaimed_lists} growth={growth} next={} elapsed_ms={elapsed_ms} list_storage_allocated={} list_payload_len={} list_payload_cap={} list_order_len={} list_order_cap={} list_prefix_retained={} list_prefix_compacted={} list_prefix_entries_compacted={} list_vectors_shrunk={} list_capacity_bytes_reclaimed={} list_shared_shrink_candidates={} list_assoc_indexes={} list_assoc_index_len={} list_assoc_index_cap={} list_assoc_index_ratio_bins={:?} list_assoc_indexes_shrunk={} list_assoc_index_cap_reclaimed={} list_assoc_index_bytes_reclaimed={} list_remove_indexes={} list_remove_key_len={} list_remove_key_cap={} list_remove_position_len={} list_remove_position_cap={} list_remove_removed_len={} list_remove_removed_cap={} list_remove_indexes_dropped={} list_shared_derived_candidates={} datum_field_len={} datum_field_cap={} datum_shared_name_datums={} datum_shared_name_logical_slots={} datum_shared_name_layouts={} datum_shared_name_physical_slots={} datum_shared_name_bytes_saved={} datum_field_vectors_shrunk={} datum_capacity_bytes_reclaimed={} datum_field_indexes={} datum_field_index_len={} datum_field_index_cap={} datum_field_index_ratio_bins={:?} datum_field_indexes_shrunk={} datum_field_index_cap_reclaimed={} datum_field_index_bytes_reclaimed={} datum_field_indexes_deduplicated={} datum_field_index_dedupe_bytes_reclaimed={} datum_field_physical_indexes={} datum_field_physical_index_len={} datum_field_physical_index_cap={} datum_field_index_fingerprint_collisions={} datum_field_index_fingerprints_computed={} datum_field_index_pointer_cache_hits={} datum_field_index_exact_layout_comparisons={} datum_arena_live={} datum_arena_slots={} datum_arena_free={} datum_arena_chunks={} datum_arena_reserved={} list_arena_live={} list_arena_slots={} list_arena_free={} list_arena_chunks={} list_arena_reserved={}",
                 self.next_list_collection,
                 lists.allocated_lists,
                 lists.payload_len,
@@ -12632,6 +12632,11 @@ impl ExecutionState {
                 lists.shared_derived_index_candidates,
                 datum_storage.field_len,
                 datum_storage.field_capacity,
+                datum_storage.shared_field_name_datums,
+                datum_storage.shared_field_name_logical_slots,
+                datum_storage.shared_field_name_layouts,
+                datum_storage.shared_field_name_physical_slots,
+                datum_storage.shared_field_name_bytes_saved,
                 datum_storage.shrunk_field_vectors,
                 datum_storage.reclaimed_capacity_bytes,
                 datum_storage.field_indexes,
@@ -20687,6 +20692,10 @@ fn allocate_or_replace_engine_datum(
     }
     let datum = allocate_initialized_datum(state, type_path.clone())?;
     initialize_engine_resource(state, datum, &type_path, arguments)?;
+    state
+        .heap
+        .compact_datum_layout(datum)
+        .map_err(|error| error.to_string())?;
     Ok(datum)
 }
 
@@ -20968,6 +20977,10 @@ fn initialize_existing_datum(
     if is_atom {
         let contents = FieldName::parse("contents").expect("built-in contents field");
         if preserve_cell {
+            state
+                .heap
+                .compact_datum_layout(datum)
+                .map_err(|error| error.to_string())?;
             return Ok(());
         }
         let world = FieldName::parse("world").expect("built-in world global");
@@ -20990,6 +21003,10 @@ fn initialize_existing_datum(
                 .add(Value::Datum(datum));
         }
     }
+    state
+        .heap
+        .compact_datum_layout(datum)
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
