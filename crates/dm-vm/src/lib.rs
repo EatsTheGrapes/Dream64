@@ -12503,6 +12503,16 @@ impl ExecutionState {
                 std::iter::once(&frame.usr),
             );
             extend_heap_root_ids(&mut datum_roots, &mut list_roots, &frame.arguments);
+            extend_heap_root_ids(
+                &mut datum_roots,
+                &mut list_roots,
+                &frame.pending_argument_roots,
+            );
+            extend_heap_root_ids(
+                &mut datum_roots,
+                &mut list_roots,
+                &frame.retained_call_roots,
+            );
             list_roots.extend(frame.args_list);
             extend_heap_root_ids(
                 &mut datum_roots,
@@ -12885,6 +12895,11 @@ struct CallFrame {
     // Runtime names produced by arglist(list). This is consumed by the
     // immediately following call/constructor instruction.
     pending_argument_names: Option<Vec<Option<String>>>,
+    // Source lists consumed by arglist expansion. Re-entrant engine execution
+    // cannot always see the outer caller's frames, so transfer these roots to
+    // the callee until it returns.
+    pending_argument_roots: SmallVec<[Value; 2]>,
+    retained_call_roots: SmallVec<[Value; 2]>,
     exception_handlers: Vec<ExceptionHandler>,
     // A waitfor=FALSE boundary detaches from its caller only once. Later
     // sleeps in the already-detached continuation yield normally.
@@ -12930,6 +12945,12 @@ fn preserve_reentrant_frame_roots(state: &mut ExecutionState, frames: &[CallFram
         state
             .host_value_roots
             .extend(frame.arguments.iter().cloned());
+        state
+            .host_value_roots
+            .extend(frame.pending_argument_roots.iter().cloned());
+        state
+            .host_value_roots
+            .extend(frame.retained_call_roots.iter().cloned());
         if let Some(list) = frame.args_list {
             state.host_value_roots.push(Value::List(list));
         }
@@ -14529,6 +14550,7 @@ fn run_frames(
                 };
                 let mut expanded = Vec::new();
                 let mut expanded_names = Vec::new();
+                let mut expanded_roots = SmallVec::<[Value; 2]>::new();
                 for (index, value) in source.into_iter().enumerate() {
                     let index = u16::try_from(index).expect("source argument count is u16");
                     if expanded_indices.binary_search(&index).is_ok() {
@@ -14545,6 +14567,7 @@ fn run_frames(
                                 "arglist requires a list value",
                             ));
                         };
+                        expanded_roots.push(Value::List(list));
                         let list = state
                             .heap
                             .list(list)
@@ -14592,6 +14615,7 @@ fn run_frames(
                 stack.extend(expanded);
                 stack.push(Value::number(f32::from(expanded_count)));
                 frames[frame_index].pending_argument_names = Some(expanded_names);
+                frames[frame_index].pending_argument_roots = expanded_roots;
             }
             Instruction::AllocateDatum {
                 argument_count,
@@ -14600,6 +14624,9 @@ fn run_frames(
                 let expanded_argument_names = (*argument_count == EXPANDED_ARGUMENT_COUNT)
                     .then(|| frames[frame_index].pending_argument_names.take())
                     .flatten();
+                let expanded_argument_roots = (*argument_count == EXPANDED_ARGUMENT_COUNT)
+                    .then(|| std::mem::take(&mut frames[frame_index].pending_argument_roots))
+                    .unwrap_or_default();
                 let count_result =
                     runtime_argument_count(&mut frames[frame_index].stack, *argument_count);
                 let count =
@@ -14755,6 +14782,7 @@ fn run_frames(
                         } else {
                             make_frame_owned(constructor, constructor_program, arguments, &context)
                         };
+                        constructor_frame.retained_call_roots = expanded_argument_roots;
                         constructor_frame.caller_result_override = Some(allocated.clone());
                         mark_boot_trace_frame(
                             &mut constructor_frame,
@@ -14772,6 +14800,9 @@ fn run_frames(
                 let expanded_argument_names = (*argument_count == EXPANDED_ARGUMENT_COUNT)
                     .then(|| frames[frame_index].pending_argument_names.take())
                     .flatten();
+                let expanded_argument_roots = (*argument_count == EXPANDED_ARGUMENT_COUNT)
+                    .then(|| std::mem::take(&mut frames[frame_index].pending_argument_roots))
+                    .unwrap_or_default();
                 let count = runtime_argument_count(&mut frames[frame_index].stack, *argument_count)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 if frames[frame_index].stack.len() < count {
@@ -14843,6 +14874,7 @@ fn run_frames(
                     } else {
                         make_frame_owned(constructor, constructor_program, arguments, &context)
                     };
+                    constructor_frame.retained_call_roots = expanded_argument_roots;
                     constructor_frame.caller_result_override = Some(Value::Datum(datum));
                     mark_boot_trace_frame(&mut constructor_frame, module, state, executed_steps);
                     frames.push(constructor_frame);
@@ -15585,6 +15617,7 @@ fn run_frames(
             }
             Instruction::PickExpandedArguments => {
                 frames[frame_index].pending_argument_names = None;
+                frames[frame_index].pending_argument_roots.clear();
                 let count =
                     runtime_argument_count(&mut frames[frame_index].stack, EXPANDED_ARGUMENT_COUNT)
                         .map_err(|message| execution_error(module, &frames, message))?;
@@ -17963,6 +17996,9 @@ fn run_frames(
                 let expanded_argument_names = (argument_count == EXPANDED_ARGUMENT_COUNT)
                     .then(|| frames[frame_index].pending_argument_names.take())
                     .flatten();
+                let expanded_argument_roots = (argument_count == EXPANDED_ARGUMENT_COUNT)
+                    .then(|| std::mem::take(&mut frames[frame_index].pending_argument_roots))
+                    .unwrap_or_default();
                 let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let stack_length = frames[frame_index].stack.len();
@@ -18037,6 +18073,7 @@ fn run_frames(
                 } else {
                     make_frame_named(target, target_program, &arguments, names, &context)
                 };
+                target_frame.retained_call_roots = expanded_argument_roots;
                 if shuttle_trace_enabled() {
                     let slot = shuttle_trace_slot_from_arguments(&target_frame.arguments);
                     shuttle_trace_prepare_call(
@@ -18064,6 +18101,10 @@ fn run_frames(
                 let expanded_argument_names = argument_count
                     .filter(|count| *count == EXPANDED_ARGUMENT_COUNT)
                     .and_then(|_| frames[frame_index].pending_argument_names.take());
+                let expanded_argument_roots = argument_count
+                    .filter(|count| *count == EXPANDED_ARGUMENT_COUNT)
+                    .map(|_| std::mem::take(&mut frames[frame_index].pending_argument_roots))
+                    .unwrap_or_default();
                 let arguments = if let Some(argument_count) = argument_count {
                     let count =
                         runtime_argument_count(&mut frames[frame_index].stack, argument_count)
@@ -18093,6 +18134,7 @@ fn run_frames(
                         &context,
                     )
                 };
+                target_frame.retained_call_roots = expanded_argument_roots;
                 if shuttle_trace_enabled() {
                     let slot = shuttle_trace_slot_from_arguments(&target_frame.arguments);
                     shuttle_trace_prepare_call(
@@ -18206,6 +18248,10 @@ fn run_frames(
                 let expanded_argument_names = argument_count
                     .filter(|count| *count == EXPANDED_ARGUMENT_COUNT)
                     .and_then(|_| frames[frame_index].pending_argument_names.take());
+                let expanded_argument_roots = argument_count
+                    .filter(|count| *count == EXPANDED_ARGUMENT_COUNT)
+                    .map(|_| std::mem::take(&mut frames[frame_index].pending_argument_roots))
+                    .unwrap_or_default();
                 let arguments = if let Some(argument_count) = argument_count {
                     let count =
                         runtime_argument_count(&mut frames[frame_index].stack, argument_count)
@@ -18239,6 +18285,7 @@ fn run_frames(
                         &context,
                     )
                 };
+                target_frame.retained_call_roots = expanded_argument_roots;
                 if shuttle_trace_enabled() {
                     let slot = shuttle_trace_slot_from_arguments(&target_frame.arguments);
                     shuttle_trace_prepare_call(
@@ -18265,6 +18312,9 @@ fn run_frames(
                 let expanded_argument_names = (argument_count == EXPANDED_ARGUMENT_COUNT)
                     .then(|| frames[frame_index].pending_argument_names.take())
                     .flatten();
+                let expanded_argument_roots = (argument_count == EXPANDED_ARGUMENT_COUNT)
+                    .then(|| std::mem::take(&mut frames[frame_index].pending_argument_roots))
+                    .unwrap_or_default();
                 let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 let stack_length = frames[frame_index].stack.len();
@@ -18344,6 +18394,7 @@ fn run_frames(
                                 &context,
                             )
                         };
+                    target_frame.retained_call_roots = expanded_argument_roots;
                     if shuttle_trace_enabled() {
                         let slot = shuttle_trace_slot_from_arguments(&target_frame.arguments);
                         shuttle_trace_prepare_call(
@@ -19527,6 +19578,8 @@ fn make_frame_inline(
             .map(|index| index < supplied_argument_count)
             .collect(),
         pending_argument_names: None,
+        pending_argument_roots: SmallVec::new(),
+        retained_call_roots: SmallVec::new(),
         exception_handlers: Vec::new(),
         detached_waitfor: false,
         caller_result_override: None,
