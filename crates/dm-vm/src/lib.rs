@@ -329,6 +329,30 @@ pub enum Instruction {
         /// Instruction after the loop when the snapshot is exhausted.
         exit: usize,
     },
+    /// Checks a compiler-generated inclusive numeric loop bound in one step.
+    ///
+    /// The following three reference instructions remain in the program for
+    /// stable branch targets and dynamic-value fallback.
+    CheckNumericLoop {
+        /// Local containing the current loop value.
+        current_slot: u16,
+        /// Local containing the inclusive upper bound.
+        end_slot: u16,
+        /// Instruction after the loop when `current > end`.
+        exit: usize,
+    },
+    /// Applies a constant numeric loop increment and jumps to its condition.
+    ///
+    /// The original compound-assignment tail remains immediately afterward,
+    /// allowing non-numeric locals to retain ordinary DM operator semantics.
+    AdvanceNumericLoop {
+        /// Local updated by the loop tail.
+        slot: u16,
+        /// Constant increment encoded by the source loop.
+        step: DmNumberBits,
+        /// Condition header for the next iteration.
+        target: usize,
+    },
     /// Pops a value, index/key, and list handle and updates that list.
     SetListIndex,
     /// Like [`Self::SetListIndex`], but leaves the stored value on the stack.
@@ -1451,6 +1475,7 @@ pub fn compile_initializer_program(
         _ => return Err(compile_error("expected an initializer expression")),
     };
     specialize_local_list_iteration_headers(&mut instructions);
+    specialize_numeric_loop_edges(&mut instructions);
     Ok(Program {
         wait_for: true,
         parameter_count: 0,
@@ -2057,6 +2082,7 @@ fn compile_procedure_with_resolver_and_fields(
     }
 
     specialize_local_list_iteration_headers(&mut instructions);
+    specialize_numeric_loop_edges(&mut instructions);
     Ok(Program {
         wait_for: procedure_wait_for(definition),
         parameter_count: definition.parameters.len(),
@@ -2107,6 +2133,46 @@ fn specialize_local_list_iteration_headers(instructions: &mut [Instruction]) {
             exit: *exit,
         };
         instructions[index] = specialized;
+    }
+}
+
+fn specialize_numeric_loop_edges(instructions: &mut [Instruction]) {
+    for index in 0..instructions.len() {
+        if let Some(
+            [
+                Instruction::LoadLocal(current_slot),
+                Instruction::LoadLocal(end_slot),
+                Instruction::LessEqual,
+                Instruction::JumpIfFalse(exit),
+            ],
+        ) = instructions.get(index..index.saturating_add(4))
+        {
+            instructions[index] = Instruction::CheckNumericLoop {
+                current_slot: *current_slot,
+                end_slot: *end_slot,
+                exit: *exit,
+            };
+            continue;
+        }
+        if let Some(
+            [
+                Instruction::LoadLocal(slot),
+                Instruction::PushNumber(step),
+                Instruction::CompoundAssignment(CompoundAssignmentOperator::Add),
+                Instruction::Duplicate,
+                Instruction::StoreLocal(stored_slot),
+                Instruction::Pop,
+                Instruction::Jump(target),
+            ],
+        ) = instructions.get(index..index.saturating_add(7))
+            && slot == stored_slot
+        {
+            instructions[index] = Instruction::AdvanceNumericLoop {
+                slot: *slot,
+                step: *step,
+                target: *target,
+            };
+        }
     }
 }
 
@@ -13087,6 +13153,8 @@ fn startup_instruction_category(instruction: &Instruction) -> usize {
         | Instruction::JumpIfFalse(_)
         | Instruction::Jump(_)
         | Instruction::JumpIfArgumentSupplied { .. }
+        | Instruction::CheckNumericLoop { .. }
+        | Instruction::AdvanceNumericLoop { .. }
         | Instruction::IterationTypeFilter(_) => 5,
         _ => 6,
     }
@@ -16295,6 +16363,62 @@ fn run_frames(
                 frames[frame_index].instruction += 7;
                 continue;
             }
+            Instruction::CheckNumericLoop {
+                current_slot,
+                end_slot,
+                exit,
+            } => {
+                let current_slot = usize::from(*current_slot);
+                let end_slot = usize::from(*end_slot);
+                let current = frames[frame_index]
+                    .locals
+                    .get(current_slot)
+                    .cloned()
+                    .ok_or_else(|| {
+                        execution_error(
+                            module,
+                            &frames,
+                            format!("invalid local slot {current_slot}"),
+                        )
+                    })?;
+                let end = frames[frame_index]
+                    .locals
+                    .get(end_slot)
+                    .cloned()
+                    .ok_or_else(|| {
+                        execution_error(module, &frames, format!("invalid local slot {end_slot}"))
+                    })?;
+                if let (Value::Number(current), Value::Number(end)) = (&current, &end) {
+                    frames[frame_index].instruction = if current.to_f32() <= end.to_f32() {
+                        frames[frame_index].instruction + 4
+                    } else {
+                        *exit
+                    };
+                    continue;
+                }
+                // Re-enter the untouched tail at its second LoadLocal. The
+                // ordinary LessEqual path retains dynamic comparison errors.
+                frames[frame_index].stack.push(current);
+            }
+            Instruction::AdvanceNumericLoop { slot, step, target } => {
+                let slot = usize::from(*slot);
+                let current = frames[frame_index]
+                    .locals
+                    .get(slot)
+                    .cloned()
+                    .ok_or_else(|| {
+                        execution_error(module, &frames, format!("invalid local slot {slot}"))
+                    })?;
+                if let Value::Number(current) = current {
+                    frames[frame_index].locals[slot] =
+                        Value::Number(DmNumberBits::from_f32(current.to_f32() + step.to_f32()));
+                    frames[frame_index].instruction = *target;
+                    continue;
+                }
+                // Preserve the original compound-assignment tail for a
+                // dynamically non-numeric iterator.
+                frames[frame_index].stack.push(current);
+            }
             Instruction::SetListIndex => {
                 let value = match pop(&mut frames[frame_index].stack) {
                     Ok(value) => value,
@@ -19136,7 +19260,8 @@ fn compile_register_signal_trace(
                 argument_count: 1
             }
         )
-        || !matches!(instructions[121], Instruction::SetListIndex)
+        || !matches!(instructions[120], Instruction::SetListIndex)
+        || !matches!(instructions[121], Instruction::Jump(138))
         || !matches!(instructions[138], Instruction::LoadResult)
         || !matches!(instructions[139], Instruction::Return)
     {
@@ -19168,8 +19293,7 @@ fn try_run_register_signal_fast_path(
     {
         return None;
     }
-    let override_supplied = frame.supplied_parameters.get(3).copied().unwrap_or(false)
-        && !matches!(frame.locals.get(3), None | Some(Value::Null));
+    let override_supplied = frame.supplied_parameters.get(3).copied().unwrap_or(false);
     let accounted_steps = if override_supplied { 54 } else { 56 };
     if remaining_steps < accounted_steps {
         return None;
@@ -19182,6 +19306,8 @@ fn try_run_register_signal_fast_path(
     };
     let signal_type = frame.locals.get(1)?.clone();
     let proctype = frame.locals.get(2)?.clone();
+    let override_enabled =
+        runtime_truthy(&state.heap, frame.locals.get(3).unwrap_or(&Value::Null)).ok()?;
     // Signals are canonically text. Restricting the native path here retains
     // the interpreter's exact coercion/error behavior for every odd key type.
     if !matches!(signal_type, Value::Text(_)) {
@@ -19256,8 +19382,8 @@ fn try_run_register_signal_fast_path(
         } else {
             None
         };
-        if let Some(target_procs) = target_procs {
-            let existing = match read_list_value(
+        let existing = if let Some(target_procs) = target_procs {
+            match read_list_value(
                 &state.heap,
                 target_procs,
                 &signal_type,
@@ -19266,13 +19392,17 @@ fn try_run_register_signal_fast_path(
                 Ok(value) => value,
                 Err(ValueError::MissingKey) => Value::Null,
                 Err(_) => return None,
-            };
-            if runtime_truthy(&state.heap, &existing).ok()? {
-                return None;
             }
+        } else {
+            Value::Null
+        };
+        // Formatting the warning and collecting its DM stack trace are
+        // observable. Side-exit before mutation so bytecode performs it once.
+        if runtime_truthy(&state.heap, &existing).ok()? && !override_enabled {
+            return None;
         }
-        if let Some(lookup) = lookup {
-            let looked_up = match read_list_value(
+        let looked_up = if let Some(lookup) = lookup {
+            match read_list_value(
                 &state.heap,
                 lookup,
                 &signal_type,
@@ -19281,10 +19411,14 @@ fn try_run_register_signal_fast_path(
                 Ok(value) => value,
                 Err(ValueError::MissingKey) => Value::Null,
                 Err(_) => return None,
-            };
-            if !matches!(looked_up, Value::Null) {
-                return None;
             }
+        } else {
+            Value::Null
+        };
+        if let Value::List(listeners) = &looked_up
+            && !ordinary_list(state, *listeners)
+        {
+            return None;
         }
 
         // Every fallible read and shape guard is complete. Materialize the
@@ -19331,11 +19465,29 @@ fn try_run_register_signal_fast_path(
             .list_mut(target_procs)
             .ok()?
             .set_key(signal_type.clone(), proctype);
-        state
-            .heap
-            .list_mut(lookup)
-            .ok()?
-            .set_key(signal_type, Value::Datum(src));
+        match looked_up {
+            Value::Null => {
+                state
+                    .heap
+                    .list_mut(lookup)
+                    .ok()?
+                    .set_key(signal_type, Value::Datum(src));
+            }
+            Value::List(listeners) => {
+                state.heap.list_mut(listeners).ok()?.add(Value::Datum(src));
+            }
+            listener => {
+                let listeners = state.heap.allocate_list();
+                let values = state.heap.list_mut(listeners).ok()?;
+                values.add(listener);
+                values.add(Value::Datum(src));
+                state
+                    .heap
+                    .list_mut(lookup)
+                    .ok()?
+                    .set_key(signal_type, Value::List(listeners));
+            }
+        }
         frame.instruction = 138;
         Some(accounted_steps)
     })
@@ -25406,27 +25558,29 @@ mod tests {
     use dm_dmf::{ControlTree, parse as parse_dmf};
     use dm_lexer::{SpannedToken, TokenKind, lex};
     use dm_syntax::{DefinitionKind, parse};
-    use dm_value::{FieldName, ModifiedTypePath, TypePath, ValueError};
+    use dm_value::{DatumId, FieldName, ModifiedTypePath, TypePath, ValueError};
 
     use super::{
-        CANONICAL_TYPE2PARENT_SOURCE, CompoundListIndexOperator, ExecutionContext, ExecutionLimits,
-        ExecutionState, InitializerBinding, InstanceInitializer, Instruction,
-        LocalClientPromptKind, LocalClientPromptResponse, LocalClientUiEvent,
+        CANONICAL_TYPE2PARENT_SOURCE, CompoundAssignmentOperator, CompoundListIndexOperator,
+        ExecutionContext, ExecutionLimits, ExecutionState, InitializerBinding, InstanceInitializer,
+        Instruction, LocalClientPromptKind, LocalClientPromptResponse, LocalClientUiEvent,
         MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES,
         MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE, MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH,
         MAXIMUM_LOW_YIELD_COLLECTION_GROWTH, MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH,
-        MINIMUM_HEAP_COLLECTION_GROWTH, Module, ProcedureSpec, Program, Value,
+        MINIMUM_HEAP_COLLECTION_GROWTH, Module, ProcedureId, ProcedureSpec, Program,
+        REGISTER_SIGNAL_FAST_CACHE, TypePredicateKind, Value, VerbParameterType,
         adaptive_heap_collection_growth, advance_scheduler, allocate_initialized_datum,
         allocate_matrix, assign_datum_field, compile_initializer, compile_initializer_into_module,
         compile_module, compile_module_specs, compile_module_specs_selective,
         compile_module_specs_selective_with_errors, compile_module_with_global_fields,
         compile_procedure, compile_procedure_with_resolver_and_fields, condition_tokens,
-        datum_field_or_initial, dm_builtin_numeric_constant, execute, execute_in_context,
-        execute_in_state, execute_module, execute_module_in_context, execute_module_in_state,
-        execute_module_with_limits, execute_module_with_limits_in_state, execute_with_limits,
-        execute_with_limits_in_state, initial_value_or_engine_root, instance_initializer_plan,
-        interpolated_expression_close, is_subtype, matrix_components,
-        prepare_iteration_consumes_fresh_block,
+        datum_field_or_initial, datum_field_or_shared, dm_builtin_numeric_constant, execute,
+        execute_in_context, execute_in_state, execute_module, execute_module_in_context,
+        execute_module_in_state, execute_module_with_limits, execute_module_with_limits_in_state,
+        execute_with_limits, execute_with_limits_in_state, initial_value_or_engine_root,
+        instance_initializer_plan, interpolated_expression_close, is_subtype, make_frame,
+        matrix_components, next_module_identity, prepare_iteration_consumes_fresh_block,
+        read_list_value, try_run_register_signal_fast_path,
     };
 
     #[test]
@@ -31053,6 +31207,212 @@ mod tests {
         ));
     }
 
+    fn production_register_signal_fixture() -> Module {
+        let mut instructions = vec![Instruction::PushNull; 140];
+        instructions[10] = Instruction::LoadField(field("gc_destroyed"));
+        instructions[22] = Instruction::LoadDeclaredField(field("gc_destroyed"));
+        instructions[26] = Instruction::LoadLocal(1);
+        instructions[27] = Instruction::TypePredicate {
+            kind: TypePredicateKind::IsList,
+            argument_count: 1,
+        };
+        instructions[70] = Instruction::LogicalOrEmptyListField(field("_signal_procs"));
+        instructions[74] = Instruction::LogicalOrEmptyListIndex;
+        instructions[77] = Instruction::LogicalOrEmptyListField(field("_listen_lookup"));
+        instructions[80] = Instruction::IndexLocalList(9);
+        instructions[86] = Instruction::SetListIndex;
+        instructions[111] = Instruction::IndexLocalList(10);
+        instructions[114] = Instruction::TypePredicate {
+            kind: TypePredicateKind::IsNull,
+            argument_count: 1,
+        };
+        // Production signals.dm stores at 120 and jumps at 121. Reversing
+        // these slots silently disabled the native path for every real call.
+        instructions[120] = Instruction::SetListIndex;
+        instructions[121] = Instruction::Jump(138);
+        instructions[138] = Instruction::LoadResult;
+        instructions[139] = Instruction::Return;
+        let instruction_count = instructions.len();
+        let program = Program {
+            wait_for: true,
+            parameter_count: 4,
+            parameter_names: vec![String::new(); 4],
+            verb_parameter_types: vec![VerbParameterType::Unsupported; 4],
+            verb_name: None,
+            local_count: 14,
+            instructions,
+            source_spans: vec![SourceSpan::new(0, 1); instruction_count],
+        };
+        Module {
+            identity: next_module_identity(),
+            procedures: vec![Arc::new(program)],
+            paths: vec!["/datum/proc/RegisterSignal@0".to_owned()],
+            names: HashMap::new(),
+            dynamic_names: HashMap::new(),
+            deferred: Arc::new(HashMap::new()),
+            procedure_types: vec![TypePath::parse("/datum").unwrap()],
+            initializer_call_names: None,
+        }
+    }
+
+    fn signal_fixture_datum(state: &mut ExecutionState) -> DatumId {
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/listener").unwrap());
+        for name in ["gc_destroyed", "_signal_procs", "_listen_lookup"] {
+            state
+                .heap_mut()
+                .set_datum_field(datum, field(name), Value::Null)
+                .unwrap();
+        }
+        datum
+    }
+
+    fn run_signal_fixture(
+        module: &Module,
+        state: &mut ExecutionState,
+        src: DatumId,
+        target: DatumId,
+        signal: &Value,
+        callback: Value,
+        override_value: Option<Value>,
+    ) -> Option<u64> {
+        let program = module.procedure(ProcedureId(0)).unwrap();
+        let mut arguments = vec![Value::Datum(target), signal.clone(), callback];
+        if let Some(value) = override_value {
+            arguments.push(value);
+        }
+        let mut frame = make_frame(
+            ProcedureId(0),
+            program,
+            &arguments,
+            &ExecutionContext::new(Value::Datum(src), Value::Null),
+        );
+        let result = try_run_register_signal_fast_path(
+            module,
+            ProcedureId(0),
+            program,
+            &mut frame,
+            100,
+            state,
+        );
+        if result.is_some() {
+            assert_eq!(frame.instruction, 138);
+        }
+        result
+    }
+
+    fn signal_fixture_lookup(state: &ExecutionState, target: DatumId, signal: &Value) -> Value {
+        let Value::List(lookup) =
+            datum_field_or_shared(state, target, &field("_listen_lookup")).unwrap()
+        else {
+            panic!("expected listener lookup")
+        };
+        read_list_value(&state.heap, lookup, signal, false).unwrap()
+    }
+
+    #[test]
+    fn register_signal_fast_path_recognizes_production_slots_and_promotes_listeners() {
+        REGISTER_SIGNAL_FAST_CACHE.with(|cache| cache.borrow_mut().clear());
+        let module = production_register_signal_fixture();
+        let program = module.procedure(ProcedureId(0)).unwrap();
+        assert!(super::compile_register_signal_trace(&module, ProcedureId(0), program).is_some());
+
+        let mut state = ExecutionState::new();
+        let target = signal_fixture_datum(&mut state);
+        let first = signal_fixture_datum(&mut state);
+        let second = signal_fixture_datum(&mut state);
+        let third = signal_fixture_datum(&mut state);
+        let signal = Value::text("prepare");
+        for (listener, callback) in [
+            (first, "first_callback"),
+            (second, "second_callback"),
+            (third, "third_callback"),
+        ] {
+            assert_eq!(
+                run_signal_fixture(
+                    &module,
+                    &mut state,
+                    listener,
+                    target,
+                    &signal,
+                    Value::text(callback),
+                    None,
+                ),
+                Some(56)
+            );
+        }
+        let Value::List(listeners) = signal_fixture_lookup(&state, target, &signal) else {
+            panic!("multiple listeners should promote the scalar lookup to a list")
+        };
+        assert_eq!(
+            state
+                .heap()
+                .list(listeners)
+                .unwrap()
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Value::Datum(first),
+                Value::Datum(second),
+                Value::Datum(third)
+            ]
+        );
+    }
+
+    #[test]
+    fn register_signal_fast_path_uses_runtime_override_truthiness() {
+        REGISTER_SIGNAL_FAST_CACHE.with(|cache| cache.borrow_mut().clear());
+        let module = production_register_signal_fixture();
+        let mut state = ExecutionState::new();
+        let target = signal_fixture_datum(&mut state);
+        let listener = signal_fixture_datum(&mut state);
+        let signal = Value::text("prepare");
+
+        assert_eq!(
+            run_signal_fixture(
+                &module,
+                &mut state,
+                listener,
+                target,
+                &signal,
+                Value::text("original"),
+                None,
+            ),
+            Some(56)
+        );
+        assert_eq!(
+            run_signal_fixture(
+                &module,
+                &mut state,
+                listener,
+                target,
+                &signal,
+                Value::text("ignored"),
+                Some(Value::number(0.0)),
+            ),
+            None,
+            "a supplied false override must preserve the warning bytecode path"
+        );
+        assert_eq!(
+            run_signal_fixture(
+                &module,
+                &mut state,
+                listener,
+                target,
+                &signal,
+                Value::text("replacement"),
+                Some(Value::number(1.0)),
+            ),
+            Some(54)
+        );
+        let Value::List(listeners) = signal_fixture_lookup(&state, target, &signal) else {
+            panic!("override should preserve the listener relationship")
+        };
+        assert_eq!(state.heap().list(listeners).unwrap().len(), 2);
+    }
+
     #[test]
     fn rooted_register_block_matches_interpreter_shape_and_materializes_lists() {
         let canonical = parse(
@@ -33994,6 +34354,55 @@ mod tests {
     }
 
     #[test]
+    fn numeric_loop_edges_fuse_constant_step_and_preserve_dynamic_fallback() {
+        let source = parse(
+            "/proc/sum(limit)\n\tvar/total = 0\n\tfor(var/i = 1; i <= limit; i += 2)\n\t\ttotal += i\n\treturn total\n",
+        )
+        .expect("numeric loop fixture should parse");
+        let program =
+            compile_procedure(&source.definitions[0]).expect("numeric loop fixture should compile");
+        assert!(
+            program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::CheckNumericLoop { .. }))
+        );
+        assert!(program.instructions.iter().any(|instruction| matches!(
+            instruction,
+            Instruction::AdvanceNumericLoop { step, .. } if step.to_f32() == 2.0
+        )));
+        assert_eq!(
+            execute(&program, &[Value::number(8.0)]),
+            Ok(Value::number(16.0))
+        );
+
+        let fallback_instructions = vec![
+            Instruction::AdvanceNumericLoop {
+                slot: 0,
+                step: DmNumberBits::from_f32(1.0),
+                target: 7,
+            },
+            Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+            Instruction::CompoundAssignment(CompoundAssignmentOperator::Add),
+            Instruction::Duplicate,
+            Instruction::StoreLocal(0),
+            Instruction::Pop,
+            Instruction::Jump(7),
+            Instruction::LoadLocal(0),
+            Instruction::Return,
+        ];
+        let mut reference_instructions = fallback_instructions.clone();
+        reference_instructions[0] = Instruction::LoadLocal(0);
+        let fallback = manual_program(fallback_instructions, 1);
+        let reference = manual_program(reference_instructions, 1);
+        assert_eq!(
+            execute(&fallback, &[Value::text("iteration-")]),
+            execute(&reference, &[Value::text("iteration-")]),
+            "a non-numeric local must execute the untouched compound-assignment tail"
+        );
+    }
+
+    #[test]
     fn for_to_range_is_inclusive_and_continue_runs_its_increment() {
         let source = "/proc/sum(first, last)\n\tvar/total = 0\n\tfor(var/i in first to last)\n\t\tif(i == first)\n\t\t\tcontinue\n\t\ttotal += i\n\treturn total\n";
         let syntax = parse(source).expect("source should parse");
@@ -34002,10 +34411,10 @@ mod tests {
             program
                 .instructions
                 .iter()
-                .filter(|instruction| matches!(instruction, Instruction::LessEqual))
+                .filter(|instruction| matches!(instruction, Instruction::CheckNumericLoop { .. }))
                 .count(),
             1,
-            "the implicit +1 step should compile to one inclusive comparison"
+            "the implicit +1 step should compile to one fused inclusive comparison"
         );
         assert!(!program.instructions.iter().any(|instruction| matches!(
             instruction,
