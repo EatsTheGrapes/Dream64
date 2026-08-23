@@ -304,6 +304,45 @@ This supports Dream64's owned values, stable logical IDs, scheduler frames, and
 string-ID fast paths. It does not establish BYOND's private struct layout or
 authorize copying its ABI into generated code.
 
+### Datum construction and atom-initialization boundary
+
+A read-only x86 pass over `byondcore.dll` establishes a central scalar
+construction gateway:
+
+- `Byond_New` is exported at RVA `0x00237D00` and `Byond_NewArglist` at RVA
+  `0x00238040`.
+- Both owner-thread branches call the same private routine at RVA
+  `0x001678F0`. A raw relative-call scan finds eleven direct calls to that
+  routine in executable sections: nine private engine sites plus the two public
+  wrappers.
+- `Byond_New` allocates `argument_count * 8` bytes, validates and copies each
+  tagged argument into that contiguous buffer, and passes the buffer and count
+  to the private routine. `Byond_NewArglist` passes its already-materialized
+  argument-list value to the same routine.
+- Both wrappers first call the same owner-thread predicate at RVA `0x00296CE0`.
+  When invoked off-owner-thread, they allocate a small task record containing
+  the arguments and wrapper entry point, enqueue it through
+  `DungThreadManager::AddTask` at RVA `0x00293DC0`, and wait for the serialized
+  result. They do not construct live datums concurrently on the caller thread.
+- The private routine branches on the runtime value/type tag and dispatches
+  through internal type/procedure helpers. The inspected entry path contains no
+  worker-pool fan-out or public bulk-atom constructor.
+
+This is evidence for a highly optimized native scalar constructor and one
+authoritative mutation thread, not a hidden parallel `/atom/Initialize` pass.
+It also fits the callback-queue ownership evidence above: workers may prepare
+immutable data, but live datum construction and DM lifecycle dispatch commit on
+the owner thread.
+
+The absence of a direct call does not prove that no private or inlined bulk
+helper exists elsewhere. It does rule out treating BYOND's public construction
+API as such a helper. For Dream64, the defensible performance strategy is to
+keep map decoding and immutable resource work parallel, while accelerating the
+scalar VM/value/list/type-dispatch path exercised by every `New` and
+`Initialize`. Production frontier benchmarks must preserve scheduler
+instruction accounting; advancing farther only by under-counting fused
+bytecodes is not a valid speedup.
+
 ## Prioritized compatibility work
 
 1. Apply effective `UiState` layout/visibility changes to native controls after
