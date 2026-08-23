@@ -3,15 +3,27 @@ param(
     [string] $ServerExecutable,
     [string] $CompilerExecutable,
     [string] $ClientExecutable,
-    [string] $Dme = "C:\Users\Administrator\Desktop\RBMK Project\Monkestation2.0\tgstation.dme",
-    [string] $Map = "C:\Users\Administrator\Desktop\RBMK Project\Monkestation2.0\_maps\map_files\generic\CentCom.dmm",
-    [string] $Skin = "C:\Users\Administrator\Desktop\RBMK Project\Monkestation2.0\interface\skin.dmf",
-    [switch] $ReuseInitializedWorld,
-    [switch] $SkipCompile
+    [string] $MonkestationDirectory,
+    [string] $Dme,
+    [string] $Map,
+    [string] $Skin
 )
 
 $ErrorActionPreference = "Stop"
 $workspace = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$desktop = Split-Path -Parent $workspace
+if ([string]::IsNullOrWhiteSpace($MonkestationDirectory)) {
+    $MonkestationDirectory = Join-Path $desktop "Monkestation2.0"
+}
+if ([string]::IsNullOrWhiteSpace($Dme)) {
+    $Dme = Join-Path $MonkestationDirectory "tgstation.dme"
+}
+if ([string]::IsNullOrWhiteSpace($Map)) {
+    $Map = Join-Path $MonkestationDirectory "_maps\map_files\generic\CentCom.dmm"
+}
+if ([string]::IsNullOrWhiteSpace($Skin)) {
+    $Skin = Join-Path $MonkestationDirectory "interface\skin.dmf"
+}
 if ($BootNumber -le 0) {
     $BootNumber = [int](Get-Date -Format "HHmmss")
 }
