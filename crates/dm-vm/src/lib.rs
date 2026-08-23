@@ -314,6 +314,21 @@ pub enum Instruction {
     /// retaining the local slot in the opcode avoids repeated stack traffic
     /// while preserving [`Self::ListLength`] as the semantic implementation.
     ListLengthLocal(u16),
+    /// Advances one compiler-generated local-list iteration header.
+    ///
+    /// The original seven instructions remain in the program for stable jump
+    /// targets, but execution enters through this fused header and skips their
+    /// redundant stack traffic.
+    NextLocalListIteration {
+        /// Local containing the immutable iteration snapshot.
+        list_slot: u16,
+        /// Local containing the current one-based iteration index.
+        index_slot: u16,
+        /// Local receiving the current iteration value.
+        item_slot: u16,
+        /// Instruction after the loop when the snapshot is exhausted.
+        exit: usize,
+    },
     /// Pops a value, index/key, and list handle and updates that list.
     SetListIndex,
     /// Like [`Self::SetListIndex`], but leaves the stored value on the stack.
@@ -1435,6 +1450,7 @@ pub fn compile_initializer_program(
         (Some(first), Some(last)) => SourceSpan::new(first.span.start, last.span.end),
         _ => return Err(compile_error("expected an initializer expression")),
     };
+    specialize_local_list_iteration_headers(&mut instructions);
     Ok(Program {
         wait_for: true,
         parameter_count: 0,
@@ -2040,6 +2056,7 @@ fn compile_procedure_with_resolver_and_fields(
         );
     }
 
+    specialize_local_list_iteration_headers(&mut instructions);
     Ok(Program {
         wait_for: procedure_wait_for(definition),
         parameter_count: definition.parameters.len(),
@@ -2062,6 +2079,35 @@ fn compile_procedure_with_resolver_and_fields(
         instructions,
         source_spans,
     })
+}
+
+fn specialize_local_list_iteration_headers(instructions: &mut [Instruction]) {
+    for index in 0..instructions.len().saturating_sub(6) {
+        let Some(
+            [
+                Instruction::LoadLocal(index_slot),
+                Instruction::ListLengthLocal(list_slot),
+                Instruction::LessEqual,
+                Instruction::JumpIfFalse(exit),
+                Instruction::LoadLocal(fetch_index),
+                Instruction::IndexLocalList(fetch_list),
+                Instruction::StoreLocal(item_slot),
+            ],
+        ) = instructions.get(index..index + 7)
+        else {
+            continue;
+        };
+        if index_slot != fetch_index || list_slot != fetch_list {
+            continue;
+        }
+        let specialized = Instruction::NextLocalListIteration {
+            list_slot: *list_slot,
+            index_slot: *index_slot,
+            item_slot: *item_slot,
+            exit: *exit,
+        };
+        instructions[index] = specialized;
+    }
 }
 
 /// Joins physical source lines while a parenthesized/bracketed expression is
@@ -12998,6 +13044,8 @@ struct AtomsProfile {
     samples: HashMap<AtomsProfileProcedure, u64>,
     frame_entries: HashMap<AtomsProfileProcedure, u64>,
     paths: HashMap<AtomsProfileProcedure, String>,
+    instruction_samples: HashMap<AtomsProfileInstruction, u64>,
+    instruction_labels: HashMap<AtomsProfileInstruction, String>,
 }
 
 const STARTUP_INSTRUCTION_CATEGORY_COUNT: usize = 7;
@@ -13006,6 +13054,7 @@ fn startup_instruction_category(instruction: &Instruction) -> usize {
     match instruction {
         Instruction::IndexList
         | Instruction::IndexLocalList(_)
+        | Instruction::NextLocalListIteration { .. }
         | Instruction::ListLength
         | Instruction::ListLengthLocal(_)
         | Instruction::Contains
@@ -13047,6 +13096,13 @@ fn startup_instruction_category(instruction: &Instruction) -> usize {
 struct AtomsProfileProcedure {
     module_identity: u64,
     procedure: ProcedureId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct AtomsProfileInstruction {
+    module_identity: u64,
+    procedure: ProcedureId,
+    instruction: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -13197,7 +13253,7 @@ fn simple_iteration_field_assignment(
         Instruction::StoreLocal(list_slot),
         Instruction::PushNumber(one),
         Instruction::StoreLocal(index_slot),
-        Instruction::LoadLocal(condition_index),
+        condition_header,
         Instruction::ListLengthLocal(condition_list),
         Instruction::LessEqual,
         Instruction::JumpIfFalse(exit_instruction),
@@ -13218,9 +13274,24 @@ fn simple_iteration_field_assignment(
     };
     let condition = prepare + 4;
     let exit = prepare + 19;
+    let condition_index_matches = match condition_header {
+        Instruction::LoadLocal(condition_index) => condition_index == index_slot,
+        Instruction::NextLocalListIteration {
+            list_slot: fused_list,
+            index_slot: fused_index,
+            item_slot: fused_item,
+            exit: fused_exit,
+        } => {
+            fused_list == list_slot
+                && fused_index == index_slot
+                && fused_item == item_slot
+                && fused_exit == exit_instruction
+        }
+        _ => false,
+    };
     if one.to_f32() != 1.0
         || increment.to_f32() != 1.0
-        || condition_index != index_slot
+        || !condition_index_matches
         || condition_list != list_slot
         || iteration_list != list_slot
         || iteration_index != index_slot
@@ -14256,6 +14327,8 @@ fn run_frames(
                     samples: HashMap::new(),
                     frame_entries: HashMap::new(),
                     paths: HashMap::new(),
+                    instruction_samples: HashMap::new(),
+                    instruction_labels: HashMap::new(),
                 });
                 frames[frame_index].atoms_profile_root = true;
                 if let Some(root) = startup_root {
@@ -14453,6 +14526,30 @@ fn run_frames(
                         .to_owned()
                 });
                 *profile.samples.entry(key).or_default() += 1;
+                if profile.instruction_categories.is_some() {
+                    let instruction_key = AtomsProfileInstruction {
+                        module_identity: module.identity.0,
+                        procedure,
+                        instruction: instruction_index,
+                    };
+                    *profile
+                        .instruction_samples
+                        .entry(instruction_key)
+                        .or_default() += 1;
+                    profile
+                        .instruction_labels
+                        .entry(instruction_key)
+                        .or_insert_with(|| {
+                            let span = program.source_spans.get(instruction_index).copied();
+                            format!(
+                                "{} instruction={} opcode={instruction:?} source={}..{}",
+                                module.procedure_path(procedure).unwrap_or("<missing>"),
+                                instruction_index,
+                                span.map_or(0, |span| span.start),
+                                span.map_or(0, |span| span.end),
+                            )
+                        });
+                }
                 if let Some(lines) = atoms_profile_snapshot_lines_if_due(
                     profile,
                     Instant::now(),
@@ -16137,6 +16234,66 @@ fn run_frames(
             }
             Instruction::ListLengthLocal(_) => {
                 unreachable!("local list length is normalized before dispatch")
+            }
+            Instruction::NextLocalListIteration {
+                list_slot,
+                index_slot,
+                item_slot,
+                exit,
+            } => {
+                let list_slot = usize::from(*list_slot);
+                let index_slot = usize::from(*index_slot);
+                let item_slot = usize::from(*item_slot);
+                let Some(Value::List(list)) = frames[frame_index].locals.get(list_slot).cloned()
+                else {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "local list iteration received a non-list snapshot",
+                    ));
+                };
+                let Some(Value::Number(index)) =
+                    frames[frame_index].locals.get(index_slot).cloned()
+                else {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        "local list iteration received a non-numeric index",
+                    ));
+                };
+                let length = state
+                    .heap
+                    .list(list)
+                    .map_err(|error| execution_error(module, &frames, error.to_string()))?
+                    .len();
+                if index.to_f32() > dm_list_length_number(length) {
+                    frames[frame_index].instruction = *exit;
+                    continue;
+                }
+                let key = Value::Number(index);
+                let value =
+                    read_list_value(&state.heap, list, &key, state.is_associative_list(list))
+                        .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                let Some(item) = frames[frame_index].locals.get(item_slot) else {
+                    return Err(execution_error(
+                        module,
+                        &frames,
+                        format!("invalid local slot {item_slot}"),
+                    ));
+                };
+                if let Value::List(reference) = item
+                    && state.reference_lists.contains(reference)
+                {
+                    state
+                        .heap
+                        .list_mut(*reference)
+                        .and_then(|values| values.set(1, value))
+                        .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                } else {
+                    frames[frame_index].locals[item_slot] = value;
+                }
+                frames[frame_index].instruction += 7;
+                continue;
             }
             Instruction::SetListIndex => {
                 let value = match pop(&mut frames[frame_index].stack) {
@@ -20182,6 +20339,35 @@ fn atoms_profile_lines_with_event(profile: &AtomsProfile, event: &str) -> Vec<St
             "{prefix} list_read={} list_write={} field_read={} field_write={} call={} branch={} other={}",
             counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], counts[6],
         ));
+        let mut instructions = profile
+            .instruction_samples
+            .iter()
+            .map(|(instruction, samples)| (*instruction, *samples))
+            .collect::<Vec<_>>();
+        instructions.sort_by(|(left, left_samples), (right, right_samples)| {
+            right_samples.cmp(left_samples).then_with(|| {
+                profile
+                    .instruction_labels
+                    .get(left)
+                    .map_or("<missing>", String::as_str)
+                    .cmp(
+                        profile
+                            .instruction_labels
+                            .get(right)
+                            .map_or("<missing>", String::as_str),
+                    )
+            })
+        });
+        for (rank, (instruction, samples)) in instructions.into_iter().take(30).enumerate() {
+            let label = profile
+                .instruction_labels
+                .get(&instruction)
+                .map_or("<missing>", String::as_str);
+            lines.push(format!(
+                "{prefix} hot_pc_rank={} samples={samples} {label}",
+                rank + 1,
+            ));
+        }
     }
     for (rank, procedure) in procedures.into_iter().take(30).enumerate() {
         let samples = profile.samples.get(&procedure).copied().unwrap_or(0);
@@ -30052,6 +30238,8 @@ mod tests {
             samples: HashMap::new(),
             frame_entries: HashMap::new(),
             paths: HashMap::new(),
+            instruction_samples: HashMap::new(),
+            instruction_labels: HashMap::new(),
         });
         let limits = ExecutionLimits {
             max_call_depth: 64,
@@ -30131,6 +30319,8 @@ mod tests {
                 (first_key, "/proc/first".to_owned()),
                 (second_key, "/proc/second".to_owned()),
             ]),
+            instruction_samples: HashMap::new(),
+            instruction_labels: HashMap::new(),
         };
         let lines = crate::atoms_profile_lines(&profile);
         assert!(lines[0].contains("total_instructions=12345 samples=5 procedures=2"));
@@ -30182,6 +30372,8 @@ mod tests {
             samples: HashMap::new(),
             frame_entries: HashMap::new(),
             paths: HashMap::new(),
+            instruction_samples: HashMap::new(),
+            instruction_labels: HashMap::new(),
         };
         let lines = crate::atoms_profile_lines(&profile);
         assert_eq!(lines.len(), 2);
@@ -30206,6 +30398,8 @@ mod tests {
             samples: HashMap::from([(key, 3)]),
             frame_entries: HashMap::from([(key, 9)]),
             paths: HashMap::from([(key, "/proc/hot".to_owned())]),
+            instruction_samples: HashMap::new(),
+            instruction_labels: HashMap::new(),
         };
         assert!(
             crate::atoms_profile_snapshot_lines_if_due(
@@ -33918,10 +34112,10 @@ mod tests {
         let program = compile_procedure(&list_iteration.definitions[0])
             .expect("for-in list iteration should compile");
         assert!(
-            program
-                .instructions
-                .iter()
-                .any(|instruction| matches!(instruction, Instruction::ListLengthLocal(_)))
+            program.instructions.iter().any(|instruction| matches!(
+                instruction,
+                Instruction::NextLocalListIteration { .. }
+            ))
         );
         assert_eq!(
             execute(&program, &[Value::Null]),

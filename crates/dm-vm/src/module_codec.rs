@@ -15,9 +15,9 @@ use crate::{
 };
 
 const MAGIC: &[u8; 8] = b"DM64MOD\0";
-const VERSION: u16 = 5;
+const VERSION: u16 = 6;
 #[cfg(test)]
-const INSTRUCTION_TAG_COUNT: u8 = 136;
+const INSTRUCTION_TAG_COUNT: u8 = 137;
 const MAX_ARTIFACT_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const MAX_PROCEDURES: usize = 1_000_000;
 const MAX_PROCEDURE_TYPES: usize = 1_000_000;
@@ -837,6 +837,18 @@ fn encode_instruction(
         Instruction::StoreDynamicField => unit!(133),
         Instruction::IndexLocalList(value) => one_u16!(134, value),
         Instruction::ListLengthLocal(value) => one_u16!(135, value),
+        Instruction::NextLocalListIteration {
+            list_slot,
+            index_slot,
+            item_slot,
+            exit,
+        } => {
+            writer.u8(136);
+            writer.u16(*list_slot);
+            writer.u16(*index_slot);
+            writer.u16(*item_slot);
+            writer.target(*exit)?;
+        }
     }
     Ok(())
 }
@@ -1100,6 +1112,12 @@ fn decode_instruction(
         133 => Instruction::StoreDynamicField,
         134 => Instruction::IndexLocalList(reader.u16("local slot")?),
         135 => Instruction::ListLengthLocal(reader.u16("local slot")?),
+        136 => Instruction::NextLocalListIteration {
+            list_slot: reader.u16("list local slot")?,
+            index_slot: reader.u16("index local slot")?,
+            item_slot: reader.u16("item local slot")?,
+            exit: reader.target()?,
+        },
         unknown => {
             return Err(ModuleCodecError::new(format!(
                 "unknown instruction tag {unknown}"
@@ -1622,6 +1640,12 @@ mod tests {
             Instruction::IndexList,
             Instruction::IndexLocalList(4),
             Instruction::ListLengthLocal(4),
+            Instruction::NextLocalListIteration {
+                list_slot: 4,
+                index_slot: 5,
+                item_slot: 6,
+                exit: 9,
+            },
             Instruction::SetListIndex,
             Instruction::SetListIndexKeep,
             Instruction::CompoundListIndex(CompoundListIndexOperator::Add),
