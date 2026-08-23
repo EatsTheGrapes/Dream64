@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// One server-owned appearance ready for client composition.
@@ -35,8 +36,21 @@ pub(crate) struct DmiSheet {
     pub width: u32,
     pub height: u32,
     image_width: u32,
-    rgba: Vec<u8>,
+    image_height: u32,
+    rgba: Arc<[u8]>,
     states: Vec<DmiState>,
+}
+
+/// One DMI cell plus its shared decoded sheet, ready for GPU upload/selection.
+pub(crate) struct GpuSpriteFrame {
+    pub(crate) resource: PathBuf,
+    pub(crate) sheet_width: u32,
+    pub(crate) sheet_height: u32,
+    pub(crate) rgba: Arc<[u8]>,
+    pub(crate) source_x: u32,
+    pub(crate) source_y: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -91,6 +105,29 @@ impl SpriteCache {
         self.has_animations
     }
 
+    pub(crate) fn gpu_frame(&mut self, appearance: &Appearance) -> Result<GpuSpriteFrame, String> {
+        let elapsed = self.animation_elapsed();
+        let sheet = self.load(&appearance.resource)?;
+        let (source_x, source_y) = sheet
+            .cell(
+                &appearance.state,
+                appearance.direction,
+                appearance.frame,
+                elapsed,
+            )
+            .ok_or("DMI state has no selectable frame")?;
+        Ok(GpuSpriteFrame {
+            resource: appearance.resource.clone(),
+            sheet_width: sheet.image_width,
+            sheet_height: sheet.image_height,
+            rgba: sheet.rgba.clone(),
+            source_x,
+            source_y,
+            width: sheet.width,
+            height: sheet.height,
+        })
+    }
+
     fn animation_elapsed(&self) -> f32 {
         self.animation_epoch.elapsed().as_secs_f32()
     }
@@ -138,7 +175,8 @@ impl DmiSheet {
             width,
             height,
             image_width: output.width,
-            rgba,
+            image_height: output.height,
+            rgba: Arc::from(rgba),
             states,
         })
     }

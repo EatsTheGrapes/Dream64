@@ -1,10 +1,14 @@
 use std::collections::BTreeMap;
+use std::collections::hash_map::RandomState;
 use std::env;
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::hash::{BuildHasher, Hasher};
+use std::io::{BufRead as _, BufReader, BufWriter, Read as _, Write as _};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dm_compiler::{Compilation, CompilerDatabase};
 use dm_lifecycle::ipc::{LoopbackIpc, parse_loopback_address};
@@ -27,6 +31,9 @@ use dm_semantics::{ExecutableProcedures, ProcedureRegistry};
 use dm_value::{FieldName, TypePath, Value};
 use dm_vm::{ExecutionLimits, advance_scheduler};
 use dm_world::allocate_world;
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 
 const MAX_EAGER_ARTIFACT_DIAGNOSTICS: usize = 32;
 
@@ -39,6 +46,92 @@ enum Command {
     SweepClosure,
     LobbyPreflight,
     LobbyPreview,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProductionReadyWorldIdentity {
+    random_seed: u64,
+    deployment_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReadyWorldMode {
+    Disabled,
+    Development,
+    Prewarm(ProductionReadyWorldIdentity),
+    Activate(ProductionReadyWorldIdentity),
+}
+
+impl ReadyWorldMode {
+    const fn production_identity(&self) -> Option<&ProductionReadyWorldIdentity> {
+        match self {
+            Self::Prewarm(identity) | Self::Activate(identity) => Some(identity),
+            Self::Disabled | Self::Development => None,
+        }
+    }
+
+    const fn writes_snapshot(&self) -> bool {
+        matches!(self, Self::Development | Self::Prewarm(_))
+    }
+}
+
+fn parse_ready_world_mode(
+    prewarm: bool,
+    activate: bool,
+    development: bool,
+    disabled: bool,
+    random_seed: Option<&str>,
+    deployment_id: Option<&str>,
+) -> Result<ReadyWorldMode, String> {
+    if disabled {
+        return Ok(ReadyWorldMode::Disabled);
+    }
+    if prewarm && activate {
+        return Err(
+            "DREAM64_PREWARM_READY_WORLD and DREAM64_ACTIVATE_READY_WORLD are mutually exclusive"
+                .to_owned(),
+        );
+    }
+    if !prewarm && !activate {
+        return Ok(if development {
+            ReadyWorldMode::Development
+        } else {
+            ReadyWorldMode::Disabled
+        });
+    }
+    let random_seed = random_seed
+        .ok_or_else(|| "production ready-world mode requires DREAM64_RANDOM_SEED".to_owned())?
+        .parse::<u64>()
+        .map_err(|_| "DREAM64_RANDOM_SEED must be a nonzero u64".to_owned())?;
+    if random_seed == 0 {
+        return Err("DREAM64_RANDOM_SEED must be a nonzero u64".to_owned());
+    }
+    let deployment_id = deployment_id
+        .map(str::trim)
+        .filter(|identity| !identity.is_empty())
+        .ok_or_else(|| "production ready-world mode requires DREAM64_DEPLOYMENT_ID".to_owned())?
+        .to_owned();
+    let identity = ProductionReadyWorldIdentity {
+        random_seed,
+        deployment_id,
+    };
+    Ok(if prewarm {
+        ReadyWorldMode::Prewarm(identity)
+    } else {
+        ReadyWorldMode::Activate(identity)
+    })
+}
+
+fn ready_world_mode_from_environment() -> Result<ReadyWorldMode, String> {
+    let enabled = |name| env::var(name).is_ok_and(|value| value.trim() == "1");
+    parse_ready_world_mode(
+        enabled("DREAM64_PREWARM_READY_WORLD"),
+        enabled("DREAM64_ACTIVATE_READY_WORLD"),
+        env::var_os("DREAM64_ENABLE_READY_WORLD_CACHE").is_some(),
+        env::var_os("DREAM64_DISABLE_READY_CACHE").is_some(),
+        env::var("DREAM64_RANDOM_SEED").ok().as_deref(),
+        env::var("DREAM64_DEPLOYMENT_ID").ok().as_deref(),
+    )
 }
 
 const fn progress_label(command: Command) -> &'static str {
@@ -76,49 +169,46 @@ fn run_main() -> ExitCode {
     let mut arguments = env::args_os().skip(1);
     let Some(first) = arguments.next() else {
         eprintln!(
-            "usage: dm-lifecycle [compile|plan|boot|sweep|sweep-closure|lobby-preflight|lobby-preview] <world.dme> [map.dmm]"
+            "usage: dream64-server [plan|boot|sweep|sweep-closure|lobby-preflight|lobby-preview] <world.dme> [map.dmm]"
         );
         return ExitCode::from(2);
     };
     let (command, environment) = if first.as_os_str() == OsStr::new("compile") {
-        let Some(environment) = arguments.next() else {
-            eprintln!("usage: dm-lifecycle compile <world.dme>");
-            return ExitCode::from(2);
-        };
-        (Command::Compile, PathBuf::from(environment))
+        eprintln!("dream64-server never compiles projects; use `dream64-compiler <world.dme>`");
+        return ExitCode::from(2);
     } else if first.as_os_str() == OsStr::new("plan") {
         let Some(environment) = arguments.next() else {
-            eprintln!("usage: dm-lifecycle plan <world.dme> [map.dmm]");
+            eprintln!("usage: dream64-server plan <world.dme> [map.dmm]");
             return ExitCode::from(2);
         };
         (Command::Plan, PathBuf::from(environment))
     } else if first.as_os_str() == OsStr::new("boot") {
         let Some(environment) = arguments.next() else {
-            eprintln!("usage: dm-lifecycle boot <world.dme> [map.dmm]");
+            eprintln!("usage: dream64-server boot <world.dme> [map.dmm]");
             return ExitCode::from(2);
         };
         (Command::Boot, PathBuf::from(environment))
     } else if first.as_os_str() == OsStr::new("sweep") {
         let Some(environment) = arguments.next() else {
-            eprintln!("usage: dm-lifecycle sweep <world.dme> [map.dmm]");
+            eprintln!("usage: dream64-server sweep <world.dme> [map.dmm]");
             return ExitCode::from(2);
         };
         (Command::Sweep, PathBuf::from(environment))
     } else if first.as_os_str() == OsStr::new("sweep-closure") {
         let Some(environment) = arguments.next() else {
-            eprintln!("usage: dm-lifecycle sweep-closure <world.dme> [map.dmm]");
+            eprintln!("usage: dream64-server sweep-closure <world.dme> [map.dmm]");
             return ExitCode::from(2);
         };
         (Command::SweepClosure, PathBuf::from(environment))
     } else if first.as_os_str() == OsStr::new("lobby-preflight") {
         let Some(environment) = arguments.next() else {
-            eprintln!("usage: dm-lifecycle lobby-preflight <world.dme>");
+            eprintln!("usage: dream64-server lobby-preflight <world.dme>");
             return ExitCode::from(2);
         };
         (Command::LobbyPreflight, PathBuf::from(environment))
     } else if first.as_os_str() == OsStr::new("lobby-preview") {
         let Some(environment) = arguments.next() else {
-            eprintln!("usage: dm-lifecycle lobby-preview <world.dme> <world-params>");
+            eprintln!("usage: dream64-server lobby-preview <world.dme> <world-params>");
             return ExitCode::from(2);
         };
         (Command::LobbyPreview, PathBuf::from(environment))
@@ -128,7 +218,7 @@ fn run_main() -> ExitCode {
     let requested_map = arguments.next().map(PathBuf::from);
     if arguments.next().is_some() {
         eprintln!(
-            "usage: dm-lifecycle [compile|plan|boot|sweep|sweep-closure|lobby-preflight] <world.dme> [map.dmm]"
+            "usage: dream64-server [plan|boot|sweep|sweep-closure|lobby-preflight] <world.dme> [map.dmm]"
         );
         return ExitCode::from(2);
     }
@@ -136,9 +226,23 @@ fn run_main() -> ExitCode {
         eprintln!("usage: dm-lifecycle {} <world.dme>", "compile");
         return ExitCode::from(2);
     }
+    let ready_world_mode = if command == Command::Boot {
+        match ready_world_mode_from_environment() {
+            Ok(mode) => mode,
+            Err(error) => {
+                eprintln!("ready-world mode: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        ReadyWorldMode::Disabled
+    };
     let audit_runtime =
         command == Command::Boot && env::var_os("DREAM64_BOOT_AUDIT_RUNTIME").is_some();
-    let mut boot_startup_ipc = if command == Command::Boot && !audit_runtime {
+    let mut boot_startup_ipc = if command == Command::Boot
+        && !audit_runtime
+        && !matches!(&ready_world_mode, ReadyWorldMode::Prewarm(_))
+    {
         let ipc_address =
             env::var("DREAM64_IPC_ADDR").unwrap_or_else(|_| "127.0.0.1:51664".to_owned());
         let ipc = match parse_loopback_address(&ipc_address)
@@ -170,13 +274,30 @@ fn run_main() -> ExitCode {
             environment.display()
         );
     }
+    let standalone_artifact = environment
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("d64"));
     let cache_file = project_cache_file(&environment);
-    let artifact_file = executable_artifact_file(&environment);
+    let artifact_file = if standalone_artifact {
+        environment.clone()
+    } else {
+        executable_artifact_file(&environment)
+    };
     let mut cached_executable = None;
     let mut cached_procedures = None;
     let mut cached_structural_seed = None;
     let compilation_result: Result<_, String> = if cached_compilation {
-        prepare_compiled_executable(&environment, &cache_file, &artifact_file).map(|prepared| {
+        if standalone_artifact {
+            prepare_standalone_artifact(&artifact_file)
+        } else {
+            prepare_compiled_executable(
+                &environment,
+                &cache_file,
+                &artifact_file,
+                command == Command::Compile,
+            )
+        }
+        .map(|prepared| {
             let progress = progress_label(command);
             eprintln!(
                 "{progress}: executable-artifact executable_artifact={} artifact={} miss_reason={:?} lowering_new={} lowering_deferred={} procedures={}",
@@ -213,9 +334,11 @@ fn run_main() -> ExitCode {
     if cached_compilation {
         let progress = progress_label(command);
         eprintln!(
-            "{progress}: project-compile-complete elapsed_ms={} preprocessing_cache={} parsed_syntax_cache={} cache={}",
+            "{progress}: runtime-image-ready elapsed_ms={} source_validation={} parsed_syntax_cache={} cache={}",
             compile_started.elapsed().as_millis(),
-            if project_cache.is_some_and(|cache| cache.project_snapshot_hit) {
+            if standalone_artifact {
+                "not-required"
+            } else if project_cache.is_some_and(|cache| cache.project_snapshot_hit) {
                 "hit"
             } else {
                 "miss"
@@ -225,6 +348,34 @@ fn run_main() -> ExitCode {
                 .map_or("skipped", |hit| if hit { "hit" } else { "miss" }),
             cache_file.display(),
         );
+    }
+    if let Some(selector) =
+        env::var_os("DREAM64_DUMP_PROCEDURE").and_then(|value| value.into_string().ok())
+        && let Some(executable) = cached_executable.as_ref()
+    {
+        for (index, path) in executable.module().procedure_paths().enumerate() {
+            if !path.contains(&selector) {
+                continue;
+            }
+            let Some(id) = executable.module().procedure_id_at(index) else {
+                continue;
+            };
+            let Some(program) = executable.module().procedure(id) else {
+                continue;
+            };
+            eprintln!(
+                "procedure-dump: path={path} parameters={} locals={} instructions={}",
+                program.parameter_count,
+                program.local_count,
+                program.instructions.len(),
+            );
+            for (pc, instruction) in program.instructions.iter().enumerate() {
+                eprintln!(
+                    "procedure-dump: pc={pc} source={:?} opcode={instruction:?}",
+                    program.source_spans.get(pc),
+                );
+            }
+        }
     }
     if command == Command::Compile {
         eprintln!(
@@ -258,6 +409,12 @@ fn run_main() -> ExitCode {
             }
         };
         eprintln!("boot-progress: preparing map plan {map_path}");
+        let ready_cache = ready_world_cache_file(
+            &cache_file,
+            &map_source,
+            &compilation,
+            ready_world_mode.production_identity(),
+        );
         let world = match cached_world_plan(&cache_file, &map_source, &compilation) {
             Ok(world) => world,
             Err(error) => {
@@ -299,7 +456,7 @@ fn run_main() -> ExitCode {
             precompiled.module_procedures(),
             precompiled.deferred_procedures(),
         );
-        prepared_boot = Some((map_path, world, precompiled));
+        prepared_boot = Some((map_path, world, precompiled, ready_cache));
     }
     if command == Command::Boot {
         if let Some(ipc) = &boot_startup_ipc {
@@ -327,7 +484,7 @@ fn run_main() -> ExitCode {
             );
         }
     };
-    let runtime_result = if let Some((_, _, precompiled)) = prepared_boot.as_mut() {
+    let runtime_result = if let Some((_, _, precompiled, _)) = prepared_boot.as_mut() {
         match cached_structural_seed.take() {
             Some(seed) => RuntimeImage::from_compilation_with_prelinked_module_and_seed(
                 &compilation,
@@ -359,6 +516,21 @@ fn run_main() -> ExitCode {
         }
     };
     if command == Command::Boot {
+        if let ReadyWorldMode::Activate(identity) = &ready_world_mode {
+            eprintln!(
+                "boot-progress: random stream preserved from ready-world snapshot deployment={:?} seed={}",
+                identity.deployment_id, identity.random_seed,
+            );
+        } else {
+            let (launch_random_seed, random_seed_source) = match &ready_world_mode {
+                ReadyWorldMode::Prewarm(identity) => (identity.random_seed, "production-identity"),
+                _ => launch_random_seed(),
+            };
+            runtime.set_launch_random_seed(launch_random_seed);
+            eprintln!(
+                "boot-progress: random stream seeded for this launch source={random_seed_source} seed={launch_random_seed}"
+            );
+        }
         let stats = runtime.stats();
         eprintln!(
             "boot-progress: initializer frontier selectors={} typed_constructors={} dynamic_constructor_fallback={} complete_inventory_fallback={} module_procedures={} deferred={} materialized={} direct_initial_values={} shared_reflection_entries={}",
@@ -406,26 +578,29 @@ fn run_main() -> ExitCode {
     }
     let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
     let mut boot_precompiled = None;
-    let (map_path, world) = if let Some((map_path, world, precompiled)) = prepared_boot.take() {
-        boot_precompiled = Some(precompiled);
-        (map_path, world)
-    } else {
-        let (map_path, map_source) = match load_map(&compilation, requested_map.as_deref()) {
-            Ok(map) => map,
-            Err(error) => {
-                eprintln!("{error}");
-                return ExitCode::FAILURE;
-            }
+    let mut ready_world_cache = None;
+    let (map_path, world) =
+        if let Some((map_path, world, precompiled, ready_cache)) = prepared_boot.take() {
+            boot_precompiled = Some(precompiled);
+            ready_world_cache = Some(ready_cache);
+            (map_path, world)
+        } else {
+            let (map_path, map_source) = match load_map(&compilation, requested_map.as_deref()) {
+                Ok(map) => map,
+                Err(error) => {
+                    eprintln!("{error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let world = match cached_world_plan(&cache_file, &map_source, &compilation) {
+                Ok(world) => world,
+                Err(error) => {
+                    eprintln!("{map_path}: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            (map_path, world)
         };
-        let world = match cached_world_plan(&cache_file, &map_source, &compilation) {
-            Ok(world) => world,
-            Err(error) => {
-                eprintln!("{map_path}: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
-        (map_path, world)
-    };
     let plan = build_initialization_plan(&runtime, &index, &world, map_path.clone());
 
     print_plan_summary(&map_path, &index, &procedures, &plan);
@@ -463,6 +638,79 @@ fn run_main() -> ExitCode {
         drop(procedures);
         drop(compilation);
         let mut startup_ipc = boot_startup_ipc.take();
+        let ready_cache = ready_world_cache
+            .as_deref()
+            .expect("production boot prepared a ready-world cache identity");
+        let restore_snapshot = matches!(
+            &ready_world_mode,
+            ReadyWorldMode::Development | ReadyWorldMode::Activate(_)
+        );
+        if restore_snapshot && ready_cache.is_file() {
+            if let Some(ipc) = &startup_ipc {
+                ipc.set_startup_phase("Restoring ready world");
+            }
+            let restore_started = Instant::now();
+            let mut state = runtime.take_execution_state();
+            let precompiled = boot_precompiled.as_mut().expect("boot precompile exists");
+            match restore_ready_world_cache(ready_cache, &mut state, precompiled.module()) {
+                Ok(bytes) => {
+                    if matches!(&ready_world_mode, ReadyWorldMode::Development) {
+                        // Development reuse intentionally starts a fresh random
+                        // stream. Production activation instead continues the
+                        // exact stream captured by its matching prewarm image.
+                        state.reseed_random(fresh_launch_random_seed());
+                    }
+                    precompiled.install_persistent_state(state);
+                    eprintln!(
+                        "boot-progress: ready-world-cache cache=hit artifact={} bytes={} restore_ms={}",
+                        ready_cache.display(),
+                        bytes,
+                        restore_started.elapsed().as_millis(),
+                    );
+                    eprintln!(
+                        "boot-progress: headless ready from snapshot; entering persistent scheduler loop ready_elapsed_ms={}",
+                        process_started.elapsed().as_millis()
+                    );
+                    return run_persistent_server_loop(&mut runtime, precompiled, startup_ipc);
+                }
+                Err(error) => {
+                    runtime.restore_execution_state(state);
+                    if matches!(&ready_world_mode, ReadyWorldMode::Activate(_)) {
+                        eprintln!(
+                            "boot-progress: ready-world activation failed closed artifact={} reason={error:?}",
+                            ready_cache.display(),
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    eprintln!(
+                        "boot-progress: ready-world-cache cache=miss artifact={} reason={error:?}",
+                        ready_cache.display(),
+                    );
+                    if let Err(remove_error) = fs::remove_file(ready_cache) {
+                        eprintln!(
+                            "boot-progress: ready-world-cache corrupt-artifact-retained error={remove_error}"
+                        );
+                    }
+                }
+            }
+        } else {
+            if matches!(&ready_world_mode, ReadyWorldMode::Activate(_)) {
+                eprintln!(
+                    "boot-progress: ready-world activation failed closed artifact={} reason=not-found",
+                    ready_cache.display(),
+                );
+                return ExitCode::FAILURE;
+            }
+            eprintln!(
+                "boot-progress: ready-world-cache cache=miss artifact={} reason={:?}",
+                ready_cache.display(),
+                match &ready_world_mode {
+                    ReadyWorldMode::Disabled => "disabled",
+                    ReadyWorldMode::Prewarm(_) => "production prewarm requested",
+                    ReadyWorldMode::Development | ReadyWorldMode::Activate(_) => "not found",
+                },
+            );
+        }
         if let Some(ipc) = &startup_ipc {
             ipc.set_startup_phase("Preflighting map initializer plans");
         }
@@ -535,16 +783,14 @@ fn run_main() -> ExitCode {
                 precompiled,
             )
         } else if let Some(ipc) = startup_ipc.as_mut() {
-            let mut startup_lobby_visible = false;
             let mut service_startup_clients =
-                |executable: &ExecutableProcedures, state: &mut dm_vm::ExecutionState| {
-                    if !startup_lobby_visible {
-                        ipc.set_startup_phase("Initializing subsystems");
-                        ipc.show_startup_lobby();
-                        startup_lobby_visible = true;
-                        eprintln!("server-progress: startup-lobby=read-only");
-                    }
-                    ipc.apply_executable_tick_boundary(executable, state);
+                |_executable: &ExecutableProcedures, _state: &mut dm_vm::ExecutionState| {
+                    // Keep the listener available for phase polling, but do
+                    // not materialize /client datums in the world that will
+                    // become the content-addressed ready image. The native
+                    // client retries its attach once per second and replaces
+                    // its startup replay as soon as the gate opens below.
+                    ipc.set_startup_phase("Initializing subsystems");
                 };
             execute_boot_initialization_plan_with_precompiled_and_startup_service(
                 &index,
@@ -581,102 +827,354 @@ fn run_main() -> ExitCode {
             );
             return ExitCode::FAILURE;
         }
+        if let Some(state) = precompiled.persistent_state_mut() {
+            let compaction = state.compact_quiescent_heap();
+            eprintln!(
+                "boot-progress: ready-heap-compaction reclaimed_datums={} reclaimed_lists={} elapsed_ms={}",
+                compaction.reclaimed_datums,
+                compaction.reclaimed_lists,
+                compaction.elapsed.as_millis(),
+            );
+        }
         eprintln!(
             "boot-progress: headless ready; entering persistent scheduler loop ready_elapsed_ms={}",
             process_started.elapsed().as_millis()
         );
-        if let Some(ipc) = &startup_ipc {
-            ipc.set_startup_phase("Server ready");
-            ipc.accept_startup_clients();
-            if let Some(state) = precompiled.persistent_state_mut() {
-                ipc.enable_session_interaction(state);
+        let mut snapshot_written = false;
+        if ready_world_mode.writes_snapshot()
+            && let Some(state) = precompiled.persistent_state_mut()
+        {
+            let snapshot_started = Instant::now();
+            match write_ready_world_cache(ready_cache, state) {
+                Ok(bytes) => {
+                    snapshot_written = true;
+                    eprintln!(
+                        "boot-progress: ready-world-cache cache=stored artifact={} bytes={} write_ms={}",
+                        ready_cache.display(),
+                        bytes,
+                        snapshot_started.elapsed().as_millis(),
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "boot-progress: ready-world-cache store-failed artifact={} error={error:?}",
+                        ready_cache.display(),
+                    );
+                    if matches!(&ready_world_mode, ReadyWorldMode::Prewarm(_)) {
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+        }
+        if let ReadyWorldMode::Prewarm(identity) = &ready_world_mode {
+            if !snapshot_written {
+                eprintln!(
+                    "boot-progress: ready-world prewarm failed artifact={} reason=persistent-state-unavailable",
+                    ready_cache.display(),
+                );
+                return ExitCode::FAILURE;
             }
             eprintln!(
-                "server-progress: loopback-ipc={} startup=accepting",
-                ipc.local_addr()
+                "boot-progress: ready-world prewarm complete artifact={} deployment={:?} seed={} elapsed_ms={}",
+                ready_cache.display(),
+                identity.deployment_id,
+                identity.random_seed,
+                process_started.elapsed().as_millis(),
             );
-        }
-        let mut ipc_address = startup_ipc.expect("production boot bound loopback IPC");
-        let max_slices = env::var_os("DREAM64_BOOT_MAX_SLICES")
-            .and_then(|limit| {
-                limit
-                    .to_str()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .map(Some)
-                    .or_else(|| {
-                        eprintln!("DREAM64_BOOT_MAX_SLICES ignored: not a valid u64: {limit:?}");
-                        None
-                    })
-            })
-            .flatten();
-        let mut slices = 0u64;
-        let mut host_budget =
-            HostSliceBudget::new(100_000, 1_000, 100_000, Duration::from_millis(10));
-        let mut max_vm_slice = Duration::ZERO;
-        let mut over_target_slices = 0u64;
-        loop {
-            let slice_started = Instant::now();
-            let tick_duration = precompiled.persistent_tick_duration();
-            ipc_address.apply_lifecycle_tick_boundary(precompiled);
-            let vm_started = Instant::now();
-            let scheduled_steps = host_budget.steps();
-            let scheduler = match advance_persistent_scheduler_responsive(
-                precompiled,
-                &mut runtime,
-                SchedulerDrainLimits {
-                    max_ticks: 1,
-                    max_rounds: 1,
-                },
-                scheduled_steps,
-            ) {
-                Ok(scheduler) => scheduler,
-                Err(error) => {
-                    eprintln!("persistent scheduler: {error}");
+            if let Some(control_address) = env::var_os("DREAM64_PREWARM_STANDBY_ADDR") {
+                let Some(control_address) = control_address.to_str() else {
+                    eprintln!("DREAM64_PREWARM_STANDBY_ADDR is not valid Unicode");
                     return ExitCode::FAILURE;
-                }
-            };
-            let vm_elapsed = vm_started.elapsed();
-            max_vm_slice = max_vm_slice.max(vm_elapsed);
-            over_target_slices = over_target_slices
-                .saturating_add(u64::from(vm_elapsed > Duration::from_millis(10)));
-            host_budget.observe(vm_elapsed);
-            // A VM slice may have consumed the complete latency allowance.
-            // Pump transport again before logging or sleeping so ping/input and
-            // completed immutable worker jobs never wait for the next tick.
-            ipc_address.apply_lifecycle_tick_boundary(precompiled);
-            slices = slices.saturating_add(1);
-            if slices == 1 || slices % 100 == 0 {
-                eprintln!(
-                    "server-progress: scheduler slice={} tick={} rounds={} completed={} failed={} pending={} termination={:?} vm_us={} vm_max_us={} next_step_budget={} over_10ms={} host_loop_us={}",
-                    slices,
-                    scheduler.final_tick,
-                    scheduler.rounds,
-                    scheduler.completed_tasks,
-                    scheduler.failed_tasks,
-                    scheduler.pending_tasks,
-                    scheduler.termination,
-                    vm_elapsed.as_micros(),
-                    max_vm_slice.as_micros(),
-                    host_budget.steps(),
-                    over_target_slices,
-                    slice_started.elapsed().as_micros(),
-                );
+                };
+                return run_prewarmed_standby(&mut runtime, precompiled, identity, control_address);
             }
-            if let Some(limit) = max_slices
-                && slices >= limit
-            {
-                eprintln!("boot-progress: reached DREAM64_BOOT_MAX_SLICES={limit}; stopping");
-                for line in precompiled.bounded_scheduler_progress() {
-                    eprintln!("boot-progress: shutdown-dm-frame {line}");
-                }
-                return ExitCode::SUCCESS;
-            }
-            if let Some(remaining) = tick_duration.checked_sub(slice_started.elapsed()) {
-                std::thread::sleep(remaining);
-            }
+            return ExitCode::SUCCESS;
         }
+        return run_persistent_server_loop(&mut runtime, precompiled, startup_ipc);
     }
     ExitCode::SUCCESS
+}
+
+fn run_prewarmed_standby(
+    runtime: &mut RuntimeImage,
+    precompiled: &mut dm_lifecycle::PrecompiledLifecycle,
+    identity: &ProductionReadyWorldIdentity,
+    control_address: &str,
+) -> ExitCode {
+    let control_address = match parse_loopback_address(control_address) {
+        Ok(address) => address,
+        Err(error) => {
+            eprintln!("prewarm standby address: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let listener = match TcpListener::bind(control_address) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("prewarm standby bind {control_address}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!(
+        "boot-progress: prewarmed standby ready control={} deployment={:?} seed={}",
+        control_address, identity.deployment_id, identity.random_seed,
+    );
+    let expected = format!("ACTIVATE {}", identity.deployment_id);
+    loop {
+        let (stream, peer) = match listener.accept() {
+            Ok(connection) => connection,
+            Err(error) => {
+                eprintln!("prewarm standby accept: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+        let mut command = String::new();
+        match BufReader::new(stream).take(4_096).read_line(&mut command) {
+            Ok(_) if command.trim() == expected => {
+                eprintln!(
+                    "boot-progress: prewarmed standby activation accepted peer={peer} deployment={:?}",
+                    identity.deployment_id,
+                );
+                break;
+            }
+            Ok(_) if command.trim() == format!("CANCEL {}", identity.deployment_id) => {
+                eprintln!(
+                    "boot-progress: prewarmed standby cancelled deployment={:?}",
+                    identity.deployment_id,
+                );
+                return ExitCode::SUCCESS;
+            }
+            Ok(_) => eprintln!("prewarm standby rejected command from {peer}"),
+            Err(error) => eprintln!("prewarm standby read from {peer}: {error}"),
+        }
+    }
+    drop(listener);
+
+    let ipc_address = env::var("DREAM64_IPC_ADDR").unwrap_or_else(|_| "127.0.0.1:51664".to_owned());
+    let ipc_address = match parse_loopback_address(&ipc_address) {
+        Ok(address) => address,
+        Err(error) => {
+            eprintln!("loopback IPC: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let timeout = env::var("DREAM64_HANDOFF_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(Duration::from_secs(30), Duration::from_millis);
+    let deadline = Instant::now() + timeout;
+    let ipc = loop {
+        match LoopbackIpc::bind_starting(ipc_address, "Activating prepared world") {
+            Ok(ipc) => break ipc,
+            Err(error) if Instant::now() < deadline => {
+                eprintln!(
+                    "boot-progress: handoff waiting for ipc={} reason={error}",
+                    ipc_address
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                eprintln!(
+                    "boot-progress: handoff failed ipc={} reason={error}",
+                    ipc_address
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    eprintln!(
+        "boot-progress: prewarmed handoff complete ipc={} deployment={:?}",
+        ipc.local_addr(),
+        identity.deployment_id,
+    );
+    run_persistent_server_loop(runtime, precompiled, Some(ipc))
+}
+
+fn launch_random_seed() -> (u64, &'static str) {
+    launch_random_seed_from(env::var("DREAM64_RANDOM_SEED").ok().as_deref())
+}
+
+fn launch_random_seed_from(value: Option<&str>) -> (u64, &'static str) {
+    if let Some(value) = value
+        && let Ok(seed) = value.parse::<u64>()
+        && seed != 0
+    {
+        return (seed, "environment");
+    }
+    (fresh_launch_random_seed(), "host-entropy")
+}
+
+fn fresh_launch_random_seed() -> u64 {
+    // `RandomState::new()` obtains independently keyed entropy from the host.
+    // Mix in launch-local values as domain separation and avoid the all-zero
+    // state used by deterministic unit tests.
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
+    hasher.write_u32(std::process::id());
+    let seed = hasher.finish();
+    if seed == 0 {
+        0x9e37_79b9_7f4a_7c15
+    } else {
+        seed
+    }
+}
+
+fn run_persistent_server_loop(
+    runtime: &mut RuntimeImage,
+    precompiled: &mut dm_lifecycle::PrecompiledLifecycle,
+    startup_ipc: Option<LoopbackIpc>,
+) -> ExitCode {
+    if let Some(ipc) = &startup_ipc {
+        ipc.set_startup_phase("Server ready");
+        ipc.accept_startup_clients();
+        if let Some(state) = precompiled.persistent_state_mut() {
+            ipc.enable_session_interaction(state);
+        }
+        eprintln!(
+            "server-progress: loopback-ipc={} startup=accepting",
+            ipc.local_addr()
+        );
+    }
+    let mut ipc_address = startup_ipc.expect("production boot bound loopback IPC");
+    let max_slices = env::var_os("DREAM64_BOOT_MAX_SLICES")
+        .and_then(|limit| {
+            limit
+                .to_str()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Some)
+                .or_else(|| {
+                    eprintln!("DREAM64_BOOT_MAX_SLICES ignored: not a valid u64: {limit:?}");
+                    None
+                })
+        })
+        .flatten();
+    let mut slices = 0u64;
+    let mut host_budget = HostSliceBudget::new(100_000, 1_000, 100_000, Duration::from_millis(10));
+    let mut max_vm_slice = Duration::ZERO;
+    let mut over_target_slices = 0u64;
+    loop {
+        let slice_started = Instant::now();
+        let tick_duration = precompiled.persistent_tick_duration();
+        ipc_address.apply_lifecycle_tick_boundary(precompiled);
+        let vm_started = Instant::now();
+        let scheduled_steps = host_budget.steps();
+        let scheduler = match advance_persistent_scheduler_responsive(
+            precompiled,
+            runtime,
+            SchedulerDrainLimits {
+                max_ticks: 1,
+                max_rounds: 1,
+            },
+            scheduled_steps,
+        ) {
+            Ok(scheduler) => scheduler,
+            Err(error) => {
+                eprintln!("persistent scheduler: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let vm_elapsed = vm_started.elapsed();
+        max_vm_slice = max_vm_slice.max(vm_elapsed);
+        over_target_slices =
+            over_target_slices.saturating_add(u64::from(vm_elapsed > Duration::from_millis(10)));
+        host_budget.observe(vm_elapsed);
+        ipc_address.apply_lifecycle_tick_boundary(precompiled);
+        slices = slices.saturating_add(1);
+        if slices == 1 || slices % 100 == 0 {
+            eprintln!(
+                "server-progress: scheduler slice={} tick={} rounds={} completed={} failed={} pending={} termination={:?} vm_us={} vm_max_us={} next_step_budget={} over_10ms={} host_loop_us={}",
+                slices,
+                scheduler.final_tick,
+                scheduler.rounds,
+                scheduler.completed_tasks,
+                scheduler.failed_tasks,
+                scheduler.pending_tasks,
+                scheduler.termination,
+                vm_elapsed.as_micros(),
+                max_vm_slice.as_micros(),
+                host_budget.steps(),
+                over_target_slices,
+                slice_started.elapsed().as_micros(),
+            );
+        }
+        if let Some(limit) = max_slices
+            && slices >= limit
+        {
+            eprintln!("boot-progress: reached DREAM64_BOOT_MAX_SLICES={limit}; stopping");
+            for line in precompiled.bounded_scheduler_progress() {
+                eprintln!("boot-progress: shutdown-dm-frame {line}");
+            }
+            return ExitCode::SUCCESS;
+        }
+        if let Some(remaining) = tick_duration.checked_sub(slice_started.elapsed()) {
+            std::thread::sleep(remaining);
+        }
+    }
+}
+
+fn restore_ready_world_cache(
+    path: &Path,
+    state: &mut dm_vm::ExecutionState,
+    module: &dm_vm::Module,
+) -> Result<u64, String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let bytes = file.metadata().map_err(|error| error.to_string())?.len();
+    state
+        .restore_ready_world_snapshot_from(&mut GzDecoder::new(BufReader::new(file)), module)
+        .map_err(|error| error.to_string())?;
+    Ok(bytes)
+}
+
+fn write_ready_world_cache(path: &Path, state: &dm_vm::ExecutionState) -> Result<u64, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut temporary = None;
+    for sequence in 0..100_u32 {
+        let candidate =
+            path.with_extension(format!("ready.tmp.{}.{}", std::process::id(), sequence));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let (temporary_path, file) = temporary
+        .ok_or_else(|| "could not reserve a ready-world cache temporary file".to_owned())?;
+    let result = (|| {
+        let mut writer = GzEncoder::new(BufWriter::new(file), Compression::fast());
+        state
+            .write_ready_world_snapshot_to(&mut writer)
+            .map_err(|error| error.to_string())?;
+        let mut writer = writer.finish().map_err(|error| error.to_string())?;
+        writer.flush().map_err(|error| error.to_string())?;
+        let file = writer.into_inner().map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        let bytes = file.metadata().map_err(|error| error.to_string())?.len();
+        drop(file);
+        if path.exists() {
+            fs::remove_file(path).map_err(|error| error.to_string())?;
+        }
+        fs::rename(&temporary_path, path).map_err(|error| error.to_string())?;
+        Ok(bytes)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result
 }
 
 fn startup_scheduler_limits() -> SchedulerDrainLimits {
@@ -1025,10 +1523,30 @@ struct PreparedCompiledExecutable {
     new_lowerings: usize,
 }
 
+fn prepare_standalone_artifact(artifact_file: &Path) -> Result<PreparedCompiledExecutable, String> {
+    let project_fingerprint = CompiledArtifact::peek_project_fingerprint(artifact_file)
+        .map_err(|error| error.to_string())?;
+    let (compilation, executable, structural_seed) =
+        decode_compiled_executable(artifact_file, project_fingerprint)?;
+    let procedures = ProcedureRegistry::build_lazy(&compilation);
+    Ok(PreparedCompiledExecutable {
+        compilation,
+        procedures,
+        executable,
+        structural_seed,
+        project_snapshot_hit: false,
+        parsed_syntax_hit: None,
+        artifact_hit: true,
+        miss_reason: None,
+        new_lowerings: 0,
+    })
+}
+
 fn prepare_compiled_executable(
     environment: &Path,
     cache_file: &Path,
     artifact_file: &Path,
+    allow_compile: bool,
 ) -> Result<PreparedCompiledExecutable, String> {
     // The compact project snapshot validates every discovered input before we
     // trust the heavyweight executable. Normal interactive boots use the
@@ -1086,6 +1604,13 @@ fn prepare_compiled_executable(
     };
     drop(project);
 
+    if !allow_compile {
+        return Err(format!(
+            "runtime artifacts are unavailable or stale: {miss_reason}; run `dream64-compiler {}` before booting",
+            environment.display(),
+        ));
+    }
+
     // One miss performs exactly one ordinary frontend compilation followed by
     // one complete symbolic link and deterministic eager materialization.
     let phase = Instant::now();
@@ -1093,9 +1618,11 @@ fn prepare_compiled_executable(
         .compile_cached_with_stats(environment, cache_file)
         .map_err(|error| error.to_string())?;
     eprintln!(
-        "compile-cache-phase: frontend-compile elapsed_ms={} parsed_syntax_hit={}",
+        "compile-cache-phase: frontend-compile elapsed_ms={} parsed_syntax_hit={} syntax_reused={} syntax_reparsed={}",
         phase.elapsed().as_millis(),
-        cache_stats.parsed_syntax_hit
+        cache_stats.parsed_syntax_hit,
+        cache_stats.syntax_files_reused,
+        cache_stats.syntax_files_reparsed,
     );
     let phase = Instant::now();
     let procedures = ProcedureRegistry::build(&compilation);
@@ -1151,7 +1678,7 @@ fn prepare_compiled_executable(
     );
     let fingerprint = *compilation.project().content_fingerprint().as_bytes();
     let phase = Instant::now();
-    let artifact = CompiledArtifact::new(
+    let runtime_artifact = CompiledArtifact::new(
         fingerprint,
         vec![
             ArtifactSection::new(COMPILATION_ARTIFACT_SECTION, compilation_payload),
@@ -1165,19 +1692,20 @@ fn prepare_compiled_executable(
         phase.elapsed().as_millis()
     );
     let phase = Instant::now();
-    let write_stats = artifact
+    let runtime_write_stats = runtime_artifact
         .write_atomic_with_stats(artifact_file)
-        .map_err(|error| format!("write executable artifact: {error}"))?;
+        .map_err(|error| format!("write runtime artifact: {error}"))?;
     eprintln!(
         "compile-cache-phase: artifact-write elapsed_ms={}",
         phase.elapsed().as_millis()
     );
     eprintln!(
-        "compile-progress: executable-artifact-write encoded_bytes={} payload_bytes={} peak_staging_bytes={} write_calls={}",
-        write_stats.encoded_bytes,
-        write_stats.payload_bytes,
-        write_stats.peak_staging_bytes,
-        write_stats.write_calls,
+        "compile-progress: runtime-artifact-write runtime={} runtime_bytes={} payload_bytes={} peak_staging_bytes={} write_calls={}",
+        artifact_file.display(),
+        runtime_write_stats.encoded_bytes,
+        runtime_write_stats.payload_bytes,
+        runtime_write_stats.peak_staging_bytes,
+        runtime_write_stats.write_calls,
     );
     Ok(PreparedCompiledExecutable {
         compilation,
@@ -1197,11 +1725,11 @@ fn decode_compiled_executable(
     project_fingerprint: [u8; 16],
 ) -> Result<(Compilation, ExecutableProcedures, RuntimeStructuralSeed), String> {
     let phase = Instant::now();
-    let artifact = match CompiledArtifact::read_from(artifact_file, project_fingerprint) {
+    let runtime_artifact = match CompiledArtifact::read_from(artifact_file, project_fingerprint) {
         Ok(artifact) => artifact,
         Err(error) => {
             eprintln!(
-                "compile-cache-phase: artifact-read-checksum-rejected elapsed_ms={} reason={error}",
+                "compile-cache-phase: runtime-artifact-read-rejected elapsed_ms={} reason={error}",
                 phase.elapsed().as_millis()
             );
             return Err(error.to_string());
@@ -1211,28 +1739,30 @@ fn decode_compiled_executable(
         "compile-cache-phase: artifact-read-checksum elapsed_ms={}",
         phase.elapsed().as_millis()
     );
-    let storage = artifact.storage_stats();
+    let runtime_storage = runtime_artifact.storage_stats();
     eprintln!(
-        "boot-progress: executable-artifact-storage payload_bytes={} backing_bytes={} backing_allocations={}",
-        storage.payload_bytes, storage.backing_bytes, storage.backing_allocations,
+        "boot-progress: runtime-artifact-storage payload_bytes={} backing_bytes={} backing_allocations={}",
+        runtime_storage.payload_bytes,
+        runtime_storage.backing_bytes,
+        runtime_storage.backing_allocations,
     );
-    if artifact.sections().len() != 3 {
+    if runtime_artifact.sections().len() != 3 {
         return Err(format!(
-            "compiled executable contains {} sections instead of 3",
-            artifact.sections().len()
+            "runtime artifact contains {} sections instead of 3",
+            runtime_artifact.sections().len()
         ));
     }
-    let frontend_payload = artifact
+    let frontend_payload = runtime_artifact
         .section(COMPILATION_ARTIFACT_SECTION)
-        .ok_or_else(|| "compiled executable is missing the frontend section".to_owned())?
+        .ok_or_else(|| "runtime artifact is missing the bootstrap section".to_owned())?
         .payload();
-    let executable_payload = artifact
+    let executable_payload = runtime_artifact
         .section(EXECUTABLE_ARTIFACT_SECTION)
-        .ok_or_else(|| "compiled executable is missing the bytecode section".to_owned())?
+        .ok_or_else(|| "runtime artifact is missing the bytecode section".to_owned())?
         .payload();
-    let structural_payload = artifact
+    let structural_payload = runtime_artifact
         .section(RUNTIME_STRUCTURAL_ARTIFACT_SECTION)
-        .ok_or_else(|| "compiled executable is missing the runtime structural section".to_owned())?
+        .ok_or_else(|| "runtime artifact is missing the structural section".to_owned())?
         .payload();
     let parallel_phase = Instant::now();
     let (compilation, executable, structural_seed) = std::thread::scope(|scope| {
@@ -1317,6 +1847,27 @@ fn project_cache_file(environment: &Path) -> PathBuf {
         PathBuf::from,
     );
     cache_root.join(format!("project-{hash:016x}.bin"))
+}
+
+fn ready_world_cache_file(
+    project_cache: &Path,
+    map_source: &str,
+    compilation: &Compilation,
+    production_identity: Option<&ProductionReadyWorldIdentity>,
+) -> PathBuf {
+    let mut identity = md5::Context::new();
+    identity.consume(b"dream64-ready-world-v1");
+    identity.consume(engine_semantics_fingerprint());
+    identity.consume(env!("DREAM64_ENGINE_TARGET").as_bytes());
+    identity.consume(compilation.project().content_fingerprint().as_bytes());
+    identity.consume(map_source.as_bytes());
+    if let Some(production_identity) = production_identity {
+        identity.consume(b"production-ready-world-v1");
+        identity.consume(production_identity.random_seed.to_le_bytes());
+        identity.consume(production_identity.deployment_id.as_bytes());
+    }
+    let digest = identity.compute();
+    project_cache.with_file_name(format!("ready-{digest:x}.bin"))
 }
 
 fn cached_world_plan(
@@ -1476,7 +2027,7 @@ fn print_boot_summary(
     println!("allocation_turfs={}", stats.turfs);
     println!("allocation_movables={}", stats.movables);
     println!("allocation_deferred={}", allocation.work_items().len());
-    println!("lifecycle_executed={}", execution.events.len());
+    println!("lifecycle_executed={}", execution.executed_events);
     println!("lifecycle_duplicates={}", execution.duplicate_map_events);
     println!("world_allocated={}", usize::from(execution.world.is_some()));
     println!("scheduler_tick={}", execution.scheduler.final_tick);
@@ -1490,13 +2041,6 @@ fn print_boot_summary(
         "scheduler_termination={:?}",
         execution.scheduler.termination
     );
-    let mut counts = BTreeMap::new();
-    for event in &execution.events {
-        let dm_lifecycle::InitializationEvent::Lifecycle { kind, .. } = event.event else {
-            continue;
-        };
-        *counts.entry(kind).or_insert(0usize) += 1;
-    }
     for kind in [
         LifecycleKind::Genesis,
         LifecycleKind::New,
@@ -1505,7 +2049,11 @@ fn print_boot_summary(
     ] {
         println!(
             "executed_{kind:?}={}",
-            counts.get(&kind).copied().unwrap_or(0)
+            execution
+                .executed_event_counts
+                .get(&kind)
+                .copied()
+                .unwrap_or(0)
         );
     }
 }
@@ -1563,11 +2111,14 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use dm_value::Value;
+    use dm_value::{FieldName, Value};
     use dm_vm::{ExecutionState, execute_module_in_state};
 
     use super::{
-        decode_compiled_executable, executable_artifact_file, prepare_compiled_executable,
+        ProductionReadyWorldIdentity, ReadyWorldMode, decode_compiled_executable,
+        executable_artifact_file, fresh_launch_random_seed, launch_random_seed_from,
+        parse_ready_world_mode, prepare_compiled_executable, prepare_standalone_artifact,
+        ready_world_cache_file, restore_ready_world_cache, write_ready_world_cache,
     };
 
     static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
@@ -1613,7 +2164,7 @@ mod tests {
         }
 
         fn prepare(&self) -> super::PreparedCompiledExecutable {
-            prepare_compiled_executable(&self.environment, &self.cache, &self.artifact)
+            prepare_compiled_executable(&self.environment, &self.cache, &self.artifact, true)
                 .expect("artifact preparation should succeed")
         }
     }
@@ -1625,11 +2176,121 @@ mod tests {
     }
 
     #[test]
-    fn executable_artifact_is_a_lowercase_d64_sibling_of_the_environment() {
+    fn runtime_artifact_is_a_lowercase_d64_sibling_of_the_environment() {
         let environment = Path::new("Monkestation2.0").join("tgstation.DmE");
+        let runtime = executable_artifact_file(&environment);
+        assert_eq!(runtime, Path::new("Monkestation2.0").join("tgstation.d64"));
+    }
+
+    #[test]
+    fn launch_entropy_never_uses_the_deterministic_test_seed() {
+        let first = fresh_launch_random_seed();
+        let second = fresh_launch_random_seed();
+        assert_ne!(first, 0);
+        assert_ne!(second, 0);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn launch_seed_can_be_replayed_from_the_environment() {
         assert_eq!(
-            executable_artifact_file(&environment),
-            Path::new("Monkestation2.0").join("tgstation.d64")
+            launch_random_seed_from(Some("8675309")),
+            (8_675_309, "environment")
+        );
+    }
+
+    #[test]
+    fn production_ready_world_modes_require_exclusive_complete_identity() {
+        assert!(parse_ready_world_mode(true, true, false, false, Some("7"), Some("blue")).is_err());
+        assert!(parse_ready_world_mode(true, false, false, false, None, Some("blue")).is_err());
+        assert!(
+            parse_ready_world_mode(true, false, false, false, Some("0"), Some("blue")).is_err()
+        );
+        assert!(parse_ready_world_mode(true, false, false, false, Some("7"), Some(" ")).is_err());
+        assert_eq!(
+            parse_ready_world_mode(true, false, true, false, Some("7"), Some(" blue ")).unwrap(),
+            ReadyWorldMode::Prewarm(ProductionReadyWorldIdentity {
+                random_seed: 7,
+                deployment_id: "blue".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse_ready_world_mode(false, true, false, false, Some("9"), Some("green")).unwrap(),
+            ReadyWorldMode::Activate(ProductionReadyWorldIdentity {
+                random_seed: 9,
+                deployment_id: "green".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse_ready_world_mode(true, true, true, true, None, None).unwrap(),
+            ReadyWorldMode::Disabled,
+            "the explicit disable switch overrides every cache mode"
+        );
+        assert_eq!(
+            parse_ready_world_mode(false, false, true, false, None, None).unwrap(),
+            ReadyWorldMode::Development
+        );
+    }
+
+    #[test]
+    fn ready_world_identity_changes_with_map_content_and_compressed_state_roundtrips() {
+        let fixture = Fixture::new();
+        let prepared = fixture.prepare();
+        let first = ready_world_cache_file(
+            &fixture.cache,
+            "(1,1,1) = {\"a\"}",
+            &prepared.compilation,
+            None,
+        );
+        let second = ready_world_cache_file(
+            &fixture.cache,
+            "(1,1,1) = {\"b\"}",
+            &prepared.compilation,
+            None,
+        );
+        assert_ne!(first, second);
+        let deployment = |random_seed, deployment_id: &str| ProductionReadyWorldIdentity {
+            random_seed,
+            deployment_id: deployment_id.to_owned(),
+        };
+        let production = ready_world_cache_file(
+            &fixture.cache,
+            "(1,1,1) = {\"a\"}",
+            &prepared.compilation,
+            Some(&deployment(41, "blue")),
+        );
+        assert_ne!(production, first);
+        assert_ne!(
+            production,
+            ready_world_cache_file(
+                &fixture.cache,
+                "(1,1,1) = {\"a\"}",
+                &prepared.compilation,
+                Some(&deployment(42, "blue")),
+            )
+        );
+        assert_ne!(
+            production,
+            ready_world_cache_file(
+                &fixture.cache,
+                "(1,1,1) = {\"a\"}",
+                &prepared.compilation,
+                Some(&deployment(41, "green")),
+            )
+        );
+
+        let mut state = ExecutionState::new();
+        state.set_global(FieldName::parse("answer").unwrap(), Value::number(42.0));
+        let bytes = write_ready_world_cache(&first, &state).unwrap();
+        assert!(bytes > 0);
+        let mut restored = ExecutionState::new();
+        assert_eq!(
+            restore_ready_world_cache(&first, &mut restored, prepared.executable.module()).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            restored.global(&FieldName::parse("answer").unwrap()),
+            Some(&Value::number(42.0))
         );
     }
 
@@ -1671,6 +2332,52 @@ mod tests {
             changed.compilation.project().content_fingerprint(),
             first_fingerprint
         );
+    }
+
+    #[test]
+    fn runtime_mode_never_compiles_a_missing_artifact() {
+        let fixture = Fixture::new();
+        drop(fixture.prepare());
+        let runtime = prepare_compiled_executable(
+            &fixture.environment,
+            &fixture.cache,
+            &fixture.artifact,
+            false,
+        )
+        .expect("runtime should load a compiler-produced artifact");
+        assert!(runtime.artifact_hit);
+        drop(runtime);
+
+        fs::remove_file(&fixture.artifact).expect("runtime artifact should be removed");
+        let error = prepare_compiled_executable(
+            &fixture.environment,
+            &fixture.cache,
+            &fixture.artifact,
+            false,
+        )
+        .err()
+        .expect("runtime must fail instead of compiling");
+        assert!(error.contains("run `dream64-compiler"));
+        assert!(!fixture.artifact.exists());
+    }
+
+    #[test]
+    fn standalone_runtime_loads_only_the_compiled_d64() {
+        let fixture = Fixture::new();
+        let compiled = fixture.prepare();
+        let expected = compiled.compilation.project().content_fingerprint();
+        drop(compiled);
+        fs::remove_file(&fixture.environment).expect("source environment should be removable");
+        fs::remove_file(&fixture.source).expect("source file should be removable");
+
+        let runtime = prepare_standalone_artifact(&fixture.artifact)
+            .expect("self-contained runtime should not require compiler sources");
+        assert!(runtime.artifact_hit);
+        assert_eq!(
+            runtime.compilation.project().content_fingerprint(),
+            expected
+        );
+        assert_eq!(runtime.new_lowerings, 0);
     }
 
     #[test]

@@ -1,10 +1,13 @@
 param(
     [int] $BootNumber = 0,
     [string] $ServerExecutable,
+    [string] $CompilerExecutable,
     [string] $ClientExecutable,
     [string] $Dme = "C:\Users\Administrator\Desktop\RBMK Project\Monkestation2.0\tgstation.dme",
     [string] $Map = "C:\Users\Administrator\Desktop\RBMK Project\Monkestation2.0\_maps\map_files\generic\CentCom.dmm",
-    [string] $Skin = "C:\Users\Administrator\Desktop\RBMK Project\Monkestation2.0\interface\skin.dmf"
+    [string] $Skin = "C:\Users\Administrator\Desktop\RBMK Project\Monkestation2.0\interface\skin.dmf",
+    [switch] $ReuseInitializedWorld,
+    [switch] $SkipCompile
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,13 +16,17 @@ if ($BootNumber -le 0) {
     $BootNumber = [int](Get-Date -Format "HHmmss")
 }
 if ([string]::IsNullOrWhiteSpace($ServerExecutable)) {
-    $ServerExecutable = Join-Path $workspace "target\release\dm-lifecycle.exe"
+    $ServerExecutable = Join-Path $workspace "target\release\dream64-server.exe"
+}
+if ([string]::IsNullOrWhiteSpace($CompilerExecutable)) {
+    $CompilerExecutable = Join-Path $workspace "target\release\dream64-compiler.exe"
 }
 if ([string]::IsNullOrWhiteSpace($ClientExecutable)) {
     $ClientExecutable = Join-Path $workspace "target\release\dm-client.exe"
 }
 
 $ServerExecutable = (Resolve-Path -LiteralPath $ServerExecutable).Path
+$CompilerExecutable = (Resolve-Path -LiteralPath $CompilerExecutable).Path
 $ClientExecutable = (Resolve-Path -LiteralPath $ClientExecutable).Path
 $Dme = (Resolve-Path -LiteralPath $Dme).Path
 $Map = (Resolve-Path -LiteralPath $Map).Path
@@ -29,6 +36,7 @@ $logDirectory = Join-Path $workspace "logs"
 [IO.Directory]::CreateDirectory($logDirectory) | Out-Null
 $serverLog = Join-Path $logDirectory "visible-boot-$BootNumber-server.log"
 $clientLog = Join-Path $logDirectory "visible-boot-$BootNumber-client.log"
+$compilerLog = Join-Path $logDirectory "visible-boot-$BootNumber-compiler.log"
 
 # Production-visible boot: no instruction tracing, profilers, audit sweep,
 # dashboard memory sampling, or atom inventory. The client receives lightweight
@@ -46,8 +54,16 @@ $clientLog = Join-Path $logDirectory "visible-boot-$BootNumber-client.log"
     "DREAM64_STRICT_STARTUP_ERRORS",
     "DREAM64_FAIL_FAST_STARTUP_ERRORS",
     "DREAM64_STARTUP_FATAL",
-    "DREAM64_STARTUP_NONFATAL"
+    "DREAM64_STARTUP_NONFATAL",
+    "DREAM64_ENABLE_READY_WORLD_CACHE",
+    "DREAM64_DISABLE_READY_CACHE"
 ) | ForEach-Object { Remove-Item "Env:$_" -ErrorAction SilentlyContinue }
+
+if ($ReuseInitializedWorld) {
+    $env:DREAM64_ENABLE_READY_WORLD_CACHE = "1"
+} else {
+    $env:DREAM64_DISABLE_READY_CACHE = "1"
+}
 
 $logicalProcessors = [Environment]::ProcessorCount
 $env:RAYON_NUM_THREADS = [string]$logicalProcessors
@@ -58,9 +74,36 @@ Write-Host "  DREAM64 / MONKESTATION" -ForegroundColor Cyan
 Write-Host "  Visible boot $BootNumber" -ForegroundColor White
 Write-Host "  $logicalProcessors logical processors available; affinity pinning disabled" -ForegroundColor Green
 Write-Host "  Heavy trace/profile/audit modes disabled" -ForegroundColor DarkGray
+if ($ReuseInitializedWorld) {
+    Write-Host "  Initialized-world reuse enabled (development; map-load rolls are preserved)." -ForegroundColor Yellow
+} else {
+    Write-Host "  Fresh-random production boot (mapping, ruins, rooms, engine and round rolls run now)." -ForegroundColor Green
+}
+if ($env:DREAM64_RANDOM_SEED) {
+    Write-Host "  Replaying random seed $($env:DREAM64_RANDOM_SEED)." -ForegroundColor Yellow
+}
 Write-Host ""
 
-$quotedDme = '"' + $Dme + '"'
+if (-not $SkipCompile) {
+    Write-Host "  Checking compiler artifacts in a separate compiler process..." -ForegroundColor Cyan
+    $quotedDme = '"' + $Dme + '"'
+    $compiler = Start-Process -FilePath $CompilerExecutable `
+        -ArgumentList @($quotedDme) `
+        -WorkingDirectory $workspace `
+        -RedirectStandardError $compilerLog `
+        -WindowStyle Hidden `
+        -Wait `
+        -PassThru
+    if ($compiler.ExitCode -ne 0) {
+        Write-Host "  Compiler failed with code $($compiler.ExitCode). Log: $compilerLog" -ForegroundColor Red
+        exit $compiler.ExitCode
+    }
+    Write-Host "  Compiler artifacts ready; launching the runtime-only server." -ForegroundColor Green
+}
+
+$Artifact = [IO.Path]::ChangeExtension($Dme, ".d64")
+$Artifact = (Resolve-Path -LiteralPath $Artifact).Path
+$quotedArtifact = '"' + $Artifact + '"'
 $quotedMap = '"' + $Map + '"'
 $quotedSkin = '"' + $Skin + '"'
 $clientArguments = @("--connect", "127.0.0.1:51664", "--skin", $quotedSkin)
@@ -74,7 +117,7 @@ $client = $null
 
 try {
     $server = Start-Process -FilePath $ServerExecutable `
-        -ArgumentList @("boot", $quotedDme, $quotedMap) `
+        -ArgumentList @("boot", $quotedArtifact, $quotedMap) `
         -WorkingDirectory $workspace `
         -RedirectStandardError $serverLog `
         -WindowStyle Hidden `
@@ -93,10 +136,27 @@ try {
     Write-Host "  Client PID $($client.Id) | Server PID $($server.Id)" -ForegroundColor Yellow
     Write-Host "  Both are AboveNormal priority with all cores available." -ForegroundColor Green
 
+    $lastProgress = ""
     while (-not $server.HasExited -and -not $client.HasExited) {
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Seconds 1
         $server.Refresh()
         $client.Refresh()
+        if (Test-Path -LiteralPath $serverLog -PathType Leaf) {
+            $progress = Get-Content -LiteralPath $serverLog -Tail 40 -ErrorAction SilentlyContinue |
+                Where-Object { $_ -match '^(boot-progress|server-progress):' } |
+                Select-Object -Last 1
+            if ($progress -and $progress -ne $lastProgress) {
+                $color = if ($progress -match 'cache=hit|headless ready|startup=accepting') {
+                    'Green'
+                } elseif ($progress -match 'cache=miss|store-failed|runtime-error|failed') {
+                    'Yellow'
+                } else {
+                    'Cyan'
+                }
+                Write-Host "  $progress" -ForegroundColor $color
+                $lastProgress = $progress
+            }
+        }
     }
 
     if ($server.HasExited) {

@@ -4,7 +4,7 @@
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::Path,
@@ -29,6 +29,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHan
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+mod gpu;
 mod sprite;
 #[cfg(test)]
 use sprite::composite_tile;
@@ -3217,7 +3218,7 @@ fn tile_color(template: &dm_world::CellTemplate) -> u32 {
 
 struct LocalClient {
     context: Context<OwnedDisplayHandle>,
-    surface: Option<Surface<OwnedDisplayHandle, Rc<Window>>>,
+    surface: Option<ClientSurface>,
     runtime: ExecutionState,
     client: dm_value::DatumId,
     local_input_events: usize,
@@ -3252,6 +3253,71 @@ struct LocalClient {
     browsers: BTreeMap<String, WebView>,
     #[cfg(windows)]
     browser_assets: BrowserAssetServer,
+}
+
+enum ClientSurface {
+    Gpu(Box<gpu::GpuRenderer>),
+    Cpu(Surface<OwnedDisplayHandle, Arc<Window>>),
+}
+
+impl ClientSurface {
+    const fn is_gpu(&self) -> bool {
+        matches!(self, Self::Gpu(_))
+    }
+
+    fn window(&self) -> &Window {
+        match self {
+            Self::Gpu(renderer) => renderer.window(),
+            Self::Cpu(surface) => surface.window(),
+        }
+    }
+
+    fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
+        match self {
+            Self::Gpu(renderer) => {
+                renderer.resize(width, height);
+                Ok(())
+            }
+            Self::Cpu(surface) => {
+                let Some(width) = NonZeroU32::new(width) else {
+                    return Ok(());
+                };
+                let Some(height) = NonZeroU32::new(height) else {
+                    return Ok(());
+                };
+                surface
+                    .resize(width, height)
+                    .map_err(|error| format!("resize CPU surface: {error}"))
+            }
+        }
+    }
+
+    fn present(
+        &mut self,
+        pixels: &[u32],
+        dmi_sprites: &[gpu::DmiSpriteDraw],
+        sprites: &[gpu::SpriteDraw],
+    ) -> Result<(), String> {
+        match self {
+            Self::Gpu(renderer) => renderer.present(pixels, dmi_sprites, sprites),
+            Self::Cpu(surface) => {
+                let mut buffer = surface
+                    .buffer_mut()
+                    .map_err(|error| format!("draw CPU surface: {error}"))?;
+                if buffer.len() != pixels.len() {
+                    return Err(format!(
+                        "CPU framebuffer has {} pixels; expected {}",
+                        buffer.len(),
+                        pixels.len()
+                    ));
+                }
+                buffer.copy_from_slice(pixels);
+                buffer
+                    .present()
+                    .map_err(|error| format!("present CPU surface: {error}"))
+            }
+        }
+    }
 }
 
 impl LocalClient {
@@ -3890,8 +3956,7 @@ impl LocalClient {
             .surface
             .as_ref()
             .expect("the browser has a parent window")
-            .window()
-            .clone();
+            .window();
         let bounds = Self::webview_bounds(PixelRect {
             x: 0,
             y: 0,
@@ -4084,20 +4149,14 @@ audio.play().catch(error => console.error('Dream64 sound playback failed', error
             .unwrap_or_else(|| "Dream64".to_owned())
     }
 
-    fn resize(surface: &mut Surface<OwnedDisplayHandle, Rc<Window>>, width: u32, height: u32) {
-        let Some(width) = NonZeroU32::new(width) else {
-            return;
-        };
-        let Some(height) = NonZeroU32::new(height) else {
-            return;
-        };
-        surface
-            .resize(width, height)
-            .expect("the client surface resizes");
+    fn resize(surface: &mut ClientSurface, width: u32, height: u32) {
+        if let Err(error) = surface.resize(width, height) {
+            eprintln!("client-surface-resize-error: {error}");
+        }
     }
 
     fn redraw(
-        surface: &mut Surface<OwnedDisplayHandle, Rc<Window>>,
+        surface: &mut ClientSurface,
         snapshot: Option<&MapSnapshot>,
         sprites: &mut SpriteCache,
         layout: ClientLayout,
@@ -4117,9 +4176,10 @@ audio.play().catch(error => console.error('Dream64 sound playback failed', error
         let size = surface.window().inner_size();
         let width = usize::try_from(size.width).expect("window width fits usize");
         let height = usize::try_from(size.height).expect("window height fits usize");
-        let mut buffer = surface
-            .buffer_mut()
-            .expect("the client surface is drawable");
+        let mut buffer = vec![0_u32; width.saturating_mul(height)];
+        let mut gpu_sprites = Vec::new();
+        let mut gpu_dmi_sprites = Vec::new();
+        let gpu_enabled = surface.is_gpu();
         // The supplied BYOND skin owns the full surface. Match OpenDream's
         // RobustToolbox window default and let resolved DMF controls paint it.
         buffer.fill(0xfff0f0f0);
@@ -4136,6 +4196,7 @@ audio.play().catch(error => console.error('Dream64 sound playback failed', error
             ),
             snapshot,
             sprites,
+            gpu_enabled.then_some((&mut gpu_dmi_sprites, &mut gpu_sprites)),
         );
         // Keep the DMF CHILD splitter visible on the native map side. The
         // browser pane is a child WebView and otherwise covers the boundary.
@@ -4205,7 +4266,9 @@ audio.play().catch(error => console.error('Dream64 sound playback failed', error
         if snapshot.is_some_and(|snapshot| !snapshot.screen.is_empty()) {
             maybe_dump_rendered_frame(&buffer, size.width, size.height);
         }
-        buffer.present().expect("the client surface presents");
+        if let Err(error) = surface.present(&buffer, &gpu_dmi_sprites, &gpu_sprites) {
+            eprintln!("client-surface-present-error: {error}");
+        }
     }
 }
 
@@ -4323,14 +4386,25 @@ impl ApplicationHandler for LocalClient {
                 f64::from(self.layout.window_width),
                 f64::from(self.layout.window_height),
             ));
-        let window = Rc::new(
+        let window = Arc::new(
             event_loop
                 .create_window(attributes)
                 .expect("the native Dream64 client window is created"),
         );
         let size = window.inner_size();
-        let mut surface =
-            Surface::new(&self.context, window).expect("the client surface is created");
+        let mut surface = match gpu::GpuRenderer::new(window.clone()) {
+            Ok(renderer) => {
+                eprintln!("client-renderer: wgpu adapter={}", renderer.adapter_label());
+                ClientSurface::Gpu(Box::new(renderer))
+            }
+            Err(error) => {
+                eprintln!("client-renderer-fallback: {error}");
+                ClientSurface::Cpu(
+                    Surface::new(&self.context, window)
+                        .expect("the fallback client surface is created"),
+                )
+            }
+        };
         Self::resize(&mut surface, size.width, size.height);
         // Some Windows/Wry combinations do not deliver a RedrawRequested
         // event for a request made while the maximized window is still being
@@ -5408,6 +5482,99 @@ fn world_display_items(
         .collect()
 }
 
+struct GpuWorldDisplayItem {
+    draw: gpu::DmiSpriteDraw,
+    appearance: Appearance,
+    maptext_origin_x: i32,
+    maptext_origin_y: i32,
+}
+
+fn gpu_world_display_items(
+    snapshot: &MapSnapshot,
+    sprites: &mut SpriteCache,
+    transform: MapTransform,
+) -> Vec<GpuWorldDisplayItem> {
+    let center_column = i32::try_from(transform.columns / 2).unwrap_or(0);
+    let center_row = i32::try_from(transform.rows / 2).unwrap_or(0);
+    let mut appearances = Vec::new();
+    for row in 0..transform.rows {
+        for column in 0..transform.columns {
+            let owner = WorldCoordinate {
+                x: snapshot.center.x + i32::try_from(column).unwrap_or(0) - center_column,
+                y: snapshot.center.y + center_row - i32::try_from(row).unwrap_or(0),
+                z: snapshot.center.z,
+            };
+            if let Some(items) = snapshot.appearances.get(&(owner.x, owner.y, owner.z)) {
+                appearances.extend(
+                    items
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(|(insertion, appearance)| (row, column, insertion, appearance)),
+                );
+            }
+        }
+    }
+    appearances.sort_by(|left, right| {
+        left.3
+            .plane
+            .total_cmp(&right.3.plane)
+            .then_with(|| left.3.layer.total_cmp(&right.3.layer))
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    appearances
+        .into_iter()
+        .filter_map(|(row, column, _, appearance)| {
+            if appearance.resource.as_os_str().is_empty() {
+                return None;
+            }
+            let frame = sprites.gpu_frame(&appearance).ok()?;
+            let sprite_scale = transform.tile as f32 / 32.0;
+            let width = (frame.width as f32 * sprite_scale).round().max(1.0);
+            let height = (frame.height as f32 * sprite_scale).round().max(1.0);
+            let cell_left = i32::try_from(transform.origin_x + column * transform.tile).ok()?;
+            let cell_bottom =
+                i32::try_from(transform.origin_y + (row + 1) * transform.tile).ok()?;
+            let pixel_x = (appearance.pixel_x as f32 * sprite_scale).round() as i32;
+            let pixel_y = (appearance.pixel_y as f32 * sprite_scale).round() as i32;
+            let (origin_x, origin_y) = world_appearance_origin(
+                cell_left,
+                cell_bottom,
+                height.round() as u32,
+                pixel_x,
+                pixel_y,
+            );
+            Some(GpuWorldDisplayItem {
+                draw: gpu::DmiSpriteDraw {
+                    resource: frame.resource,
+                    sheet_width: frame.sheet_width,
+                    sheet_height: frame.sheet_height,
+                    rgba: frame.rgba,
+                    source: [frame.source_x, frame.source_y, frame.width, frame.height],
+                    destination: [origin_x as f32, origin_y as f32, width, height],
+                    tint: [
+                        appearance.color[0],
+                        appearance.color[1],
+                        appearance.color[2],
+                        appearance.alpha,
+                    ],
+                    clip: [
+                        transform.clip.x,
+                        transform.clip.y,
+                        transform.clip.x.saturating_add(transform.clip.width),
+                        transform.clip.y.saturating_add(transform.clip.height),
+                    ],
+                },
+                appearance,
+                maptext_origin_x: cell_left,
+                maptext_origin_y: i32::try_from(transform.origin_y + row * transform.tile).ok()?,
+            })
+        })
+        .collect()
+}
+
 fn scale_argb_nearest(
     source: &[u32],
     source_width: u32,
@@ -5437,6 +5604,7 @@ fn draw_map(
     transform: MapTransform,
     snapshot: Option<&MapSnapshot>,
     sprites: &mut SpriteCache,
+    mut gpu_batches: Option<(&mut Vec<gpu::DmiSpriteDraw>, &mut Vec<gpu::SpriteDraw>)>,
 ) {
     draw_panel(
         buffer,
@@ -5497,8 +5665,28 @@ fn draw_map(
     // World appearances are a viewport-wide ordered scene. BYOND icons are
     // anchored by their lower-left corner to the owning turf and may be much
     // larger than world.icon_size (title/splash turfs are a common example).
-    if let Some(snapshot) = snapshot {
+    if let (Some(snapshot), Some((dmi_sprites, _))) = (snapshot, gpu_batches.as_mut()) {
+        for item in gpu_world_display_items(snapshot, sprites, transform) {
+            draw_appearance_maptext_signed(
+                buffer,
+                width,
+                height,
+                item.maptext_origin_x,
+                item.maptext_origin_y,
+                std::slice::from_ref(&item.appearance),
+            );
+            dmi_sprites.push(item.draw);
+        }
+    } else if let Some(snapshot) = snapshot {
         for item in world_display_items(snapshot, sprites, transform) {
+            draw_appearance_maptext_signed(
+                buffer,
+                width,
+                height,
+                item.maptext_origin_x,
+                item.maptext_origin_y,
+                std::slice::from_ref(&item.appearance),
+            );
             blit_sprite_clipped(
                 buffer,
                 width,
@@ -5508,14 +5696,6 @@ fn draw_map(
                 usize::try_from(item.width).unwrap_or(0),
                 &item.pixels,
                 transform.clip,
-            );
-            draw_appearance_maptext_signed(
-                buffer,
-                width,
-                height,
-                item.maptext_origin_x,
-                item.maptext_origin_y,
-                std::slice::from_ref(&item.appearance),
             );
         }
     }
@@ -5587,15 +5767,6 @@ fn draw_map(
                             );
                         });
                     }
-                    blit_sprite_signed(
-                        buffer,
-                        width,
-                        height,
-                        screen_x,
-                        screen_y,
-                        usize::try_from(sprite_width).unwrap_or(1),
-                        &sprite,
-                    );
                     draw_appearance_maptext_signed(
                         buffer,
                         width,
@@ -5604,6 +5775,31 @@ fn draw_map(
                         screen_y,
                         &screen.appearances,
                     );
+                    if let Some((_, batch)) = gpu_batches.as_mut() {
+                        batch.push(gpu::SpriteDraw {
+                            x: screen_x,
+                            y: screen_y,
+                            width: sprite_width,
+                            height: sprite_height,
+                            pixels: sprite,
+                            clip: [
+                                0,
+                                0,
+                                u32::try_from(width).unwrap_or(u32::MAX),
+                                u32::try_from(height).unwrap_or(u32::MAX),
+                            ],
+                        });
+                    } else {
+                        blit_sprite_signed(
+                            buffer,
+                            width,
+                            height,
+                            screen_x,
+                            screen_y,
+                            usize::try_from(sprite_width).unwrap_or(1),
+                            &sprite,
+                        );
+                    }
                 }
                 Err(error) => eprintln!(
                     "client-sprite-error: screen_loc={:?} {error}",
@@ -6146,6 +6342,11 @@ mod tests {
             (items[0].origin_x, items[0].width, items[0].height),
             (74, 128, 64)
         );
+        let gpu_items = gpu_world_display_items(&snapshot, &mut sprites, transform);
+        assert_eq!(gpu_items.len(), 1);
+        assert_eq!(gpu_items[0].draw.destination, [74.0, 0.0, 128.0, 64.0]);
+        assert_eq!(gpu_items[0].draw.source, [0, 0, 64, 32]);
+        assert_eq!(gpu_items[0].draw.tint, [255, 255, 255, 255]);
         // x=150 resolves to the turf east of the owner, but the wide sprite
         // visibly covers it. Picking must return the appearance and its owner.
         let hit = map_hit_at(&snapshot, &mut sprites, transform, 150, 20).expect("wide hit");
@@ -6843,6 +7044,7 @@ mod tests {
             transform,
             None,
             &mut SpriteCache::default(),
+            None,
         );
         assert_eq!(pixels[23 * 140 + 10], 0xff00_0000, "letterbox bar is black");
         assert_eq!(

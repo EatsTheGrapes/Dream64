@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -328,6 +328,34 @@ impl CompiledArtifact {
         expected_project_fingerprint: [u8; 16],
     ) -> Result<Self, ArtifactError> {
         Self::read_from_with_mode(path, expected_project_fingerprint, ArtifactReadMode::Auto)
+    }
+
+    /// Reads the embedded project identity from the fixed header.
+    ///
+    /// This is only a routing hint for a self-contained deployment. Callers
+    /// must subsequently pass the returned value to [`Self::read_from`], which
+    /// validates the complete header, checksums, engine identity, target, and
+    /// committed footer before exposing any payload.
+    pub fn peek_project_fingerprint(path: impl AsRef<Path>) -> Result<[u8; 16], ArtifactError> {
+        let path = path.as_ref();
+        let mut file = File::open(path).map_err(|source| ArtifactError::Io {
+            operation: "open compiled artifact header",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let mut header = [0_u8; 56];
+        file.read_exact(&mut header)
+            .map_err(|source| ArtifactError::Io {
+                operation: "read compiled artifact header",
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if &header[..MAGIC.len()] != MAGIC {
+            return Err(ArtifactError::InvalidMagic);
+        }
+        let mut fingerprint = [0_u8; 16];
+        fingerprint.copy_from_slice(&header[40..56]);
+        Ok(fingerprint)
     }
 
     /// Reads with an explicit mapping/buffering policy for diagnostics and

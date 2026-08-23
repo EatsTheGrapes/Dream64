@@ -619,6 +619,11 @@ pub struct InitializationExecution {
     pub world: Option<DatumId>,
     /// Hooks executed in event order.
     pub events: Vec<ExecutedLifecycleEvent>,
+    /// Total successfully executed hooks, including production boots that
+    /// release the detailed per-event audit trail after initialization.
+    pub executed_events: usize,
+    /// Successfully executed hooks grouped by lifecycle kind.
+    pub executed_event_counts: BTreeMap<LifecycleKind, usize>,
     /// Repeated map placements sharing an already initialized datum.
     pub duplicate_map_events: usize,
     /// Deterministic scheduler work completed after lifecycle initialization.
@@ -717,6 +722,19 @@ pub struct PrecompiledLifecycle {
 }
 
 impl PrecompiledLifecycle {
+    /// Complete executable module used to validate/restored scheduler frames.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn module(&self) -> &dm_vm::Module {
+        self.executable.module()
+    }
+
+    /// Installs a validated ready-world state loaded from the startup cache.
+    #[doc(hidden)]
+    pub fn install_persistent_state(&mut self, state: dm_vm::ExecutionState) {
+        self.persistent_state = Some(state);
+    }
+
     /// Returns the complete linked module so runtime initializer expressions
     /// can be appended without relinking the project inventory.
     #[doc(hidden)]
@@ -1861,12 +1879,19 @@ fn execute_initialization_plan_with_executable(
             {
                 initialized_during_new.insert(datum);
             }
-            result.events.push(ExecutedLifecycleEvent {
-                event: *event,
-                datum,
-                procedure_path: target.procedure_path.clone(),
-                result: value,
-            });
+            result.executed_events += 1;
+            *result
+                .executed_event_counts
+                .entry(event_kind(*event))
+                .or_default() += 1;
+            if !release_runtime_metadata {
+                result.events.push(ExecutedLifecycleEvent {
+                    event: *event,
+                    datum,
+                    procedure_path: target.procedure_path.clone(),
+                    result: value,
+                });
+            }
         }
         eprintln!("boot-progress: completed lifecycle events");
         if !audit_failures.is_empty() {
@@ -1880,9 +1905,6 @@ fn execute_initialization_plan_with_executable(
             });
         }
         if release_runtime_metadata {
-            for event in &mut result.events {
-                event.result = Value::Null;
-            }
             let released = state.release_host_value_roots();
             eprintln!("boot-progress: released consumed host result roots={released}");
         }
@@ -3727,6 +3749,15 @@ mod tests {
         assert_eq!(
             execution.scheduler.termination,
             SchedulerDrainTermination::HeadlessReady
+        );
+        assert!(execution.executed_events > 0);
+        assert_eq!(
+            execution.executed_event_counts.values().sum::<usize>(),
+            execution.executed_events,
+        );
+        assert!(
+            execution.events.is_empty(),
+            "production boot retains aggregate lifecycle counts, not per-event audit records",
         );
         let attached = attached.expect("startup service attached a client");
         let state = precompiled

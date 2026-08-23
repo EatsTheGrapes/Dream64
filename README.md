@@ -33,9 +33,16 @@ Current measured progress:
 - The complete MonkeStation source graph compiles into a reusable Dream64
   artifact; a warm artifact load is currently about 9–10 seconds on the test
   machine.
-- Compilation, structural seeding, and executable-bytecode sections are cached.
-  Their independent decode work now runs concurrently and rejoins in a fixed,
-  deterministic order.
+- Compiler and server are separate processes. The compiler's incremental state
+  remains in `dream64-cache`; the one deployable `.d64` contains executable
+  bytecode and the bootstrap metadata needed by the server. A runtime launch
+  never recompiles stale or missing input—it fails closed and asks the compiler
+  process to rebuild.
+- Production prewarming uses an explicit deployment identity and random seed,
+  so station-map, ruin, room, engine, storyteller, and round selection happen
+  normally in the background. The fully initialized process can then wait in a
+  low-priority hot-standby state and take ownership of the live IPC port during
+  handoff without rerunning atom or subsystem initialization.
 - The server and native client have a real loopback transport for attach,
   ordered UI batches and acknowledgements, resource transfer, map/screen
   appearances, input, and movement commands.
@@ -57,8 +64,8 @@ The immediate release path is:
    deterministic owner-thread commit.
 3. Specialize the hottest exact mapping loops without changing DM-visible
    execution order.
-4. Reduce initialization memory and latency until a cold MonkeStation boot and
-   usable client consistently complete within five minutes.
+4. Keep cold initialization isolated and low-impact, then make the player-facing
+   restart a fast, validated hot-standby handoff.
 5. Package reproducible 64-bit server and client builds without redistributing
    or loading proprietary BYOND DLLs.
 
@@ -149,8 +156,14 @@ cargo run -p dm-conformance -- compile-check path\to\world.dme
 Build a map allocation and execute the supported deterministic startup hooks:
 
 ```powershell
-cargo run -p dm-lifecycle -- boot path\to\world.dme path\to\map.dmm
+cargo run -p dm-lifecycle --bin dream64-compiler -- path\to\world.dme
+cargo run -p dm-lifecycle --bin dream64-server -- boot path\to\world.d64 path\to\map.dmm
 ```
+
+`dream64-compiler` never removes or relocates the `.dme` source tree. It writes
+one sibling `.d64`; `dream64-server` can load that artifact without compiler
+sources or private caches. The compiler reuses the whole artifact when the DME
+graph is unchanged and reuses unchanged per-file syntax units after edits.
 
 This currently runs the supported `New()`, `Initialize()`, and
 `LateInitialize()` bodies against the allocated `/world`, areas, turfs, and
@@ -162,7 +175,7 @@ iterations for deterministic smoke runs.
 Preview a compiled project's lobby through the loopback client protocol:
 
 ```powershell
-target\release\dm-lifecycle.exe lobby-preview path\to\world.dme no-init
+target\release\dream64-server.exe lobby-preview path\to\world.dme no-init
 target\release\dm-client.exe --skin path\to\skin.dmf
 ```
 

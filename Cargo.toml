@@ -34,3 +34,10 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = "warn"
 pedantic = "warn"
+
+# Runtime releases spend most of their time crossing crate boundaries between
+# bytecode dispatch, value storage, and host builtins. Give LLVM one optimized
+# whole-program view while retaining ThinLTO's practical release build time.
+[profile.release]
+lto = "thin"
+codegen-units = 1

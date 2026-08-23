@@ -100,21 +100,26 @@ impl CompilerDatabase {
         let (project, project_snapshot_hit) =
             Project::load_cached(root_file, cache_file).map_err(CompilerError::Project)?;
         let syntax_cache_file = parsed_syntax_cache_path(cache_file);
-        let cached_syntax = project_snapshot_hit
-            .then(|| {
-                fs::read(&syntax_cache_file)
-                    .ok()
-                    .and_then(|bytes| decode_parsed_syntax_cache(&bytes, &project))
-            })
-            .flatten();
-        let parsed_syntax_hit = cached_syntax.is_some();
-        let (syntax_files, syntax_diagnostics) =
-            cached_syntax.unwrap_or_else(|| parse_project_syntax(&project));
+        let cached_syntax = fs::read(&syntax_cache_file)
+            .ok()
+            .and_then(|bytes| decode_parsed_syntax_cache(&bytes, &project));
+        let source_file_count = project
+            .files
+            .iter()
+            .filter(|file| matches!(file.kind, FileKind::Environment | FileKind::Source))
+            .count();
+        let (syntax_files, syntax_diagnostics, parsed_syntax_hit, syntax_files_reused) =
+            cached_syntax
+                .map(|(syntax, diagnostics, exact, reused)| (syntax, diagnostics, exact, reused))
+                .unwrap_or_else(|| {
+                    let (syntax, diagnostics) = parse_project_syntax(&project);
+                    (syntax, diagnostics, false, 0)
+                });
         if !parsed_syntax_hit {
             if let Some(parent) = syntax_cache_file.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            let encoded = encode_parsed_syntax_cache(&syntax_files);
+            let encoded = encode_parsed_syntax_cache(&project, &syntax_files);
             let _ = fs::write(&syntax_cache_file, encoded);
         }
         Ok((
@@ -122,6 +127,8 @@ impl CompilerDatabase {
             CompilationCacheStats {
                 project_snapshot_hit,
                 parsed_syntax_hit,
+                syntax_files_reused,
+                syntax_files_reparsed: source_file_count.saturating_sub(syntax_files_reused),
             },
         ))
     }
@@ -134,6 +141,10 @@ pub struct CompilationCacheStats {
     pub project_snapshot_hit: bool,
     /// Parsed declaration syntax was restored without lexing or parsing sources.
     pub parsed_syntax_hit: bool,
+    /// Source files restored without lexing or parsing.
+    pub syntax_files_reused: usize,
+    /// Source files lexed and parsed for this compilation.
+    pub syntax_files_reparsed: usize,
 }
 
 /// A complete frontend snapshot for one project.
@@ -174,7 +185,7 @@ impl Compilation {
     #[must_use]
     pub fn encode_compiled_artifact_segments(&self) -> Vec<Vec<u8>> {
         let project = self.project.encode_compiled_artifact();
-        let syntax = encode_parsed_syntax_cache(&self.syntax_files);
+        let syntax = encode_parsed_syntax_cache(&self.project, &self.syntax_files);
         let code_tree = self.code_tree.encode_compiled_artifact();
         let mut header = COMPILATION_ARTIFACT_MAGIC.to_vec();
         syntax_cache_write_len(&mut header, project.len());
@@ -236,7 +247,7 @@ impl Compilation {
         let project_bytes = compilation_artifact_read_bytes(&mut input, "project")?;
         let project = Project::decode_compiled_artifact(project_bytes)?;
         let syntax_bytes = compilation_artifact_read_bytes(&mut input, "syntax")?;
-        let (syntax_files, _) = decode_parsed_syntax_cache(syntax_bytes, &project)
+        let (syntax_files, _, _, _) = decode_parsed_syntax_cache(syntax_bytes, &project)
             .ok_or_else(|| "compiled frontend syntax payload is invalid".to_owned())?;
         let code_tree_bytes = compilation_artifact_read_bytes(&mut input, "code tree")?;
         let code_tree = CodeTree::decode_compiled_artifact(code_tree_bytes)?;
@@ -538,7 +549,7 @@ impl std::error::Error for CompilerError {
     }
 }
 
-const PARSED_SYNTAX_CACHE_MAGIC: &[u8] = b"DREAM64-PARSED-SYNTAX\0\x01";
+const PARSED_SYNTAX_CACHE_MAGIC: &[u8] = b"DREAM64-PARSED-SYNTAX\0\x02";
 const PARSED_SYNTAX_FRONTEND_FINGERPRINT: u64 = syntax_frontend_fingerprint();
 
 const fn hash_source(mut hash: u64, source: &[u8]) -> u64 {
@@ -565,12 +576,25 @@ fn parsed_syntax_cache_path(project_cache: &Path) -> PathBuf {
     project_cache.with_file_name(name)
 }
 
-fn encode_parsed_syntax_cache(syntax_files: &[Option<SyntaxFile>]) -> Vec<u8> {
+fn syntax_source_fingerprint(file: &dm_project::ProjectFile) -> u64 {
+    file.compiler_text().map_or(0, |source| {
+        hash_source(
+            hash_source(
+                0xcbf2_9ce4_8422_2325,
+                file.relative_path.to_string_lossy().as_bytes(),
+            ),
+            source.as_bytes(),
+        )
+    })
+}
+
+fn encode_parsed_syntax_cache(project: &Project, syntax_files: &[Option<SyntaxFile>]) -> Vec<u8> {
     let mut output = Vec::new();
     output.extend_from_slice(PARSED_SYNTAX_CACHE_MAGIC);
     syntax_cache_write_u64(&mut output, PARSED_SYNTAX_FRONTEND_FINGERPRINT);
     syntax_cache_write_len(&mut output, syntax_files.len());
-    for syntax in syntax_files {
+    for (file, syntax) in project.files.iter().zip(syntax_files) {
+        syntax_cache_write_u64(&mut output, syntax_source_fingerprint(file));
         let Some(syntax) = syntax else {
             output.push(0);
             continue;
@@ -616,7 +640,7 @@ fn encode_parsed_syntax_cache(syntax_files: &[Option<SyntaxFile>]) -> Vec<u8> {
 fn decode_parsed_syntax_cache(
     bytes: &[u8],
     project: &Project,
-) -> Option<(Vec<Option<SyntaxFile>>, Vec<Diagnostic>)> {
+) -> Option<(Vec<Option<SyntaxFile>>, Vec<Diagnostic>, bool, usize)> {
     let mut input = Cursor::new(bytes);
     let mut magic = vec![0; PARSED_SYNTAX_CACHE_MAGIC.len()];
     input.read_exact(&mut magic).ok()?;
@@ -628,28 +652,27 @@ fn decode_parsed_syntax_cache(
     }
     let mut syntax_files = Vec::with_capacity(project.files.len());
     let mut diagnostics = Vec::new();
+    let mut exact = true;
+    let mut reused = 0;
     for file in &project.files {
+        let cached_fingerprint = syntax_cache_read_u64(&mut input)?;
+        let source_matches = cached_fingerprint == syntax_source_fingerprint(file);
+        exact &= source_matches;
         let present = syntax_cache_read_byte(&mut input)?;
         let source_bearing = matches!(file.kind, FileKind::Environment | FileKind::Source);
+        if source_bearing && source_matches && present == 1 {
+            reused += 1;
+        }
         if present == 0 {
             if !source_bearing {
                 syntax_files.push(None);
                 continue;
             }
-            let source = file.compiler_text().ok()?;
-            match dm_syntax::parse(source) {
-                Ok(_) => return None,
-                Err(error) => {
-                    let compiler_span = syntax_error_span(&error);
-                    diagnostics.push(syntax_diagnostic(
-                        file.id,
-                        file.path.clone(),
-                        file.original_span(compiler_span),
-                        &error,
-                    ));
-                    syntax_files.push(None);
-                }
+            let parsed = parse_one_syntax_file(file, &mut diagnostics);
+            if source_matches && parsed.is_some() {
+                return None;
             }
+            syntax_files.push(parsed);
             continue;
         }
         if present != 1 || !source_bearing {
@@ -707,9 +730,14 @@ fn decode_parsed_syntax_cache(
                 body,
             });
         }
-        syntax_files.push(Some(SyntaxFile { definitions }));
+        let cached = Some(SyntaxFile { definitions });
+        syntax_files.push(if source_matches {
+            cached
+        } else {
+            parse_one_syntax_file(file, &mut diagnostics)
+        });
     }
-    (input.position() == bytes.len() as u64).then_some((syntax_files, diagnostics))
+    (input.position() == bytes.len() as u64).then_some((syntax_files, diagnostics, exact, reused))
 }
 
 fn syntax_cache_write_tokens(output: &mut Vec<u8>, tokens: &[SpannedToken]) {
@@ -1108,28 +1136,33 @@ fn parse_project_syntax(project: &Project) -> (Vec<Option<SyntaxFile>>, Vec<Diag
             continue;
         }
 
-        // Source-bearing project files have already been UTF-8 validated by
-        // the loader while it scanned preprocessing directives.
-        let source = file
-            .compiler_text()
-            .expect("project loader validates source-bearing files as UTF-8");
-        match dm_syntax::parse(source) {
-            Ok(syntax) => {
-                syntax_files.push(Some(syntax));
-            }
-            Err(error) => {
-                let compiler_span = syntax_error_span(&error);
-                diagnostics.push(syntax_diagnostic(
-                    file.id,
-                    file.path.clone(),
-                    file.original_span(compiler_span),
-                    &error,
-                ));
-                syntax_files.push(None);
-            }
-        }
+        syntax_files.push(parse_one_syntax_file(file, &mut diagnostics));
     }
     (syntax_files, diagnostics)
+}
+
+fn parse_one_syntax_file(
+    file: &dm_project::ProjectFile,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<SyntaxFile> {
+    // Source-bearing project files have already been UTF-8 validated by the
+    // loader while it scanned preprocessing directives.
+    let source = file
+        .compiler_text()
+        .expect("project loader validates source-bearing files as UTF-8");
+    match dm_syntax::parse(source) {
+        Ok(syntax) => Some(syntax),
+        Err(error) => {
+            let compiler_span = syntax_error_span(&error);
+            diagnostics.push(syntax_diagnostic(
+                file.id,
+                file.path.clone(),
+                file.original_span(compiler_span),
+                &error,
+            ));
+            None
+        }
+    }
 }
 
 fn syntax_error_span(error: &SyntaxError) -> SourceSpan {
@@ -4200,12 +4233,16 @@ mod tests {
             .expect("cold cached compilation should succeed");
         assert!(!cold_cache.project_snapshot_hit);
         assert!(!cold_cache.parsed_syntax_hit);
+        assert_eq!(cold_cache.syntax_files_reused, 0);
+        assert_eq!(cold_cache.syntax_files_reparsed, 2);
 
         let (warm, warm_cache) = database
             .compile_cached_with_stats(fixture.path("world.dme"), &cache)
             .expect("warm cached compilation should succeed");
         assert!(warm_cache.project_snapshot_hit);
         assert!(warm_cache.parsed_syntax_hit);
+        assert_eq!(warm_cache.syntax_files_reused, 2);
+        assert_eq!(warm_cache.syntax_files_reparsed, 0);
         assert_eq!(cold.stats(), warm.stats());
 
         let syntax_cache = parsed_syntax_cache_path(&cache);
@@ -4230,6 +4267,8 @@ mod tests {
             .expect("a changed project should invalidate both cache tiers");
         assert!(!changed_cache.project_snapshot_hit);
         assert!(!changed_cache.parsed_syntax_hit);
+        assert_eq!(changed_cache.syntax_files_reused, 1);
+        assert_eq!(changed_cache.syntax_files_reparsed, 1);
         assert_eq!(changed.stats().definitions, 3);
     }
 

@@ -847,6 +847,7 @@ fn complete_runtime_phase(
 /// A deterministic runtime-ready constant image for one compiled project.
 pub struct RuntimeImage {
     heap: ValueHeap,
+    random_state: u64,
     compact_default_datums: HashSet<DatumId>,
     variables: Vec<RuntimeVariable>,
     types: BTreeMap<TypePath, RuntimeType>,
@@ -1764,6 +1765,7 @@ impl RuntimeImage {
         complete_runtime_phase(&mut observer, phase, phase_started, Some(types.len()));
         let mut image = Self {
             heap: ValueHeap::new(),
+            random_state: 0,
             compact_default_datums: HashSet::new(),
             variables: Vec::new(),
             types,
@@ -2350,6 +2352,7 @@ impl RuntimeImage {
     #[must_use]
     pub fn take_execution_state(&mut self) -> ExecutionState {
         let mut state = ExecutionState::from_heap(std::mem::take(&mut self.heap));
+        state.reseed_random(self.random_state);
         state.set_compact_default_datums(std::mem::take(&mut self.compact_default_datums));
         state.set_shared_type_paths(Arc::clone(&self.type_paths));
         state.set_shared_type_parents(Arc::clone(&self.type_parents));
@@ -2396,6 +2399,7 @@ impl RuntimeImage {
     /// Values written to globals unknown to this image are retained only by the
     /// supplied state; declared globals are synchronized by their DM field name.
     pub fn restore_execution_state(&mut self, mut state: ExecutionState) {
+        self.random_state = state.random_state();
         for (field, index) in &self.global_variable_indices {
             if let Some(value) = state.global(field) {
                 self.variables[*index].value.clone_from(value);
@@ -2404,6 +2408,13 @@ impl RuntimeImage {
         self.procedure_static_locals = state.take_procedure_static_locals();
         self.compact_default_datums = state.take_compact_default_datums();
         self.heap = state.into_heap();
+    }
+
+    /// Installs the random seed that the next transferred execution state will
+    /// use. Production hosts set this once per launch before map and subsystem
+    /// initialization; deterministic tests may retain the zero default.
+    pub const fn set_launch_random_seed(&mut self, seed: u64) {
+        self.random_state = seed;
     }
 
     /// Allocates one datum with all constant ancestor defaults applied.
@@ -5947,6 +5958,23 @@ mod tests {
             .allocate_datum(&type_path("/datum/base/child"))
             .expect("repeated dynamic defaults should allocate");
         assert_eq!(image.stats().execution_metadata_builds, builds);
+    }
+
+    #[test]
+    fn launch_random_state_survives_runtime_state_transfers() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write("types.dm", "/datum/example\n");
+        let mut image = fixture.image();
+
+        image.set_launch_random_seed(0x1234_5678_9abc_def0);
+        let mut state = image.take_execution_state();
+        assert_eq!(state.random_state(), 0x1234_5678_9abc_def0);
+
+        state.reseed_random(0x0fed_cba9_8765_4321);
+        image.restore_execution_state(state);
+        let state = image.take_execution_state();
+        assert_eq!(state.random_state(), 0x0fed_cba9_8765_4321);
     }
 
     #[test]

@@ -5,6 +5,15 @@ edition = "2024"
 license = "MIT"
 rust-version = "1.85"
 publish = false
+autobins = false
+
+[[bin]]
+name = "dream64-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "dream64-compiler"
+path = "src/bin/dream64-compiler.rs"
 
 [dependencies]
 crc32fast = "1.5"
@@ -19,6 +28,8 @@ dm-semantics = { path = "../dm-semantics" }
 dm-value = { path = "../dm-value" }
 dm-vm = { path = "../dm-vm" }
 dm-world = { path = "../dm-world" }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+md5 = "0.7"
 
 [build-dependencies]
 md5 = "0.7"

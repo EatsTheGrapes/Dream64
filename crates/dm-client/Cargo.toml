@@ -18,9 +18,12 @@ dm-vm = { path = "../dm-vm" }
 dm-world = { path = "../dm-world" }
 flate2 = "1.1"
 font8x8 = "0.3"
+bytemuck = { version = "1.23", features = ["derive"] }
 png = "0.17"
+pollster = "0.4"
 softbuffer = "0.4.8"
 serde_json = "1"
+wgpu = { version = "26.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "gles", "vulkan", "wgsl"] }
 winit = "0.30.13"
 
 [target.'cfg(windows)'.dependencies]

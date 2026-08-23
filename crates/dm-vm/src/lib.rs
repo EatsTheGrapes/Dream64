@@ -4,10 +4,12 @@
 
 mod builtins;
 mod module_codec;
+mod ready_snapshot;
 pub mod tgm_planner;
 pub mod worker_lane;
 
 pub use module_codec::ModuleCodecError;
+pub use ready_snapshot::ReadyWorldCoreSnapshot;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -9683,6 +9685,17 @@ const MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES: usize = 524_288;
 const MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE: usize = 8;
 const MAX_INSTANCE_INITIALIZER_PLAN_CACHE_ENTRIES: usize = 16_384;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Result of a host-requested heap collection at a quiescent VM boundary.
+pub struct QuiescentHeapCompaction {
+    /// Unreachable datum slots released by the collection.
+    pub reclaimed_datums: usize,
+    /// Unreachable list slots released by the collection.
+    pub reclaimed_lists: usize,
+    /// Wall-clock time spent tracing, reclaiming, and compacting storage.
+    pub elapsed: Duration,
+}
+
 /// Mutable heap state shared by executions in one runtime world.
 ///
 /// Values contain only stable logical handles. All mutable list and datum
@@ -12382,6 +12395,22 @@ impl ExecutionState {
         self.scheduler_tick
     }
 
+    /// Replaces the per-world random stream seed used by DM `rand()`,
+    /// `pick()`, `prob()`, `roll()`, and related engine fallbacks.
+    ///
+    /// Hosts call this once for every real process launch so structural caches
+    /// never turn independent rounds into repetitions of one deterministic
+    /// startup stream. DM's explicit `rand_seed()` can still replace it later.
+    pub const fn reseed_random(&mut self, seed: u64) {
+        self.random_state = seed;
+    }
+
+    /// Returns the current per-world random stream state.
+    #[must_use]
+    pub const fn random_state(&self) -> u64 {
+        self.random_state
+    }
+
     /// Returns the number of suspended or spawned tasks awaiting dispatch.
     #[must_use]
     pub fn scheduled_task_count(&self) -> usize {
@@ -12448,6 +12477,24 @@ impl ExecutionState {
         let released = self.host_value_roots.len();
         self.host_value_roots.clear();
         released
+    }
+
+    /// Forces one full heap collection at a host-owned quiescent boundary.
+    ///
+    /// Startup calls this only after VM execution has returned all active
+    /// frames to the scheduler-owned queues, so the normal global, scheduler,
+    /// client, world, and host roots are complete without an extra frame set.
+    pub fn compact_quiescent_heap(&mut self) -> QuiescentHeapCompaction {
+        let before_datums = self.heap.live_datum_count();
+        let before_lists = self.heap.live_list_count();
+        let started = Instant::now();
+        self.next_list_collection = 1;
+        self.maybe_collect_unreachable_lists(&[]);
+        QuiescentHeapCompaction {
+            reclaimed_datums: before_datums.saturating_sub(self.heap.live_datum_count()),
+            reclaimed_lists: before_lists.saturating_sub(self.heap.live_list_count()),
+            elapsed: started.elapsed(),
+        }
     }
 
     /// Returns the earliest tick at which pending scheduler work is due.
@@ -14077,6 +14124,367 @@ fn world_numeric_field(state: &ExecutionState, name: &str) -> Option<f32> {
         .as_number()
 }
 
+// MAPLOADING_CHECK_TICK expands this comparison into five bytecodes at every
+// hot map/cache/atom loop site. When its condition is false, jumping directly
+// to the compiler-provided false target is exactly equivalent and avoids four
+// additional dispatches. Non-numeric or structurally different cases stay in
+// the reference interpreter, including the complete stoplag/yielding branch.
+fn false_tick_check_target(
+    instructions: &[Instruction],
+    instruction_index: usize,
+    state: &ExecutionState,
+) -> Option<usize> {
+    let [
+        Instruction::LoadGlobal(world_name),
+        Instruction::LoadField(tick_usage_name),
+        Instruction::LoadGlobal(limit_name),
+        Instruction::Greater,
+        Instruction::JumpIfFalse(target),
+    ] = instructions.get(instruction_index..instruction_index.checked_add(5)?)?
+    else {
+        return None;
+    };
+    if world_name.as_str() != "world" || tick_usage_name.as_str() != "tick_usage" {
+        return None;
+    }
+    let Value::Datum(world) = state.global(world_name)? else {
+        return None;
+    };
+    if world_datum(state) != Some(*world) {
+        return None;
+    }
+    let usage = datum_field_or_shared(state, *world, tick_usage_name)
+        .ok()?
+        .as_number()?;
+    if *target > instructions.len() {
+        return None;
+    }
+    let limit = state.global(limit_name)?.as_number()?;
+    (!(usage > limit)).then_some(*target)
+}
+
+fn try_run_numeric_loop_branch(
+    program: &Program,
+    frame: &mut CallFrame,
+    remaining_steps: u64,
+    state: &ExecutionState,
+) -> Option<u64> {
+    const ACCOUNTED_STEPS: u64 = 4;
+    if remaining_steps < ACCOUNTED_STEPS {
+        return None;
+    }
+    let instruction = frame.instruction;
+    let instructions = program.instructions.get(instruction..instruction + 4)?;
+    let Instruction::LoadLocal(left_slot) = instructions[0] else {
+        return None;
+    };
+    let left = frame.locals.get(usize::from(left_slot))?.clone();
+    let right = match &instructions[1] {
+        Instruction::LoadLocal(slot) => frame.locals.get(usize::from(*slot))?.clone(),
+        Instruction::PushNumber(number) => Value::Number(*number),
+        Instruction::ListLengthLocal(slot) => {
+            let mut receiver = frame.locals.get(usize::from(*slot))?.clone();
+            if let Value::List(list) = receiver
+                && state.reference_lists.contains(&list)
+            {
+                receiver = state.heap.list(list).ok()?.get(1).ok()?.clone();
+            }
+            let receiver = canonicalize_owned_value(&state.heap, receiver);
+            let length = match receiver {
+                Value::Null => 0,
+                Value::List(list) => state.heap.list(list).ok()?.len(),
+                _ => return None,
+            };
+            Value::number(dm_list_length_number(length))
+        }
+        _ => return None,
+    };
+    let comparison = compare_values(&left, &right).ok()??;
+    let condition = match instructions[2] {
+        Instruction::Less => comparison.is_lt(),
+        Instruction::LessEqual => comparison.is_le(),
+        Instruction::Greater => comparison.is_gt(),
+        Instruction::GreaterEqual => comparison.is_ge(),
+        _ => return None,
+    };
+    let Instruction::JumpIfFalse(target) = instructions[3] else {
+        return None;
+    };
+    frame.instruction = if condition { instruction + 4 } else { target };
+    Some(ACCOUNTED_STEPS)
+}
+
+fn try_run_numeric_local_update(
+    program: &Program,
+    frame: &mut CallFrame,
+    remaining_steps: u64,
+    state: &ExecutionState,
+) -> Option<u64> {
+    const ACCOUNTED_STEPS: u64 = 4;
+    if remaining_steps < ACCOUNTED_STEPS {
+        return None;
+    }
+    let instruction = frame.instruction;
+    let instructions = program.instructions.get(instruction..instruction + 4)?;
+    let Instruction::LoadLocal(load_slot) = instructions[0] else {
+        return None;
+    };
+    let Instruction::PushNumber(delta) = instructions[1] else {
+        return None;
+    };
+    let Instruction::StoreLocal(store_slot) = instructions[3] else {
+        return None;
+    };
+    let store_index = usize::from(store_slot);
+    let store = frame.locals.get(store_index)?;
+    if store_index < frame.declared_argument_count
+        || frame.static_locals.contains(&store_slot)
+        || matches!(store, Value::List(list) if state.reference_lists.contains(list))
+    {
+        return None;
+    }
+    let mut current = frame.locals.get(usize::from(load_slot))?.clone();
+    if let Value::List(list) = current
+        && state.reference_lists.contains(&list)
+    {
+        current = state.heap.list(list).ok()?.get(1).ok()?.clone();
+    }
+    let current = canonicalize_owned_value(&state.heap, current);
+    let current = match current {
+        Value::Null => 0.0,
+        Value::Number(number) => number.to_f32(),
+        _ => return None,
+    };
+    let delta = delta.to_f32();
+    let updated = match instructions[2] {
+        Instruction::Add => current + delta,
+        Instruction::Subtract => current - delta,
+        _ => return None,
+    };
+    frame.locals[store_index] = Value::number(updated);
+    frame.instruction = instruction + 4;
+    Some(ACCOUNTED_STEPS)
+}
+
+fn quick_numeric_value(value: &Value) -> Option<f32> {
+    match value {
+        Value::Null => Some(0.0),
+        Value::Number(number) => Some(number.to_f32()),
+        _ => None,
+    }
+}
+
+fn numeric_dispatch_candidate(instruction: &Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::PushNull
+            | Instruction::PushNumber(_)
+            | Instruction::PushText(_)
+            | Instruction::LoadLocal(_)
+            | Instruction::StoreLocal(_)
+            | Instruction::LoadResult
+            | Instruction::StoreResult
+            | Instruction::Duplicate
+            | Instruction::Pop
+            | Instruction::ListLengthLocal(_)
+            | Instruction::Add
+            | Instruction::Subtract
+            | Instruction::Multiply
+            | Instruction::Divide
+            | Instruction::Less
+            | Instruction::LessEqual
+            | Instruction::Greater
+            | Instruction::GreaterEqual
+            | Instruction::Negate
+            | Instruction::Not
+            | Instruction::And
+            | Instruction::Or
+            | Instruction::JumpIfFalse(_)
+            | Instruction::Jump(_)
+    )
+}
+
+fn try_run_numeric_dispatch_block(
+    program: &Program,
+    frame: &mut CallFrame,
+    max_steps: u64,
+    state: &ExecutionState,
+) -> Option<u64> {
+    if max_steps == 0 {
+        return None;
+    }
+    let mut steps = 0_u64;
+    while steps < max_steps {
+        let instruction = program.instructions.get(frame.instruction)?;
+        let mut advance = true;
+        match instruction {
+            Instruction::PushNull => frame.stack.push(Value::Null),
+            Instruction::PushNumber(number) => frame.stack.push(Value::Number(*number)),
+            Instruction::PushText(text) => frame.stack.push(Value::Text(Arc::clone(text))),
+            Instruction::LoadLocal(slot) => {
+                let mut value = frame.locals.get(usize::from(*slot))?.clone();
+                if let Value::List(list) = value
+                    && state.reference_lists.contains(&list)
+                {
+                    let Ok(reference) = state.heap.list(list) else {
+                        break;
+                    };
+                    let Ok(referenced) = reference.get(1) else {
+                        break;
+                    };
+                    value = referenced.clone();
+                }
+                frame
+                    .stack
+                    .push(canonicalize_owned_value(&state.heap, value));
+            }
+            Instruction::StoreLocal(slot) => {
+                let local_index = usize::from(*slot);
+                let Some(local) = frame.locals.get(local_index) else {
+                    break;
+                };
+                if local_index < frame.declared_argument_count
+                    || frame.static_locals.contains(slot)
+                    || matches!(local, Value::List(list) if state.reference_lists.contains(list))
+                {
+                    break;
+                }
+                let Some(value) = frame.stack.pop() else {
+                    break;
+                };
+                frame.locals[local_index] = value;
+            }
+            Instruction::LoadResult => frame.stack.push(frame.result.clone()),
+            Instruction::StoreResult => frame.result = frame.stack.pop()?,
+            Instruction::Duplicate => frame.stack.push(frame.stack.last()?.clone()),
+            Instruction::Pop => {
+                frame.stack.pop()?;
+            }
+            Instruction::ListLengthLocal(slot) => {
+                let mut receiver = frame.locals.get(usize::from(*slot))?.clone();
+                if let Value::List(list) = receiver
+                    && state.reference_lists.contains(&list)
+                {
+                    let Ok(reference) = state.heap.list(list) else {
+                        break;
+                    };
+                    let Ok(referenced) = reference.get(1) else {
+                        break;
+                    };
+                    receiver = referenced.clone();
+                }
+                let receiver = canonicalize_owned_value(&state.heap, receiver);
+                let length = match receiver {
+                    Value::Null => 0,
+                    Value::List(list) => state.heap.list(list).ok()?.len(),
+                    _ => break,
+                };
+                frame
+                    .stack
+                    .push(Value::number(dm_list_length_number(length)));
+            }
+            Instruction::Add
+            | Instruction::Subtract
+            | Instruction::Multiply
+            | Instruction::Divide => {
+                let len = frame.stack.len();
+                if len < 2 {
+                    break;
+                }
+                let left = quick_numeric_value(&frame.stack[len - 2]);
+                let right = quick_numeric_value(&frame.stack[len - 1]);
+                let (Some(left), Some(right)) = (left, right) else {
+                    break;
+                };
+                let value = match instruction {
+                    Instruction::Add => left + right,
+                    Instruction::Subtract => left - right,
+                    Instruction::Multiply => left * right,
+                    Instruction::Divide => left / right,
+                    _ => unreachable!(),
+                };
+                frame.stack.truncate(len - 2);
+                frame.stack.push(Value::number(value));
+            }
+            Instruction::Less
+            | Instruction::LessEqual
+            | Instruction::Greater
+            | Instruction::GreaterEqual => {
+                let len = frame.stack.len();
+                if len < 2 {
+                    break;
+                }
+                let left = &frame.stack[len - 2];
+                let right = &frame.stack[len - 1];
+                let Ok(Some(comparison)) = compare_values(left, right) else {
+                    break;
+                };
+                let value = match instruction {
+                    Instruction::Less => comparison.is_lt(),
+                    Instruction::LessEqual => comparison.is_le(),
+                    Instruction::Greater => comparison.is_gt(),
+                    Instruction::GreaterEqual => comparison.is_ge(),
+                    _ => unreachable!(),
+                };
+                frame.stack.truncate(len - 2);
+                frame.stack.push(Value::number(f32::from(value)));
+            }
+            Instruction::Negate => {
+                let value = quick_numeric_value(frame.stack.last()?)?;
+                *frame.stack.last_mut()? = Value::number(-value);
+            }
+            Instruction::Not => {
+                let value = quick_numeric_value(frame.stack.last()?)?;
+                *frame.stack.last_mut()? = Value::number(f32::from(value == 0.0));
+            }
+            Instruction::And | Instruction::Or => {
+                let len = frame.stack.len();
+                if len < 2 {
+                    break;
+                }
+                let left = quick_numeric_value(&frame.stack[len - 2]);
+                let right = quick_numeric_value(&frame.stack[len - 1]);
+                let (Some(left), Some(right)) = (left, right) else {
+                    break;
+                };
+                let value = if matches!(instruction, Instruction::And) {
+                    left != 0.0 && right != 0.0
+                } else {
+                    left != 0.0 || right != 0.0
+                };
+                frame.stack.truncate(len - 2);
+                frame.stack.push(Value::number(f32::from(value)));
+            }
+            Instruction::JumpIfFalse(target) => {
+                let Some(condition) = frame.stack.last().and_then(quick_numeric_value) else {
+                    break;
+                };
+                frame.stack.pop();
+                if condition == 0.0 {
+                    if *target >= program.instructions.len() {
+                        break;
+                    }
+                    frame.instruction = *target;
+                    advance = false;
+                }
+            }
+            Instruction::Jump(target) => {
+                if *target >= program.instructions.len() {
+                    break;
+                }
+                frame.instruction = *target;
+                advance = false;
+            }
+            _ => break,
+        }
+        steps += 1;
+        if advance {
+            frame.instruction += 1;
+        }
+    }
+    (steps > 0).then_some(steps)
+}
+
 fn set_world_numeric_field(state: &mut ExecutionState, name: &str, value: f32) {
     let Some(world) = world_datum(state) else {
         return;
@@ -14478,6 +14886,67 @@ fn run_frames(
                 });
                 frames[frame_index].instruction = program.instructions.len() - 1;
             }
+        }
+        let numeric_loop_steps = (!trace_enabled
+            && !dashboard_enabled
+            && state.atoms_profile.is_none())
+        .then(|| {
+            try_run_numeric_loop_branch(program, &mut frames[frame_index], remaining_steps, state)
+                .or_else(|| {
+                    try_run_numeric_local_update(
+                        program,
+                        &mut frames[frame_index],
+                        remaining_steps,
+                        state,
+                    )
+                })
+        })
+        .flatten();
+        if let Some(accounted_steps) = numeric_loop_steps {
+            static REPORTED: OnceLock<()> = OnceLock::new();
+            REPORTED.get_or_init(|| {
+                eprintln!(
+                    "boot-vm: native-peephole enabled optimization=numeric-loop-superinstructions"
+                );
+            });
+            let scheduler_batches_before = executed_steps / 4_096;
+            remaining_steps -= accounted_steps;
+            executed_steps += accounted_steps;
+            for _ in scheduler_batches_before..(executed_steps / 4_096) {
+                account_scheduler_tick_usage(state);
+            }
+            continue;
+        }
+        let steps_to_scheduler_accounting = 4_096 - executed_steps % 4_096;
+        let quick_block_budget = remaining_steps.min(steps_to_scheduler_accounting).min(256);
+        let quick_block_steps = (!trace_enabled
+            && !dashboard_enabled
+            && state.atoms_profile.is_none()
+            && program
+                .instructions
+                .get(frames[frame_index].instruction)
+                .is_some_and(numeric_dispatch_candidate))
+        .then(|| {
+            try_run_numeric_dispatch_block(
+                program,
+                &mut frames[frame_index],
+                quick_block_budget,
+                state,
+            )
+        })
+        .flatten();
+        if let Some(accounted_steps) = quick_block_steps {
+            static REPORTED: OnceLock<()> = OnceLock::new();
+            REPORTED.get_or_init(|| {
+                eprintln!("boot-vm: tier1 enabled optimization=numeric-dispatch-block");
+            });
+            let scheduler_batches_before = executed_steps / 4_096;
+            remaining_steps -= accounted_steps;
+            executed_steps += accounted_steps;
+            for _ in scheduler_batches_before..(executed_steps / 4_096) {
+                account_scheduler_tick_usage(state);
+            }
+            continue;
         }
         let instruction_index = frames[frame_index].instruction;
         let Some(instruction) = program.instructions.get(instruction_index) else {
@@ -16173,6 +16642,28 @@ fn run_frames(
                 }
                 let list = match receiver {
                     Value::List(list) => list,
+                    Value::Null
+                        if frames.len() > 1
+                            && module.procedure_path(procedure).is_some_and(|path| {
+                                path == "/datum/proc/_SendSignal"
+                                    || path.contains("/proc/_SendSignal@")
+                            }) =>
+                    {
+                        // DCS can retain a listener for the remainder of an
+                        // in-flight signal after that listener unregisters or
+                        // is deleted. BYOND reports the null callback lookup,
+                        // aborts only _SendSignal, and returns null to setDir;
+                        // it does not unwind the scheduler's entire Master
+                        // initialization continuation.
+                        let error =
+                            execution_error(module, &frames, "list index operation received null");
+                        eprintln!("dream64 recovered signal runtime: {error}");
+                        frames.pop().expect("nested signal frame exists");
+                        let caller = frames.last_mut().expect("signal caller exists");
+                        caller.stack.push(Value::Null);
+                        caller.instruction += 1;
+                        continue;
+                    }
                     value => {
                         return Err(execution_error(
                             module,
@@ -16793,7 +17284,7 @@ fn run_frames(
                                         name,
                                     ) =>
                             {
-                                Some(datum_field_or_shared_record(state, record, name))
+                                Some(datum_field_or_shared(state, datum, name))
                             }
                             Ok(_) => None,
                             Err(error) => {
@@ -17129,6 +17620,36 @@ fn run_frames(
                 }
             }
             Instruction::LoadGlobal(name) => {
+                if remaining_steps >= 4
+                    && let Some(target) =
+                        false_tick_check_target(&program.instructions, instruction_index, state)
+                {
+                    let scheduler_batches_before = executed_steps / 4_096;
+                    remaining_steps -= 4;
+                    executed_steps += 4;
+                    for _ in scheduler_batches_before..(executed_steps / 4_096) {
+                        account_scheduler_tick_usage(state);
+                    }
+                    if let Some(profile) = &mut state.atoms_profile {
+                        profile.total_instructions = profile.total_instructions.saturating_add(4);
+                        if let Some(counts) = &mut profile.instruction_categories {
+                            for skipped in
+                                &program.instructions[instruction_index + 1..instruction_index + 5]
+                            {
+                                let category = startup_instruction_category(skipped);
+                                counts[category] = counts[category].saturating_add(1);
+                            }
+                        }
+                    }
+                    static REPORTED: OnceLock<()> = OnceLock::new();
+                    REPORTED.get_or_init(|| {
+                        eprintln!(
+                            "boot-vm: native-peephole enabled optimization=false-tick-check-skip"
+                        );
+                    });
+                    frames[frame_index].instruction = target;
+                    continue;
+                }
                 let Some(value) = state.global(&name).cloned() else {
                     return Err(execution_error(
                         module,
@@ -19341,6 +19862,7 @@ fn try_run_register_signal_fast_path(
                 .list_mut(procs)
                 .ok()?
                 .set_key(Value::Datum(target), Value::List(target_procs));
+            state.mark_associative_list(procs);
             target_procs
         };
         let lookup = if let Some(lookup) = lookup {
@@ -19361,6 +19883,7 @@ fn try_run_register_signal_fast_path(
             .list_mut(target_procs)
             .ok()?
             .set_key(signal_type.clone(), proctype);
+        state.mark_associative_list(target_procs);
         match looked_up {
             Value::Null => {
                 state
@@ -19368,6 +19891,7 @@ fn try_run_register_signal_fast_path(
                     .list_mut(lookup)
                     .ok()?
                     .set_key(signal_type, Value::Datum(src));
+                state.mark_associative_list(lookup);
             }
             Value::List(listeners) => {
                 state.heap.list_mut(listeners).ok()?.add(Value::Datum(src));
@@ -19382,6 +19906,7 @@ fn try_run_register_signal_fast_path(
                     .list_mut(lookup)
                     .ok()?
                     .set_key(signal_type, Value::List(listeners));
+                state.mark_associative_list(lookup);
             }
         }
         frame.instruction = 138;
@@ -20546,8 +21071,14 @@ fn mark_boot_trace_frame(
         .is_some_and(|needle| path.contains(needle))
     {
         eprintln!(
-            "boot-vm: proc-arguments path={path} arguments={:?}",
-            frame.arguments
+            "boot-vm: proc-arguments path={path} src={} arguments=[{}]",
+            boot_trace_describe_value(&frame.src, state),
+            frame
+                .arguments
+                .iter()
+                .map(|value| boot_trace_describe_value(value, state))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     // Monkestation's title subsystem owns the authoritative startup display:
@@ -20601,6 +21132,33 @@ fn mark_boot_trace_frame(
         module.materialized_deferred_procedure_count(),
     ));
     frame.boot_trace_step = executed_steps;
+}
+
+fn boot_trace_describe_value(value: &Value, state: &ExecutionState) -> String {
+    let Value::Datum(datum) = value else {
+        return value.to_string();
+    };
+    let Ok(record) = state.heap.datum(*datum) else {
+        return value.to_string();
+    };
+    let loc = record
+        .field(&FieldName::parse("loc").expect("built-in loc field is valid"))
+        .map_or_else(|_| "<unset>".to_owned(), ToString::to_string);
+    let contents = record
+        .field(&FieldName::parse("contents").expect("built-in contents field is valid"))
+        .ok()
+        .and_then(|value| match value {
+            Value::List(list) => state.heap.list(*list).ok().map(|list| list.len()),
+            _ => None,
+        })
+        .map_or_else(|| "<unset>".to_owned(), |length| length.to_string());
+    format!(
+        "{}{{type={},loc={},contents_len={}}}",
+        value,
+        record.type_path(),
+        loc,
+        contents
+    )
 }
 
 fn boot_trace_display_value(value: Option<&Value>) -> String {
@@ -27477,6 +28035,245 @@ mod tests {
         FieldName::parse(name).unwrap()
     }
 
+    #[test]
+    fn false_tick_check_peephole_preserves_branch_and_step_budget() {
+        let program = manual_program(
+            vec![
+                Instruction::LoadGlobal(field("world")),
+                Instruction::LoadField(field("tick_usage")),
+                Instruction::LoadGlobal(field("current_ticklimit")),
+                Instruction::Greater,
+                Instruction::JumpIfFalse(7),
+                Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+                Instruction::Return,
+                Instruction::PushNumber(DmNumberBits::from_f32(2.0)),
+                Instruction::Return,
+            ],
+            0,
+        );
+        let make_state = |usage| {
+            let mut state = ExecutionState::new();
+            let world = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/world").unwrap());
+            state
+                .heap_mut()
+                .set_datum_field(world, field("tick_usage"), Value::number(usage))
+                .unwrap();
+            state.set_global(field("world"), Value::Datum(world));
+            state.set_global(field("current_ticklimit"), Value::number(50.0));
+            state
+        };
+
+        let limits = ExecutionLimits {
+            max_call_depth: 16,
+            max_steps: 7,
+        };
+        let mut false_state = make_state(40.0);
+        assert_eq!(
+            execute_with_limits_in_state(&program, &[], limits, &mut false_state),
+            Ok(Value::number(2.0)),
+        );
+        let mut true_state = make_state(60.0);
+        assert_eq!(
+            execute_with_limits_in_state(&program, &[], limits, &mut true_state),
+            Ok(Value::number(1.0)),
+        );
+        let mut exhausted_state = make_state(40.0);
+        assert!(
+            execute_with_limits_in_state(
+                &program,
+                &[],
+                ExecutionLimits {
+                    max_call_depth: 16,
+                    max_steps: 6,
+                },
+                &mut exhausted_state,
+            )
+            .is_err(),
+        );
+    }
+
+    #[test]
+    fn numeric_loop_branch_peephole_preserves_bounds_and_step_budget() {
+        let bounded = manual_program(
+            vec![
+                Instruction::LoadLocal(0),
+                Instruction::LoadLocal(1),
+                Instruction::LessEqual,
+                Instruction::JumpIfFalse(6),
+                Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+                Instruction::Return,
+                Instruction::PushNumber(DmNumberBits::from_f32(2.0)),
+                Instruction::Return,
+            ],
+            2,
+        );
+        let limits = ExecutionLimits {
+            max_call_depth: 16,
+            max_steps: 6,
+        };
+        assert_eq!(
+            execute_with_limits(&bounded, &[Value::number(3.0), Value::number(4.0)], limits),
+            Ok(Value::number(1.0)),
+        );
+        assert_eq!(
+            execute_with_limits(&bounded, &[Value::number(5.0), Value::number(4.0)], limits),
+            Ok(Value::number(2.0)),
+        );
+        assert!(
+            execute_with_limits(
+                &bounded,
+                &[Value::number(3.0), Value::number(4.0)],
+                ExecutionLimits {
+                    max_call_depth: 16,
+                    max_steps: 5,
+                },
+            )
+            .is_err(),
+        );
+
+        let list_bounded = manual_program(
+            vec![
+                Instruction::LoadLocal(0),
+                Instruction::ListLengthLocal(1),
+                Instruction::LessEqual,
+                Instruction::JumpIfFalse(6),
+                Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+                Instruction::Return,
+                Instruction::PushNumber(DmNumberBits::from_f32(2.0)),
+                Instruction::Return,
+            ],
+            2,
+        );
+        let mut state = ExecutionState::new();
+        let list = state.heap_mut().allocate_list();
+        let values = state.heap_mut().list_mut(list).unwrap();
+        values.add(Value::number(10.0));
+        values.add(Value::number(20.0));
+        assert_eq!(
+            execute_with_limits_in_state(
+                &list_bounded,
+                &[Value::number(2.0), Value::List(list)],
+                limits,
+                &mut state,
+            ),
+            Ok(Value::number(1.0)),
+        );
+
+        let update = manual_program(
+            vec![
+                Instruction::LoadLocal(0),
+                Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+                Instruction::Add,
+                Instruction::StoreLocal(0),
+                Instruction::LoadLocal(0),
+                Instruction::Return,
+            ],
+            1,
+        );
+        assert_eq!(
+            execute_with_limits(&update, &[Value::number(41.0)], limits),
+            Ok(Value::number(42.0)),
+        );
+        assert_eq!(
+            execute_with_limits(&update, &[Value::Null], limits),
+            Ok(Value::number(1.0)),
+        );
+    }
+
+    #[test]
+    fn numeric_dispatch_block_preserves_complex_loop_and_step_budget() {
+        let program = manual_program(
+            vec![
+                Instruction::LoadLocal(0),
+                Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+                Instruction::Add,
+                Instruction::StoreLocal(0),
+                Instruction::LoadLocal(0),
+                Instruction::LoadLocal(1),
+                Instruction::LessEqual,
+                Instruction::LoadLocal(0),
+                Instruction::PushNumber(DmNumberBits::from_f32(0.0)),
+                Instruction::Greater,
+                Instruction::And,
+                Instruction::JumpIfFalse(13),
+                Instruction::Jump(0),
+                Instruction::LoadLocal(0),
+                Instruction::Return,
+            ],
+            2,
+        );
+        let arguments = [Value::number(0.0), Value::number(3.0)];
+        assert_eq!(
+            execute_with_limits(
+                &program,
+                &arguments,
+                ExecutionLimits {
+                    max_call_depth: 16,
+                    max_steps: 53,
+                },
+            ),
+            Ok(Value::number(4.0)),
+        );
+        assert!(
+            execute_with_limits(
+                &program,
+                &arguments,
+                ExecutionLimits {
+                    max_call_depth: 16,
+                    max_steps: 52,
+                },
+            )
+            .is_err(),
+        );
+
+        let text_fallback = manual_program(
+            vec![
+                Instruction::PushText(Arc::from("a")),
+                Instruction::PushText(Arc::from("b")),
+                Instruction::Add,
+                Instruction::Return,
+            ],
+            0,
+        );
+        assert_eq!(
+            execute_with_limits(
+                &text_fallback,
+                &[],
+                ExecutionLimits {
+                    max_call_depth: 16,
+                    max_steps: 4,
+                },
+            ),
+            Ok(Value::text("ab")),
+        );
+
+        let mut parameter_alias = manual_program(
+            vec![
+                Instruction::PushNumber(DmNumberBits::from_f32(5.0)),
+                Instruction::StoreLocal(0),
+                Instruction::MakeArgs,
+                Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+                Instruction::IndexList,
+                Instruction::Return,
+            ],
+            1,
+        );
+        parameter_alias.parameter_names[0] = "value".to_owned();
+        assert_eq!(
+            execute_with_limits(
+                &parameter_alias,
+                &[Value::number(2.0)],
+                ExecutionLimits {
+                    max_call_depth: 16,
+                    max_steps: 6,
+                },
+            ),
+            Ok(Value::number(5.0)),
+        );
+    }
+
     fn expression_tokens(source: &str) -> Vec<SpannedToken> {
         lex(source)
             .expect("expression should lex")
@@ -31272,7 +32069,13 @@ mod tests {
         else {
             panic!("expected listener lookup")
         };
-        read_list_value(&state.heap, lookup, signal, false).unwrap()
+        read_list_value(
+            &state.heap,
+            lookup,
+            signal,
+            state.is_associative_list(lookup),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -31309,6 +32112,32 @@ mod tests {
         let Value::List(listeners) = signal_fixture_lookup(&state, target, &signal) else {
             panic!("multiple listeners should promote the scalar lookup to a list")
         };
+        let Value::List(first_procs) =
+            datum_field_or_shared(&state, first, &field("_signal_procs")).unwrap()
+        else {
+            panic!("listener should own a signal procedure map")
+        };
+        let Value::List(first_target_procs) = read_list_value(
+            state.heap(),
+            first_procs,
+            &Value::Datum(target),
+            state.is_associative_list(first_procs),
+        )
+        .unwrap() else {
+            panic!("listener should index its callback map by target")
+        };
+        assert!(state.is_associative_list(first_procs));
+        assert!(state.is_associative_list(first_target_procs));
+        assert_eq!(
+            read_list_value(
+                state.heap(),
+                first_target_procs,
+                &signal,
+                state.is_associative_list(first_target_procs),
+            )
+            .unwrap(),
+            Value::text("first_callback")
+        );
         assert_eq!(
             state
                 .heap()
@@ -33484,6 +34313,21 @@ mod tests {
         assert!(
             execute_module(&module, module.procedure_id("/proc/direct").unwrap(), &[]).is_err(),
             "direct CRASH must remain fatal to its execution"
+        );
+    }
+
+    #[test]
+    fn stale_send_signal_callback_aborts_only_the_signal_proc() {
+        let source = parse(
+            "/datum/proc/_SendSignal()\n\tvar/list/missing\n\treturn missing[\"callback\"]\n/proc/probe()\n\tvar/datum/target = new\n\ttarget._SendSignal()\n\treturn 42\n",
+        )
+        .expect("signal recovery source should parse");
+        let module =
+            compile_module(&source.definitions).expect("signal recovery source should compile");
+        assert_eq!(
+            execute_module(&module, module.procedure_id("/proc/probe").unwrap(), &[]),
+            Ok(Value::number(42.0)),
+            "a stale DCS listener must not unwind the caller or Master scheduler task"
         );
     }
 

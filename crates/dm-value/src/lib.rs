@@ -20,8 +20,11 @@ use std::hash::BuildHasherDefault;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use dm_core::DmNumberBits;
 use rayon::prelude::*;
+
+mod snapshot;
 
 /// A canonical absolute DM type path.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -135,6 +138,13 @@ macro_rules! handle_type {
         }
 
         impl $name {
+            /// Reconstructs a stable handle from a persisted arena slot and generation.
+            #[doc(hidden)]
+            #[must_use]
+            pub const fn from_parts(index: u32, generation: u32) -> Self {
+                Self { index, generation }
+            }
+
             /// Returns the stable slot index used by heap tables.
             #[must_use]
             pub const fn index(self) -> u32 {
@@ -436,7 +446,12 @@ fn gc_index_ratio_bin(len: usize, capacity: usize) -> usize {
     }
 }
 
-type DatumFieldIndex = HashMap<FieldName, usize>;
+// Field lookup is the hottest generic operation during map and atom startup.
+// These maps are process-local derived indexes, so cryptographic SipHash does
+// not buy observable DM semantics or persistence safety. AHash retains keyed
+// collision resistance while substantially reducing millions of short
+// identifier lookups across mapping, atoms, lighting, atmos, and shuttles.
+type DatumFieldIndex = AHashMap<FieldName, usize>;
 
 const DATUM_LAYOUT_CACHE_MAX_ENTRIES: usize = 65_536;
 const DATUM_LAYOUT_CACHE_MAX_VARIANTS_PER_TYPE: usize = 8;
@@ -960,12 +975,16 @@ impl Datum {
     /// Reads a named field without allocating an error for an absent sparse slot.
     #[must_use]
     pub fn field_optional(&self, name: &FieldName) -> Option<&Value> {
+        self.field_slot(name).map(|index| self.fields.value(index))
+    }
+
+    /// Returns the current positional slot for a materialized field.
+    #[must_use]
+    pub fn field_slot(&self, name: &FieldName) -> Option<usize> {
         if let Some(field_index) = &self.field_index {
-            return field_index.get(name).map(|&index| self.fields.value(index));
+            return field_index.get(name).copied();
         }
-        self.fields
-            .position(name)
-            .map(|index| self.fields.value(index))
+        self.fields.position(name)
     }
 
     /// Inserts or updates a field while retaining first-insertion order.
@@ -2362,6 +2381,8 @@ impl DmList {
 /// Heap and list operation failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ValueError {
+    /// A ready-world heap image violated an arena or record invariant.
+    CorruptHeapSnapshot(String),
     /// A type path was not a valid canonical absolute path.
     InvalidTypePath(String),
     /// A field name was not a canonical DM identifier.
@@ -2397,6 +2418,9 @@ pub enum ValueError {
 impl fmt::Display for ValueError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CorruptHeapSnapshot(message) => {
+                write!(formatter, "corrupt ready-world heap snapshot: {message}")
+            }
             Self::InvalidTypePath(path) => write!(formatter, "invalid absolute type path {path:?}"),
             Self::InvalidFieldName(name) => write!(formatter, "invalid DM field name {name:?}"),
             Self::MissingField(name) => write!(formatter, "datum field {name:?} is absent"),
@@ -2482,6 +2506,50 @@ impl<T> Default for Arena<T> {
 }
 
 impl<T> Arena<T> {
+    fn push_snapshot_slot(&mut self, generation: u32, value: Option<T>) {
+        if self
+            .chunks
+            .last()
+            .is_none_or(|chunk| chunk.len() == ARENA_CHUNK_SLOTS)
+        {
+            self.chunks.push(Vec::with_capacity(ARENA_CHUNK_SLOTS));
+        }
+        self.live += usize::from(value.is_some());
+        self.chunks
+            .last_mut()
+            .expect("arena snapshot chunk was just ensured")
+            .push(Slot { generation, value });
+        self.slot_len += 1;
+    }
+
+    fn install_snapshot_free(&mut self, free: Vec<u32>, kind: &str) -> Result<(), ValueError> {
+        let mut free_seen = vec![false; self.slot_len];
+        for &index in &free {
+            let index = index as usize;
+            if index >= self.slot_len
+                || free_seen[index]
+                || self.slot(index).is_some_and(|slot| slot.value.is_some())
+            {
+                return Err(ValueError::CorruptHeapSnapshot(format!(
+                    "{kind} free list contains invalid slot {index}"
+                )));
+            }
+            free_seen[index] = true;
+        }
+        for (index, seen) in free_seen.into_iter().enumerate() {
+            let slot = self
+                .slot(index)
+                .expect("snapshot validation index addresses an arena slot");
+            if slot.value.is_none() && slot.generation != u32::MAX && !seen {
+                return Err(ValueError::CorruptHeapSnapshot(format!(
+                    "{kind} vacant slot {index} is absent from its free list"
+                )));
+            }
+        }
+        self.free = free;
+        Ok(())
+    }
+
     fn stats(&self) -> ArenaStats {
         ArenaStats {
             live: self.live,
@@ -2634,6 +2702,90 @@ pub struct ValueHeap {
     datum_layouts: DatumLayoutCache,
 }
 
+/// Pointer-free logical value stored in a ready-world heap image.
+///
+/// Text and identifier storage is owned so an image does not retain process
+/// addresses. Datum and list references preserve their stable slot and
+/// generation identities.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum HeapSnapshotValue {
+    /// DM `null`.
+    Null,
+    /// Exact binary32 number bits.
+    Number(u32),
+    /// Immutable text content.
+    Text(String),
+    /// Project-relative file/resource path.
+    File(String),
+    /// Canonical type path.
+    TypePath(String),
+    /// Modified type path and evaluated overrides.
+    ModifiedTypePath {
+        /// Canonical base path.
+        base: String,
+        /// Overrides in source order.
+        overrides: Vec<(String, HeapSnapshotValue)>,
+    },
+    /// Stable datum identity.
+    Datum {
+        /// Stable arena slot.
+        index: u32,
+        /// Slot generation.
+        generation: u32,
+    },
+    /// Stable list identity.
+    List {
+        /// Stable arena slot.
+        index: u32,
+        /// Slot generation.
+        generation: u32,
+    },
+}
+
+/// One materialized datum in a ready-world heap image.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct HeapSnapshotDatum {
+    /// Canonical runtime type.
+    pub type_path: String,
+    /// Materialized fields in declaration/insertion order.
+    pub fields: Vec<(String, HeapSnapshotValue)>,
+}
+
+/// One entry in a list's unified iteration order.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum HeapSnapshotListEntry {
+    /// Positional value.
+    Positional(HeapSnapshotValue),
+    /// Associative key and value.
+    Associative(HeapSnapshotValue, HeapSnapshotValue),
+}
+
+/// One arena slot in a ready-world heap image.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct HeapSnapshotSlot<T> {
+    /// Generation used to reject stale handles.
+    pub generation: u32,
+    /// Live payload, or `None` for a reusable vacant slot.
+    pub value: Option<T>,
+}
+
+/// Pointer-free snapshot of the mutable value heap.
+///
+/// This is the first persistent section of a ready-world image. It retains
+/// vacant-slot generations and free-list order so allocations after restore
+/// produce the same logical identities as uninterrupted execution.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ValueHeapSnapshot {
+    /// Datum arena slots in stable index order.
+    pub datums: Vec<HeapSnapshotSlot<HeapSnapshotDatum>>,
+    /// Datum free-list pop order.
+    pub datum_free: Vec<u32>,
+    /// List arena slots in stable index order.
+    pub lists: Vec<HeapSnapshotSlot<Vec<HeapSnapshotListEntry>>>,
+    /// List free-list pop order.
+    pub list_free: Vec<u32>,
+}
+
 /// Results and storage telemetry from one combined datum/list collection.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HeapCollectionStats {
@@ -2683,6 +2835,102 @@ impl ValueHeap {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Captures all logical heap state without retaining process pointers or
+    /// derived lookup indexes.
+    ///
+    /// The returned representation is suitable for a versioned ready-world
+    /// image encoder. Derived datum/list indexes and layout sharing are rebuilt
+    /// on restore instead of being persisted.
+    #[must_use]
+    pub fn snapshot(&self) -> ValueHeapSnapshot {
+        let datums = (0..self.datums.slot_len())
+            .map(|index| {
+                let slot = self
+                    .datums
+                    .slot(index)
+                    .expect("datum snapshot index addresses an allocated slot");
+                HeapSnapshotSlot {
+                    generation: slot.generation,
+                    value: slot.value.as_ref().map(|datum| HeapSnapshotDatum {
+                        type_path: datum.type_path().as_str().to_owned(),
+                        fields: datum
+                            .fields()
+                            .map(|(name, value)| {
+                                (name.as_str().to_owned(), HeapSnapshotValue::from(value))
+                            })
+                            .collect(),
+                    }),
+                }
+            })
+            .collect();
+        let lists = (0..self.lists.slot_len())
+            .map(|index| {
+                let slot = self
+                    .lists
+                    .slot(index)
+                    .expect("list snapshot index addresses an allocated slot");
+                HeapSnapshotSlot {
+                    generation: slot.generation,
+                    value: slot.value.as_ref().map(snapshot_list_entries),
+                }
+            })
+            .collect();
+        ValueHeapSnapshot {
+            datums,
+            datum_free: self.datums.free.clone(),
+            lists,
+            list_free: self.lists.free.clone(),
+        }
+    }
+
+    /// Restores a heap snapshot while preserving every stable handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValueError::CorruptHeapSnapshot`] for malformed identifiers,
+    /// inconsistent free lists, or corrupt list records.
+    pub fn from_snapshot(snapshot: ValueHeapSnapshot) -> Result<Self, ValueError> {
+        let datum_slots = snapshot
+            .datums
+            .into_iter()
+            .map(|slot| {
+                let value = slot.value.map(restore_snapshot_datum).transpose()?;
+                Ok((slot.generation, value))
+            })
+            .collect::<Result<Vec<_>, ValueError>>()?;
+        let list_slots = snapshot
+            .lists
+            .into_iter()
+            .map(|slot| {
+                let value = slot.value.map(restore_list_entries).transpose()?;
+                Ok((slot.generation, value))
+            })
+            .collect::<Result<Vec<_>, ValueError>>()?;
+        let datums = arena_from_snapshot_slots(datum_slots, snapshot.datum_free, "datum")?;
+        let lists = arena_from_snapshot_slots(list_slots, snapshot.list_free, "list")?;
+        let mut heap = Self {
+            datums,
+            lists,
+            datum_layouts: DatumLayoutCache::default(),
+        };
+        heap.compact_restored_datum_layouts();
+        Ok(heap)
+    }
+
+    fn compact_restored_datum_layouts(&mut self) {
+        // Recreate field-name/index sharing without changing logical state.
+        for index in 0..self.datums.slot_len() {
+            let Some(datum) = self
+                .datums
+                .slot_mut(index)
+                .and_then(|slot| slot.value.as_mut())
+            else {
+                continue;
+            };
+            self.datum_layouts.compact(datum);
+        }
     }
 
     /// Returns the number of currently live datum identities.
@@ -3238,6 +3486,183 @@ impl ValueHeap {
             Value::List(id) => Ok(self.list(*id).is_ok()),
         }
     }
+}
+
+impl From<&Value> for HeapSnapshotValue {
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Number(number) => Self::Number(number.bits()),
+            Value::Text(text) => Self::Text(text.to_string()),
+            Value::File(path) => Self::File(path.to_string()),
+            Value::TypePath(path) => Self::TypePath(path.as_str().to_owned()),
+            Value::ModifiedTypePath(path) => Self::ModifiedTypePath {
+                base: path.base().as_str().to_owned(),
+                overrides: path
+                    .overrides()
+                    .iter()
+                    .map(|(name, value)| (name.as_str().to_owned(), HeapSnapshotValue::from(value)))
+                    .collect(),
+            },
+            Value::Datum(datum) => Self::Datum {
+                index: datum.index(),
+                generation: datum.generation(),
+            },
+            Value::List(list) => Self::List {
+                index: list.index(),
+                generation: list.generation(),
+            },
+        }
+    }
+}
+
+impl HeapSnapshotValue {
+    /// Reconstructs the runtime value represented by this pointer-free record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a value validation error for malformed field or type names.
+    pub fn into_value(self) -> Result<Value, ValueError> {
+        Ok(match self {
+            Self::Null => Value::Null,
+            Self::Number(bits) => Value::Number(DmNumberBits::from_f32(f32::from_bits(bits))),
+            Self::Text(text) => Value::text(text),
+            Self::File(path) => Value::file(path),
+            Self::TypePath(path) => Value::TypePath(TypePath::parse(&path)?),
+            Self::ModifiedTypePath { base, overrides } => {
+                let overrides = overrides
+                    .into_iter()
+                    .map(|(name, value)| Ok((FieldName::parse(&name)?, value.into_value()?)))
+                    .collect::<Result<Vec<_>, ValueError>>()?;
+                Value::ModifiedTypePath(Arc::new(ModifiedTypePath::new(
+                    TypePath::parse(&base)?,
+                    overrides,
+                )))
+            }
+            Self::Datum { index, generation } => Value::Datum(DatumId { index, generation }),
+            Self::List { index, generation } => Value::List(ListId { index, generation }),
+        })
+    }
+}
+
+fn restore_snapshot_datum(datum: HeapSnapshotDatum) -> Result<Datum, ValueError> {
+    let type_path = TypePath::parse(&datum.type_path)?;
+    let mut fields = Vec::with_capacity(datum.fields.len());
+    for (name, value) in datum.fields {
+        fields.push((FieldName::parse(&name)?, value.into_value()?));
+    }
+    let mut datum = Datum {
+        type_path,
+        fields: DatumFields::Owned(fields),
+        field_index: None,
+    };
+    if datum.fields.len() >= DATUM_FIELD_INDEX_THRESHOLD {
+        datum.build_field_index();
+    }
+    Ok(datum)
+}
+
+fn snapshot_list_entries(list: &DmList) -> Vec<HeapSnapshotListEntry> {
+    let Some(storage) = list.storage.as_deref() else {
+        return Vec::new();
+    };
+    storage.order[storage.prefix_head..]
+        .iter()
+        .map(|entry| {
+            if let Some(index) = entry.positional_index() {
+                HeapSnapshotListEntry::Positional(HeapSnapshotValue::from(
+                    &storage.positional[index],
+                ))
+            } else {
+                let index = entry
+                    .associative_index()
+                    .expect("live list order entry is valid");
+                let (key, value) = &storage.associative[index];
+                HeapSnapshotListEntry::Associative(
+                    HeapSnapshotValue::from(key),
+                    HeapSnapshotValue::from(value),
+                )
+            }
+        })
+        .collect()
+}
+
+fn restore_list_entries(entries: Vec<HeapSnapshotListEntry>) -> Result<DmList, ValueError> {
+    if entries.is_empty() {
+        return Ok(DmList::default());
+    }
+    let mut positional = Vec::new();
+    let mut associative = Vec::new();
+    let mut order = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match entry {
+            HeapSnapshotListEntry::Positional(value) => {
+                order.push(ListOrder::positional(positional.len()));
+                positional.push(value.into_value()?);
+            }
+            HeapSnapshotListEntry::Associative(key, value) => {
+                order.push(ListOrder::associative(associative.len()));
+                associative.push((key.into_value()?, value.into_value()?));
+            }
+        }
+    }
+    let mut list = DmList {
+        storage: Some(Arc::new(DmListStorage {
+            positional,
+            associative,
+            order,
+            associative_index: None,
+            positional_remove_index: None,
+            prefix_head: 0,
+        })),
+    };
+    list.rebuild_associative_index();
+    Ok(list)
+}
+
+fn arena_from_snapshot_slots<T>(
+    slots: Vec<(u32, Option<T>)>,
+    free: Vec<u32>,
+    kind: &str,
+) -> Result<Arena<T>, ValueError> {
+    let mut free_seen = vec![false; slots.len()];
+    for &index in &free {
+        let index = index as usize;
+        if index >= slots.len() || free_seen[index] || slots[index].1.is_some() {
+            return Err(ValueError::CorruptHeapSnapshot(format!(
+                "{kind} free list contains invalid slot {index}"
+            )));
+        }
+        free_seen[index] = true;
+    }
+    for (index, (generation, value)) in slots.iter().enumerate() {
+        if value.is_none() && *generation != u32::MAX && !free_seen[index] {
+            return Err(ValueError::CorruptHeapSnapshot(format!(
+                "{kind} vacant slot {index} is absent from its free list"
+            )));
+        }
+    }
+    let live = slots.iter().filter(|(_, value)| value.is_some()).count();
+    let slot_len = slots.len();
+    let mut chunks = Vec::with_capacity(slot_len.div_ceil(ARENA_CHUNK_SLOTS));
+    for chunk in slots
+        .into_iter()
+        .collect::<Vec<_>>()
+        .chunks_mut(ARENA_CHUNK_SLOTS)
+    {
+        let mut values = Vec::with_capacity(ARENA_CHUNK_SLOTS);
+        values.extend(chunk.iter_mut().map(|(generation, value)| Slot {
+            generation: *generation,
+            value: value.take(),
+        }));
+        chunks.push(values);
+    }
+    Ok(Arena {
+        chunks,
+        slot_len,
+        free,
+        live,
+    })
 }
 
 #[cfg(test)]
@@ -5519,6 +5944,74 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list.get(1), Ok(&Value::number(1.0)));
         assert_eq!(list.get(2), Ok(&Value::number(2.0)));
+    }
+
+    #[test]
+    fn heap_snapshot_roundtrip_preserves_handles_aliases_and_free_order() {
+        let mut heap = ValueHeap::new();
+        let discarded = heap.allocate_datum(TypePath::parse("/datum/discarded").unwrap());
+        let owner = heap.allocate_datum(TypePath::parse("/datum/owner").unwrap());
+        let values = heap.allocate_list();
+        heap.list_mut(values).unwrap().add(Value::Datum(owner));
+        heap.list_mut(values)
+            .unwrap()
+            .set_key(Value::text("answer"), Value::number(42.0));
+        heap.list_mut(values).unwrap().add(Value::List(values));
+        heap.set_datum_field(
+            owner,
+            FieldName::parse("values").unwrap(),
+            Value::List(values),
+        )
+        .unwrap();
+        heap.set_datum_field(
+            owner,
+            FieldName::parse("kind").unwrap(),
+            Value::ModifiedTypePath(Arc::new(ModifiedTypePath::new(
+                TypePath::parse("/obj/item").unwrap(),
+                vec![(FieldName::parse("amount").unwrap(), Value::number(15.0))],
+            ))),
+        )
+        .unwrap();
+        heap.destroy_datum(discarded).unwrap();
+
+        let snapshot = heap.snapshot();
+        let mut restored = ValueHeap::from_snapshot(snapshot.clone()).unwrap();
+        assert_eq!(restored.snapshot(), snapshot);
+        assert_eq!(
+            restored.datum_field(owner, &FieldName::parse("values").unwrap()),
+            Ok(&Value::List(values))
+        );
+        assert_eq!(
+            restored.list(values).unwrap().get(1),
+            Ok(&Value::Datum(owner))
+        );
+        assert_eq!(
+            restored
+                .list(values)
+                .unwrap()
+                .get_key(&Value::text("answer")),
+            Ok(&Value::number(42.0))
+        );
+        assert_eq!(
+            restored.list(values).unwrap().get(3),
+            Ok(&Value::List(values))
+        );
+
+        let reused = restored.allocate_datum(TypePath::parse("/datum/reused").unwrap());
+        assert_eq!(reused.index(), discarded.index());
+        assert_eq!(reused.generation(), discarded.generation() + 1);
+    }
+
+    #[test]
+    fn heap_snapshot_rejects_inconsistent_free_list() {
+        let mut heap = ValueHeap::new();
+        let live = heap.allocate_list();
+        let mut snapshot = heap.snapshot();
+        snapshot.list_free.push(live.index());
+        assert!(matches!(
+            ValueHeap::from_snapshot(snapshot),
+            Err(ValueError::CorruptHeapSnapshot(_))
+        ));
     }
 
     #[test]

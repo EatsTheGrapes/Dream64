@@ -7,8 +7,10 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+ahash = "0.8.12"
 dm-core = { path = "../dm-core" }
 rayon = "1.11"
+serde = { version = "1", features = ["derive"] }
 
 [lints]
 workspace = true
