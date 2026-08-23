@@ -16,6 +16,7 @@
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::BuildHasherDefault;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
@@ -1152,7 +1153,7 @@ pub struct DmListStorage {
     positional: Vec<Value>,
     associative: Vec<(Value, Value)>,
     order: Vec<ListOrder>,
-    associative_index: Option<Box<HashMap<SemanticKey, usize>>>,
+    associative_index: Option<Box<AssociativeIndex>>,
     positional_remove_index: Option<Box<PositionalRemoveIndex>>,
     /// Logically removed prefix for canonical purely positional lists. This
     /// makes repeated `Cut(1, n)` queue drains amortized linear.
@@ -1332,6 +1333,32 @@ enum SemanticKey {
     List(ListId),
 }
 
+const ASSOCIATIVE_INDEX_COLLISION: u32 = u32::MAX;
+
+#[derive(Default)]
+struct IdentityHasher(u64);
+
+impl Hasher for IdentityHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        self.0 = hash;
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+type AssociativeIndex = HashMap<u64, u32, BuildHasherDefault<IdentityHasher>>;
+
 fn semantic_key(value: &Value) -> Option<SemanticKey> {
     Some(match value {
         Value::Null => SemanticKey::Null,
@@ -1349,6 +1376,43 @@ fn semantic_key(value: &Value) -> Option<SemanticKey> {
         Value::List(list) => SemanticKey::List(*list),
         Value::ModifiedTypePath(_) => return None,
     })
+}
+
+fn semantic_hash(value: &Value) -> Option<u64> {
+    let mut hasher = DefaultHasher::new();
+    match value {
+        Value::Null => 0_u8.hash(&mut hasher),
+        Value::Number(number) => {
+            let value = number.to_f32();
+            if value.is_nan() {
+                return None;
+            }
+            1_u8.hash(&mut hasher);
+            (if value == 0.0 { 0 } else { number.bits() }).hash(&mut hasher);
+        }
+        Value::Text(text) => {
+            2_u8.hash(&mut hasher);
+            text.as_ref().hash(&mut hasher);
+        }
+        Value::File(path) => {
+            3_u8.hash(&mut hasher);
+            path.as_ref().hash(&mut hasher);
+        }
+        Value::TypePath(path) => {
+            4_u8.hash(&mut hasher);
+            path.as_str().hash(&mut hasher);
+        }
+        Value::Datum(datum) => {
+            5_u8.hash(&mut hasher);
+            datum.hash(&mut hasher);
+        }
+        Value::List(list) => {
+            6_u8.hash(&mut hasher);
+            list.hash(&mut hasher);
+        }
+        Value::ModifiedTypePath(_) => return None,
+    }
+    Some(hasher.finish())
 }
 
 impl DmList {
@@ -1499,7 +1563,7 @@ impl DmList {
                         .saturating_add(reclaimed);
                     aggregate.reclaimed_associative_index_bytes =
                         aggregate.reclaimed_associative_index_bytes.saturating_add(
-                            reclaimed.saturating_mul(std::mem::size_of::<(SemanticKey, usize)>()),
+                            reclaimed.saturating_mul(std::mem::size_of::<(u64, u32)>()),
                         );
                 }
                 if storage.positional_remove_index.take().is_some() {
@@ -1570,10 +1634,28 @@ impl DmList {
             self.associative_index = None;
             return;
         }
-        let mut index = HashMap::with_capacity(self.associative.len());
+        let mut index = AssociativeIndex::with_capacity_and_hasher(
+            self.associative.len(),
+            BuildHasherDefault::default(),
+        );
         for (position, (key, _)) in self.associative.iter().enumerate() {
-            if let Some(key) = semantic_key(key) {
-                index.insert(key, position);
+            let Some(hash) = semantic_hash(key) else {
+                continue;
+            };
+            let compact_position =
+                u32::try_from(position).expect("DM list associative storage exceeds 2^31 entries");
+            match index.entry(hash) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(compact_position);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let indexed = *entry.get();
+                    if indexed != ASSOCIATIVE_INDEX_COLLISION
+                        && !self.associative[indexed as usize].0.semantic_eq(key)
+                    {
+                        entry.insert(ASSOCIATIVE_INDEX_COLLISION);
+                    }
+                }
             }
         }
         self.associative_index = Some(Box::new(index));
@@ -1588,11 +1670,62 @@ impl DmList {
             return;
         }
         let position = self.associative.len() - 1;
-        let Some(key) = semantic_key(&self.associative[position].0) else {
+        let Some(hash) = semantic_hash(&self.associative[position].0) else {
             return;
         };
+        let compact_position =
+            u32::try_from(position).expect("DM list associative storage exceeds 2^31 entries");
+        let collision = self
+            .associative_index
+            .as_ref()
+            .and_then(|index| index.get(&hash))
+            .copied()
+            .is_some_and(|indexed| {
+                indexed != ASSOCIATIVE_INDEX_COLLISION
+                    && !self.associative[indexed as usize]
+                        .0
+                        .semantic_eq(&self.associative[position].0)
+            });
         if let Some(index) = &mut self.associative_index {
-            index.insert(key, position);
+            match index.entry(hash) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(compact_position);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) if collision => {
+                    entry.insert(ASSOCIATIVE_INDEX_COLLISION);
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+            }
+        }
+    }
+
+    fn association_position_for_key(&self, key: &Value) -> Option<usize> {
+        match (&self.associative_index, semantic_hash(key)) {
+            (Some(index), Some(hash)) => match index.get(&hash).copied() {
+                Some(position) if position != ASSOCIATIVE_INDEX_COLLISION => {
+                    let position = position as usize;
+                    if self
+                        .associative
+                        .get(position)
+                        .is_some_and(|(candidate, _)| candidate.semantic_eq(key))
+                    {
+                        Some(position)
+                    } else {
+                        self.associative
+                            .iter()
+                            .position(|(candidate, _)| candidate.semantic_eq(key))
+                    }
+                }
+                Some(_) => self
+                    .associative
+                    .iter()
+                    .position(|(candidate, _)| candidate.semantic_eq(key)),
+                None => None,
+            },
+            _ => self
+                .associative
+                .iter()
+                .position(|(candidate, _)| candidate.semantic_eq(key)),
         }
     }
 
@@ -2121,16 +2254,8 @@ impl DmList {
     ///
     /// Returns [`ValueError::MissingKey`] when the key is absent.
     pub fn get_key(&self, key: &Value) -> Result<&Value, ValueError> {
-        if let (Some(index), Some(key)) = (&self.associative_index, semantic_key(key)) {
-            return index
-                .get(&key)
-                .and_then(|position| self.associative.get(*position))
-                .map(|(_, value)| value)
-                .ok_or(ValueError::MissingKey);
-        }
-        self.associative
-            .iter()
-            .find(|(candidate, _)| candidate.semantic_eq(key))
+        self.association_position_for_key(key)
+            .and_then(|position| self.associative.get(position))
             .map(|(_, value)| value)
             .ok_or(ValueError::MissingKey)
     }
@@ -2142,14 +2267,7 @@ impl DmList {
     pub fn set_key(&mut self, key: Value, value: Value) -> Option<Value> {
         self.materialize_prefix();
         self.invalidate_positional_remove_index();
-        let indexed_key = semantic_key(&key);
-        let existing = match (&self.associative_index, indexed_key.as_ref()) {
-            (Some(index), Some(key)) => index.get(key).copied(),
-            _ => self
-                .associative
-                .iter()
-                .position(|(candidate, _)| candidate.semantic_eq(&key)),
-        };
+        let existing = self.association_position_for_key(&key);
         if let Some(position) = existing {
             let current = &mut self.associative[position].1;
             return Some(std::mem::replace(current, value));
@@ -2187,18 +2305,10 @@ impl DmList {
     /// Returns whether an iteration entry is semantically equal to `value`.
     #[must_use]
     pub fn contains(&self, value: &Value) -> bool {
-        if let (Some(index), Some(key)) = (&self.associative_index, semantic_key(value)) {
-            if index.contains_key(&key) {
-                return true;
-            }
-            // Indexed associative keys cannot equal a semantic key missing
-            // from the index. Only ordinary positional values remain.
-            return self.positional[self.prefix_head..]
+        self.association_position_for_key(value).is_some()
+            || self.positional[self.prefix_head..]
                 .iter()
-                .any(|candidate| candidate.semantic_eq(value));
-        }
-        self.positions()
-            .any(|(_, candidate)| candidate.semantic_eq(value))
+                .any(|candidate| candidate.semantic_eq(value))
     }
 
     /// Removes an associative key and returns its value.
@@ -3566,6 +3676,7 @@ mod tests {
     #[test]
     fn large_associative_lists_keep_indexed_lookup_and_byond_order_in_sync() {
         assert_eq!(std::mem::size_of::<ListOrder>(), 4);
+        assert_eq!(std::mem::size_of::<(u64, u32)>(), 16);
         let mut list = DmList::default();
         for index in 0..16 {
             list.set_key(
@@ -3607,6 +3718,38 @@ mod tests {
                 .unwrap()
                 .semantic_eq(&text("zero"))
         );
+    }
+
+    #[test]
+    fn compact_associative_index_collision_marker_preserves_exact_keys() {
+        let mut list = DmList::default();
+        for index in 0..16 {
+            list.set_key(
+                Value::text(format!("key-{index}")),
+                Value::number(index as f32),
+            );
+        }
+
+        let key = text("key-12");
+        let hash = semantic_hash(&key).unwrap();
+        list.associative_index
+            .as_mut()
+            .unwrap()
+            .insert(hash, ASSOCIATIVE_INDEX_COLLISION);
+        assert_eq!(list.get_key(&key), Ok(&Value::number(12.0)));
+        assert!(list.contains(&key));
+        assert_eq!(
+            list.set_key(key.clone(), Value::number(99.0)),
+            Some(Value::number(12.0)),
+        );
+        assert_eq!(list.get_key(&key), Ok(&Value::number(99.0)));
+
+        let missing = text("missing-collision");
+        list.associative_index.as_mut().unwrap().insert(
+            semantic_hash(&missing).unwrap(),
+            ASSOCIATIVE_INDEX_COLLISION,
+        );
+        assert_eq!(list.get_key(&missing), Err(ValueError::MissingKey));
     }
 
     #[test]
@@ -4619,7 +4762,7 @@ mod tests {
         );
         assert_eq!(
             stats.list_storage.reclaimed_associative_index_bytes,
-            reclaimed.saturating_mul(std::mem::size_of::<(SemanticKey, usize)>()),
+            reclaimed.saturating_mul(std::mem::size_of::<(u64, u32)>()),
         );
         assert!(after >= 56, "the compacted index retains 6.25% headroom");
         assert_eq!(
