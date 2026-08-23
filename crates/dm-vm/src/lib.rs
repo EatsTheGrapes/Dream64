@@ -329,30 +329,6 @@ pub enum Instruction {
         /// Instruction after the loop when the snapshot is exhausted.
         exit: usize,
     },
-    /// Checks a compiler-generated inclusive numeric loop bound in one step.
-    ///
-    /// The following three reference instructions remain in the program for
-    /// stable branch targets and dynamic-value fallback.
-    CheckNumericLoop {
-        /// Local containing the current loop value.
-        current_slot: u16,
-        /// Local containing the inclusive upper bound.
-        end_slot: u16,
-        /// Instruction after the loop when `current > end`.
-        exit: usize,
-    },
-    /// Applies a constant numeric loop increment and jumps to its condition.
-    ///
-    /// The original compound-assignment tail remains immediately afterward,
-    /// allowing non-numeric locals to retain ordinary DM operator semantics.
-    AdvanceNumericLoop {
-        /// Local updated by the loop tail.
-        slot: u16,
-        /// Constant increment encoded by the source loop.
-        step: DmNumberBits,
-        /// Condition header for the next iteration.
-        target: usize,
-    },
     /// Pops a value, index/key, and list handle and updates that list.
     SetListIndex,
     /// Like [`Self::SetListIndex`], but leaves the stored value on the stack.
@@ -1475,7 +1451,6 @@ pub fn compile_initializer_program(
         _ => return Err(compile_error("expected an initializer expression")),
     };
     specialize_local_list_iteration_headers(&mut instructions);
-    specialize_numeric_loop_edges(&mut instructions);
     Ok(Program {
         wait_for: true,
         parameter_count: 0,
@@ -2082,7 +2057,6 @@ fn compile_procedure_with_resolver_and_fields(
     }
 
     specialize_local_list_iteration_headers(&mut instructions);
-    specialize_numeric_loop_edges(&mut instructions);
     Ok(Program {
         wait_for: procedure_wait_for(definition),
         parameter_count: definition.parameters.len(),
@@ -2133,46 +2107,6 @@ fn specialize_local_list_iteration_headers(instructions: &mut [Instruction]) {
             exit: *exit,
         };
         instructions[index] = specialized;
-    }
-}
-
-fn specialize_numeric_loop_edges(instructions: &mut [Instruction]) {
-    for index in 0..instructions.len() {
-        if let Some(
-            [
-                Instruction::LoadLocal(current_slot),
-                Instruction::LoadLocal(end_slot),
-                Instruction::LessEqual,
-                Instruction::JumpIfFalse(exit),
-            ],
-        ) = instructions.get(index..index.saturating_add(4))
-        {
-            instructions[index] = Instruction::CheckNumericLoop {
-                current_slot: *current_slot,
-                end_slot: *end_slot,
-                exit: *exit,
-            };
-            continue;
-        }
-        if let Some(
-            [
-                Instruction::LoadLocal(slot),
-                Instruction::PushNumber(step),
-                Instruction::CompoundAssignment(CompoundAssignmentOperator::Add),
-                Instruction::Duplicate,
-                Instruction::StoreLocal(stored_slot),
-                Instruction::Pop,
-                Instruction::Jump(target),
-            ],
-        ) = instructions.get(index..index.saturating_add(7))
-            && slot == stored_slot
-        {
-            instructions[index] = Instruction::AdvanceNumericLoop {
-                slot: *slot,
-                step: *step,
-                target: *target,
-            };
-        }
     }
 }
 
@@ -13153,8 +13087,6 @@ fn startup_instruction_category(instruction: &Instruction) -> usize {
         | Instruction::JumpIfFalse(_)
         | Instruction::Jump(_)
         | Instruction::JumpIfArgumentSupplied { .. }
-        | Instruction::CheckNumericLoop { .. }
-        | Instruction::AdvanceNumericLoop { .. }
         | Instruction::IterationTypeFilter(_) => 5,
         _ => 6,
     }
@@ -16362,62 +16294,6 @@ fn run_frames(
                 }
                 frames[frame_index].instruction += 7;
                 continue;
-            }
-            Instruction::CheckNumericLoop {
-                current_slot,
-                end_slot,
-                exit,
-            } => {
-                let current_slot = usize::from(*current_slot);
-                let end_slot = usize::from(*end_slot);
-                let current = frames[frame_index]
-                    .locals
-                    .get(current_slot)
-                    .cloned()
-                    .ok_or_else(|| {
-                        execution_error(
-                            module,
-                            &frames,
-                            format!("invalid local slot {current_slot}"),
-                        )
-                    })?;
-                let end = frames[frame_index]
-                    .locals
-                    .get(end_slot)
-                    .cloned()
-                    .ok_or_else(|| {
-                        execution_error(module, &frames, format!("invalid local slot {end_slot}"))
-                    })?;
-                if let (Value::Number(current), Value::Number(end)) = (&current, &end) {
-                    frames[frame_index].instruction = if current.to_f32() <= end.to_f32() {
-                        frames[frame_index].instruction + 4
-                    } else {
-                        *exit
-                    };
-                    continue;
-                }
-                // Re-enter the untouched tail at its second LoadLocal. The
-                // ordinary LessEqual path retains dynamic comparison errors.
-                frames[frame_index].stack.push(current);
-            }
-            Instruction::AdvanceNumericLoop { slot, step, target } => {
-                let slot = usize::from(*slot);
-                let current = frames[frame_index]
-                    .locals
-                    .get(slot)
-                    .cloned()
-                    .ok_or_else(|| {
-                        execution_error(module, &frames, format!("invalid local slot {slot}"))
-                    })?;
-                if let Value::Number(current) = current {
-                    frames[frame_index].locals[slot] =
-                        Value::Number(DmNumberBits::from_f32(current.to_f32() + step.to_f32()));
-                    frames[frame_index].instruction = *target;
-                    continue;
-                }
-                // Preserve the original compound-assignment tail for a
-                // dynamically non-numeric iterator.
-                frames[frame_index].stack.push(current);
             }
             Instruction::SetListIndex => {
                 let value = match pop(&mut frames[frame_index].stack) {
@@ -25561,7 +25437,7 @@ mod tests {
     use dm_value::{DatumId, FieldName, ModifiedTypePath, TypePath, ValueError};
 
     use super::{
-        CANONICAL_TYPE2PARENT_SOURCE, CompoundAssignmentOperator, CompoundListIndexOperator,
+        CANONICAL_TYPE2PARENT_SOURCE, CompoundListIndexOperator,
         ExecutionContext, ExecutionLimits, ExecutionState, InitializerBinding, InstanceInitializer,
         Instruction, LocalClientPromptKind, LocalClientPromptResponse, LocalClientUiEvent,
         MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES,
@@ -34354,55 +34230,6 @@ mod tests {
     }
 
     #[test]
-    fn numeric_loop_edges_fuse_constant_step_and_preserve_dynamic_fallback() {
-        let source = parse(
-            "/proc/sum(limit)\n\tvar/total = 0\n\tfor(var/i = 1; i <= limit; i += 2)\n\t\ttotal += i\n\treturn total\n",
-        )
-        .expect("numeric loop fixture should parse");
-        let program =
-            compile_procedure(&source.definitions[0]).expect("numeric loop fixture should compile");
-        assert!(
-            program
-                .instructions
-                .iter()
-                .any(|instruction| matches!(instruction, Instruction::CheckNumericLoop { .. }))
-        );
-        assert!(program.instructions.iter().any(|instruction| matches!(
-            instruction,
-            Instruction::AdvanceNumericLoop { step, .. } if step.to_f32() == 2.0
-        )));
-        assert_eq!(
-            execute(&program, &[Value::number(8.0)]),
-            Ok(Value::number(16.0))
-        );
-
-        let fallback_instructions = vec![
-            Instruction::AdvanceNumericLoop {
-                slot: 0,
-                step: DmNumberBits::from_f32(1.0),
-                target: 7,
-            },
-            Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
-            Instruction::CompoundAssignment(CompoundAssignmentOperator::Add),
-            Instruction::Duplicate,
-            Instruction::StoreLocal(0),
-            Instruction::Pop,
-            Instruction::Jump(7),
-            Instruction::LoadLocal(0),
-            Instruction::Return,
-        ];
-        let mut reference_instructions = fallback_instructions.clone();
-        reference_instructions[0] = Instruction::LoadLocal(0);
-        let fallback = manual_program(fallback_instructions, 1);
-        let reference = manual_program(reference_instructions, 1);
-        assert_eq!(
-            execute(&fallback, &[Value::text("iteration-")]),
-            execute(&reference, &[Value::text("iteration-")]),
-            "a non-numeric local must execute the untouched compound-assignment tail"
-        );
-    }
-
-    #[test]
     fn for_to_range_is_inclusive_and_continue_runs_its_increment() {
         let source = "/proc/sum(first, last)\n\tvar/total = 0\n\tfor(var/i in first to last)\n\t\tif(i == first)\n\t\t\tcontinue\n\t\ttotal += i\n\treturn total\n";
         let syntax = parse(source).expect("source should parse");
@@ -34411,10 +34238,10 @@ mod tests {
             program
                 .instructions
                 .iter()
-                .filter(|instruction| matches!(instruction, Instruction::CheckNumericLoop { .. }))
+                .filter(|instruction| matches!(instruction, Instruction::LessEqual))
                 .count(),
             1,
-            "the implicit +1 step should compile to one fused inclusive comparison"
+            "the implicit +1 step should compile to one inclusive comparison"
         );
         assert!(!program.instructions.iter().any(|instruction| matches!(
             instruction,

@@ -15,9 +15,9 @@ use crate::{
 };
 
 const MAGIC: &[u8; 8] = b"DM64MOD\0";
-const VERSION: u16 = 7;
+const VERSION: u16 = 6;
 #[cfg(test)]
-const INSTRUCTION_TAG_COUNT: u8 = 139;
+const INSTRUCTION_TAG_COUNT: u8 = 137;
 const MAX_ARTIFACT_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const MAX_PROCEDURES: usize = 1_000_000;
 const MAX_PROCEDURE_TYPES: usize = 1_000_000;
@@ -284,9 +284,7 @@ fn validate_program(program: &Program, procedure_count: usize) -> Result<(), Mod
             | Instruction::JumpIfFalse(target)
             | Instruction::Jump(target)
             | Instruction::JumpIfArgumentSupplied { target, .. }
-            | Instruction::Spawn { entry: target }
-            | Instruction::CheckNumericLoop { exit: target, .. }
-            | Instruction::AdvanceNumericLoop { target, .. } => valid_jump(*target)?,
+            | Instruction::Spawn { entry: target } => valid_jump(*target)?,
             Instruction::BeginTry { catch, end, .. } => {
                 valid_jump(*catch)?;
                 valid_jump(*end)?;
@@ -851,22 +849,6 @@ fn encode_instruction(
             writer.u16(*item_slot);
             writer.target(*exit)?;
         }
-        Instruction::CheckNumericLoop {
-            current_slot,
-            end_slot,
-            exit,
-        } => {
-            writer.u8(137);
-            writer.u16(*current_slot);
-            writer.u16(*end_slot);
-            writer.target(*exit)?;
-        }
-        Instruction::AdvanceNumericLoop { slot, step, target } => {
-            writer.u8(138);
-            writer.u16(*slot);
-            writer.u32(step.bits());
-            writer.target(*target)?;
-        }
     }
     Ok(())
 }
@@ -1135,16 +1117,6 @@ fn decode_instruction(
             index_slot: reader.u16("index local slot")?,
             item_slot: reader.u16("item local slot")?,
             exit: reader.target()?,
-        },
-        137 => Instruction::CheckNumericLoop {
-            current_slot: reader.u16("current local slot")?,
-            end_slot: reader.u16("end local slot")?,
-            exit: reader.target()?,
-        },
-        138 => Instruction::AdvanceNumericLoop {
-            slot: reader.u16("numeric loop local slot")?,
-            step: DmNumberBits::from_f32(f32::from_bits(reader.u32("numeric loop step")?)),
-            target: reader.target()?,
         },
         unknown => {
             return Err(ModuleCodecError::new(format!(
@@ -1673,16 +1645,6 @@ mod tests {
                 index_slot: 5,
                 item_slot: 6,
                 exit: 9,
-            },
-            Instruction::CheckNumericLoop {
-                current_slot: 5,
-                end_slot: 6,
-                exit: 9,
-            },
-            Instruction::AdvanceNumericLoop {
-                slot: 5,
-                step: DmNumberBits::from_f32(8.0),
-                target: 9,
             },
             Instruction::SetListIndex,
             Instruction::SetListIndexKeep,
