@@ -14301,6 +14301,27 @@ fn run_frames(
                 program
             }
         };
+        if matches!(instruction_index, 68 | 117)
+            && let Some(accounted_steps) = try_run_major_camera_loop_fast_path(
+                module,
+                procedure,
+                program,
+                &mut frames[frame_index],
+                remaining_steps,
+            )
+        {
+            let scheduler_batches_before = executed_steps / 4_096;
+            remaining_steps = remaining_steps.saturating_sub(accounted_steps);
+            executed_steps += accounted_steps;
+            for _ in scheduler_batches_before..(executed_steps / 4_096) {
+                account_scheduler_tick_usage(state);
+            }
+            if let Some(profile) = &mut state.atoms_profile {
+                profile.total_instructions =
+                    profile.total_instructions.saturating_add(accounted_steps);
+            }
+            continue;
+        }
         if instruction_index == 0
             && !frames[frame_index].atoms_profile_entry_counted
             && (atoms_profiling_enabled
@@ -14536,8 +14557,7 @@ fn run_frames(
                 });
                 *profile.samples.entry(key).or_default() += 1;
                 if let Some(batch_elapsed) = batch_elapsed {
-                    *profile.wall_sample_nanos.entry(key).or_default() +=
-                        batch_elapsed.as_nanos();
+                    *profile.wall_sample_nanos.entry(key).or_default() += batch_elapsed.as_nanos();
                 }
                 if profile.instruction_categories.is_some() {
                     let instruction_key = AtomsProfileInstruction {
@@ -18934,8 +18954,124 @@ thread_local! {
         RefCell::new(HashMap::new());
     static REGISTER_SIGNAL_FAST_CACHE: RefCell<HashMap<(u64, ProcedureId), Option<RegisterSignalTrace>>> =
         RefCell::new(HashMap::new());
+    static MAJOR_CAMERA_LOOP_FAST_CACHE: RefCell<HashMap<(u64, ProcedureId), bool>> =
+        RefCell::new(HashMap::new());
     static CAMERA_CHUNK_FAST_CACHE: RefCell<HashMap<(u64, ProcedureId), Option<CameraChunkTrace>>> =
         RefCell::new(HashMap::new());
+}
+
+fn compile_major_camera_loop_trace(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+) -> bool {
+    let canonical_path = module
+        .procedure_path(procedure)
+        .and_then(|path| path.split('@').next());
+    if canonical_path != Some("/datum/cameranet/proc/major_chunk_change")
+        || program.parameter_count != 3
+        || program.local_count != 13
+        || program.instructions.len() != 133
+    {
+        return false;
+    }
+    let instructions = program.instructions.as_slice();
+    matches!(instructions[68], Instruction::LoadLocal(10))
+        && matches!(instructions[69], Instruction::LoadLocal(8))
+        && matches!(instructions[70], Instruction::LessEqual)
+        && matches!(instructions[71], Instruction::JumpIfFalse(131))
+        && matches!(instructions[72], Instruction::LoadLocal(7))
+        && matches!(instructions[73], Instruction::StoreLocal(11))
+        && matches!(instructions[74], Instruction::LoadLocal(11))
+        && matches!(instructions[75], Instruction::LoadLocal(9))
+        && matches!(instructions[76], Instruction::LessEqual)
+        && matches!(instructions[77], Instruction::JumpIfFalse(124))
+        && matches!(instructions[117], Instruction::LoadLocal(11))
+        && matches!(instructions[118], Instruction::PushNumber(number) if number.to_f32() == 8.0)
+        && matches!(
+            instructions[119],
+            Instruction::CompoundAssignment(CompoundAssignmentOperator::Add)
+        )
+        && matches!(instructions[120], Instruction::Duplicate)
+        && matches!(instructions[121], Instruction::StoreLocal(11))
+        && matches!(instructions[122], Instruction::Pop)
+        && matches!(instructions[123], Instruction::Jump(74))
+        && matches!(instructions[124], Instruction::LoadLocal(10))
+        && matches!(instructions[125], Instruction::PushNumber(number) if number.to_f32() == 8.0)
+        && matches!(
+            instructions[126],
+            Instruction::CompoundAssignment(CompoundAssignmentOperator::Add)
+        )
+        && matches!(instructions[127], Instruction::Duplicate)
+        && matches!(instructions[128], Instruction::StoreLocal(10))
+        && matches!(instructions[129], Instruction::Pop)
+        && matches!(instructions[130], Instruction::Jump(68))
+        && matches!(instructions[131], Instruction::LoadResult)
+        && matches!(instructions[132], Instruction::Return)
+}
+
+fn try_run_major_camera_loop_fast_path(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+    frame: &mut CallFrame,
+    remaining_steps: u64,
+) -> Option<u64> {
+    let instruction = frame.instruction;
+    if !matches!(instruction, 68 | 117) || !frame.stack.is_empty() || remaining_steps < 28 {
+        return None;
+    }
+    let key = (module.identity.0, procedure);
+    let recognized = MAJOR_CAMERA_LOOP_FAST_CACHE.with(|cache| {
+        *cache
+            .borrow_mut()
+            .entry(key)
+            .or_insert_with(|| compile_major_camera_loop_trace(module, procedure, program))
+    });
+    if !recognized {
+        return None;
+    }
+    let x2 = frame.locals.get(8)?.as_number()?;
+    let y2 = frame.locals.get(9)?.as_number()?;
+    let mut x = frame.locals.get(10)?.as_number()?;
+    let y1 = frame.locals.get(7)?.as_number()?;
+    if ![x, x2, y1, y2].into_iter().all(f32::is_finite) || y1 > y2 {
+        return None;
+    }
+
+    let accounted_steps = if instruction == 68 {
+        if x > x2 {
+            frame.instruction = 131;
+            4
+        } else {
+            frame.locals[11] = Value::number(y1);
+            frame.instruction = 78;
+            10
+        }
+    } else {
+        let mut y = frame.locals.get(11)?.as_number()?;
+        if !y.is_finite() {
+            return None;
+        }
+        y += 8.0;
+        if y <= y2 {
+            frame.locals[11] = Value::number(y);
+            frame.instruction = 78;
+            11
+        } else {
+            x += 8.0;
+            frame.locals[10] = Value::number(x);
+            if x <= x2 {
+                frame.locals[11] = Value::number(y1);
+                frame.instruction = 78;
+                28
+            } else {
+                frame.instruction = 131;
+                22
+            }
+        }
+    };
+    Some(accounted_steps)
 }
 
 struct CameraChunkTrace {
@@ -25518,9 +25654,9 @@ mod tests {
     use dm_value::{DatumId, FieldName, ModifiedTypePath, TypePath, ValueError};
 
     use super::{
-        CANONICAL_TYPE2PARENT_SOURCE, CompoundListIndexOperator,
-        ExecutionContext, ExecutionLimits, ExecutionState, InitializerBinding, InstanceInitializer,
-        Instruction, LocalClientPromptKind, LocalClientPromptResponse, LocalClientUiEvent,
+        CANONICAL_TYPE2PARENT_SOURCE, CompoundListIndexOperator, ExecutionContext, ExecutionLimits,
+        ExecutionState, InitializerBinding, InstanceInitializer, Instruction,
+        LocalClientPromptKind, LocalClientPromptResponse, LocalClientUiEvent,
         MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES,
         MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE, MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH,
         MAXIMUM_LOW_YIELD_COLLECTION_GROWTH, MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH,
@@ -25537,8 +25673,97 @@ mod tests {
         execute_with_limits, execute_with_limits_in_state, initial_value_or_engine_root,
         instance_initializer_plan, interpolated_expression_close, is_subtype, make_frame,
         matrix_components, next_module_identity, prepare_iteration_consumes_fresh_block,
-        read_list_value, try_run_register_signal_fast_path,
+        read_list_value, try_run_major_camera_loop_fast_path, try_run_register_signal_fast_path,
     };
+
+    #[test]
+    fn major_camera_loop_fast_path_preserves_nested_loop_progression() {
+        let syntax = parse(
+            "/datum/cameranet/proc/major_chunk_change(center_or_camera, choice, update_delay_buffer)\n\treturn null\n",
+        )
+        .unwrap();
+        let mut module = compile_module(&syntax.definitions).unwrap();
+        let entry = module
+            .procedure_id("/datum/cameranet/proc/major_chunk_change")
+            .unwrap();
+        let mut instructions = vec![Instruction::PushNull; 133];
+        instructions[68] = Instruction::LoadLocal(10);
+        instructions[69] = Instruction::LoadLocal(8);
+        instructions[70] = Instruction::LessEqual;
+        instructions[71] = Instruction::JumpIfFalse(131);
+        instructions[72] = Instruction::LoadLocal(7);
+        instructions[73] = Instruction::StoreLocal(11);
+        instructions[74] = Instruction::LoadLocal(11);
+        instructions[75] = Instruction::LoadLocal(9);
+        instructions[76] = Instruction::LessEqual;
+        instructions[77] = Instruction::JumpIfFalse(124);
+        instructions[117] = Instruction::LoadLocal(11);
+        instructions[118] = Instruction::PushNumber(DmNumberBits::from_f32(8.0));
+        instructions[119] = Instruction::CompoundAssignment(super::CompoundAssignmentOperator::Add);
+        instructions[120] = Instruction::Duplicate;
+        instructions[121] = Instruction::StoreLocal(11);
+        instructions[122] = Instruction::Pop;
+        instructions[123] = Instruction::Jump(74);
+        instructions[124] = Instruction::LoadLocal(10);
+        instructions[125] = Instruction::PushNumber(DmNumberBits::from_f32(8.0));
+        instructions[126] = Instruction::CompoundAssignment(super::CompoundAssignmentOperator::Add);
+        instructions[127] = Instruction::Duplicate;
+        instructions[128] = Instruction::StoreLocal(10);
+        instructions[129] = Instruction::Pop;
+        instructions[130] = Instruction::Jump(68);
+        instructions[131] = Instruction::LoadResult;
+        instructions[132] = Instruction::Return;
+        let program = Arc::make_mut(&mut module.procedures[entry.index()]);
+        program.parameter_count = 3;
+        program.parameter_names = vec![
+            "center_or_camera".to_owned(),
+            "choice".to_owned(),
+            "update_delay_buffer".to_owned(),
+        ];
+        program.local_count = 13;
+        program.instructions = instructions;
+        program.source_spans = vec![SourceSpan { start: 0, end: 0 }; 133];
+
+        let program = module.procedure(entry).unwrap();
+        let mut frame = make_frame(entry, program, &[], &ExecutionContext::default());
+        frame.locals[7] = Value::number(2.0);
+        frame.locals[8] = Value::number(20.0);
+        frame.locals[9] = Value::number(20.0);
+        frame.locals[10] = Value::number(1.0);
+        frame.instruction = 68;
+        assert_eq!(
+            try_run_major_camera_loop_fast_path(&module, entry, program, &mut frame, 28),
+            Some(10)
+        );
+        assert_eq!(frame.instruction, 78);
+        assert_eq!(frame.locals[11], Value::number(2.0));
+
+        frame.instruction = 117;
+        assert_eq!(
+            try_run_major_camera_loop_fast_path(&module, entry, program, &mut frame, 28),
+            Some(11)
+        );
+        assert_eq!(frame.locals[11], Value::number(10.0));
+
+        frame.locals[11] = Value::number(20.0);
+        frame.instruction = 117;
+        assert_eq!(
+            try_run_major_camera_loop_fast_path(&module, entry, program, &mut frame, 28),
+            Some(28)
+        );
+        assert_eq!(frame.locals[10], Value::number(9.0));
+        assert_eq!(frame.locals[11], Value::number(2.0));
+
+        frame.locals[10] = Value::number(17.0);
+        frame.locals[11] = Value::number(20.0);
+        frame.instruction = 117;
+        assert_eq!(
+            try_run_major_camera_loop_fast_path(&module, entry, program, &mut frame, 28),
+            Some(22)
+        );
+        assert_eq!(frame.locals[10], Value::number(25.0));
+        assert_eq!(frame.instruction, 131);
+    }
 
     #[test]
     fn builtin_mob_sight_flag_family_has_byond_bit_values() {

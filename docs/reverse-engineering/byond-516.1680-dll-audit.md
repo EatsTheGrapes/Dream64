@@ -75,11 +75,18 @@ Relevant `byondwin.dll` RVAs include:
 - `CIOutputCtrl::PutText`: `0x000F6F00`
 - `CIOutputCtrl::Update`: `0x000F7570`
 - `CIOutputCtrl::UpdatePrinter`: `0x000F7880`
+- `CIOutputCtrl::GetLines`: `0x000F69A0`
+- `CIOutputCtrl::SetLines`: `0x000F7410`
 
 RTTI/vtables explicitly show `CRichEditCtrl` and `DMTextPrinter` bases.
 Dream64 is correct to keep OUTPUT separate from WebView. Remaining work includes
-rich text, links, embedded images/objects, style properties, and max-line
-trimming.
+rich text, links, embedded images/objects, and style properties.
+
+`SetLines` stores the supplied integer in the output printer state and tail-calls
+the rich-edit line-limit routine; `GetLines` reads the effective value back from
+that same printer. Dream64 now applies the effective per-control DMF `lines`
+property, including runtime `winset` overrides, when trimming retained OUTPUT
+history. A bounded 512-line fallback remains for skins that omit the property.
 
 ### Map
 

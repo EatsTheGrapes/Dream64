@@ -96,47 +96,6 @@ impl SpriteCache {
     }
 }
 
-/// Returns whether one appearance contributes a visible pixel at tile-local
-/// framebuffer coordinates. This mirrors `composite_tile`'s DMI selection,
-/// offsets, tint alpha, and top-down Y convention without allocating a tile.
-pub(crate) fn appearance_hit(
-    cache: &mut SpriteCache,
-    appearance: &Appearance,
-    x: u32,
-    y: u32,
-) -> Result<bool, String> {
-    if appearance.resource.as_os_str().is_empty() {
-        return Ok(false);
-    }
-    let elapsed = cache.animation_elapsed();
-    let sheet = cache.load(&appearance.resource)?;
-    let Some((source_x, source_y)) = sheet.cell(
-        &appearance.state,
-        appearance.direction,
-        appearance.frame,
-        elapsed,
-    ) else {
-        return Ok(false);
-    };
-    let source_x_in_cell = i64::from(x) - i64::from(appearance.pixel_x);
-    let source_y_in_cell = i64::from(y) + i64::from(appearance.pixel_y);
-    if source_x_in_cell < 0
-        || source_y_in_cell < 0
-        || source_x_in_cell >= i64::from(sheet.width)
-        || source_y_in_cell >= i64::from(sheet.height)
-    {
-        return Ok(false);
-    }
-    let source_index = usize::try_from(
-        ((source_y + u32::try_from(source_y_in_cell).unwrap()) * sheet.image_width
-            + source_x
-            + u32::try_from(source_x_in_cell).unwrap())
-            * 4,
-    )
-    .map_err(|_| "DMI pixel offset overflow")?;
-    Ok(sheet.rgba[source_index + 3] != 0 && appearance.alpha != 0)
-}
-
 impl DmiSheet {
     pub(crate) fn load(path: &Path) -> Result<Self, String> {
         Self::decode(&fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?)

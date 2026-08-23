@@ -53,6 +53,8 @@ const LOCAL_SKIN: &str = "window \"main\"\n\
 \t\tpos = 690,74\n\
 \t\tsize = 318x618\n";
 
+const DEFAULT_RETAINED_OUTPUT_LINES: usize = 512;
+
 #[cfg(windows)]
 const EMPTY_BROWSER_DOCUMENT: &str = "<!doctype html><html><head></head><body></body></html>";
 
@@ -190,6 +192,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let launch = LaunchOptions::parse()?;
     let startup_snapshot_active = launch.startup_replay.is_some();
     let (skin_source, skin_label) = load_skin(launch.skin.as_deref())?;
+    eprintln!("client-skin-loaded: {skin_label}");
     let (mut runtime, scene) = launch
         .world
         .as_deref()
@@ -312,7 +315,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         surface: None,
         runtime,
         client,
-        skin_label,
         local_input_events: 0,
         inbound_ui_events: 0,
         transport,
@@ -1327,11 +1329,11 @@ impl UiPresentation {
                 } else {
                     match resolve_control_type(session.ui().tree(), &control, ControlType::Output) {
                         Ok(control) => {
+                            let retained_lines = output_line_limit(session.ui(), &control);
                             let lines = self.output_text.entry(control).or_default();
                             lines.extend(message.lines().map(str::to_owned));
-                            const RETAINED_OUTPUT_LINES: usize = 512;
-                            if lines.len() > RETAINED_OUTPUT_LINES {
-                                lines.drain(..lines.len() - RETAINED_OUTPUT_LINES);
+                            if lines.len() > retained_lines {
+                                lines.drain(..lines.len() - retained_lines);
                             }
                             None
                         }
@@ -1385,6 +1387,14 @@ impl UiPresentation {
         self.last_sequence = sequence;
         Ok(browser_update)
     }
+}
+
+fn output_line_limit(ui: &dm_dmf::UiState, control: &str) -> usize {
+    ui.winget(control, "lines")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_RETAINED_OUTPUT_LINES)
 }
 
 fn resolve_browser_output_target(tree: &ControlTree, target: &str) -> Option<String> {
@@ -1679,6 +1689,7 @@ fn load_skin(path: Option<&Path>) -> Result<(String, String), std::io::Error> {
     Ok((source, path.display().to_string()))
 }
 
+#[derive(Debug)]
 struct LaunchOptions {
     skin: Option<PathBuf>,
     world: Option<PathBuf>,
@@ -1691,6 +1702,10 @@ struct LaunchOptions {
 
 impl LaunchOptions {
     fn parse() -> Result<Self, String> {
+        Self::parse_from(std::env::args_os().skip(1))
+    }
+
+    fn parse_from(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Self, String> {
         let mut options = Self {
             skin: None,
             world: None,
@@ -1702,13 +1717,29 @@ impl LaunchOptions {
             replay: None,
             startup_replay: None,
         };
-        let mut arguments = std::env::args_os().skip(1);
+        let mut connect_seen = false;
+        let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             match argument.to_string_lossy().as_ref() {
-                "--skin" => options.skin = Some(next_path(&mut arguments, "--skin")?),
-                "--world" => options.world = Some(next_path(&mut arguments, "--world")?),
-                "--map" => options.map = Some(next_path(&mut arguments, "--map")?),
+                "--skin" => set_path_option(
+                    &mut options.skin,
+                    next_path(&mut arguments, "--skin")?,
+                    "--skin",
+                )?,
+                "--world" => set_path_option(
+                    &mut options.world,
+                    next_path(&mut arguments, "--world")?,
+                    "--world",
+                )?,
+                "--map" => set_path_option(
+                    &mut options.map,
+                    next_path(&mut arguments, "--map")?,
+                    "--map",
+                )?,
                 "--connect" => {
+                    if std::mem::replace(&mut connect_seen, true) {
+                        return Err("--connect may only be specified once".to_owned());
+                    }
                     let value = arguments
                         .next()
                         .ok_or_else(|| "--connect requires a loopback address".to_owned())?;
@@ -1720,13 +1751,21 @@ impl LaunchOptions {
                         return Err("--connect must use a loopback address".to_owned());
                     }
                 }
-                "--record-replay" => {
-                    options.record = Some(next_path(&mut arguments, "--record-replay")?)
-                }
-                "--replay" => options.replay = Some(next_path(&mut arguments, "--replay")?),
-                "--startup-replay" => {
-                    options.startup_replay = Some(next_path(&mut arguments, "--startup-replay")?)
-                }
+                "--record-replay" => set_path_option(
+                    &mut options.record,
+                    next_path(&mut arguments, "--record-replay")?,
+                    "--record-replay",
+                )?,
+                "--replay" => set_path_option(
+                    &mut options.replay,
+                    next_path(&mut arguments, "--replay")?,
+                    "--replay",
+                )?,
+                "--startup-replay" => set_path_option(
+                    &mut options.startup_replay,
+                    next_path(&mut arguments, "--startup-replay")?,
+                    "--startup-replay",
+                )?,
                 other if other.ends_with(".dmf") && options.skin.is_none() => {
                     options.skin = Some(PathBuf::from(argument));
                 }
@@ -1754,6 +1793,13 @@ impl LaunchOptions {
         }
         Ok(options)
     }
+}
+
+fn set_path_option(slot: &mut Option<PathBuf>, value: PathBuf, flag: &str) -> Result<(), String> {
+    if slot.replace(value).is_some() {
+        return Err(format!("{flag} may only be specified once"));
+    }
+    Ok(())
 }
 
 fn next_path(
@@ -3174,7 +3220,6 @@ struct LocalClient {
     surface: Option<Surface<OwnedDisplayHandle, Rc<Window>>>,
     runtime: ExecutionState,
     client: dm_value::DatumId,
-    skin_label: String,
     local_input_events: usize,
     inbound_ui_events: usize,
     transport: ClientTransport,
@@ -5942,6 +5987,100 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
+    fn launch_options(arguments: &[&str]) -> Result<LaunchOptions, String> {
+        LaunchOptions::parse_from(arguments.iter().map(std::ffi::OsString::from))
+    }
+
+    #[test]
+    fn launch_options_accept_each_supported_mode() {
+        let live = launch_options(&[
+            "--skin",
+            "lobby.dmf",
+            "--connect",
+            "127.0.0.1:55164",
+            "--startup-replay",
+            "startup.d64r",
+            "--record-replay",
+            "live.d64r",
+        ])
+        .expect("live launch options");
+        assert_eq!(live.skin.as_deref(), Some(Path::new("lobby.dmf")));
+        assert_eq!(live.connect.port(), 55_164);
+        assert_eq!(
+            live.startup_replay.as_deref(),
+            Some(Path::new("startup.d64r"))
+        );
+        assert_eq!(live.record.as_deref(), Some(Path::new("live.d64r")));
+
+        let replay = launch_options(&["lobby.dmf", "--replay", "lobby.d64r"])
+            .expect("replay launch options");
+        assert_eq!(replay.skin.as_deref(), Some(Path::new("lobby.dmf")));
+        assert_eq!(replay.replay.as_deref(), Some(Path::new("lobby.d64r")));
+
+        let offline = launch_options(&[
+            "--world",
+            "game.dme",
+            "--map",
+            "station.dmm",
+            "--skin",
+            "game.dmf",
+        ])
+        .expect("offline launch options");
+        assert_eq!(offline.world.as_deref(), Some(Path::new("game.dme")));
+        assert_eq!(offline.map.as_deref(), Some(Path::new("station.dmm")));
+    }
+
+    #[test]
+    fn launch_options_reject_conflicting_modes_and_invalid_connections() {
+        for (arguments, expected) in [
+            (vec!["--map", "station.dmm"], "--map requires --world"),
+            (
+                vec!["--record-replay", "a.d64r", "--replay", "b.d64r"],
+                "--record-replay and --replay are mutually exclusive",
+            ),
+            (
+                vec!["--startup-replay", "a.d64r", "--replay", "b.d64r"],
+                "--replay and --startup-replay are mutually exclusive",
+            ),
+            (
+                vec!["--world", "game.dme", "--replay", "a.d64r"],
+                "replay recording/playback cannot be combined with --world",
+            ),
+            (
+                vec!["--world", "game.dme", "--startup-replay", "a.d64r"],
+                "--startup-replay cannot be combined with --world",
+            ),
+            (
+                vec!["--connect", "192.0.2.10:51664"],
+                "--connect must use a loopback address",
+            ),
+        ] {
+            assert_eq!(launch_options(&arguments).unwrap_err(), expected);
+        }
+    }
+
+    #[test]
+    fn launch_options_reject_missing_values_duplicates_and_unknown_flags() {
+        for (arguments, expected) in [
+            (vec!["--skin"], "--skin requires a path"),
+            (
+                vec!["--skin", "one.dmf", "--skin", "two.dmf"],
+                "--skin may only be specified once",
+            ),
+            (
+                vec!["--connect", "127.0.0.1:1", "--connect", "127.0.0.1:2"],
+                "--connect may only be specified once",
+            ),
+        ] {
+            assert_eq!(launch_options(&arguments).unwrap_err(), expected);
+        }
+        assert!(
+            launch_options(&["--bogus"])
+                .unwrap_err()
+                .contains("unknown client argument")
+        );
+    }
+
     fn opaque_png(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = Vec::new();
         {
@@ -6548,6 +6687,56 @@ mod tests {
             .apply(8, duplicate, &mut session, &mut layout)
             .unwrap();
         assert_eq!(presentation.output_text["main.log"], ["ready"]);
+    }
+
+    #[test]
+    fn output_retention_tracks_the_effective_dmf_lines_property() {
+        let document = dm_dmf::parse(concat!(
+            "window \"main\"\n",
+            "\telem \"main\"\n\t\ttype = MAIN\n\t\tis-default = true\n",
+            "\telem \"log\"\n\t\ttype = OUTPUT\n\t\tlines = 2\n",
+        ));
+        let tree = ControlTree::from_document(&document);
+        let mut layout = ClientLayout::from_tree(&tree);
+        let mut session = dm_dmf::ClientSession::new(tree);
+        let mut presentation = UiPresentation::default();
+
+        presentation
+            .apply(
+                1,
+                InboundUiCommand::Output {
+                    control: Some("log".to_owned()),
+                    message: "one\ntwo\nthree".to_owned(),
+                },
+                &mut session,
+                &mut layout,
+            )
+            .unwrap();
+        assert_eq!(presentation.output_text["main.log"], ["two", "three"]);
+
+        presentation
+            .apply(
+                2,
+                InboundUiCommand::WinSet {
+                    control: "log".to_owned(),
+                    parameters: "lines=1".to_owned(),
+                },
+                &mut session,
+                &mut layout,
+            )
+            .unwrap();
+        presentation
+            .apply(
+                3,
+                InboundUiCommand::Output {
+                    control: Some("log".to_owned()),
+                    message: "four".to_owned(),
+                },
+                &mut session,
+                &mut layout,
+            )
+            .unwrap();
+        assert_eq!(presentation.output_text["main.log"], ["four"]);
     }
 
     #[test]
