@@ -13042,9 +13042,14 @@ struct AtomsProfile {
     total_instructions: u64,
     instruction_categories: Option<[u64; STARTUP_INSTRUCTION_CATEGORY_COUNT]>,
     samples: HashMap<AtomsProfileProcedure, u64>,
+    // Approximate wall time sampled at the existing 4,096-step checkpoints.
+    // Native helpers retain logical instruction accounting, so this separates
+    // expensive interpreter work from cheaply replayed reference budgets.
+    wall_sample_nanos: HashMap<AtomsProfileProcedure, u128>,
     frame_entries: HashMap<AtomsProfileProcedure, u64>,
     paths: HashMap<AtomsProfileProcedure, String>,
     instruction_samples: HashMap<AtomsProfileInstruction, u64>,
+    instruction_wall_nanos: HashMap<AtomsProfileInstruction, u128>,
     instruction_labels: HashMap<AtomsProfileInstruction, String>,
 }
 
@@ -14325,9 +14330,11 @@ fn run_frames(
                     instruction_categories: startup_instruction_profile_enabled()
                         .then_some([0; STARTUP_INSTRUCTION_CATEGORY_COUNT]),
                     samples: HashMap::new(),
+                    wall_sample_nanos: HashMap::new(),
                     frame_entries: HashMap::new(),
                     paths: HashMap::new(),
                     instruction_samples: HashMap::new(),
+                    instruction_wall_nanos: HashMap::new(),
                     instruction_labels: HashMap::new(),
                 });
                 frames[frame_index].atoms_profile_root = true;
@@ -14513,6 +14520,8 @@ fn run_frames(
             }
         }
         if executed_steps.is_multiple_of(4_096) {
+            let batch_elapsed = (dashboard_enabled || state.atoms_profile.is_some())
+                .then(|| instruction_batch.elapsed());
             account_scheduler_tick_usage(state);
             if let Some(profile) = &mut state.atoms_profile {
                 let key = AtomsProfileProcedure {
@@ -14526,6 +14535,10 @@ fn run_frames(
                         .to_owned()
                 });
                 *profile.samples.entry(key).or_default() += 1;
+                if let Some(batch_elapsed) = batch_elapsed {
+                    *profile.wall_sample_nanos.entry(key).or_default() +=
+                        batch_elapsed.as_nanos();
+                }
                 if profile.instruction_categories.is_some() {
                     let instruction_key = AtomsProfileInstruction {
                         module_identity: module.identity.0,
@@ -14536,6 +14549,12 @@ fn run_frames(
                         .instruction_samples
                         .entry(instruction_key)
                         .or_default() += 1;
+                    if let Some(batch_elapsed) = batch_elapsed {
+                        *profile
+                            .instruction_wall_nanos
+                            .entry(instruction_key)
+                            .or_default() += batch_elapsed.as_nanos();
+                    }
                     profile
                         .instruction_labels
                         .entry(instruction_key)
@@ -14561,7 +14580,7 @@ fn run_frames(
                 }
             }
             if dashboard_enabled {
-                let batch_elapsed = instruction_batch.elapsed();
+                let batch_elapsed = batch_elapsed.expect("dashboard captures batch elapsed time");
                 if batch_elapsed.as_millis() >= 250 && slow_batch_report.elapsed().as_secs() >= 30 {
                     let span = program.source_spans.get(instruction_index).copied();
                     eprintln!(
@@ -14578,6 +14597,8 @@ fn run_frames(
                     );
                     slow_batch_report = Instant::now();
                 }
+                instruction_batch = Instant::now();
+            } else if batch_elapsed.is_some() {
                 instruction_batch = Instant::now();
             }
         }
@@ -20396,6 +20417,66 @@ fn atoms_profile_lines_with_event(profile: &AtomsProfile, event: &str) -> Vec<St
                 rank + 1,
             ));
         }
+        let mut wall_instructions = profile
+            .instruction_wall_nanos
+            .iter()
+            .map(|(instruction, nanos)| (*instruction, *nanos))
+            .collect::<Vec<_>>();
+        wall_instructions.sort_by(|(left, left_nanos), (right, right_nanos)| {
+            right_nanos.cmp(left_nanos).then_with(|| {
+                profile
+                    .instruction_labels
+                    .get(left)
+                    .map_or("<missing>", String::as_str)
+                    .cmp(
+                        profile
+                            .instruction_labels
+                            .get(right)
+                            .map_or("<missing>", String::as_str),
+                    )
+            })
+        });
+        for (rank, (instruction, nanos)) in wall_instructions.into_iter().take(30).enumerate() {
+            let label = profile
+                .instruction_labels
+                .get(&instruction)
+                .map_or("<missing>", String::as_str);
+            lines.push(format!(
+                "{prefix} wall_pc_rank={} sampled_ms={} {label}",
+                rank + 1,
+                nanos / 1_000_000,
+            ));
+        }
+    }
+    let mut wall_samples = profile
+        .wall_sample_nanos
+        .iter()
+        .map(|(procedure, nanos)| (*procedure, *nanos))
+        .collect::<Vec<_>>();
+    wall_samples.sort_by(|(left, left_nanos), (right, right_nanos)| {
+        right_nanos.cmp(left_nanos).then_with(|| {
+            profile
+                .paths
+                .get(left)
+                .map_or("<missing>", String::as_str)
+                .cmp(profile.paths.get(right).map_or("<missing>", String::as_str))
+        })
+    });
+    for (rank, (procedure, nanos)) in wall_samples.into_iter().take(30).enumerate() {
+        let path = profile
+            .paths
+            .get(&procedure)
+            .map_or("<missing>", String::as_str);
+        let prefix = if let Some(root) = &profile.startup_root {
+            format!("boot-vm: startup-profile-wall subsystem={root}")
+        } else {
+            "boot-vm: atoms-profile-wall".to_owned()
+        };
+        lines.push(format!(
+            "{prefix} rank={} sampled_ms={} procedure={path}",
+            rank + 1,
+            nanos / 1_000_000,
+        ));
     }
     for (rank, procedure) in procedures.into_iter().take(30).enumerate() {
         let samples = profile.samples.get(&procedure).copied().unwrap_or(0);
@@ -30266,9 +30347,11 @@ mod tests {
             total_instructions: 0,
             instruction_categories: None,
             samples: HashMap::new(),
+            wall_sample_nanos: HashMap::new(),
             frame_entries: HashMap::new(),
             paths: HashMap::new(),
             instruction_samples: HashMap::new(),
+            instruction_wall_nanos: HashMap::new(),
             instruction_labels: HashMap::new(),
         });
         let limits = ExecutionLimits {
@@ -30344,12 +30427,14 @@ mod tests {
             total_instructions: 12_345,
             instruction_categories: None,
             samples: HashMap::from([(first_key, 2), (second_key, 3)]),
+            wall_sample_nanos: HashMap::new(),
             frame_entries: HashMap::from([(first_key, 20), (second_key, 1)]),
             paths: HashMap::from([
                 (first_key, "/proc/first".to_owned()),
                 (second_key, "/proc/second".to_owned()),
             ]),
             instruction_samples: HashMap::new(),
+            instruction_wall_nanos: HashMap::new(),
             instruction_labels: HashMap::new(),
         };
         let lines = crate::atoms_profile_lines(&profile);
@@ -30400,9 +30485,11 @@ mod tests {
             total_instructions: 28,
             instruction_categories: Some([10, 3, 4, 2, 5, 1, 3]),
             samples: HashMap::new(),
+            wall_sample_nanos: HashMap::new(),
             frame_entries: HashMap::new(),
             paths: HashMap::new(),
             instruction_samples: HashMap::new(),
+            instruction_wall_nanos: HashMap::new(),
             instruction_labels: HashMap::new(),
         };
         let lines = crate::atoms_profile_lines(&profile);
@@ -30426,9 +30513,11 @@ mod tests {
             total_instructions: 12_345,
             instruction_categories: None,
             samples: HashMap::from([(key, 3)]),
+            wall_sample_nanos: HashMap::new(),
             frame_entries: HashMap::from([(key, 9)]),
             paths: HashMap::from([(key, "/proc/hot".to_owned())]),
             instruction_samples: HashMap::new(),
+            instruction_wall_nanos: HashMap::new(),
             instruction_labels: HashMap::new(),
         };
         assert!(
