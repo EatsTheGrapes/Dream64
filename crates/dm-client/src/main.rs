@@ -2678,9 +2678,6 @@ impl RemoteTransport {
     }
 
     fn connect(address: SocketAddr, record: Option<&Path>) -> Result<Self, String> {
-        if !address.ip().is_loopback() {
-            return Err("remote client transport is restricted to loopback".to_owned());
-        }
         let stream =
             TcpStream::connect(address).map_err(|error| format!("connect {address}: {error}"))?;
         stream
