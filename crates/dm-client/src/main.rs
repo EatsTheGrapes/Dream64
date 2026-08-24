@@ -10,7 +10,7 @@ use std::{
     path::Path,
 };
 use std::{
-    io::{self, Read, Write},
+    io::{Read, Write},
     net::{IpAddr, SocketAddr, TcpStream},
 };
 
@@ -1982,6 +1982,99 @@ impl LaunchOptions {
     }
 }
 
+#[cfg(windows)]
+fn prompt_for_server() -> Result<SocketAddr, String> {
+    const SCRIPT: &str = r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'Connect to Dream64'
+$form.ClientSize = New-Object System.Drawing.Size(360, 165)
+$form.FormBorderStyle = 'FixedDialog'
+$form.StartPosition = 'CenterScreen'
+$form.MaximizeBox = $false
+$form.MinimizeBox = $false
+$form.TopMost = $true
+
+$ipLabel = New-Object System.Windows.Forms.Label
+$ipLabel.Text = 'Server IP address'
+$ipLabel.Location = New-Object System.Drawing.Point(20, 18)
+$ipLabel.AutoSize = $true
+$form.Controls.Add($ipLabel)
+
+$ip = New-Object System.Windows.Forms.TextBox
+$ip.Location = New-Object System.Drawing.Point(20, 40)
+$ip.Size = New-Object System.Drawing.Size(320, 23)
+$form.Controls.Add($ip)
+
+$portLabel = New-Object System.Windows.Forms.Label
+$portLabel.Text = 'Port'
+$portLabel.Location = New-Object System.Drawing.Point(20, 75)
+$portLabel.AutoSize = $true
+$form.Controls.Add($portLabel)
+
+$port = New-Object System.Windows.Forms.NumericUpDown
+$port.Location = New-Object System.Drawing.Point(20, 97)
+$port.Size = New-Object System.Drawing.Size(120, 23)
+$port.Minimum = 1
+$port.Maximum = 65535
+$port.Value = 51664
+$form.Controls.Add($port)
+
+$connect = New-Object System.Windows.Forms.Button
+$connect.Text = 'Connect'
+$connect.Location = New-Object System.Drawing.Point(178, 96)
+$connect.Size = New-Object System.Drawing.Size(78, 26)
+$connect.DialogResult = [System.Windows.Forms.DialogResult]::OK
+$form.AcceptButton = $connect
+$form.Controls.Add($connect)
+
+$cancel = New-Object System.Windows.Forms.Button
+$cancel.Text = 'Cancel'
+$cancel.Location = New-Object System.Drawing.Point(262, 96)
+$cancel.Size = New-Object System.Drawing.Size(78, 26)
+$cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+$form.CancelButton = $cancel
+$form.Controls.Add($cancel)
+
+$form.Add_Shown({ $ip.Focus() })
+if ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+    [Console]::Out.Write($ip.Text.Trim() + '|' + [int]$port.Value)
+    exit 0
+}
+exit 1
+"#;
+    loop {
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-STA", "-Command", SCRIPT])
+            .output()
+            .map_err(|error| format!("could not open connection window: {error}"))?;
+        if !output.status.success() {
+            return Err("connection cancelled".to_owned());
+        }
+        let response = String::from_utf8(output.stdout)
+            .map_err(|_| "connection window returned invalid text".to_owned())?;
+        let (ip, port) = response
+            .trim()
+            .split_once('|')
+            .ok_or("connection window returned an invalid address")?;
+        match (ip.parse::<IpAddr>(), port.parse::<u16>()) {
+            (Ok(ip), Ok(port @ 1..)) => return Ok(SocketAddr::new(ip, port)),
+            _ => {
+                let _ = std::process::Command::new("powershell.exe")
+                    .args([
+                        "-NoProfile",
+                        "-STA",
+                        "-Command",
+                        "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('Enter a valid server IP address.', 'Dream64', 'OK', 'Warning')",
+                    ])
+                    .status();
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
 fn prompt_for_server() -> Result<SocketAddr, String> {
     println!("Dream64 Server Connection\n");
     let ip = loop {
@@ -2005,13 +2098,14 @@ fn prompt_for_server() -> Result<SocketAddr, String> {
     Ok(SocketAddr::new(ip, port))
 }
 
+#[cfg(not(windows))]
 fn prompt_line(label: &str) -> Result<String, String> {
     print!("{label}");
-    io::stdout()
+    std::io::stdout()
         .flush()
         .map_err(|error| format!("could not display connection prompt: {error}"))?;
     let mut value = String::new();
-    io::stdin()
+    std::io::stdin()
         .read_line(&mut value)
         .map_err(|error| format!("could not read connection prompt: {error}"))?;
     Ok(value.trim().to_owned())
