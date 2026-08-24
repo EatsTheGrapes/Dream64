@@ -528,6 +528,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(windows)]
         browsers: BTreeMap::new(),
         #[cfg(windows)]
+        ready_browsers: BTreeSet::new(),
+        #[cfg(windows)]
+        pending_browser_scripts: BTreeMap::new(),
+        #[cfg(windows)]
         native_menu: None,
         #[cfg(windows)]
         browser_assets,
@@ -3613,6 +3617,10 @@ struct LocalClient {
     #[cfg(windows)]
     browsers: BTreeMap<String, WebView>,
     #[cfg(windows)]
+    ready_browsers: BTreeSet<String>,
+    #[cfg(windows)]
+    pending_browser_scripts: BTreeMap<String, Vec<String>>,
+    #[cfg(windows)]
     native_menu: Option<NativeMenuBar>,
     #[cfg(windows)]
     browser_assets: BrowserAssetServer,
@@ -3746,6 +3754,22 @@ impl LocalClient {
                         eprintln!("client-browser-topic-error: {error}");
                     } else {
                         self.schedule_screen_refresh();
+                    }
+                }
+                Some("ready") => {
+                    self.ready_browsers.insert(control.clone());
+                    let scripts = self
+                        .pending_browser_scripts
+                        .remove(&control)
+                        .unwrap_or_default();
+                    if let Some(browser) = self.browsers.get(&control) {
+                        for script in scripts {
+                            if let Err(error) = browser.evaluate_script(&script) {
+                                eprintln!(
+                                    "client-browser-script-error: control={control} error={error}"
+                                );
+                            }
+                        }
                     }
                 }
                 Some(kind) => eprintln!("client-browser-message-unsupported: {kind}"),
@@ -4395,6 +4419,8 @@ impl LocalClient {
     #[cfg(windows)]
     fn load_browser_html(&mut self, control: &str, html: &str) {
         self.ensure_browser(control);
+        self.ready_browsers.remove(control);
+        self.pending_browser_scripts.remove(control);
         let url = self.browser_assets.publish_document(html);
         if let Some(browser) = self.browsers.get(control) {
             if let Err(error) = browser.load_url(&url) {
@@ -4417,6 +4443,8 @@ impl LocalClient {
                 }
             }
         }
+        self.ready_browsers.remove(control);
+        self.pending_browser_scripts.remove(control);
         let url = self.browser_assets.url(path);
         if let Some(browser) = self.browsers.get(control)
             && let Err(error) = browser.load_url(&url)
@@ -4428,6 +4456,13 @@ impl LocalClient {
     #[cfg(windows)]
     fn execute_browser_script(&mut self, control: &str, script: &str) {
         self.ensure_browser(control);
+        if !self.ready_browsers.contains(control) {
+            self.pending_browser_scripts
+                .entry(control.to_owned())
+                .or_default()
+                .push(script.to_owned());
+            return;
+        }
         if let Some(browser) = self.browsers.get(control)
             && let Err(error) = browser.evaluate_script(script)
         {

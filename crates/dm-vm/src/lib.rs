@@ -12618,40 +12618,48 @@ impl ExecutionState {
         }
 
         let mut add_frame_roots = |frame: &CallFrame| {
-            extend_heap_root_ids(&mut datum_roots, &mut list_roots, &frame.locals);
-            extend_heap_root_ids(&mut datum_roots, &mut list_roots, &frame.stack);
-            extend_heap_root_ids(
-                &mut datum_roots,
-                &mut list_roots,
-                std::iter::once(&frame.result),
-            );
-            extend_heap_root_ids(
-                &mut datum_roots,
-                &mut list_roots,
-                std::iter::once(&frame.src),
-            );
-            extend_heap_root_ids(
-                &mut datum_roots,
-                &mut list_roots,
-                std::iter::once(&frame.usr),
-            );
-            extend_heap_root_ids(&mut datum_roots, &mut list_roots, &frame.arguments);
-            extend_heap_root_ids(
-                &mut datum_roots,
-                &mut list_roots,
-                &frame.pending_argument_roots,
-            );
-            extend_heap_root_ids(
-                &mut datum_roots,
-                &mut list_roots,
-                &frame.retained_call_roots,
-            );
-            list_roots.extend(frame.args_list);
-            extend_heap_root_ids(
-                &mut datum_roots,
-                &mut list_roots,
-                frame.caller_result_override.iter(),
-            );
+            // Engine-owned post-return continuations are suspended frames, not
+            // disposable metadata. A collection may run while their child is
+            // active, so root the complete boxed continuation chain exactly as
+            // we do for ordinary scheduler frames.
+            let mut frame = Some(frame);
+            while let Some(current) = frame {
+                extend_heap_root_ids(&mut datum_roots, &mut list_roots, &current.locals);
+                extend_heap_root_ids(&mut datum_roots, &mut list_roots, &current.stack);
+                extend_heap_root_ids(
+                    &mut datum_roots,
+                    &mut list_roots,
+                    std::iter::once(&current.result),
+                );
+                extend_heap_root_ids(
+                    &mut datum_roots,
+                    &mut list_roots,
+                    std::iter::once(&current.src),
+                );
+                extend_heap_root_ids(
+                    &mut datum_roots,
+                    &mut list_roots,
+                    std::iter::once(&current.usr),
+                );
+                extend_heap_root_ids(&mut datum_roots, &mut list_roots, &current.arguments);
+                extend_heap_root_ids(
+                    &mut datum_roots,
+                    &mut list_roots,
+                    &current.pending_argument_roots,
+                );
+                extend_heap_root_ids(
+                    &mut datum_roots,
+                    &mut list_roots,
+                    &current.retained_call_roots,
+                );
+                list_roots.extend(current.args_list);
+                extend_heap_root_ids(
+                    &mut datum_roots,
+                    &mut list_roots,
+                    current.caller_result_override.iter(),
+                );
+                frame = current.engine_post_return.as_deref();
+            }
         };
         for frame in active_frames {
             add_frame_roots(frame);
@@ -15696,15 +15704,18 @@ fn run_frames(
                 let value = if let Value::Datum(regex) = arguments[1]
                     && is_regex_datum(regex, state)
                 {
-                    replace_text_regex(
+                    let caller_context = frame_context(&frames[frame_index]);
+                    let root_len = preserve_reentrant_frame_roots(state, &frames);
+                    let result = replace_text_regex(
                         module,
                         state,
                         regex,
                         &arguments,
                         *character_indices,
-                        &frame_context(&frames[frame_index]),
-                    )
-                    .map_err(|message| execution_error(module, &frames, message))?
+                        &caller_context,
+                    );
+                    state.host_value_roots.truncate(root_len);
+                    result.map_err(|message| execution_error(module, &frames, message))?
                 } else {
                     replace_text_builtin(&arguments, *exact, *character_indices, &state.heap)
                         .map_err(|message| execution_error(module, &frames, message))?
@@ -15770,12 +15781,11 @@ fn run_frames(
                     });
                 }
                 let value = if name == "del" {
-                    execute_del(
-                        module,
-                        &arguments,
-                        state,
-                        &frame_context(&frames[frame_index]),
-                    )?
+                    let caller_context = frame_context(&frames[frame_index]);
+                    let root_len = preserve_reentrant_frame_roots(state, &frames);
+                    let result = execute_del(module, &arguments, state, &caller_context);
+                    state.host_value_roots.truncate(root_len);
+                    result?
                 } else {
                     let builtin_name = name.split_once('@').map_or(name.as_str(), |(name, _)| name);
                     execute_standard_builtin_with_usr(builtin_name, &arguments, state, &usr)
@@ -16681,15 +16691,101 @@ fn run_frames(
                                     || path.contains("/proc/_SendSignal@")
                             }) =>
                     {
-                        // DCS can retain a listener for the remainder of an
-                        // in-flight signal after that listener unregisters or
-                        // is deleted. BYOND reports the null callback lookup,
-                        // aborts only _SendSignal, and returns null to setDir;
-                        // it does not unwind the scheduler's entire Master
-                        // initialization continuation.
+                        // A receiver can unregister itself during a nested DCS
+                        // callback. If its callback table no longer contains
+                        // this sender but the sender still holds the scalar
+                        // lookup edge, remove that provably stale reciprocal
+                        // edge before aborting only this signal dispatch.
+                        let signal_frame = &frames[frame_index];
+                        let sender = match signal_frame.src {
+                            Value::Datum(sender) => Some(sender),
+                            _ => None,
+                        };
+                        let listener = signal_frame
+                            .locals
+                            .get(4)
+                            .or_else(|| signal_frame.locals.get(3))
+                            .and_then(|value| match value {
+                                Value::Datum(listener) => Some(*listener),
+                                _ => None,
+                            });
+                        let listen_lookup_field =
+                            FieldName::parse("_listen_lookup").expect("DCS field name is valid");
+                        let lookup = sender.and_then(|sender| {
+                            state
+                                .heap
+                                .datum_field(sender, &listen_lookup_field)
+                                .ok()
+                                .and_then(|value| match value {
+                                    Value::List(lookup) => Some((sender, *lookup)),
+                                    _ => None,
+                                })
+                        });
+                        let repaired = match (lookup, listener) {
+                            (Some((sender, lookup)), Some(listener)) => {
+                                let is_stale_scalar = state
+                                    .heap
+                                    .list(lookup)
+                                    .ok()
+                                    .and_then(|lookup| lookup.get_key(&key).ok())
+                                    .is_some_and(|value| {
+                                        value.semantic_eq(&Value::Datum(listener))
+                                    });
+                                if is_stale_scalar {
+                                    let empty = {
+                                        let lookup = state
+                                            .heap
+                                            .list_mut(lookup)
+                                            .expect("live DCS lookup was just read");
+                                        lookup.remove_key(&key);
+                                        lookup.len() == 0
+                                    };
+                                    if empty {
+                                        state
+                                            .heap
+                                            .set_datum_field(
+                                                sender,
+                                                listen_lookup_field,
+                                                Value::Null,
+                                            )
+                                            .expect("live DCS sender was just read");
+                                    }
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            _ => false,
+                        };
                         let error =
                             execution_error(module, &frames, "list index operation received null");
-                        eprintln!("dream64 recovered signal runtime: {error}");
+                        if repaired {
+                            if std::env::var_os("DREAM64_TRACE_SIGNAL_MISS").is_some() {
+                                eprintln!("dream64 repaired stale signal edge: {error}");
+                            }
+                        } else {
+                            eprintln!("dream64 recovered signal runtime: {error}");
+                        }
+                        if std::env::var_os("DREAM64_TRACE_SIGNAL_MISS").is_some() {
+                            let signal_frame = &frames[frame_index];
+                            eprintln!(
+                                "dream64 signal miss diagnostic: src={:?} instruction={} key={:?} locals={:?} arguments={:?}",
+                                signal_frame.src,
+                                signal_frame.instruction,
+                                key,
+                                signal_frame.locals,
+                                signal_frame.arguments,
+                            );
+                            if let Some(caller) = frames.get(frame_index.saturating_sub(1)) {
+                                eprintln!(
+                                    "dream64 signal miss caller: src={:?} procedure={:?} instruction={} locals={:?}",
+                                    caller.src,
+                                    module.procedure_path(caller.procedure),
+                                    caller.instruction,
+                                    caller.locals,
+                                );
+                            }
+                        }
                         frames.pop().expect("nested signal frame exists");
                         let caller = frames.last_mut().expect("signal caller exists");
                         caller.stack.push(Value::Null);
@@ -19248,15 +19344,18 @@ fn run_frames(
                         replacement_arguments
                             .push(arguments.get(1).cloned().unwrap_or(Value::Null));
                         replacement_arguments.extend(arguments.iter().skip(2).cloned());
-                        replace_text_regex(
+                        let caller_context = frame_context(&frames[frame_index]);
+                        let root_len = preserve_reentrant_frame_roots(state, &frames);
+                        let result = replace_text_regex(
                             module,
                             state,
                             *datum,
                             &replacement_arguments,
                             false,
-                            &frame_context(&frames[frame_index]),
-                        )
-                        .map_err(|message| execution_error(module, &frames, message))?
+                            &caller_context,
+                        );
+                        state.host_value_roots.truncate(root_len);
+                        result.map_err(|message| execution_error(module, &frames, message))?
                     } else {
                         execute_regex_method(*datum, method, &arguments, state)
                             .map_err(|message| execution_error(module, &frames, message))?
@@ -19368,7 +19467,11 @@ fn run_frames(
                     // caller here; otherwise it executes Spawn a second time
                     // with the delay already popped and underflows its stack.
                     frames[frame_index].instruction += 1;
-                    match run_frames(module, vec![spawned], limits, step_budget_behavior, state)? {
+                    let root_len = preserve_reentrant_frame_roots(state, &frames);
+                    let outcome =
+                        run_frames(module, vec![spawned], limits, step_budget_behavior, state);
+                    state.host_value_roots.truncate(root_len);
+                    match outcome? {
                         FrameRunOutcome::Complete(_) => {}
                         FrameRunOutcome::Yielded { frames, delay } => {
                             schedule_frames(state, frames, delay);
@@ -22435,6 +22538,7 @@ fn datum_field_requires_special_read(runtime_type: &TypePath, field: &FieldName)
                 | "verbs"
                 | "vis_contents"
                 | "vis_locs"
+                | "locs"
         )
 }
 
@@ -22445,12 +22549,14 @@ fn lazy_atom_list_field(
 ) -> Result<Option<Value>, String> {
     enum ListKind {
         Contents,
+        Locs,
         Ordinary,
         VisContents,
         VisLocs,
     }
     let kind = match field.as_str() {
         "contents" => ListKind::Contents,
+        "locs" => ListKind::Locs,
         "filters" | "overlays" | "underlays" | "verbs" => ListKind::Ordinary,
         "vis_contents" => ListKind::VisContents,
         "vis_locs" => ListKind::VisLocs,
@@ -22468,6 +22574,7 @@ fn lazy_atom_list_field(
     }
     let list = match kind {
         ListKind::Contents => state.ensure_contents(datum)?,
+        ListKind::Locs => return movable_locs(state, datum).map(Some),
         ListKind::VisContents => state.ensure_visibility_list(datum, true)?,
         ListKind::VisLocs => state.ensure_visibility_list(datum, false)?,
         ListKind::Ordinary => {
@@ -22484,6 +22591,104 @@ fn lazy_atom_list_field(
         }
     };
     Ok(Some(Value::List(list)))
+}
+
+/// Materializes BYOND's read-only `atom/movable.locs` view.
+///
+/// `locs` contains every turf overlapped by the movable's pixel bounds. Most
+/// movables occupy only `loc`; multi-tile machinery expands the view through
+/// `bound_*`. A fresh engine view avoids retaining one heap list on every
+/// movable that base game initialization happens to inspect.
+fn movable_locs(state: &mut ExecutionState, datum: DatumId) -> Result<Value, String> {
+    let runtime_type = state
+        .heap
+        .datum(datum)
+        .map_err(|error| error.to_string())?
+        .type_path()
+        .clone();
+    if !builtins::is_subtype(
+        state,
+        &runtime_type,
+        &TypePath::parse("/atom/movable").expect("built-in movable path is valid"),
+    ) {
+        return Ok(Value::Null);
+    }
+
+    let list = state.heap.allocate_list();
+    let loc = datum_field_or_initial(
+        state,
+        datum,
+        &FieldName::parse("loc").expect("built-in loc field is valid"),
+    )
+    .unwrap_or(Value::Null);
+    let Value::Datum(loc_datum) = loc else {
+        return Ok(Value::List(list));
+    };
+    let loc_type = state
+        .heap
+        .datum(loc_datum)
+        .map_err(|error| error.to_string())?
+        .type_path();
+    if !is_turf_type_path(loc_type) {
+        state
+            .heap
+            .list_mut(list)
+            .map_err(|error| error.to_string())?
+            .add(Value::Datum(loc_datum));
+        return Ok(Value::List(list));
+    }
+
+    let scalar = |state: &ExecutionState, name: &str, fallback: f32| {
+        datum_field_or_initial(
+            state,
+            datum,
+            &FieldName::parse(name).expect("built-in movable bounds field is valid"),
+        )
+        .ok()
+        .and_then(|value| value.as_number())
+        .filter(|value| value.is_finite())
+        .unwrap_or(fallback)
+    };
+    let bound_x = scalar(state, "bound_x", 0.0);
+    let bound_y = scalar(state, "bound_y", 0.0);
+    let bound_width = scalar(state, "bound_width", 32.0).max(1.0);
+    let bound_height = scalar(state, "bound_height", 32.0).max(1.0);
+    let icon_size = 32.0;
+    let min_dx = (bound_x / icon_size).floor() as i32;
+    let min_dy = (bound_y / icon_size).floor() as i32;
+    let max_dx = ((bound_x + bound_width - 1.0) / icon_size).floor() as i32;
+    let max_dy = ((bound_y + bound_height - 1.0) / icon_size).floor() as i32;
+
+    let Some((base_x, base_y, base_z)) =
+        builtins::datum_coordinates(state, &Value::Datum(loc_datum))
+    else {
+        state
+            .heap
+            .list_mut(list)
+            .map_err(|error| error.to_string())?
+            .add(Value::Datum(loc_datum));
+        return Ok(Value::List(list));
+    };
+    let (base_x, base_y, base_z) = (base_x as i32, base_y as i32, base_z as i32);
+    let mut locations = Vec::new();
+    for dx in min_dx..=max_dx {
+        for dy in min_dy..=max_dy {
+            if let Some(turf) = state.turf_at(base_x + dx, base_y + dy, base_z) {
+                locations.push(turf);
+            }
+        }
+    }
+    if locations.is_empty() {
+        locations.push(loc_datum);
+    }
+    let values = state
+        .heap
+        .list_mut(list)
+        .map_err(|error| error.to_string())?;
+    for location in locations {
+        values.add(Value::Datum(location));
+    }
+    Ok(Value::List(list))
 }
 
 fn world_contents_iteration_snapshot(
@@ -27324,6 +27529,68 @@ mod tests {
     }
 
     #[test]
+    fn nested_spawn_minus_one_gc_preserves_outer_frame_lists() {
+        let syntax = parse(concat!(
+            "/proc/inner()\n",
+            "\tspawn(-1)\n",
+            "\t\tvar/list/transient = list(1, 2, 3)\n",
+            "\t\tsleep(1)\n",
+            "\treturn 0\n",
+            "/proc/outer()\n",
+            "\tvar/list/kept = list(7)\n",
+            "\tinner()\n",
+            "\treturn kept[1]\n",
+        ))
+        .expect("nested spawn(-1) GC source should parse");
+        let module = compile_module(&syntax.definitions).expect("fixture should compile");
+        let mut state = ExecutionState::new();
+        state.next_list_collection = 1;
+
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/outer").unwrap(),
+                &[],
+                &mut state,
+            ),
+            Ok(Value::number(7.0)),
+            "a reentrant spawn(-1) collection must retain every outer caller frame",
+        );
+        assert_eq!(state.scheduled_task_count(), 1);
+    }
+
+    #[test]
+    fn reentrant_del_gc_preserves_outer_frame_lists() {
+        let syntax = parse(concat!(
+            "/datum/victim/Del()\n",
+            "\tvar/list/transient = list(1, 2, 3)\n",
+            "\tsleep(1)\n",
+            "/proc/remove(datum/victim/value)\n",
+            "\tdel(value)\n",
+            "/proc/outer()\n",
+            "\tvar/list/kept = list(9)\n",
+            "\tvar/datum/victim/value = new\n",
+            "\tremove(value)\n",
+            "\treturn kept[1]\n",
+        ))
+        .expect("reentrant Del GC source should parse");
+        let module = compile_module(&syntax.definitions).expect("fixture should compile");
+        let mut state = ExecutionState::new();
+        state.next_list_collection = 1;
+
+        assert_eq!(
+            execute_module_in_state(
+                &module,
+                module.procedure_id("/proc/outer").unwrap(),
+                &[],
+                &mut state,
+            ),
+            Ok(Value::number(9.0)),
+            "a reentrant Del collection must retain every outer caller frame",
+        );
+    }
+
+    #[test]
     fn heap_gc_growth_window_adapts_to_reclaim_yield() {
         assert_eq!(
             adaptive_heap_collection_growth(4_000_000, 100_000),
@@ -27498,6 +27765,61 @@ mod tests {
         assert!(state.heap().list(rooted_list).is_ok());
         assert!(state.heap().datum(garbage).is_err());
         assert!(state.heap().list(garbage_list).is_err());
+    }
+
+    #[test]
+    fn heap_gc_roots_engine_post_return_signal_graphs() {
+        let syntax = parse("/proc/noop()\n\treturn\n").expect("frame fixture should parse");
+        let module = compile_module(&syntax.definitions).expect("frame fixture should compile");
+        let procedure = module.procedure_id("/proc/noop").unwrap();
+        let program = module.procedure(procedure).unwrap();
+        let mut state = ExecutionState::new();
+
+        let listener = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/listener").unwrap());
+        let source = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/source").unwrap());
+        let signal_procs = state.heap_mut().allocate_list();
+        let source_procs = state.heap_mut().allocate_list();
+        let callback_state = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(callback_state)
+            .unwrap()
+            .add(Value::number(7.0));
+        state
+            .heap_mut()
+            .list_mut(source_procs)
+            .unwrap()
+            .set_key(Value::text("signal"), Value::List(callback_state));
+        state
+            .heap_mut()
+            .list_mut(signal_procs)
+            .unwrap()
+            .set_key(Value::Datum(source), Value::List(source_procs));
+        state
+            .heap_mut()
+            .set_datum_field(listener, field("_signal_procs"), Value::List(signal_procs))
+            .unwrap();
+
+        let garbage = state.heap_mut().allocate_list();
+        let parent_context = ExecutionContext::new(Value::Datum(listener), Value::Null);
+        let parent = make_frame(procedure, program, &[], &parent_context);
+        let child_context = ExecutionContext::new(Value::Null, Value::Null);
+        let mut child = make_frame(procedure, program, &[], &child_context);
+        child.engine_post_return = Some(Box::new(parent));
+
+        state.next_list_collection = 1;
+        state.maybe_collect_unreachable_lists(&[child]);
+
+        assert!(state.heap().datum(listener).is_ok());
+        assert!(state.heap().datum(source).is_ok());
+        assert!(state.heap().list(signal_procs).is_ok());
+        assert!(state.heap().list(source_procs).is_ok());
+        assert!(state.heap().list(callback_state).is_ok());
+        assert!(state.heap().list(garbage).is_err());
     }
 
     #[test]
@@ -32222,6 +32544,85 @@ mod tests {
     }
 
     #[test]
+    fn single_listener_signal_graph_survives_forced_quiescent_gc() {
+        REGISTER_SIGNAL_FAST_CACHE.with(|cache| cache.borrow_mut().clear());
+        let register = production_register_signal_fixture();
+        let mut state = ExecutionState::new();
+        let target = signal_fixture_datum(&mut state);
+        let listener = signal_fixture_datum(&mut state);
+        let signal = Value::text("prepare");
+        let callback = Value::text("single_callback");
+
+        assert_eq!(
+            run_signal_fixture(
+                &register,
+                &mut state,
+                listener,
+                target,
+                &signal,
+                callback.clone(),
+                None,
+            ),
+            Some(56)
+        );
+        assert_eq!(
+            signal_fixture_lookup(&state, target, &signal),
+            Value::Datum(listener),
+            "one listener stays scalar in target._listen_lookup[signal]"
+        );
+
+        // At a quiescent host boundary the target is the sole external root.
+        // Its scalar lookup must retain the listener datum, whose nested
+        // _signal_procs[target][signal] lists in turn retain the callback.
+        state.set_global(field("rooted_signal_target"), Value::Datum(target));
+        let _garbage = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/unreachable_signal_fixture").unwrap());
+        let compaction = state.compact_quiescent_heap();
+        assert_eq!(
+            signal_fixture_lookup(&state, target, &signal),
+            Value::Datum(listener),
+            "forced GC must traverse scalar associative-list datum values"
+        );
+
+        let reader = parse(
+            "/proc/read_signal(datum/target, signal)\n\
+             \tvar/datum/listener = target._listen_lookup[signal]\n\
+             \treturn listener._signal_procs[target][signal]\n",
+        )
+        .expect("single-listener signal reader should parse");
+        let reader = compile_module(&reader.definitions)
+            .expect("single-listener signal reader should compile");
+        let entry = reader.procedure_id("/proc/read_signal").unwrap();
+        assert!(matches!(
+            reader.procedure(entry).unwrap().instructions.as_slice(),
+            [
+                Instruction::LoadLocal(0),
+                Instruction::LoadDeclaredField(_),
+                Instruction::LoadLocal(1),
+                Instruction::IndexList,
+                Instruction::StoreLocal(3),
+                Instruction::LoadLocal(3),
+                Instruction::LoadDeclaredField(_),
+                Instruction::LoadLocal(0),
+                Instruction::IndexList,
+                Instruction::LoadLocal(1),
+                Instruction::IndexList,
+                Instruction::Return,
+            ]
+        ));
+        assert_eq!(
+            execute_module_in_state(&reader, entry, &[Value::Datum(target), signal], &mut state,),
+            Ok(callback),
+            "the post-GC nested read must not become null at the signal lookup"
+        );
+        assert!(
+            compaction.reclaimed_datums > 0 || compaction.reclaimed_lists > 0,
+            "the forced collection should reclaim unrelated fixture state"
+        );
+    }
+
+    #[test]
     fn register_signal_fast_path_uses_runtime_override_truthiness() {
         REGISTER_SIGNAL_FAST_CACHE.with(|cache| cache.borrow_mut().clear());
         let module = production_register_signal_fixture();
@@ -34399,6 +34800,141 @@ mod tests {
     }
 
     #[test]
+    fn single_signal_unregister_removes_both_reciprocal_edges() {
+        let source = parse(
+            "/datum/listener/proc/probe(datum/target)\n\
+\tvar/list/procs = (_signal_procs ||= list())\n\
+\tvar/list/target_procs = (procs[target] ||= list())\n\
+\ttarget_procs[\"signal\"] = \"callback\"\n\
+\tvar/list/lookup = (target._listen_lookup ||= list())\n\
+\tlookup[\"signal\"] = src\n\
+\tif(!_signal_procs || !_signal_procs[target] || !lookup)\n\
+\t\treturn 900\n\
+\tswitch(length(lookup[\"signal\"]))\n\
+\t\tif(0)\n\
+\t\t\tif(lookup[\"signal\"] != src)\n\
+\t\t\t\treturn 800\n\
+\t\t\tlookup -= \"signal\"\n\
+\t_signal_procs[target] -= \"signal\"\n\
+\tif(!_signal_procs[target].len)\n\
+\t\t_signal_procs -= target\n\
+\treturn !!lookup[\"signal\"] * 100 + !!_signal_procs[target] * 10 + lookup.len\n",
+        )
+        .expect("reciprocal signal graph source should parse");
+        let module = compile_module_specs(&[ProcedureSpec {
+            path: "/datum/listener/proc/probe@0".to_owned(),
+            definition: &source.definitions[0],
+            parent: None,
+            static_calls: BTreeMap::new(),
+            src_fields: BTreeMap::from([("_signal_procs".to_owned(), field("_signal_procs"))]),
+            global_fields: BTreeMap::new(),
+        }])
+        .expect("reciprocal signal graph source should compile");
+        let entry = module.procedure_id_at(0).expect("entry");
+        let mut state = ExecutionState::new();
+        let listener = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/listener").unwrap());
+        let target = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/target").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(listener, field("_signal_procs"), Value::Null)
+            .unwrap();
+        state
+            .heap_mut()
+            .set_datum_field(target, field("_listen_lookup"), Value::Null)
+            .unwrap();
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                entry,
+                &[Value::Datum(target)],
+                &mut state,
+                &ExecutionContext::new(Value::Datum(listener), Value::Null),
+            ),
+            Ok(Value::number(0.0)),
+            "single-listener unregister must remove both the target lookup and listener callback"
+        );
+    }
+
+    #[test]
+    fn stale_single_signal_edge_is_removed_when_callback_lookup_is_missing() {
+        let source = parse(
+            "/datum/proc/_SendSignal(sigtype, list/arguments)\n\
+\tvar/target = _listen_lookup[sigtype]\n\
+\tif(!length(target))\n\
+\t\tvar/datum/listening_datum = target\n\
+\t\treturn call(listening_datum, listening_datum._signal_procs[src][sigtype])(arglist(arguments))\n\
+/proc/probe(datum/sender, list/arguments)\n\
+\treturn sender._SendSignal(\"signal\", arguments)\n",
+        )
+        .expect("stale DCS source should parse");
+        let module = compile_module_specs(&[
+            ProcedureSpec {
+                path: "/datum/proc/_SendSignal@0".to_owned(),
+                definition: &source.definitions[0],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::from([(
+                    "_listen_lookup".to_owned(),
+                    field("_listen_lookup"),
+                )]),
+                global_fields: BTreeMap::new(),
+            },
+            ProcedureSpec {
+                path: "/proc/probe@1".to_owned(),
+                definition: &source.definitions[1],
+                parent: None,
+                static_calls: BTreeMap::new(),
+                src_fields: BTreeMap::new(),
+                global_fields: BTreeMap::new(),
+            },
+        ])
+        .expect("stale DCS source should compile");
+        let entry = module.procedure_id_at(1).expect("entry");
+        let mut state = ExecutionState::new();
+        let sender = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/sender").unwrap());
+        let listener = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/listener").unwrap());
+        let lookup = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(lookup)
+            .unwrap()
+            .set_key(Value::text("signal"), Value::Datum(listener));
+        state
+            .heap_mut()
+            .set_datum_field(sender, field("_listen_lookup"), Value::List(lookup))
+            .unwrap();
+        let signal_procs = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .set_datum_field(listener, field("_signal_procs"), Value::List(signal_procs))
+            .unwrap();
+        let arguments = state.heap_mut().allocate_list();
+        assert_eq!(
+            execute_module_in_context(
+                &module,
+                entry,
+                &[Value::Datum(sender), Value::List(arguments)],
+                &mut state,
+                &ExecutionContext::default(),
+            ),
+            Ok(Value::Null),
+        );
+        assert_eq!(
+            state.heap().datum_field(sender, &field("_listen_lookup")),
+            Ok(&Value::Null),
+            "repair must remove the stale scalar lookup from the sender"
+        );
+    }
+
+    #[test]
     fn list_literals_preserve_omitted_interior_arguments_as_null() {
         let source = parse(
             "/proc/probe()\n\tvar/list/values = list(1,,3,)\n\treturn values.len == 3 && values[1] == 1 && isnull(values[2]) && values[3] == 3\n",
@@ -34614,6 +35150,67 @@ mod tests {
                 &mut state,
             ),
             Ok(Value::number(0.0)),
+        );
+    }
+
+    #[test]
+    fn movable_locs_tracks_location_and_multitile_bounds() {
+        let syntax = parse(concat!(
+            "/proc/probe(atom/movable/thing, turf/second)\n",
+            "\treturn thing.locs.len * 100 + (second in thing.locs) * 10 + (thing.loc in thing.locs)\n",
+        ))
+        .expect("movable locs fixture should parse");
+        let program =
+            compile_procedure(&syntax.definitions[0]).expect("movable locs fixture should compile");
+        let mut state = ExecutionState::new();
+        let atom = TypePath::parse("/atom").unwrap();
+        let movable = TypePath::parse("/atom/movable").unwrap();
+        let tram = TypePath::parse("/obj/structure/transport/linear/tram").unwrap();
+        let turf = TypePath::parse("/turf").unwrap();
+        let floor = TypePath::parse("/turf/floor").unwrap();
+        state.set_type_parents(BTreeMap::from([
+            (atom.clone(), None),
+            (movable.clone(), Some(atom.clone())),
+            (tram.clone(), Some(movable)),
+            (turf.clone(), Some(atom)),
+            (floor.clone(), Some(turf)),
+        ]));
+
+        let first = state.heap_mut().allocate_datum(floor.clone());
+        let second = state.heap_mut().allocate_datum(floor);
+        for (datum, x) in [(first, 4.0), (second, 5.0)] {
+            for (name, value) in [("x", x), ("y", 7.0), ("z", 2.0)] {
+                state
+                    .heap_mut()
+                    .set_datum_field(datum, field(name), Value::number(value))
+                    .unwrap();
+            }
+        }
+        state.world_turfs.insert((4, 7, 2), first);
+        state.world_turfs.insert((5, 7, 2), second);
+
+        let thing = state.heap_mut().allocate_datum(tram);
+        for (name, value) in [
+            ("loc", Value::Datum(first)),
+            ("bound_x", Value::number(0.0)),
+            ("bound_y", Value::number(0.0)),
+            ("bound_width", Value::number(64.0)),
+            ("bound_height", Value::number(32.0)),
+        ] {
+            state
+                .heap_mut()
+                .set_datum_field(thing, field(name), value)
+                .unwrap();
+        }
+
+        assert_eq!(
+            execute_in_state(
+                &program,
+                &[Value::Datum(thing), Value::Datum(second)],
+                &mut state,
+            ),
+            Ok(Value::number(211.0)),
+            "locs must expose both the base turf and every turf overlapped by bounds",
         );
     }
 

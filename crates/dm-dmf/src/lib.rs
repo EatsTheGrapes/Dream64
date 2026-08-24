@@ -491,6 +491,7 @@ pub enum ControlTreeDiagnosticKind {
 pub struct UiState {
     tree: ControlTree,
     overrides: Vec<ControlOverride>,
+    cloned_windows: Vec<ClonedWindow>,
 }
 
 impl UiState {
@@ -500,6 +501,7 @@ impl UiState {
         Self {
             tree,
             overrides: Vec::new(),
+            cloned_windows: Vec::new(),
         }
     }
 
@@ -689,7 +691,10 @@ impl UiState {
         }
         let value = self
             .tree
-            .addressable_control(&window_id, &control_id)
+            .addressable_control(
+                self.source_window_id(&window_id),
+                self.source_control_id(&window_id, &control_id),
+            )
             .and_then(|node| {
                 node.properties
                     .iter()
@@ -714,7 +719,10 @@ impl UiState {
     ) -> Result<std::collections::BTreeMap<String, String>, UiStateError> {
         let (window_id, control_id) = self.resolve_control(control)?;
         let mut properties = std::collections::BTreeMap::<String, (String, String)>::new();
-        if let Some(node) = self.tree.addressable_control(&window_id, &control_id) {
+        if let Some(node) = self.tree.addressable_control(
+            self.source_window_id(&window_id),
+            self.source_control_id(&window_id, &control_id),
+        ) {
             for property in &node.properties {
                 properties.insert(
                     property.key.to_ascii_lowercase(),
@@ -767,7 +775,10 @@ impl UiState {
             return String::new();
         };
         self.tree
-            .addressable_control(&window_id, &control_id)
+            .addressable_control(
+                self.source_window_id(&window_id),
+                self.source_control_id(&window_id, &control_id),
+            )
             .map(|control| match control.control_type {
                 ControlType::Main => "MAIN",
                 ControlType::Map => "MAP",
@@ -820,6 +831,39 @@ impl UiState {
     ///
     /// Returns an error when either control cannot be resolved.
     pub fn winclone(&mut self, source: &str, destination: &str) -> Result<(), UiStateError> {
+        if let Some(source_section) = self
+            .tree
+            .windows
+            .iter()
+            .chain(self.tree.auxiliary.iter())
+            .find(|section| section.id == source)
+        {
+            if destination.is_empty() {
+                return Err(UiStateError::UnknownControl(destination.to_owned()));
+            }
+            let source_id = source_section.id.clone();
+            self.cloned_windows
+                .retain(|clone| clone.destination != destination);
+            self.cloned_windows.push(ClonedWindow {
+                source: source_id.clone(),
+                destination: destination.to_owned(),
+            });
+            let copied = self
+                .overrides
+                .iter()
+                .filter(|override_| override_.window_id == source_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            for mut override_ in copied {
+                override_.window_id = destination.to_owned();
+                if override_.control_id == source_id {
+                    override_.control_id = destination.to_owned();
+                }
+                let target = self.overrides_mut(&override_.window_id, &override_.control_id);
+                target.properties = override_.properties;
+            }
+            return Ok(());
+        }
         let (source_window, source_control) = self.resolve_control(source)?;
         let (destination_window, destination_control) = self.resolve_control(destination)?;
         let properties = self
@@ -889,6 +933,17 @@ impl UiState {
                     .filter(|override_| override_.control_id == address)
                     .map(|override_| (override_.window_id.as_str(), address)),
             );
+            matches.extend(self.cloned_windows.iter().filter_map(|clone| {
+                let source_control = if address == clone.destination {
+                    clone.source.as_str()
+                } else {
+                    address
+                };
+                self.tree
+                    .addressable_control(&clone.source, source_control)
+                    .is_some()
+                    .then_some((clone.destination.as_str(), address))
+            }));
             matches.sort_unstable();
             matches.dedup();
             return match matches.as_slice() {
@@ -899,6 +954,24 @@ impl UiState {
                 _ => Err(UiStateError::AmbiguousControl(address.to_owned())),
             };
         };
+        if let Some(clone) = self
+            .cloned_windows
+            .iter()
+            .find(|clone| clone.destination == window_id)
+        {
+            let source_control = if control_id == window_id {
+                clone.source.as_str()
+            } else {
+                control_id
+            };
+            if self
+                .tree
+                .addressable_control(&clone.source, source_control)
+                .is_some()
+            {
+                return Ok((window_id.to_owned(), control_id.to_owned()));
+            }
+        }
         if let Some(override_) = self.overrides.iter().find(|override_| {
             (override_.window_id == window_id
                 || override_.window_id.strip_prefix("macro:") == Some(window_id)
@@ -932,6 +1005,20 @@ impl UiState {
         self.overrides
             .last_mut()
             .expect("a runtime override was just added")
+    }
+
+    fn source_window_id<'a>(&'a self, window_id: &'a str) -> &'a str {
+        self.cloned_windows
+            .iter()
+            .find(|clone| clone.destination == window_id)
+            .map_or(window_id, |clone| clone.source.as_str())
+    }
+
+    fn source_control_id<'a>(&'a self, window_id: &str, control_id: &'a str) -> &'a str {
+        self.cloned_windows
+            .iter()
+            .find(|clone| clone.destination == window_id && control_id == clone.destination)
+            .map_or(control_id, |clone| clone.source.as_str())
     }
 }
 
@@ -1179,6 +1266,7 @@ pub const WEBVIEW2_BYOND_BRIDGE_BOOTSTRAP: &str = r#"(() => {
     topic(topic) { send({ kind: "topic", topic }); },
     ui(command) { send({ kind: "ui", command }); }
   });
+  window.addEventListener("DOMContentLoaded", () => send({ kind: "ready" }), { once: true });
 })();"#;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1186,6 +1274,12 @@ struct ControlOverride {
     window_id: String,
     control_id: String,
     properties: Vec<RuntimeProperty>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClonedWindow {
+    source: String,
+    destination: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
