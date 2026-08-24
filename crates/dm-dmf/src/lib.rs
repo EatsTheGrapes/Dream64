@@ -2159,6 +2159,42 @@ mod tests {
     }
 
     #[test]
+    fn winclone_creates_a_runtime_window_and_accepts_tgui_children() {
+        let document = parse(
+            "window \"popupwindow\"\n\telem \"popupwindow\"\n\t\ttype = MAIN\n\t\tsize = 120x120\n",
+        );
+        let mut state = super::UiState::new(ControlTree::from_document(&document));
+
+        state
+            .winclone("popupwindow", "tgui-window-1")
+            .expect("BYOND winclone creates a new window id");
+        state
+            .winset("tgui-window-1", "title=Character Setup;is-visible=true")
+            .expect("the cloned main control is addressable by its new window id");
+        state
+            .winset(
+                "tgui-window-1.browser",
+                "parent=tgui-window-1;type=BROWSER;pos=0,0;size=640x480",
+            )
+            .expect("runtime children can be parented to the cloned window");
+
+        assert!(state.winexists("tgui-window-1"));
+        assert!(state.winexists("tgui-window-1.browser"));
+        assert_eq!(
+            state.winget("tgui-window-1", "size"),
+            Ok("120x120".to_owned())
+        );
+        assert_eq!(
+            state.winget("tgui-window-1", "title"),
+            Ok("Character Setup".to_owned())
+        );
+        assert_eq!(
+            state.winget("tgui-window-1.browser", "type"),
+            Ok("BROWSER".to_owned())
+        );
+    }
+
+    #[test]
     fn winget_semicolon_control_list_returns_byond_keyed_params() {
         let document = parse(
             "window \"main\"\n\telem \"split\"\n\t\ttype = CHILD\n\t\tsize = 1920x1030\nwindow \"mapwindow\"\n\telem \"mapwindow\"\n\t\ttype = MAIN\n\t\tsize = 1248x1030\n",
