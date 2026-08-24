@@ -107,6 +107,8 @@ const NATIVE_PARENT_BUILTINS: &str = concat!(
     // `/datum/New` or `/datum/Del` declaration exists.
     "/datum/New(...)\n\treturn null\n",
     "/datum/Del()\n\treturn null\n",
+    "/datum/Topic(href, list/href_list)\n\treturn null\n",
+    "/client/Click(object, location, control, params)\n\treturn null\n",
     // BYOND owns the terminal movable Bump implementation. Its ordinary
     // obstacle path has no action and returns null; retaining the entry is
     // nevertheless required so a source override can legally call `..()`.
@@ -1435,6 +1437,7 @@ impl ProcedureRegistry {
     )> {
         let static_registry = VariableRegistry::build(compilation);
         let direct_fields = direct_instance_fields(&static_registry);
+        let direct_field_types = direct_instance_field_types(compilation, &static_registry);
         let direct_static_fields = direct_static_fields(&static_registry);
         let global_fields = declared_global_fields(compilation);
         let global_types = declared_global_types(compilation);
@@ -1450,6 +1453,7 @@ impl ProcedureRegistry {
                         compilation,
                         [implementation],
                         &direct_fields,
+                        &direct_field_types,
                         &mut inherited_field_cache,
                         &direct_static_fields,
                         &mut inherited_static_field_cache,
@@ -1471,6 +1475,7 @@ impl ProcedureRegistry {
     ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
         let static_registry = VariableRegistry::build(compilation);
         let direct_fields = direct_instance_fields(&static_registry);
+        let direct_field_types = direct_instance_field_types(compilation, &static_registry);
         let direct_static_fields = direct_static_fields(&static_registry);
         let global_fields = declared_global_fields(compilation);
         let global_types = declared_global_types(compilation);
@@ -1481,6 +1486,7 @@ impl ProcedureRegistry {
             compilation,
             selected,
             &direct_fields,
+            &direct_field_types,
             &mut inherited_field_cache,
             &direct_static_fields,
             &mut inherited_static_field_cache,
@@ -1500,6 +1506,7 @@ impl ProcedureRegistry {
     ) -> Result<ExecutableProcedures, dm_vm::CompileError> {
         let static_registry = VariableRegistry::build(compilation);
         let direct_fields = direct_instance_fields(&static_registry);
+        let direct_field_types = direct_instance_field_types(compilation, &static_registry);
         let direct_static_fields = direct_static_fields(&static_registry);
         let global_fields = declared_global_fields(compilation);
         let global_types = declared_global_types(compilation);
@@ -1510,6 +1517,7 @@ impl ProcedureRegistry {
             compilation,
             selected,
             &direct_fields,
+            &direct_field_types,
             &mut inherited_field_cache,
             &direct_static_fields,
             &mut inherited_static_field_cache,
@@ -1527,6 +1535,7 @@ impl ProcedureRegistry {
         compilation: &Compilation,
         selected: impl IntoIterator<Item = ProcedureImplementationId>,
         direct_fields: &BTreeMap<NodeId, BTreeMap<String, FieldName>>,
+        direct_field_types: &BTreeMap<NodeId, BTreeMap<String, TypePath>>,
         _inherited_field_cache: &mut BTreeMap<NodeId, BTreeMap<String, FieldName>>,
         direct_static_fields: &BTreeMap<NodeId, BTreeMap<String, FieldName>>,
         _inherited_static_field_cache: &mut BTreeMap<NodeId, BTreeMap<String, FieldName>>,
@@ -1863,17 +1872,31 @@ impl ProcedureRegistry {
         }
         let mut spec_global_types = normalized_definitions
             .iter()
-            .map(|definition| {
+            .enumerate()
+            .map(|(index, definition)| {
                 let referenced = referenced_identifiers(definition);
                 typed_global_index_lookups.set(typed_global_index_lookups.get() + referenced.len());
-                referenced
+                let mut types = referenced
                     .iter()
                     .filter_map(|name| {
                         global_types
                             .get(name)
                             .map(|path| (name.clone(), path.clone()))
                     })
-                    .collect::<BTreeMap<_, _>>()
+                    .collect::<BTreeMap<_, _>>();
+                if let Some(owner) = ordered[index].0.owner_type {
+                    // A bare identifier that resolves to a src field carries
+                    // its declared type into unqualified `istype(value)`.
+                    // BYOND uses this for guards such as `istype(suit)` where
+                    // `suit` is a typed instance field rather than a local.
+                    types.extend(referenced_inherited_field_types(
+                        compilation,
+                        owner,
+                        direct_field_types,
+                        &referenced,
+                    ));
+                }
+                types
             })
             .collect::<Vec<_>>();
         spec_global_types.resize_with(specs.len(), BTreeMap::new);
@@ -5035,6 +5058,71 @@ fn direct_instance_fields(
         }
     }
     fields
+}
+
+fn direct_instance_field_types(
+    compilation: &Compilation,
+    registry: &VariableRegistry,
+) -> BTreeMap<NodeId, BTreeMap<String, TypePath>> {
+    let mut types = BTreeMap::<NodeId, BTreeMap<String, TypePath>>::new();
+    for entry in registry
+        .entries()
+        .iter()
+        .filter(|entry| entry.storage == StorageClass::Instance)
+    {
+        let Some(owner) = entry.owner.as_ref().map(|owner| owner.node) else {
+            continue;
+        };
+        let Some(name) = entry.path.rsplit('/').next() else {
+            continue;
+        };
+        let Some(definition) = compilation
+            .syntax(entry.file_id)
+            .and_then(|syntax| syntax.definitions.get(entry.definition_index))
+        else {
+            continue;
+        };
+        let Some(path) = declared_type_path(&definition.header, name) else {
+            continue;
+        };
+        let Ok(path) = TypePath::parse(&path.to_string()) else {
+            continue;
+        };
+        types
+            .entry(owner)
+            .or_default()
+            .insert(name.to_owned(), path);
+    }
+    types
+}
+
+fn referenced_inherited_field_types(
+    compilation: &Compilation,
+    owner: NodeId,
+    direct_types: &BTreeMap<NodeId, BTreeMap<String, TypePath>>,
+    referenced: &BTreeSet<String>,
+) -> BTreeMap<String, TypePath> {
+    let tree = compilation.code_tree();
+    let mut current = Some(owner);
+    let mut unresolved = referenced.clone();
+    let mut types = BTreeMap::new();
+    while let Some(node) = current {
+        if let Some(available) = direct_types.get(&node) {
+            let resolved = unresolved
+                .iter()
+                .filter_map(|name| available.get(name).map(|path| (name.clone(), path.clone())))
+                .collect::<Vec<_>>();
+            for (name, path) in resolved {
+                unresolved.remove(&name);
+                types.insert(name, path);
+            }
+        }
+        if unresolved.is_empty() {
+            break;
+        }
+        current = tree.node(node).and_then(|type_node| type_node.parent_type);
+    }
+    types
 }
 
 /// Adds the fields supplied by BYOND's built-in datum and atom hierarchies.
@@ -8787,6 +8875,28 @@ GLOBAL_REAL(Master, /datum/controller/master)
         );
         assert_eq!(error.source_span, Some(expected_span));
         assert_eq!(error.call_stack.len(), 1);
+    }
+
+    #[test]
+    fn engine_owned_topic_and_click_methods_supply_terminal_parent_targets() {
+        let compilation = TestProject::compile(
+            "/datum/Topic(href, list/href_list)\n\treturn ..()\n/client/Click(object, location, control, params)\n\treturn ..()\n/proc/run()\n\tvar/datum/target = new\n\tvar/client/user = new\n\treturn isnull(target.Topic(\"x\", list())) + isnull(user.Click(null, null, null, null))\n",
+        );
+        assert_eq!(
+            execute_effective(&compilation, "/proc/run", &[]),
+            Ok(Value::number(2.0)),
+        );
+    }
+
+    #[test]
+    fn unqualified_istype_uses_typed_src_field_declarations() {
+        let compilation = TestProject::compile(
+            "/obj/item\n/obj/item/space\n/obj/item/explorer\n/datum/holder\n\tvar/obj/item/space/suit\n\tproc/check()\n\t\treturn istype(suit)\n/proc/run()\n\tvar/datum/holder/holder = new\n\tholder.suit = new /obj/item/explorer\n\tvar/incompatible = holder.check()\n\tholder.suit = new /obj/item/space\n\treturn incompatible * 10 + holder.check()\n",
+        );
+        assert_eq!(
+            execute_effective(&compilation, "/proc/run", &[]),
+            Ok(Value::number(1.0)),
+        );
     }
 
     #[test]

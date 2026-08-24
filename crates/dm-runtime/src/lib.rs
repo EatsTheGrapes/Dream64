@@ -4017,7 +4017,7 @@ mod tests {
         fixture.write("world.dme", "#include \"types.dm\"\n");
         fixture.write(
             "types.dm",
-            "/var/global/datum/log_holder/logger = new /datum/log_holder\n/datum/log_holder\n\tvar/list/waiting_log_calls\n\tvar/initialized = FALSE\n",
+            "/var/global/datum/log_holder/logger = new /datum/log_holder\n/datum/item\n/datum/log_holder\n\tvar/list/waiting_log_calls\n\tvar/list/datum/item/typed_waiting_log_calls\n\tvar/initialized = FALSE\n",
         );
         let image = fixture.image();
         let Value::Datum(logger) = &image.variable("/var/logger").expect("logger global").value
@@ -4028,6 +4028,11 @@ mod tests {
             effective_image_field(&image, *logger, &field("waiting_log_calls")),
             Some(Value::Null),
             "an uninitialized declaration is still a real null-valued field"
+        );
+        assert_eq!(
+            effective_image_field(&image, *logger, &field("typed_waiting_log_calls")),
+            Some(Value::Null),
+            "an uninitialized typed list declaration must also remain null"
         );
         assert_eq!(
             effective_image_field(&image, *logger, &field("initialized")),

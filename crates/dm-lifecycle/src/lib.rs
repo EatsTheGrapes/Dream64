@@ -2014,7 +2014,10 @@ fn drain_startup_scheduler(
         drain.completed_tasks,
         drain.pending_tasks
     );
-    if drain.termination == SchedulerDrainTermination::RoundLimit {
+    if !matches!(
+        drain.termination,
+        SchedulerDrainTermination::HeadlessReady | SchedulerDrainTermination::StableIdle
+    ) {
         for line in state.bounded_scheduler_progress(executable.module()) {
             eprintln!("boot-progress: bounded-dm-frame {line}");
         }

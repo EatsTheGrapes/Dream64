@@ -782,6 +782,38 @@ impl UiState {
             .to_owned()
     }
 
+    /// Returns addressable control identifiers in a window/menu/macro section,
+    /// including controls created at runtime with `winset(parent=...)`.
+    /// Source order and runtime insertion order are preserved.
+    pub fn section_control_ids(&self, namespace: &str) -> Result<Vec<String>, UiStateError> {
+        let section = self
+            .tree
+            .windows
+            .iter()
+            .chain(self.tree.auxiliary.iter())
+            .find(|section| {
+                section.id == namespace
+                    || section.id.strip_prefix("macro:") == Some(namespace)
+                    || section.id.strip_prefix("menu:") == Some(namespace)
+            })
+            .ok_or_else(|| UiStateError::UnknownControl(namespace.to_owned()))?;
+        let mut ids = section
+            .controls
+            .iter()
+            .filter_map(|control| control.id.clone())
+            .collect::<Vec<_>>();
+        for override_ in self
+            .overrides
+            .iter()
+            .filter(|override_| override_.window_id == section.id)
+        {
+            if !ids.contains(&override_.control_id) {
+                ids.push(override_.control_id.clone());
+            }
+        }
+        Ok(ids)
+    }
+
     /// Copies runtime overrides from one control to another.
     ///
     /// # Errors
@@ -803,6 +835,40 @@ impl UiState {
     }
 
     fn resolve_control(&self, address: &str) -> Result<(String, String), UiStateError> {
+        if let Some(selector) = address.strip_prefix(':') {
+            let expected = ControlType::from_dmf(selector);
+            if expected != ControlType::Unknown {
+                let mut matches = self
+                    .tree
+                    .windows
+                    .iter()
+                    .chain(self.tree.auxiliary.iter())
+                    .flat_map(|window| {
+                        window.controls.iter().filter_map(move |control| {
+                            (control.control_type == expected).then_some((window, control))
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                matches.sort_by_key(|(window, control)| {
+                    let is_default = control.property("is-default").is_some_and(|value| {
+                        matches!(
+                            value.trim().to_ascii_lowercase().as_str(),
+                            "true" | "yes" | "1"
+                        )
+                    });
+                    (
+                        !is_default,
+                        window.id.as_str(),
+                        control.id.as_deref().unwrap_or(""),
+                    )
+                });
+                if let Some((window, control)) = matches.first()
+                    && let Some(control_id) = control.id.as_deref()
+                {
+                    return Ok((window.id.clone(), control_id.to_owned()));
+                }
+            }
+        }
         let Some((window_id, control_id)) = address.split_once('.') else {
             let mut matches: Vec<_> = self
                 .tree
@@ -1935,6 +2001,19 @@ mod tests {
             state.winget("Shift", "command"),
             Ok(".winset :map.right-click=false".to_owned())
         );
+    }
+
+    #[test]
+    fn byond_type_selectors_resolve_default_controls_case_insensitively() {
+        let document = parse(
+            "window \"secondary\"\n\telem \"other_input\"\n\t\ttype = INPUT\nwindow \"main\"\n\telem \"input\"\n\t\ttype = INPUT\n\t\tis-default = true\n\telem \"map\"\n\t\ttype = MAP\n\t\tis-default = true\n",
+        );
+        let mut state = super::UiState::new(ControlTree::from_document(&document));
+
+        state.winset(":map", "right-click=false").unwrap();
+        assert_eq!(state.winget(":MAP", "right-click"), Ok("false".to_owned()));
+        assert_eq!(state.winget(":Input", "type"), Ok("INPUT".to_owned()));
+        assert_eq!(state.winget(":input", "is-default"), Ok("true".to_owned()));
     }
 
     #[test]

@@ -12,6 +12,7 @@ members = [
 	"crates/dm-lowering",
 	"crates/dm-map",
 	"crates/dm-mmap",
+	"crates/dm-native-menu",
 	"crates/dm-object-tree",
 	"crates/dm-project",
 	"crates/dm-runtime",

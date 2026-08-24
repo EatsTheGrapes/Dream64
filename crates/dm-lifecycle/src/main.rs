@@ -5,9 +5,9 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
 use std::io::{BufRead as _, BufReader, BufWriter, Read as _, Write as _};
-use std::net::TcpListener;
+use std::net::{IpAddr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dm_compiler::{Compilation, CompilerDatabase};
@@ -163,6 +163,34 @@ fn main() -> ExitCode {
         })
 }
 
+fn report_public_endpoint(port: u16) {
+    let _ = std::thread::Builder::new()
+        .name("dream64-public-ip".to_owned())
+        .spawn(move || {
+            let output = ProcessCommand::new("curl")
+                .args([
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--max-time",
+                    "5",
+                    "https://api.ipify.org",
+                ])
+                .output();
+            let Ok(output) = output else {
+                eprintln!("server-network: public IP discovery unavailable");
+                return;
+            };
+            let address = String::from_utf8_lossy(&output.stdout);
+            match address.trim().parse::<IpAddr>() {
+                Ok(address) => eprintln!(
+                    "server-network: public-endpoint={address}:{port} tcp-port-forward-required=true"
+                ),
+                Err(_) => eprintln!("server-network: public IP discovery unavailable"),
+            }
+        });
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_main() -> ExitCode {
     let process_started = Instant::now();
@@ -244,7 +272,7 @@ fn run_main() -> ExitCode {
         && !matches!(&ready_world_mode, ReadyWorldMode::Prewarm(_))
     {
         let ipc_address =
-            env::var("DREAM64_IPC_ADDR").unwrap_or_else(|_| "127.0.0.1:51664".to_owned());
+            env::var("DREAM64_IPC_ADDR").unwrap_or_else(|_| "0.0.0.0:51664".to_owned());
         let ipc = match parse_loopback_address(&ipc_address)
             .and_then(|address| LoopbackIpc::bind_starting(address, "Validating compiled project"))
         {
@@ -258,6 +286,7 @@ fn run_main() -> ExitCode {
             "server-progress: loopback-ipc={} startup=validation",
             ipc.local_addr()
         );
+        report_public_endpoint(ipc.local_addr().port());
         Some(ipc)
     } else {
         None
@@ -828,6 +857,7 @@ fn run_main() -> ExitCode {
             return ExitCode::FAILURE;
         }
         if let Some(state) = precompiled.persistent_state_mut() {
+            inspect_ready_globals(state);
             let compaction = state.compact_quiescent_heap();
             eprintln!(
                 "boot-progress: ready-heap-compaction reclaimed_datums={} reclaimed_lists={} elapsed_ms={}",
@@ -895,6 +925,80 @@ fn run_main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Prints selected live global datum fields at the authoritative-ready
+/// boundary. This is deliberately opt-in: production servers retain the same
+/// output and behavior, while compatibility investigations can inspect the
+/// actual VM heap without adding game-specific knowledge to the engine.
+///
+/// Syntax: `DREAM64_READY_INSPECT=SSmapping:z_list,z_level_to_stack;Master:processing`.
+fn inspect_ready_globals(state: &dm_vm::ExecutionState) {
+    let Some(specification) = env::var_os("DREAM64_READY_INSPECT")
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return;
+    };
+    for entry in specification
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let (global_name, fields) = entry.split_once(':').unwrap_or((entry, ""));
+        let Ok(global) = FieldName::parse(global_name.trim()) else {
+            eprintln!("ready-inspect: global={global_name} error=invalid-global-name");
+            continue;
+        };
+        let value = state.global(&global).cloned().unwrap_or(Value::Null);
+        eprintln!(
+            "ready-inspect: global={} value={}",
+            global,
+            inspected_value(state, &value),
+        );
+        let Value::Datum(datum) = value else {
+            continue;
+        };
+        for field_name in fields
+            .split(',')
+            .map(str::trim)
+            .filter(|field| !field.is_empty())
+        {
+            let Ok(field) = FieldName::parse(field_name) else {
+                eprintln!(
+                    "ready-inspect: global={} field={} error=invalid-field-name",
+                    global, field_name,
+                );
+                continue;
+            };
+            match state.heap().datum_field(datum, &field) {
+                Ok(value) => eprintln!(
+                    "ready-inspect: global={} field={} value={}",
+                    global,
+                    field,
+                    inspected_value(state, value),
+                ),
+                Err(error) => eprintln!(
+                    "ready-inspect: global={} field={} error={error}",
+                    global, field,
+                ),
+            }
+        }
+    }
+}
+
+fn inspected_value(state: &dm_vm::ExecutionState, value: &Value) -> String {
+    match value {
+        Value::List(list) => state.heap().list(*list).map_or_else(
+            |error| format!("list({list:?}, error={error})"),
+            |value| format!("list({list:?}, len={})", value.len()),
+        ),
+        Value::Datum(datum) => state.heap().datum(*datum).map_or_else(
+            |error| format!("datum({datum:?}, error={error})"),
+            |value| format!("datum({datum:?}, type={})", value.type_path()),
+        ),
+        value => format!("{value:?}"),
+    }
+}
+
 fn run_prewarmed_standby(
     runtime: &mut RuntimeImage,
     precompiled: &mut dm_lifecycle::PrecompiledLifecycle,
@@ -951,7 +1055,7 @@ fn run_prewarmed_standby(
     }
     drop(listener);
 
-    let ipc_address = env::var("DREAM64_IPC_ADDR").unwrap_or_else(|_| "127.0.0.1:51664".to_owned());
+    let ipc_address = env::var("DREAM64_IPC_ADDR").unwrap_or_else(|_| "0.0.0.0:51664".to_owned());
     let ipc_address = match parse_loopback_address(&ipc_address) {
         Ok(address) => address,
         Err(error) => {
@@ -983,6 +1087,7 @@ fn run_prewarmed_standby(
             }
         }
     };
+    report_public_endpoint(ipc.local_addr().port());
     eprintln!(
         "boot-progress: prewarmed handoff complete ipc={} deployment={:?}",
         ipc.local_addr(),
@@ -1369,7 +1474,7 @@ fn run_lobby_preflight(
     state.rebuild_world_geometry();
     if serve {
         let ipc_address =
-            env::var("DREAM64_IPC_ADDR").unwrap_or_else(|_| "127.0.0.1:51664".to_owned());
+            env::var("DREAM64_IPC_ADDR").unwrap_or_else(|_| "0.0.0.0:51664".to_owned());
         let mut ipc = match parse_loopback_address(&ipc_address).and_then(LoopbackIpc::bind) {
             Ok(ipc) => ipc,
             Err(error) => {
@@ -1377,6 +1482,7 @@ fn run_lobby_preflight(
                 return ExitCode::FAILURE;
             }
         };
+        report_public_endpoint(ipc.local_addr().port());
         eprintln!(
             "lobby-preview: ready project={} loopback-ipc={} hidden_guests=0 elapsed_ms={}",
             environment.display(),

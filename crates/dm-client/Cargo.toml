@@ -27,6 +27,7 @@ wgpu = { version = "26.0.1", default-features = false, features = ["std", "parki
 winit = "0.30.13"
 
 [target.'cfg(windows)'.dependencies]
+dm-native-menu = { path = "../dm-native-menu" }
 wry = "0.53"
 
 [lints]

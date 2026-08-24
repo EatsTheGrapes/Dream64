@@ -11565,6 +11565,38 @@ impl ExecutionState {
         })
     }
 
+    /// Returns the turf coordinates observed by a client camera. BYOND uses
+    /// `client.eye` for map projection and falls back to the controlled mob
+    /// when no explicit eye is installed.
+    pub fn local_client_view_coordinates(
+        &self,
+        client: DatumId,
+    ) -> Result<(i32, i32, i32), String> {
+        let mob = *self
+            .local_client_mobs
+            .get(&client)
+            .ok_or_else(|| "local client is not attached to a mob".to_owned())?;
+        let eye = datum_field_or_initial(
+            self,
+            client,
+            &FieldName::parse("eye").expect("client eye field"),
+        )
+        .map_err(|error| error.to_string())?;
+        if let Value::Datum(eye) = eye {
+            if let Some(coordinate) = self
+                .world_turfs
+                .iter()
+                .find_map(|(coordinate, turf)| (*turf == eye).then_some(*coordinate))
+            {
+                return Ok(coordinate);
+            }
+            if let Ok(coordinate) = self.local_client_coordinates(eye) {
+                return Ok(coordinate);
+            }
+        }
+        self.local_client_coordinates(mob)
+    }
+
     /// Copies one Z level into a stable transport-owned map snapshot.
     #[must_use]
     pub fn local_client_map_snapshot(&self, z: i32) -> LocalClientMapSnapshot {
@@ -17568,15 +17600,10 @@ fn run_frames(
                             .map_err(|message| execution_error(module, &frames, message))?;
                         let new_len = match &value {
                             Value::Number(number) if number.to_f32().is_finite() => {
-                                let length = number.to_f32().trunc();
-                                if length < 0.0 {
-                                    return Err(execution_error(
-                                        module,
-                                        &frames,
-                                        "list length cannot be negative",
-                                    ));
-                                }
-                                dm_list_resize_length(length)
+                                // BYOND clips negative list lengths to zero. This is
+                                // observable during normal SS13 stack merging, where an
+                                // emptied stack can refresh its overlays before deletion.
+                                dm_list_resize_length(number.to_f32().trunc().max(0.0))
                             }
                             _ => 0,
                         };
@@ -17939,14 +17966,7 @@ fn run_frames(
                             .then(|| state.visibility_members(list))
                             .transpose()
                             .map_err(|message| execution_error(module, &frames, message))?;
-                        let length = updated.as_number().unwrap_or(0.0).trunc();
-                        if length < 0.0 {
-                            return Err(execution_error(
-                                module,
-                                &frames,
-                                "list length cannot be negative",
-                            ));
-                        }
+                        let length = updated.as_number().unwrap_or(0.0).trunc().max(0.0);
                         if state.is_associative_list(list) && length != 0.0 {
                             return Err(execution_error(
                                 module,
@@ -26772,15 +26792,15 @@ mod tests {
         let entry = module.procedure_id("/proc/run").expect("entry");
         assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(22.0)));
 
-        let negative = parse("/proc/run()\n\tvar/list/items = list()\n\titems.len--\n")
-            .expect("negative source parses");
+        let negative = parse(
+            "/proc/run()\n\tvar/list/items = list()\n\titems.len--\n\titems.len = -4\n\tvar/list/overlays = list(1)\n\toverlays.len += -2\n\treturn items.len + overlays.len\n",
+        )
+        .expect("negative source parses");
         let negative = compile_module(&negative.definitions).expect("negative source compiles");
         let entry = negative.procedure_id("/proc/run").expect("entry");
-        assert!(
-            execute_module(&negative, entry, &[])
-                .expect_err("negative length must fail")
-                .message
-                .contains("cannot be negative")
+        assert_eq!(
+            execute_module(&negative, entry, &[]),
+            Ok(Value::number(0.0))
         );
     }
 
@@ -27253,6 +27273,53 @@ mod tests {
         assert_eq!(
             advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
             Ok(vec![Value::number(7.0)])
+        );
+    }
+
+    #[test]
+    fn arglist_caller_and_callee_keep_the_original_list_across_sleep() {
+        let syntax = parse(concat!(
+            "/datum/atom/proc/Initialize(mapload)\n",
+            "\tsleep(1)\n",
+            "\treturn 1\n",
+            "/datum/atoms/proc/InitAtom(datum/atom/A, list/arguments)\n",
+            "\tvar/result = A.Initialize(arglist(arguments))\n",
+            "\tif(result == 1)\n",
+            "\t\treturn arguments[1]\n",
+            "\treturn 0\n",
+            "/datum/atoms/proc/CreateAtoms()\n",
+            "\tvar/list/mapload_arg = list(TRUE)\n",
+            "\tvar/datum/atom/A = new\n",
+            "\treturn src.InitAtom(A, mapload_arg)\n",
+        ))
+        .expect("InitAtom-shaped sleeping arglist source should parse");
+        let module = compile_module(&syntax.definitions).expect("fixture should compile");
+        let entry = module
+            .procedure_id("/datum/atoms/proc/CreateAtoms")
+            .expect("CreateAtoms entry should exist");
+        let mut state = ExecutionState::new();
+        let subsystem = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/atoms").unwrap());
+        let context = ExecutionContext::new(Value::Datum(subsystem), Value::Null);
+        state.next_list_collection = 1;
+
+        assert_eq!(
+            super::execute_module_with_limits_in_context(
+                &module,
+                entry,
+                &[],
+                ExecutionLimits::default(),
+                &mut state,
+                &context,
+            ),
+            Ok(Value::Null),
+        );
+        assert_eq!(state.scheduled_task_count(), 1);
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::number(1.0)]),
+            "arglist expansion must not let GC reclaim a caller-visible list",
         );
     }
 
@@ -41349,6 +41416,34 @@ mod tests {
         assert_eq!(snapshot.screen.len(), 1);
         assert_eq!(snapshot.screen[0].map_control, None);
         assert_eq!(snapshot.screen[0].screen_loc, "TOP:-87,CENTER:+100");
+    }
+
+    #[test]
+    fn local_client_camera_prefers_eye_over_mob_location() {
+        let mut state = ExecutionState::new();
+        for (x, y) in [(1, 1), (17, 23)] {
+            let turf = state.heap.allocate_datum(TypePath::parse("/turf").unwrap());
+            state.ensure_contents(turf).unwrap();
+            state.world_turfs.insert((x, y, 1), turf);
+        }
+        let attached = state.create_attached_local_client().unwrap();
+        assert_eq!(
+            state
+                .local_client_view_coordinates(attached.client)
+                .unwrap(),
+            (1, 1, 1)
+        );
+        let eye = state.world_turfs[&(17, 23, 1)];
+        state
+            .heap
+            .set_datum_field(attached.client, field("eye"), Value::Datum(eye))
+            .unwrap();
+        assert_eq!(
+            state
+                .local_client_view_coordinates(attached.client)
+                .unwrap(),
+            (17, 23, 1)
+        );
     }
 
     #[test]

@@ -165,7 +165,7 @@ impl LoopbackIpc {
         format!("ok {phase} protocol=7 session={session}")
     }
 
-    /// Binds a localhost listener and starts its framing thread.
+    /// Binds the configured listener and starts its framing thread.
     pub fn bind(address: SocketAddr) -> Result<Self, String> {
         Self::bind_with_startup_gate(address, None)
     }
@@ -188,9 +188,6 @@ impl LoopbackIpc {
         address: SocketAddr,
         startup_gate: Option<Arc<StartupGate>>,
     ) -> Result<Self, String> {
-        if !address.ip().is_loopback() {
-            return Err("IPC listener must bind to a loopback address".into());
-        }
         let listener = TcpListener::bind(address).map_err(|e| e.to_string())?;
         let address = listener.local_addr().map_err(|e| e.to_string())?;
         let (sender, requests) = mpsc::channel();
@@ -562,17 +559,17 @@ impl LoopbackIpc {
                 let Some(client) = self.sessions.get(&session).copied() else {
                     return "error unknown-session".into();
                 };
-                let Ok(attached) = state.local_client_state(client) else {
+                let Ok(center) = state.local_client_view_coordinates(client) else {
                     return "error stale-session".into();
                 };
-                let snapshot = state.local_client_map_snapshot_for(Some(client), attached.z);
+                let snapshot = state.local_client_map_snapshot_for(Some(client), center.2);
                 eprintln!(
                     "server-progress: map-snapshot session={} tiles={} screen={}",
                     session,
                     snapshot.tiles.len(),
                     snapshot.screen.len()
                 );
-                encode_snapshot(&session, state.scheduler_tick(), snapshot)
+                encode_snapshot(&session, state.scheduler_tick(), center, snapshot)
             }
             Command::ScreenSnapshot { session } => {
                 let Some(client) = self.sessions.get(&session).copied() else {
@@ -581,8 +578,11 @@ impl LoopbackIpc {
                 // An impossible Z level skips expensive turf/occupant
                 // appearance expansion while retaining the attached client's
                 // authoritative screen list.
+                let center = state
+                    .local_client_view_coordinates(client)
+                    .unwrap_or((1, 1, 1));
                 let snapshot = state.local_client_map_snapshot_for(Some(client), i32::MIN);
-                encode_snapshot(&session, state.scheduler_tick(), snapshot)
+                encode_snapshot(&session, state.scheduler_tick(), center, snapshot)
             }
             Command::Move { session, direction } => {
                 let Some(client) = self.sessions.get(&session).copied() else {
@@ -972,12 +972,19 @@ fn format_state(kind: &str, session: &str, state: &LocalClientState, tick: u64) 
         state.z
     )
 }
-fn encode_snapshot(session: &str, tick: u64, snapshot: LocalClientMapSnapshot) -> String {
+fn encode_snapshot(
+    session: &str,
+    tick: u64,
+    center: (i32, i32, i32),
+    snapshot: LocalClientMapSnapshot,
+) -> String {
     let mut out = format!(
-        "ok map_snapshot protocol=3 session={session} tick={tick} width={} height={} z={} tiles={} screen={}\n",
+        "ok map_snapshot protocol=3 session={session} tick={tick} width={} height={} x={} y={} z={} tiles={} screen={}\n",
         snapshot.width,
         snapshot.height,
-        snapshot.z,
+        center.0,
+        center.1,
+        center.2,
         snapshot.tiles.len(),
         snapshot.screen.len()
     );
@@ -1246,14 +1253,9 @@ fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> io::Result<()> {
     stream.write_all(&len.to_be_bytes())?;
     stream.write_all(payload)
 }
-/// Parses and validates a configured loopback address.
+/// Parses a configured TCP listener address.
 pub fn parse_loopback_address(value: &str) -> Result<SocketAddr, String> {
-    let a = value.parse::<SocketAddr>().map_err(|e| e.to_string())?;
-    if a.ip().is_loopback() {
-        Ok(a)
-    } else {
-        Err("IPC address must be loopback".into())
-    }
+    value.parse::<SocketAddr>().map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1370,9 +1372,10 @@ mod tests {
         );
     }
     #[test]
-    fn loopback_only() {
+    fn accepts_local_and_public_listener_addresses() {
         assert!(parse_loopback_address("127.0.0.1:0").is_ok());
-        assert!(parse_loopback_address("0.0.0.0:1").is_err());
+        assert!(parse_loopback_address("0.0.0.0:1").is_ok());
+        assert!(parse_loopback_address("not-an-address").is_err());
     }
 
     #[test]
@@ -1539,7 +1542,7 @@ mod tests {
                 },
             }],
         };
-        let encoded = encode_snapshot("s1", 9, snapshot);
+        let encoded = encode_snapshot("s1", 9, (4, 5, 1), snapshot);
         assert!(encoded.starts_with("ok map_snapshot protocol=3"));
         assert!(encoded.lines().any(|line| line.starts_with("S ")));
         assert_eq!(

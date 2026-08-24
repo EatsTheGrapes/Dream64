@@ -9,7 +9,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::Path,
 };
-use std::{io::Read, io::Write, net::SocketAddr, net::TcpStream};
+use std::{
+    io::{self, Read, Write},
+    net::{IpAddr, SocketAddr, TcpStream},
+};
 
 use dm_compiler::CompilerDatabase;
 use dm_dmf::{
@@ -40,6 +43,11 @@ use wry::{
     Rect, WebView, WebViewBuilder,
     dpi::{LogicalPosition, LogicalSize},
 };
+#[cfg(windows)]
+use {
+    dm_native_menu::muda::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu},
+    winit::raw_window_handle::{HasWindowHandle, RawWindowHandle},
+};
 
 const LOCAL_SKIN: &str = "window \"main\"\n\
 \telem \"main\"\n\
@@ -64,6 +72,178 @@ struct BrowserAssetServer {
     origin: String,
     assets: std::sync::Arc<std::sync::RwLock<BTreeMap<String, Vec<u8>>>>,
     next_document: u64,
+}
+
+#[cfg(windows)]
+struct NativeMenuBar {
+    root: Menu,
+    commands: BTreeMap<MenuId, String>,
+    signature: String,
+}
+
+#[cfg(windows)]
+impl NativeMenuBar {
+    fn from_ui(ui: &dm_dmf::UiState) -> Result<Option<Self>, String> {
+        let tree = ui.tree();
+        let Some(section) = tree
+            .auxiliary
+            .iter()
+            .find(|section| section.id.starts_with("menu:"))
+        else {
+            return Ok(None);
+        };
+        let namespace = section.id.strip_prefix("menu:").unwrap_or(&section.id);
+        #[derive(Clone)]
+        struct Entry {
+            id: Option<String>,
+            name: String,
+            command: String,
+            category: Option<String>,
+            parent: Option<String>,
+            index: Option<i32>,
+            order: usize,
+        }
+        let effective = |id: Option<&str>, property: &str, fallback: Option<&str>| {
+            id.and_then(|id| ui.winget(&format!("{namespace}.{id}"), property).ok())
+                .or_else(|| fallback.map(str::to_owned))
+                .filter(|value| !value.is_empty())
+        };
+        let mut entries = section
+            .controls
+            .iter()
+            .enumerate()
+            .map(|(order, control)| Entry {
+                id: control.id.clone(),
+                name: effective(control.id.as_deref(), "name", control.property("name"))
+                    .unwrap_or_default(),
+                command: effective(
+                    control.id.as_deref(),
+                    "command",
+                    control.property("command"),
+                )
+                .unwrap_or_default(),
+                category: effective(
+                    control.id.as_deref(),
+                    "category",
+                    control.property("category"),
+                ),
+                parent: effective(control.id.as_deref(), "parent", control.property("parent")),
+                index: effective(control.id.as_deref(), "index", control.property("index"))
+                    .and_then(|value| value.parse().ok()),
+                order,
+            })
+            .collect::<Vec<_>>();
+        let static_ids = entries
+            .iter()
+            .filter_map(|entry| entry.id.clone())
+            .collect::<BTreeSet<_>>();
+        for id in ui
+            .section_control_ids(namespace)
+            .map_err(|error| format!("enumerate DMF menu: {error:?}"))?
+            .into_iter()
+            .filter(|id| !static_ids.contains(id))
+        {
+            let address = format!("{namespace}.{id}");
+            let property = |name| {
+                ui.winget(&address, name)
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            };
+            let order = entries.len();
+            entries.push(Entry {
+                id: Some(id),
+                name: property("name").unwrap_or_default(),
+                command: property("command").unwrap_or_default(),
+                category: property("category"),
+                parent: property("parent"),
+                index: property("index").and_then(|value| value.parse().ok()),
+                order,
+            });
+        }
+        let signature = entries
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{:?}|{}|{}|{:?}|{:?}|{:?}",
+                    entry.id, entry.name, entry.command, entry.category, entry.parent, entry.index
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let root = Menu::new();
+        let mut commands = BTreeMap::new();
+        let mut categories = entries
+            .iter()
+            .filter(|entry| {
+                entry.category.is_none()
+                    && entry
+                        .parent
+                        .as_deref()
+                        .is_none_or(|parent| parent.eq_ignore_ascii_case(namespace))
+                    && !entry.name.is_empty()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        categories.sort_by_key(|entry| (entry.index.unwrap_or(entry.order as i32), entry.order));
+        for category in categories {
+            let label = percent_decode_form(&category.name).unwrap_or(category.name.clone());
+            let category_key = category.id.as_deref().unwrap_or(&category.name);
+            let mut children = entries
+                .iter()
+                .filter(|entry| {
+                    entry.category.as_deref() == Some(category.name.as_str())
+                        || entry.parent.as_deref() == Some(category_key)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            children.sort_by_key(|entry| (entry.index.unwrap_or(entry.order as i32), entry.order));
+            if children.is_empty() && !category.command.is_empty() {
+                let item = MenuItem::new(label, true, None);
+                commands.insert(item.id().clone(), category.command);
+                root.append(&item).map_err(|error| error.to_string())?;
+                continue;
+            }
+            let submenu = Submenu::new(label, true);
+            for entry in children {
+                let label = percent_decode_form(&entry.name).unwrap_or(entry.name.clone());
+                if label.is_empty() {
+                    submenu
+                        .append(&PredefinedMenuItem::separator())
+                        .map_err(|error| error.to_string())?;
+                    continue;
+                }
+                let item = MenuItem::new(label, true, None);
+                if !entry.command.is_empty() {
+                    commands.insert(item.id().clone(), entry.command);
+                }
+                submenu.append(&item).map_err(|error| error.to_string())?;
+            }
+            root.append(&submenu).map_err(|error| error.to_string())?;
+        }
+        Ok(Some(Self {
+            root,
+            commands,
+            signature,
+        }))
+    }
+
+    fn install(&self, window: &Window) -> Result<(), String> {
+        let handle = window.window_handle().map_err(|error| error.to_string())?;
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            return Err("native Windows menu requires a Win32 window".to_owned());
+        };
+        dm_native_menu::install_for_hwnd(&self.root, handle.hwnd.get())
+    }
+
+    fn drain_commands(&self) -> Vec<String> {
+        let mut commands = Vec::new();
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            if let Some(command) = self.commands.get(event.id()) {
+                commands.push(command.clone());
+            }
+        }
+        commands
+    }
 }
 
 #[cfg(windows)]
@@ -341,11 +521,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         button_states,
         label_states,
         active_prompt: None,
+        pending_screenshot: None,
         startup_browser_updates,
         browser_message_sender,
         browser_messages,
         #[cfg(windows)]
         browsers: BTreeMap::new(),
+        #[cfg(windows)]
+        native_menu: None,
         #[cfg(windows)]
         browser_assets,
     };
@@ -1703,7 +1886,13 @@ struct LaunchOptions {
 
 impl LaunchOptions {
     fn parse() -> Result<Self, String> {
-        Self::parse_from(std::env::args_os().skip(1))
+        let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+        if arguments.is_empty() {
+            let address = prompt_for_server()?;
+            Self::parse_from(["--connect".into(), address.to_string().into()])
+        } else {
+            Self::parse_from(arguments)
+        }
     }
 
     fn parse_from(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Self, String> {
@@ -1743,14 +1932,11 @@ impl LaunchOptions {
                     }
                     let value = arguments
                         .next()
-                        .ok_or_else(|| "--connect requires a loopback address".to_owned())?;
+                        .ok_or_else(|| "--connect requires an IP address and port".to_owned())?;
                     options.connect = value
                         .to_string_lossy()
                         .parse::<SocketAddr>()
                         .map_err(|error| format!("invalid --connect address: {error}"))?;
-                    if !options.connect.ip().is_loopback() {
-                        return Err("--connect must use a loopback address".to_owned());
-                    }
                 }
                 "--record-replay" => set_path_option(
                     &mut options.record,
@@ -1794,6 +1980,41 @@ impl LaunchOptions {
         }
         Ok(options)
     }
+}
+
+fn prompt_for_server() -> Result<SocketAddr, String> {
+    println!("Dream64 Server Connection\n");
+    let ip = loop {
+        let value = prompt_line("Server IP address: ")?;
+        match value.parse::<IpAddr>() {
+            Ok(ip) => break ip,
+            Err(error) => eprintln!("Invalid IP address: {error}"),
+        }
+    };
+    let port = loop {
+        let value = prompt_line("Server port [51664]: ")?;
+        if value.is_empty() {
+            break 51_664;
+        }
+        match value.parse::<u16>() {
+            Ok(0) => eprintln!("Port must be between 1 and 65535."),
+            Ok(port) => break port,
+            Err(error) => eprintln!("Invalid port: {error}"),
+        }
+    };
+    Ok(SocketAddr::new(ip, port))
+}
+
+fn prompt_line(label: &str) -> Result<String, String> {
+    print!("{label}");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("could not display connection prompt: {error}"))?;
+    let mut value = String::new();
+    io::stdin()
+        .read_line(&mut value)
+        .map_err(|error| format!("could not read connection prompt: {error}"))?;
+    Ok(value.trim().to_owned())
 }
 
 fn set_path_option(slot: &mut Option<PathBuf>, value: PathBuf, flag: &str) -> Result<(), String> {
@@ -2031,6 +2252,29 @@ impl ClientTransport {
         }
     }
 
+    fn reconnect(&mut self) -> Result<(), String> {
+        match self {
+            Self::Pending(pending) => {
+                pending.next_attempt = std::time::Instant::now();
+                pending.last_error = None;
+                Ok(())
+            }
+            Self::Remote(transport) => {
+                let address = transport
+                    .address
+                    .ok_or("a replay transport cannot reconnect")?;
+                *self = Self::Pending(PendingRemoteTransport {
+                    address,
+                    record: None,
+                    next_attempt: std::time::Instant::now(),
+                    last_error: None,
+                });
+                Ok(())
+            }
+            Self::Offline(_) => Err("an offline client cannot reconnect".to_owned()),
+        }
+    }
+
     fn request_resource(&mut self, path: &str) -> Result<Vec<u8>, String> {
         match self {
             Self::Pending(_) => Err(format!(
@@ -2066,6 +2310,7 @@ impl ClientTransport {
 
 struct RemoteTransport {
     stream: ProtocolStream,
+    address: Option<SocketAddr>,
     label: String,
     client_token: Option<String>,
     center: Option<WorldCoordinate>,
@@ -2345,6 +2590,7 @@ impl RemoteTransport {
             .map_err(|error| error.to_string())?;
         Ok(Self {
             stream: ProtocolStream::Live(stream),
+            address: Some(address),
             label: format!("server {address}"),
             client_token: None,
             center: None,
@@ -2356,6 +2602,7 @@ impl RemoteTransport {
     fn replay(path: &Path) -> Result<Self, String> {
         Ok(Self {
             stream: ProtocolStream::Replay(ReplayReader::open(path)?),
+            address: None,
             label: format!("replay {}", path.display()),
             client_token: None,
             center: None,
@@ -2469,15 +2716,26 @@ impl RemoteTransport {
             }
             appearances.insert((x, y, inferred_z), flattened);
         }
-        let center = self.center.unwrap_or_else(|| {
-            let max_x = cells.keys().map(|(x, _, _)| *x).max().unwrap_or(1);
-            let max_y = cells.keys().map(|(_, y, _)| *y).max().unwrap_or(1);
-            WorldCoordinate {
-                x: (max_x + 1) / 2,
-                y: (max_y + 1) / 2,
+        let center = match (
+            header.get("x").and_then(|value| value.parse().ok()),
+            header.get("y").and_then(|value| value.parse().ok()),
+        ) {
+            (Some(x), Some(y)) => WorldCoordinate {
+                x,
+                y,
                 z: inferred_z,
-            }
-        });
+            },
+            _ => self.center.unwrap_or_else(|| {
+                let max_x = cells.keys().map(|(x, _, _)| *x).max().unwrap_or(1);
+                let max_y = cells.keys().map(|(_, y, _)| *y).max().unwrap_or(1);
+                WorldCoordinate {
+                    x: (max_x + 1) / 2,
+                    y: (max_y + 1) / 2,
+                    z: inferred_z,
+                }
+            }),
+        };
+        self.center = Some(center);
         let mut resources = BTreeMap::new();
         let paths = appearances
             .iter()
@@ -2756,10 +3014,18 @@ fn quote_dmf_assignment(value: &str) -> String {
 }
 
 fn valid_byond_callback(callback: &str) -> bool {
-    callback
+    let indexed_callback = callback
         .strip_prefix("Byond.__callbacks__[")
         .and_then(|value| value.strip_suffix(']'))
-        .is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
+        .is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()));
+    indexed_callback
+        || callback.split('.').all(|segment| {
+            let mut bytes = segment.bytes();
+            bytes
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$'))
+                && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$'))
+        })
 }
 
 fn write_frame(stream: &mut impl Write, payload: &[u8]) -> std::io::Result<()> {
@@ -3246,11 +3512,14 @@ struct LocalClient {
     button_states: BTreeMap<String, ButtonState>,
     label_states: BTreeMap<String, LabelState>,
     active_prompt: Option<ClientPrompt>,
+    pending_screenshot: Option<PathBuf>,
     startup_browser_updates: Vec<BrowserUpdate>,
     browser_message_sender: std::sync::mpsc::Sender<(String, String)>,
     browser_messages: std::sync::mpsc::Receiver<(String, String)>,
     #[cfg(windows)]
     browsers: BTreeMap<String, WebView>,
+    #[cfg(windows)]
+    native_menu: Option<NativeMenuBar>,
     #[cfg(windows)]
     browser_assets: BrowserAssetServer,
 }
@@ -3862,10 +4131,17 @@ impl LocalClient {
                     }
                 }
                 self.snapshot = Some(snapshot);
-                if self.transport.is_live()
-                    && let Err(error) = self.transport.mark_input_ready()
-                {
-                    eprintln!("client-input-readiness-failed: {error}");
+                if self.transport.is_live() {
+                    // A reconnect to an already-running server may receive no
+                    // new UI event batch. The accepted snapshot itself proves
+                    // that its resource payload is installed, so advance both
+                    // readiness phases here instead of waiting forever for an
+                    // acknowledgement that will never be generated.
+                    if let Err(error) = self.transport.mark_resources_ready() {
+                        eprintln!("client-resource-readiness-failed: {error}");
+                    } else if let Err(error) = self.transport.mark_input_ready() {
+                        eprintln!("client-input-readiness-failed: {error}");
+                    }
                 }
                 if let Some(surface) = &self.surface {
                     surface.window().set_title(&self.title());
@@ -3908,6 +4184,31 @@ impl LocalClient {
         Rect {
             position: LogicalPosition::new(f64::from(rect.x), f64::from(rect.y)).into(),
             size: LogicalSize::new(f64::from(rect.width), f64::from(rect.height)).into(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn sync_native_menu(&mut self) {
+        let Some(surface) = &self.surface else { return };
+        let Some(session) = self.runtime.client_session(self.client) else {
+            return;
+        };
+        let Ok(Some(menu)) = NativeMenuBar::from_ui(session.ui()) else {
+            return;
+        };
+        if self
+            .native_menu
+            .as_ref()
+            .is_some_and(|current| current.signature == menu.signature)
+        {
+            return;
+        }
+        match menu.install(surface.window()) {
+            Ok(()) => {
+                eprintln!("client-native-menu: synchronized runtime entries");
+                self.native_menu = Some(menu);
+            }
+            Err(error) => eprintln!("client-native-menu-error: {error}"),
         }
     }
 
@@ -4167,6 +4468,7 @@ audio.play().catch(error => console.error('Dream64 sound playback failed', error
         label_states: &BTreeMap<String, LabelState>,
         active_prompt: Option<&ClientPrompt>,
         transport_status: &str,
+        screenshot_path: Option<&Path>,
     ) {
         if let Some(snapshot) = snapshot {
             for (path, bytes) in &snapshot.resources {
@@ -4179,7 +4481,11 @@ audio.play().catch(error => console.error('Dream64 sound playback failed', error
         let mut buffer = vec![0_u32; width.saturating_mul(height)];
         let mut gpu_sprites = Vec::new();
         let mut gpu_dmi_sprites = Vec::new();
-        let gpu_enabled = surface.is_gpu();
+        // Requested screenshots and diagnostic frame dumps are composed
+        // through the CPU parity path so the PNG contains world and HUD
+        // sprites, not only the base layer uploaded before the GPU batches.
+        let frame_dump_requested = std::env::var_os("DREAM64_DUMP_FRAME").is_some();
+        let gpu_enabled = surface.is_gpu() && screenshot_path.is_none() && !frame_dump_requested;
         // The supplied BYOND skin owns the full surface. Match OpenDream's
         // RobustToolbox window default and let resolved DMF controls paint it.
         buffer.fill(0xfff0f0f0);
@@ -4266,6 +4572,12 @@ audio.play().catch(error => console.error('Dream64 sound playback failed', error
         if snapshot.is_some_and(|snapshot| !snapshot.screen.is_empty()) {
             maybe_dump_rendered_frame(&buffer, size.width, size.height);
         }
+        if let Some(path) = screenshot_path {
+            match write_rendered_frame(path, &buffer, size.width, size.height) {
+                Ok(()) => eprintln!("client-screenshot: {}", path.display()),
+                Err(error) => eprintln!("client-screenshot-error: {error}"),
+            }
+        }
         if let Err(error) = surface.present(&buffer, &gpu_dmi_sprites, &gpu_sprites) {
             eprintln!("client-surface-present-error: {error}");
         }
@@ -4278,27 +4590,7 @@ fn maybe_dump_rendered_frame(buffer: &[u32], width: u32, height: u32) {
         return;
     };
     DUMPED.get_or_init(|| {
-        let result = (|| -> Result<(), String> {
-            let file =
-                std::fs::File::create(&path).map_err(|error| format!("create {path}: {error}"))?;
-            let mut encoder = png::Encoder::new(file, width, height);
-            encoder.set_color(png::ColorType::Rgba);
-            encoder.set_depth(png::BitDepth::Eight);
-            let mut writer = encoder
-                .write_header()
-                .map_err(|error| format!("write PNG header: {error}"))?;
-            let rgba = buffer
-                .iter()
-                .flat_map(|pixel| {
-                    let [blue, green, red, alpha] = pixel.to_le_bytes();
-                    [red, green, blue, alpha]
-                })
-                .collect::<Vec<_>>();
-            writer
-                .write_image_data(&rgba)
-                .map_err(|error| format!("write PNG pixels: {error}"))?;
-            Ok(())
-        })();
+        let result = write_rendered_frame(Path::new(&path), buffer, width, height);
         match result {
             Ok(()) => eprintln!("client-frame-dump: {path}"),
             Err(error) => eprintln!("client-frame-dump-error: {error}"),
@@ -4306,8 +4598,67 @@ fn maybe_dump_rendered_frame(buffer: &[u32], width: u32, height: u32) {
     });
 }
 
+fn write_rendered_frame(
+    path: &Path,
+    buffer: &[u32],
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    let file = std::fs::File::create(path)
+        .map_err(|error| format!("create {}: {error}", path.display()))?;
+    let mut encoder = png::Encoder::new(file, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|error| format!("write PNG header: {error}"))?;
+    let rgba = buffer
+        .iter()
+        .flat_map(|pixel| {
+            let [blue, green, red, alpha] = pixel.to_le_bytes();
+            [red, green, blue, alpha]
+        })
+        .collect::<Vec<_>>();
+    writer
+        .write_image_data(&rgba)
+        .map_err(|error| format!("write PNG pixels: {error}"))
+}
+
 impl ApplicationHandler for LocalClient {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(windows)]
+        if let Some(menu) = &self.native_menu {
+            for command in menu.drain_commands() {
+                if command.eq_ignore_ascii_case(".quit") {
+                    event_loop.exit();
+                    return;
+                }
+                if command.eq_ignore_ascii_case(".reconnect") {
+                    if let Err(error) = self.transport.reconnect() {
+                        eprintln!("client-menu-command-error: command={command:?} error={error}");
+                    }
+                    continue;
+                }
+                if command
+                    .split_ascii_whitespace()
+                    .next()
+                    .is_some_and(|verb| verb.eq_ignore_ascii_case(".screenshot"))
+                {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |duration| duration.as_secs());
+                    self.pending_screenshot =
+                        Some(PathBuf::from(format!("dream64-screenshot-{timestamp}.png")));
+                    if let Some(surface) = &self.surface {
+                        surface.window().request_redraw();
+                    }
+                    continue;
+                }
+                if let Err(error) = self.transport.send_command(&command) {
+                    eprintln!("client-menu-command-error: command={command:?} error={error}");
+                }
+            }
+        }
         self.drain_browser_messages();
         let previous_transport_status = self.transport.label().to_owned();
         if self.transport.try_connect() {
@@ -4341,6 +4692,10 @@ impl ApplicationHandler for LocalClient {
         // the authoritative UI actually changed. A continuous full-window
         // redraw here consumed an entire CPU core while an idle lobby sat open.
         let received_ui = self.apply_inbound_ui();
+        #[cfg(windows)]
+        if received_ui {
+            self.sync_native_menu();
+        }
         if received_ui && self.snapshot_stage >= 2 && !self.hud_snapshot_refreshed {
             self.hud_snapshot_refreshed = true;
             self.refresh_snapshot();
@@ -4391,6 +4746,22 @@ impl ApplicationHandler for LocalClient {
                 .create_window(attributes)
                 .expect("the native Dream64 client window is created"),
         );
+        #[cfg(windows)]
+        if self.native_menu.is_none()
+            && let Some(session) = self.runtime.client_session(self.client)
+        {
+            match NativeMenuBar::from_ui(session.ui()) {
+                Ok(Some(menu)) => match menu.install(&window) {
+                    Ok(()) => {
+                        eprintln!("client-native-menu: installed");
+                        self.native_menu = Some(menu);
+                    }
+                    Err(error) => eprintln!("client-native-menu-error: {error}"),
+                },
+                Ok(None) => {}
+                Err(error) => eprintln!("client-native-menu-error: {error}"),
+            }
+        }
         let size = window.inner_size();
         let mut surface = match gpu::GpuRenderer::new(window.clone()) {
             Ok(renderer) => {
@@ -4429,6 +4800,7 @@ impl ApplicationHandler for LocalClient {
             &self.label_states,
             self.active_prompt.as_ref(),
             self.transport.label(),
+            None,
         );
         self.surface = Some(surface);
         #[cfg(windows)]
@@ -4750,6 +5122,7 @@ impl ApplicationHandler for LocalClient {
                     .then_some(self.snapshot.as_ref())
                     .flatten();
                 let layout = self.effective_layout();
+                let screenshot = self.pending_screenshot.take();
                 if let Some(surface) = &mut self.surface {
                     Self::redraw(
                         surface,
@@ -4763,6 +5136,7 @@ impl ApplicationHandler for LocalClient {
                         &self.label_states,
                         self.active_prompt.as_ref(),
                         self.transport.label(),
+                        screenshot.as_deref(),
                     );
                 }
                 // Present the native DMF shell once before the potentially
@@ -6227,7 +6601,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_options_reject_conflicting_modes_and_invalid_connections() {
+    fn launch_options_reject_conflicting_modes() {
         for (arguments, expected) in [
             (vec!["--map", "station.dmm"], "--map requires --world"),
             (
@@ -6246,13 +6620,15 @@ mod tests {
                 vec!["--world", "game.dme", "--startup-replay", "a.d64r"],
                 "--startup-replay cannot be combined with --world",
             ),
-            (
-                vec!["--connect", "192.0.2.10:51664"],
-                "--connect must use a loopback address",
-            ),
         ] {
             assert_eq!(launch_options(&arguments).unwrap_err(), expected);
         }
+    }
+
+    #[test]
+    fn launch_options_accept_remote_server_address() {
+        let options = launch_options(&["--connect", "192.0.2.10:51664"]).unwrap();
+        assert_eq!(options.connect, "192.0.2.10:51664".parse().unwrap());
     }
 
     #[test]
@@ -7407,7 +7783,40 @@ mod tests {
         assert_eq!(path, "winget");
         assert_eq!(parameters["property"], "size,view-size");
         assert!(valid_byond_callback(&parameters["callback"]));
+        assert!(valid_byond_callback("checkoutput"));
+        assert!(valid_byond_callback("Dream64.callbacks.checkoutput"));
         assert!(!valid_byond_callback("alert(1)"));
+        assert!(!valid_byond_callback("checkoutput;alert(1)"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_menu_bar_preserves_dmf_categories_separators_and_commands() {
+        let source = "menu \"menu\"\n\telem\n\t\tname = \"&File\"\n\t\tcommand = \"\"\n\telem\n\t\tname = \"&Reconnect\"\n\t\tcategory = \"&File\"\n\t\tcommand = \".reconnect\"\n\telem\n\t\tname = \"\"\n\t\tcategory = \"&File\"\n\t\tcommand = \"\"\n\telem\n\t\tname = \"&Quit\\tAlt-F4\"\n\t\tcategory = \"&File\"\n\t\tcommand = \".quit\"\n\telem \"help-menu\"\n\t\tname = \"&Help\"\n\t\tcommand = \"\"\n\telem \"Use Internet Routing Relay\"\n\t\tname = \"Internet Routing Relays\"\n\t\tcommand = \"internet-routing-relays\"\n";
+        let tree = ControlTree::from_document(&dm_dmf::parse(source));
+        let mut ui = dm_dmf::UiState::new(tree);
+        ui.winset("/datum/verbs/menu/admin", "parent=menu;name=&Admin")
+            .unwrap();
+        ui.winset(
+            "/client/proc/adminwho",
+            "parent=/datum/verbs/menu/admin;name=Admin%20Who;command=adminwho",
+        )
+        .unwrap();
+        ui.winset("help-menu", "index=1000").unwrap();
+        let menu = NativeMenuBar::from_ui(&ui)
+            .unwrap()
+            .expect("DMF menu should become a native menu");
+
+        assert_eq!(menu.root.items().len(), 4);
+        assert_eq!(
+            menu.commands.values().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                ".quit".to_owned(),
+                ".reconnect".to_owned(),
+                "adminwho".to_owned(),
+                "internet-routing-relays".to_owned()
+            ])
+        );
     }
 
     #[test]

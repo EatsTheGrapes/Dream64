@@ -1,5 +1,6 @@
 target/
 /target-client-lockdown/
+/target-client-*/
 /conformance-results/
 /logs/
 

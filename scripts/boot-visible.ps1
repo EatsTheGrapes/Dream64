@@ -6,7 +6,10 @@ param(
     [string] $MonkestationDirectory,
     [string] $Dme,
     [string] $Map,
-    [string] $Skin
+    [string] $Skin,
+    [string] $IpcAddress = "127.0.0.1:51664",
+    [switch] $SkipCompile,
+    [switch] $ReuseInitializedWorld
 )
 
 $ErrorActionPreference = "Stop"
@@ -79,7 +82,7 @@ if ($ReuseInitializedWorld) {
 
 $logicalProcessors = [Environment]::ProcessorCount
 $env:RAYON_NUM_THREADS = [string]$logicalProcessors
-$env:DREAM64_IPC_ADDR = "127.0.0.1:51664"
+$env:DREAM64_IPC_ADDR = $IpcAddress
 
 Write-Host ""
 Write-Host "  DREAM64 / MONKESTATION" -ForegroundColor Cyan
@@ -118,7 +121,7 @@ $Artifact = (Resolve-Path -LiteralPath $Artifact).Path
 $quotedArtifact = '"' + $Artifact + '"'
 $quotedMap = '"' + $Map + '"'
 $quotedSkin = '"' + $Skin + '"'
-$clientArguments = @("--connect", "127.0.0.1:51664", "--skin", $quotedSkin)
+$clientArguments = @("--connect", $IpcAddress, "--skin", $quotedSkin)
 $startupReplay = Join-Path $workspace "logs\monk-lobby-topic-fixed.d64r"
 if (Test-Path -LiteralPath $startupReplay -PathType Leaf) {
     $clientArguments += @("--startup-replay", ('"' + $startupReplay + '"'))
