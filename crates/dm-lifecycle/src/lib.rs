@@ -9,8 +9,10 @@ pub mod ipc;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dm_compiler::Compilation;
 use dm_core::{FileId, SourceSpan};
@@ -20,12 +22,630 @@ use dm_runtime::RuntimeImage;
 use dm_semantics::{Procedure, ProcedureId, ProcedureImplementationId, ProcedureRegistry};
 use dm_value::{DatumId, FieldName, TypePath, Value};
 use dm_vm::{
-    ExecutionContext, ExecutionLimits, RuntimeError, advance_scheduler, execute_module_in_context,
+    DmmMeasurement, ExecutionContext, ExecutionLimits, Module, RuntimeError, advance_scheduler,
+    execute_module_in_context,
 };
 use dm_world::{
     AtomCategory, InitializerResolution, WorldAllocation, WorldAllocationWorkKind, WorldCoordinate,
     WorldPlan, materialize_world_map_state,
 };
+use serde::{Deserialize, Serialize};
+
+const LIFECYCLE_DIRECTORY_MAGIC: &[u8; 8] = b"D64LIDX\0";
+const LIFECYCLE_DIRECTORY_VERSION: u16 = 1;
+const MAX_LIFECYCLE_DIRECTORY_BYTES: u64 = 1024 * 1024 * 1024;
+
+const DMM_MEASUREMENT_MAGIC: &[u8; 8] = b"D64DMMC\0";
+const DMM_MEASUREMENT_VERSION: u16 = 1;
+const MAX_DMM_MEASUREMENT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_DMM_MEASUREMENT_ENTRIES: usize = 1_000_000;
+const MAX_DMM_PATH_BYTES: usize = 4096;
+const MAX_DMM_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_DMM_TOTAL_SOURCE_BYTES: u64 = 1024 * 1024 * 1024;
+const PARSED_DMM_MAGIC: &[u8; 8] = b"D64PDMM\0";
+// Version 2 stores TGM grid Y as the top source row, matching reader.dm.
+const PARSED_DMM_VERSION: u16 = 2;
+const MAX_PARSED_DMM_BYTES: u64 = 128 * 1024 * 1024;
+const PROCEDURE_SEMANTICS_MAGIC: &[u8; 8] = b"D64PSEM\0";
+const PROCEDURE_SEMANTICS_VERSION: u16 = 1;
+const MAX_PROCEDURE_SEMANTICS_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Builds a portable semantic-identity directory for every eager procedure.
+pub fn encode_procedure_semantics(module: &Module) -> Result<Vec<u8>, String> {
+    if module.deferred_procedure_count() != 0 || module.procedure_count() > 1_000_000 {
+        return Err(
+            "procedure semantic directory requires a bounded fully eager module".to_owned(),
+        );
+    }
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(module.procedure_count() as u32).to_le_bytes());
+    let digests = module.compute_all_procedure_semantic_digests()?;
+    for (path, digest) in module.procedure_paths().zip(digests) {
+        if path.len() > 64 * 1024 * 1024 {
+            return Err("procedure semantic path exceeds its limit".to_owned());
+        }
+        payload.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        payload.extend_from_slice(path.as_bytes());
+        payload.extend_from_slice(&digest);
+    }
+    if payload.len() as u64 > MAX_PROCEDURE_SEMANTICS_BYTES {
+        return Err("procedure semantic directory exceeds its limit".to_owned());
+    }
+    let mut encoded = Vec::with_capacity(22 + payload.len());
+    encoded.extend_from_slice(PROCEDURE_SEMANTICS_MAGIC);
+    encoded.extend_from_slice(&PROCEDURE_SEMANTICS_VERSION.to_le_bytes());
+    encoded.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    encoded.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+    encoded.extend_from_slice(&payload);
+    Ok(encoded)
+}
+
+/// Validates and attaches an artifact-emitted semantic directory to a module.
+pub fn decode_and_attach_procedure_semantics(
+    bytes: &[u8],
+    module: &mut Module,
+) -> Result<(), String> {
+    if bytes.len() < 22 || &bytes[..8] != PROCEDURE_SEMANTICS_MAGIC {
+        return Err("invalid procedure semantic directory header".to_owned());
+    }
+    if u16::from_le_bytes([bytes[8], bytes[9]]) != PROCEDURE_SEMANTICS_VERSION {
+        return Err("unsupported procedure semantic directory version".to_owned());
+    }
+    let length = u64::from_le_bytes(bytes[10..18].try_into().unwrap());
+    if length > MAX_PROCEDURE_SEMANTICS_BYTES || length as usize != bytes.len() - 22 {
+        return Err("invalid procedure semantic directory length".to_owned());
+    }
+    let payload = &bytes[22..];
+    if crc32fast::hash(payload) != u32::from_le_bytes(bytes[18..22].try_into().unwrap()) {
+        return Err("procedure semantic directory checksum mismatch".to_owned());
+    }
+    let mut cursor = 0usize;
+    let take = |cursor: &mut usize, count: usize| -> Result<&[u8], String> {
+        let end = cursor
+            .checked_add(count)
+            .ok_or("procedure semantic offset overflow")?;
+        let value = payload
+            .get(*cursor..end)
+            .ok_or("truncated procedure semantic directory")?;
+        *cursor = end;
+        Ok(value)
+    };
+    let count = u32::from_le_bytes(take(&mut cursor, 4)?.try_into().unwrap()) as usize;
+    if count != module.procedure_count() || count > 1_000_000 {
+        return Err("procedure semantic count does not match module".to_owned());
+    }
+    let expected_paths = module.procedure_paths().collect::<Vec<_>>();
+    let mut digests = Vec::with_capacity(count);
+    for expected in expected_paths {
+        let path_len = u32::from_le_bytes(take(&mut cursor, 4)?.try_into().unwrap()) as usize;
+        let path = std::str::from_utf8(take(&mut cursor, path_len)?)
+            .map_err(|_| "procedure semantic path is not UTF-8")?;
+        if path != expected {
+            return Err("procedure semantic path table does not match module".to_owned());
+        }
+        digests.push(take(&mut cursor, 32)?.try_into().unwrap());
+    }
+    if cursor != payload.len() {
+        return Err("trailing procedure semantic directory bytes".to_owned());
+    }
+    module.attach_procedure_semantic_digests(digests)
+}
+
+/// One content-addressed artifact-time DMM measurement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortableDmmMeasurement {
+    /// MD5 content identity of the exact map bytes compiled into the artifact.
+    pub digest: [u8; 16],
+    /// Exact coordinate bounds in BYOND MAP_MINX..MAP_MAXZ order.
+    pub measurement: DmmMeasurement,
+}
+
+/// One source-ordered coordinate/grid record from a parsed DMM resource.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PortableDmmGrid {
+    /// One-based starting X coordinate.
+    pub x: i32,
+    /// One-based starting Y coordinate.
+    pub y: i32,
+    /// One-based Z coordinate.
+    pub z: i32,
+    /// Grid lines in their original top-to-bottom order.
+    pub lines: Vec<String>,
+}
+
+/// Complete parser product needed to materialize `/datum/parsed_map` fields.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PortableParsedDmm {
+    /// MD5 identity of the exact source bytes.
+    pub digest: [u8; 16],
+    /// `true` for TGM formatting and `false` for ordinary DMM formatting.
+    pub tgm: bool,
+    /// Uniform map-key byte width.
+    pub key_len: u32,
+    /// Byte length of the first grid line.
+    pub line_len: u32,
+    /// Bounds in BYOND MAP_MINX..MAP_MAXZ order.
+    pub bounds: [i32; 6],
+    /// Key and raw model-body pairs in source definition order.
+    pub models: Vec<(String, String)>,
+    /// Coordinate blocks in source order.
+    pub grids: Vec<PortableDmmGrid>,
+}
+
+/// Builds measurements for every valid map resource discovered by the project loader.
+pub fn build_dmm_measurements(
+    compilation: &Compilation,
+) -> Result<BTreeMap<String, PortableDmmMeasurement>, String> {
+    Ok(dmm_measurements_from_parsed(&build_parsed_dmm_cache(
+        compilation,
+    )?))
+}
+
+/// Derives the compact section-10 catalog without reparsing map sources.
+#[must_use]
+pub fn dmm_measurements_from_parsed(
+    parsed: &BTreeMap<String, PortableParsedDmm>,
+) -> BTreeMap<String, PortableDmmMeasurement> {
+    parsed
+        .iter()
+        .map(|(path, entry)| {
+            (
+                path.clone(),
+                PortableDmmMeasurement {
+                    digest: entry.digest,
+                    measurement: DmmMeasurement {
+                        digest: entry.digest,
+                        bounds: entry.bounds,
+                    },
+                },
+            )
+        })
+        .collect()
+}
+
+/// Builds the complete source-ordered parsed-map catalog in one bounded scan.
+pub fn build_parsed_dmm_cache(
+    compilation: &Compilation,
+) -> Result<BTreeMap<String, PortableParsedDmm>, String> {
+    let root = fs::canonicalize(&compilation.project().root_directory)
+        .map_err(|error| format!("canonicalize DMM project root: {error}"))?;
+    let mut paths = Vec::new();
+    discover_dmm_paths(&root, &root, &mut paths)?;
+    paths.sort_unstable();
+    if paths.len() > MAX_DMM_MEASUREMENT_ENTRIES {
+        return Err("project contains too many DMM resources".to_owned());
+    }
+    let mut total_bytes = 0u64;
+    let mut parsed_cache = BTreeMap::new();
+    for path in paths {
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("inspect DMM resource {}: {error}", path.display()))?;
+        if metadata.len() > MAX_DMM_SOURCE_BYTES {
+            return Err(format!(
+                "DMM resource {} exceeds its byte limit",
+                path.display()
+            ));
+        }
+        total_bytes = total_bytes
+            .checked_add(metadata.len())
+            .ok_or("DMM resource byte total overflow")?;
+        if total_bytes > MAX_DMM_TOTAL_SOURCE_BYTES {
+            return Err("project DMM resources exceed their aggregate byte limit".to_owned());
+        }
+        let relative = path
+            .strip_prefix(&root)
+            .map_err(|_| format!("DMM resource escapes project root: {}", path.display()))?;
+        let portable = normalize_portable_dmm_path(&relative.to_string_lossy())
+            .ok_or_else(|| format!("invalid project-relative DMM path: {}", relative.display()))?;
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("read DMM resource {}: {error}", path.display()))?;
+        let source = std::str::from_utf8(&bytes)
+            .map_err(|_| format!("DMM resource is not UTF-8: {}", path.display()))?;
+        let Ok(map) = dm_map::parse(source) else {
+            // Invalid/non-map `.dmm` resources retain the runtime DM parser fallback.
+            continue;
+        };
+        let Some(measurement) = measure_parsed_dmm(source, &map) else {
+            continue;
+        };
+        let digest = md5::compute(&bytes).0;
+        let mut definitions = map.keys.values().collect::<Vec<_>>();
+        definitions.sort_unstable_by_key(|definition| definition.span.start);
+        let mut models = Vec::with_capacity(definitions.len());
+        let mut tgm = false;
+        for (index, definition) in definitions.into_iter().enumerate() {
+            let raw = source
+                .get(definition.span.start..definition.span.end)
+                .ok_or_else(|| format!("invalid DMM definition span in {portable:?}"))?;
+            let equals = raw
+                .find('=')
+                .ok_or_else(|| format!("missing DMM model assignment in {portable:?}"))?;
+            let open = raw[equals + 1..]
+                .find('(')
+                .map(|offset| equals + 1 + offset)
+                .ok_or_else(|| format!("missing DMM model opener in {portable:?}"))?;
+            let mut body = raw
+                .get(open + 1..raw.len().saturating_sub(1))
+                .ok_or_else(|| format!("invalid DMM model body in {portable:?}"))?;
+            if body.starts_with('\n') {
+                if index == 0 {
+                    tgm = true;
+                }
+                body = &body[1..];
+            }
+            models.push((definition.key.clone(), body.to_owned()));
+        }
+        let grids = map
+            .blocks
+            .iter()
+            .map(|block| PortableDmmGrid {
+                x: block.x,
+                // reader.dm stores TGM columns from top to bottom. After
+                // splitting the block it advances ycrd by line_count - 1 so
+                // `_tgm_load` can decrement Y for each subsequent key. DMM
+                // blocks retain their original lower-left Y coordinate.
+                y: if tgm {
+                    block.y.saturating_add(
+                        i32::try_from(block.rows.len().saturating_sub(1)).unwrap_or(i32::MAX),
+                    )
+                } else {
+                    block.y
+                },
+                z: block.z,
+                lines: block
+                    .rows
+                    .iter()
+                    .map(|row| row.concat())
+                    .collect::<Vec<_>>(),
+            })
+            .collect::<Vec<_>>();
+        let line_len = grids
+            .first()
+            .and_then(|grid| grid.lines.first())
+            .map_or(0, String::len);
+        let key_len = u32::try_from(map.key_width)
+            .map_err(|_| format!("DMM key width exceeds u32 in {portable:?}"))?;
+        let line_len = u32::try_from(line_len)
+            .map_err(|_| format!("DMM line length exceeds u32 in {portable:?}"))?;
+        if parsed_cache
+            .insert(
+                portable.clone(),
+                PortableParsedDmm {
+                    digest,
+                    tgm,
+                    key_len,
+                    line_len,
+                    bounds: measurement.bounds,
+                    models,
+                    grids,
+                },
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate normalized DMM resource path {portable:?}"
+            ));
+        }
+    }
+    Ok(parsed_cache)
+}
+
+fn discover_dmm_paths(
+    root: &Path,
+    directory: &Path,
+    output: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let mut entries = fs::read_dir(directory)
+        .map_err(|error| format!("scan DMM directory {}: {error}", directory.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("scan DMM directory {}: {error}", directory.display()))?;
+    entries.sort_unstable_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("inspect project entry {}: {error}", path.display()))?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(name.as_ref(), ".git" | "target" | "node_modules" | ".cache") {
+                continue;
+            }
+            let canonical = fs::canonicalize(&path).map_err(|error| {
+                format!("canonicalize project directory {}: {error}", path.display())
+            })?;
+            if !canonical.starts_with(root) {
+                return Err(format!(
+                    "project directory escapes root: {}",
+                    path.display()
+                ));
+            }
+            discover_dmm_paths(root, &canonical, output)?;
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("dmm"))
+        {
+            output.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Measures exact coordinate bounds using the shared loss-aware DMM parser.
+#[must_use]
+pub fn measure_dmm_source(source: &str) -> Option<DmmMeasurement> {
+    let map = dm_map::parse(source).ok()?;
+    measure_parsed_dmm(source, &map)
+}
+
+fn measure_parsed_dmm(source: &str, map: &dm_map::Map) -> Option<DmmMeasurement> {
+    let first = map.blocks.first()?;
+    let mut bounds = [first.x, first.y, first.z, first.x, first.y, first.z];
+    for block in &map.blocks {
+        let width = block.rows.first().map_or(0, Vec::len) as i32;
+        let height = block.rows.len() as i32;
+        bounds[0] = bounds[0].min(block.x);
+        bounds[1] = bounds[1].min(block.y);
+        bounds[2] = bounds[2].min(block.z);
+        bounds[3] = bounds[3].max(block.x + width.saturating_sub(1));
+        bounds[4] = bounds[4].max(block.y + height.saturating_sub(1));
+        bounds[5] = bounds[5].max(block.z);
+    }
+    Some(DmmMeasurement {
+        digest: md5::compute(source.as_bytes()).0,
+        bounds,
+    })
+}
+
+fn normalize_portable_dmm_path(path: &str) -> Option<String> {
+    let path = path.replace('\\', "/");
+    if path.is_empty() || path.starts_with('/') || path.contains(':') {
+        return None;
+    }
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => return None,
+            component => components.push(component.to_ascii_lowercase()),
+        }
+    }
+    (!components.is_empty()).then(|| components.join("/"))
+}
+
+/// Encodes a bounded, versioned, checksummed DMM measurement catalog.
+pub fn encode_dmm_measurements(
+    measurements: &BTreeMap<String, PortableDmmMeasurement>,
+) -> Result<Vec<u8>, String> {
+    if measurements.len() > MAX_DMM_MEASUREMENT_ENTRIES {
+        return Err("DMM measurement catalog has too many entries".to_owned());
+    }
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(measurements.len() as u32).to_le_bytes());
+    for (path, entry) in measurements {
+        if path.len() > MAX_DMM_PATH_BYTES
+            || normalize_portable_dmm_path(path).as_deref() != Some(path)
+        {
+            return Err(format!("invalid portable DMM path {path:?}"));
+        }
+        if entry.digest != entry.measurement.digest {
+            return Err(format!("DMM measurement digest mismatch for {path:?}"));
+        }
+        payload.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        payload.extend_from_slice(path.as_bytes());
+        payload.extend_from_slice(&entry.digest);
+        for coordinate in entry.measurement.bounds {
+            payload.extend_from_slice(&coordinate.to_le_bytes());
+        }
+    }
+    if payload.len() > MAX_DMM_MEASUREMENT_BYTES {
+        return Err("DMM measurement catalog exceeds its byte limit".to_owned());
+    }
+    let mut encoded = Vec::with_capacity(22 + payload.len());
+    encoded.extend_from_slice(DMM_MEASUREMENT_MAGIC);
+    encoded.extend_from_slice(&DMM_MEASUREMENT_VERSION.to_le_bytes());
+    encoded.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    encoded.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+    encoded.extend_from_slice(&payload);
+    Ok(encoded)
+}
+
+/// Decodes and validates a portable DMM measurement catalog.
+pub fn decode_dmm_measurements(
+    bytes: &[u8],
+) -> Result<BTreeMap<String, PortableDmmMeasurement>, String> {
+    if bytes.len() < 22 || &bytes[..8] != DMM_MEASUREMENT_MAGIC {
+        return Err("invalid DMM measurement catalog header".to_owned());
+    }
+    if u16::from_le_bytes([bytes[8], bytes[9]]) != DMM_MEASUREMENT_VERSION {
+        return Err("unsupported DMM measurement catalog version".to_owned());
+    }
+    let length = u64::from_le_bytes(bytes[10..18].try_into().unwrap());
+    if length > MAX_DMM_MEASUREMENT_BYTES as u64 || length as usize != bytes.len() - 22 {
+        return Err("invalid DMM measurement catalog length".to_owned());
+    }
+    let checksum = u32::from_le_bytes(bytes[18..22].try_into().unwrap());
+    let payload = &bytes[22..];
+    if crc32fast::hash(payload) != checksum {
+        return Err("DMM measurement catalog checksum mismatch".to_owned());
+    }
+    let mut cursor = 0usize;
+    let take = |cursor: &mut usize, count: usize| -> Result<&[u8], String> {
+        let end = cursor
+            .checked_add(count)
+            .ok_or("DMM catalog offset overflow")?;
+        let value = payload
+            .get(*cursor..end)
+            .ok_or("truncated DMM measurement catalog")?;
+        *cursor = end;
+        Ok(value)
+    };
+    let count = u32::from_le_bytes(take(&mut cursor, 4)?.try_into().unwrap()) as usize;
+    if count > MAX_DMM_MEASUREMENT_ENTRIES {
+        return Err("DMM measurement catalog has too many entries".to_owned());
+    }
+    let mut decoded = BTreeMap::new();
+    for _ in 0..count {
+        let path_len = u32::from_le_bytes(take(&mut cursor, 4)?.try_into().unwrap()) as usize;
+        if path_len > MAX_DMM_PATH_BYTES {
+            return Err("DMM measurement path exceeds its limit".to_owned());
+        }
+        let path = std::str::from_utf8(take(&mut cursor, path_len)?)
+            .map_err(|_| "DMM measurement path is not UTF-8")?
+            .to_owned();
+        if normalize_portable_dmm_path(&path).as_deref() != Some(path.as_str()) {
+            return Err("DMM measurement path is not normalized".to_owned());
+        }
+        let digest = take(&mut cursor, 16)?.try_into().unwrap();
+        let mut bounds = [0; 6];
+        for coordinate in &mut bounds {
+            *coordinate = i32::from_le_bytes(take(&mut cursor, 4)?.try_into().unwrap());
+        }
+        if decoded
+            .insert(
+                path,
+                PortableDmmMeasurement {
+                    digest,
+                    measurement: DmmMeasurement { digest, bounds },
+                },
+            )
+            .is_some()
+        {
+            return Err("duplicate DMM measurement path".to_owned());
+        }
+    }
+    if cursor != payload.len() {
+        return Err("trailing DMM measurement catalog bytes".to_owned());
+    }
+    Ok(decoded)
+}
+
+/// Encodes the complete parsed DMM catalog as a bounded, checksummed payload.
+pub fn encode_parsed_dmm_cache(
+    parsed: &BTreeMap<String, PortableParsedDmm>,
+) -> Result<Vec<u8>, String> {
+    use bincode::Options as _;
+    validate_parsed_dmm_cache(parsed)?;
+    let options = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(MAX_PARSED_DMM_BYTES);
+    let payload = options
+        .serialize(parsed)
+        .map_err(|error| format!("encode parsed DMM cache: {error}"))?;
+    let mut encoded = Vec::with_capacity(22 + payload.len());
+    encoded.extend_from_slice(PARSED_DMM_MAGIC);
+    encoded.extend_from_slice(&PARSED_DMM_VERSION.to_le_bytes());
+    encoded.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    encoded.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+    encoded.extend_from_slice(&payload);
+    Ok(encoded)
+}
+
+/// Decodes and fully validates a complete parsed DMM catalog.
+pub fn decode_parsed_dmm_cache(
+    bytes: &[u8],
+) -> Result<BTreeMap<String, PortableParsedDmm>, String> {
+    use bincode::Options as _;
+    if bytes.len() < 22 || &bytes[..8] != PARSED_DMM_MAGIC {
+        return Err("invalid parsed DMM cache header".to_owned());
+    }
+    if u16::from_le_bytes([bytes[8], bytes[9]]) != PARSED_DMM_VERSION {
+        return Err("unsupported parsed DMM cache version".to_owned());
+    }
+    let length = u64::from_le_bytes(bytes[10..18].try_into().unwrap());
+    if length > MAX_PARSED_DMM_BYTES || length as usize != bytes.len() - 22 {
+        return Err("invalid parsed DMM cache length".to_owned());
+    }
+    let checksum = u32::from_le_bytes(bytes[18..22].try_into().unwrap());
+    if crc32fast::hash(&bytes[22..]) != checksum {
+        return Err("parsed DMM cache checksum mismatch".to_owned());
+    }
+    let options = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(MAX_PARSED_DMM_BYTES)
+        .reject_trailing_bytes();
+    let parsed = options
+        .deserialize(&bytes[22..])
+        .map_err(|error| format!("decode parsed DMM cache: {error}"))?;
+    validate_parsed_dmm_cache(&parsed)?;
+    Ok(parsed)
+}
+
+fn validate_parsed_dmm_cache(parsed: &BTreeMap<String, PortableParsedDmm>) -> Result<(), String> {
+    if parsed.len() > MAX_DMM_MEASUREMENT_ENTRIES {
+        return Err("parsed DMM cache has too many entries".to_owned());
+    }
+    let mut aggregate = 0u64;
+    for (path, entry) in parsed {
+        if path.len() > MAX_DMM_PATH_BYTES
+            || normalize_portable_dmm_path(path).as_deref() != Some(path)
+        {
+            return Err(format!("invalid parsed DMM path {path:?}"));
+        }
+        if entry.key_len == 0 || entry.models.is_empty() || entry.grids.is_empty() {
+            return Err(format!("incomplete parsed DMM entry {path:?}"));
+        }
+        for (key, model) in &entry.models {
+            if key.len() != entry.key_len as usize {
+                return Err(format!("inconsistent map key width in {path:?}"));
+            }
+            aggregate = aggregate
+                .checked_add((key.len() + model.len()) as u64)
+                .ok_or("parsed DMM cache size overflow")?;
+        }
+        for grid in &entry.grids {
+            for line in &grid.lines {
+                if line.len() != entry.line_len as usize || line.len() % entry.key_len as usize != 0
+                {
+                    return Err(format!("inconsistent grid line width in {path:?}"));
+                }
+                aggregate = aggregate
+                    .checked_add(line.len() as u64)
+                    .ok_or("parsed DMM cache size overflow")?;
+            }
+        }
+        if aggregate > MAX_PARSED_DMM_BYTES {
+            return Err("parsed DMM cache content exceeds its limit".to_owned());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct PortableLifecycleDirectory {
+    types: Vec<PortableTypeLifecycle>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PortableTypeLifecycle {
+    path: String,
+    parent: Option<String>,
+    targets: [PortableLifecycleResolution; 5],
+}
+
+#[derive(Serialize, Deserialize)]
+enum PortableLifecycleResolution {
+    Absent,
+    Resolved {
+        procedure: u32,
+        implementation: u32,
+        procedure_path: String,
+        declaring_type: String,
+        inherited: bool,
+        source_path: String,
+        source_start: u64,
+        source_end: u64,
+        source_ordinal: u64,
+    },
+    Unsupported {
+        message: String,
+        procedure_path: Option<String>,
+    },
+}
 
 /// Lifecycle entry points resolved for every runtime type.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -247,7 +867,168 @@ pub struct LifecycleIndex {
     diagnostics: Vec<LifecycleDiagnostic>,
 }
 
+fn portable_resolution(value: &LifecycleResolution) -> PortableLifecycleResolution {
+    match value {
+        LifecycleResolution::Absent => PortableLifecycleResolution::Absent,
+        LifecycleResolution::Resolved(target) => PortableLifecycleResolution::Resolved {
+            procedure: target.procedure.index() as u32,
+            implementation: target.implementation.index() as u32,
+            procedure_path: target.procedure_path.clone(),
+            declaring_type: target.declaring_type.clone(),
+            inherited: target.inherited,
+            source_path: target.source.path.clone(),
+            source_start: target.source.span.start as u64,
+            source_end: target.source.span.end as u64,
+            source_ordinal: target.source.ordinal as u64,
+        },
+        LifecycleResolution::Unsupported(issue) => PortableLifecycleResolution::Unsupported {
+            message: issue.message.clone(),
+            procedure_path: issue.procedure_path.clone(),
+        },
+    }
+}
+
+fn runtime_resolution(value: PortableLifecycleResolution) -> LifecycleResolution {
+    match value {
+        PortableLifecycleResolution::Absent => LifecycleResolution::Absent,
+        PortableLifecycleResolution::Unsupported {
+            message,
+            procedure_path,
+        } => LifecycleResolution::Unsupported(Arc::new(LifecycleTargetIssue {
+            kind: LifecycleTargetIssueKind::MissingImplementation,
+            message,
+            procedure_path,
+        })),
+        PortableLifecycleResolution::Resolved {
+            procedure,
+            implementation,
+            procedure_path,
+            declaring_type,
+            inherited,
+            source_path,
+            source_start,
+            source_end,
+            source_ordinal,
+        } => {
+            let procedure = ProcedureId::from_index(procedure as usize);
+            LifecycleResolution::Resolved(Arc::new(LifecycleTarget {
+                procedure,
+                implementation: ProcedureImplementationId::from_indices(
+                    procedure.index(),
+                    implementation as usize,
+                ),
+                procedure_path,
+                declaring_type,
+                inherited,
+                source: LifecycleSource {
+                    file_id: FileId::from_index(0),
+                    path: source_path,
+                    span: SourceSpan::new(source_start as usize, source_end as usize),
+                    ordinal: source_ordinal as usize,
+                },
+            }))
+        }
+    }
+}
+
 impl LifecycleIndex {
+    /// Encodes the runtime lifecycle directory without compiler-local node identities.
+    pub fn encode_portable(&self) -> Result<Vec<u8>, String> {
+        use bincode::Options as _;
+        let directory = PortableLifecycleDirectory {
+            types: self
+                .types
+                .iter()
+                .map(|ty| PortableTypeLifecycle {
+                    path: ty.path.clone(),
+                    parent: ty.parent.clone(),
+                    targets: LifecycleKind::ALL
+                        .map(|kind| portable_resolution(ty.targets.get(kind))),
+                })
+                .collect(),
+        };
+        let payload = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(MAX_LIFECYCLE_DIRECTORY_BYTES)
+            .serialize(&directory)
+            .map_err(|error| error.to_string())?;
+        let mut bytes = Vec::with_capacity(22 + payload.len());
+        bytes.extend_from_slice(LIFECYCLE_DIRECTORY_MAGIC);
+        bytes.extend_from_slice(&LIFECYCLE_DIRECTORY_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        Ok(bytes)
+    }
+
+    /// Decodes a portable lifecycle directory and assigns process-local node handles.
+    pub fn decode_portable(bytes: &[u8]) -> Result<Self, String> {
+        use bincode::Options as _;
+        if bytes.len() < 22 || &bytes[..8] != LIFECYCLE_DIRECTORY_MAGIC {
+            return Err("bad lifecycle directory header".into());
+        }
+        if u16::from_le_bytes(bytes[8..10].try_into().unwrap()) != LIFECYCLE_DIRECTORY_VERSION {
+            return Err("unsupported lifecycle directory version".into());
+        }
+        let length = usize::try_from(u64::from_le_bytes(bytes[10..18].try_into().unwrap()))
+            .map_err(|_| "lifecycle directory length exceeds usize")?;
+        if length as u64 > MAX_LIFECYCLE_DIRECTORY_BYTES
+            || bytes.len()
+                != 22usize
+                    .checked_add(length)
+                    .ok_or("lifecycle directory length overflow")?
+        {
+            return Err("invalid lifecycle directory length".into());
+        }
+        let payload = &bytes[22..];
+        if crc32fast::hash(payload) != u32::from_le_bytes(bytes[18..22].try_into().unwrap()) {
+            return Err("lifecycle directory checksum mismatch".into());
+        }
+        let directory: PortableLifecycleDirectory = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(MAX_LIFECYCLE_DIRECTORY_BYTES)
+            .reject_trailing_bytes()
+            .deserialize(payload)
+            .map_err(|error| error.to_string())?;
+        let types = directory
+            .types
+            .into_iter()
+            .enumerate()
+            .map(|(index, ty)| {
+                let [genesis, new_target, initialize, late_initialize, destroy] =
+                    ty.targets.map(runtime_resolution);
+                TypeLifecycle {
+                    node: NodeId::from_index(index),
+                    path: ty.path,
+                    parent: ty.parent,
+                    targets: LifecycleTargets {
+                        genesis,
+                        new_target,
+                        initialize,
+                        late_initialize,
+                        destroy,
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        let by_node = types
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| (ty.node, index))
+            .collect();
+        let by_path = types
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| (ty.path.clone(), index))
+            .collect();
+        Ok(Self {
+            types,
+            by_node,
+            by_path,
+            diagnostics: Vec::new(),
+        })
+    }
+
     /// Builds lifecycle dispatch metadata directly from compiler type nodes.
     /// This compile-only variant avoids constructing a [`RuntimeImage`] when
     /// auditing procedure compatibility before boot.
@@ -447,10 +1228,6 @@ impl LifecycleIndex {
     #[must_use]
     pub fn diagnostics(&self) -> &[LifecycleDiagnostic] {
         &self.diagnostics
-    }
-
-    fn index_for_node(&self, node: NodeId) -> Option<usize> {
-        self.by_node.get(&node).copied()
     }
 }
 
@@ -709,6 +1486,183 @@ pub struct HeadlessReadinessProbe {
     pub fields: Vec<FieldName>,
     /// Value which denotes completed startup.
     pub expected: Value,
+}
+
+impl HeadlessReadinessProbe {
+    /// Encodes a bounded portable boot-readiness manifest.
+    pub fn encode_portable_manifest(&self) -> Result<Vec<u8>, String> {
+        const MAGIC: &[u8; 8] = b"D64BOOT\0";
+        let mut payload = Vec::new();
+        put_manifest_field(&mut payload, self.qualified_storage.as_ref())?;
+        put_manifest_string(&mut payload, self.global.as_str())?;
+        put_manifest_len(&mut payload, self.fields.len())?;
+        for field in &self.fields {
+            put_manifest_string(&mut payload, field.as_str())?;
+        }
+        match &self.expected {
+            Value::Null => payload.push(0),
+            Value::Number(number) => {
+                payload.push(1);
+                payload.extend_from_slice(&number.bits().to_le_bytes());
+            }
+            Value::Text(value) => {
+                payload.push(2);
+                put_manifest_string(&mut payload, value)?;
+            }
+            Value::TypePath(value) => {
+                payload.push(3);
+                put_manifest_string(&mut payload, value.as_str())?;
+            }
+            _ => return Err("boot readiness expected value is not portable".to_owned()),
+        }
+        let mut bytes = Vec::with_capacity(22 + payload.len());
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        Ok(bytes)
+    }
+
+    /// Decodes a bounded portable boot-readiness manifest.
+    pub fn decode_portable_manifest(bytes: &[u8]) -> Result<Self, String> {
+        const MAGIC: &[u8; 8] = b"D64BOOT\0";
+        const MAX: usize = 1024 * 1024;
+        if bytes.len() < 22
+            || &bytes[..8] != MAGIC
+            || u16::from_le_bytes(bytes[8..10].try_into().unwrap()) != 1
+        {
+            return Err("unsupported boot manifest header".to_owned());
+        }
+        let length = usize::try_from(u64::from_le_bytes(bytes[10..18].try_into().unwrap()))
+            .map_err(|_| "boot manifest length overflow")?;
+        if length > MAX
+            || bytes.len()
+                != 22usize
+                    .checked_add(length)
+                    .ok_or("boot manifest length overflow")?
+        {
+            return Err("invalid boot manifest length".to_owned());
+        }
+        let payload = &bytes[22..];
+        if crc32fast::hash(payload) != u32::from_le_bytes(bytes[18..22].try_into().unwrap()) {
+            return Err("boot manifest checksum mismatch".to_owned());
+        }
+        let mut input = std::io::Cursor::new(payload);
+        let qualified_storage = get_manifest_field(&mut input)?;
+        let global = FieldName::parse(&get_manifest_string(&mut input)?)
+            .map_err(|error| error.to_string())?;
+        let count = get_manifest_len(&mut input)?;
+        if count > 1024 {
+            return Err("boot manifest field chain exceeds limit".to_owned());
+        }
+        let mut fields = Vec::with_capacity(count);
+        for _ in 0..count {
+            fields.push(
+                FieldName::parse(&get_manifest_string(&mut input)?)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        let expected = match get_manifest_u8(&mut input)? {
+            0 => Value::Null,
+            1 => {
+                let mut bits = [0; 4];
+                std::io::Read::read_exact(&mut input, &mut bits)
+                    .map_err(|error| error.to_string())?;
+                Value::number(f32::from_bits(u32::from_le_bytes(bits)))
+            }
+            2 => Value::text(get_manifest_string(&mut input)?),
+            3 => Value::TypePath(
+                TypePath::parse(&get_manifest_string(&mut input)?)
+                    .map_err(|error| error.to_string())?,
+            ),
+            _ => return Err("invalid boot manifest expected-value tag".to_owned()),
+        };
+        if input.position() as usize != payload.len() {
+            return Err("boot manifest has trailing bytes".to_owned());
+        }
+        Ok(Self {
+            qualified_storage,
+            global,
+            fields,
+            expected,
+        })
+    }
+}
+
+/// Derives the project's portable lobby-readiness contract from compiler macros.
+#[must_use]
+pub fn derive_lobby_readiness(
+    compilation: &Compilation,
+    runtime: &RuntimeImage,
+) -> Option<HeadlessReadinessProbe> {
+    let has_ticker_type = runtime
+        .types()
+        .any(|(path, _)| path.as_str() == "/datum/controller/subsystem/ticker");
+    let expected = compilation
+        .project()
+        .object_macro("GAME_STATE_PREGAME")?
+        .trim()
+        .parse::<f32>()
+        .ok()?;
+    has_ticker_type.then(|| HeadlessReadinessProbe {
+        qualified_storage: None,
+        global: FieldName::parse("SSticker").expect("DM global identifier is valid"),
+        fields: vec![FieldName::parse("current_state").expect("DM field identifier is valid")],
+        expected: Value::number(expected),
+    })
+}
+
+fn put_manifest_len(output: &mut Vec<u8>, value: usize) -> Result<(), String> {
+    output.extend_from_slice(
+        &u32::try_from(value)
+            .map_err(|_| "boot manifest item count exceeds u32")?
+            .to_le_bytes(),
+    );
+    Ok(())
+}
+fn put_manifest_string(output: &mut Vec<u8>, value: &str) -> Result<(), String> {
+    if value.len() > 1024 * 1024 {
+        return Err("boot manifest string exceeds limit".to_owned());
+    }
+    put_manifest_len(output, value.len())?;
+    output.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+fn put_manifest_field(output: &mut Vec<u8>, value: Option<&FieldName>) -> Result<(), String> {
+    output.push(u8::from(value.is_some()));
+    if let Some(value) = value {
+        put_manifest_string(output, value.as_str())?;
+    }
+    Ok(())
+}
+fn get_manifest_u8(input: &mut std::io::Cursor<&[u8]>) -> Result<u8, String> {
+    let mut value = [0];
+    std::io::Read::read_exact(input, &mut value).map_err(|error| error.to_string())?;
+    Ok(value[0])
+}
+fn get_manifest_len(input: &mut std::io::Cursor<&[u8]>) -> Result<usize, String> {
+    let mut value = [0; 4];
+    std::io::Read::read_exact(input, &mut value).map_err(|error| error.to_string())?;
+    Ok(u32::from_le_bytes(value) as usize)
+}
+fn get_manifest_string(input: &mut std::io::Cursor<&[u8]>) -> Result<String, String> {
+    let length = get_manifest_len(input)?;
+    if length > 1024 * 1024 {
+        return Err("boot manifest string exceeds limit".to_owned());
+    }
+    let mut value = vec![0; length];
+    std::io::Read::read_exact(input, &mut value).map_err(|error| error.to_string())?;
+    String::from_utf8(value).map_err(|error| error.to_string())
+}
+fn get_manifest_field(input: &mut std::io::Cursor<&[u8]>) -> Result<Option<FieldName>, String> {
+    match get_manifest_u8(input)? {
+        0 => Ok(None),
+        1 => FieldName::parse(&get_manifest_string(input)?)
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        _ => Err("invalid boot manifest optional-field tag".to_owned()),
+    }
 }
 
 /// Lifecycle bytecode linked before runtime/world materialization so boot does
@@ -970,6 +1924,24 @@ pub fn precompile_lifecycle_for_world_with_executable(
     }
 }
 
+/// Prepares lifecycle execution from portable runtime directories only.
+#[must_use]
+pub fn precompile_portable_lifecycle_for_world(
+    index: &LifecycleIndex,
+    world: &WorldPlan,
+    executable: dm_semantics::ExecutableProcedures,
+) -> PrecompiledLifecycle {
+    let targets = lifecycle_targets_for_world(index, world);
+    let reachable_bodies = executable.stats().procedures;
+    PrecompiledLifecycle {
+        executable,
+        persistent_state: None,
+        targets: targets.len(),
+        reachable_bodies,
+        closure: dm_semantics::ProcedureClosureStats::default(),
+    }
+}
+
 fn lifecycle_targets_for_world(
     index: &LifecycleIndex,
     world: &WorldPlan,
@@ -991,17 +1963,17 @@ fn lifecycle_targets_for_world(
             LifecycleKind::LateInitialize,
         ]
     };
-    for node in world
+    for path in world
         .templates()
         .values()
         .flat_map(|template| &template.initializers)
         .filter_map(|initializer| match initializer.resolution {
-            InitializerResolution::Resolved { node, .. } => Some(node),
+            InitializerResolution::Resolved { .. } => Some(initializer.path.as_str()),
             _ => None,
         })
         .collect::<BTreeSet<_>>()
     {
-        let Some(lifecycle) = index.find_node(node) else {
+        let Some(lifecycle) = index.find_path(path) else {
             continue;
         };
         for &kind in map_kinds {
@@ -1590,7 +2562,7 @@ pub fn execute_boot_initialization_plan_with_precompiled(
         scheduler_limits,
         readiness,
         &mut precompiled.executable,
-        readiness.map(|_| &mut precompiled.persistent_state),
+        Some(&mut precompiled.persistent_state),
         false,
         true,
         None,
@@ -1634,7 +2606,7 @@ pub fn execute_boot_initialization_plan_with_precompiled_and_startup_service(
         scheduler_limits,
         readiness,
         &mut precompiled.executable,
-        readiness.map(|_| &mut precompiled.persistent_state),
+        Some(&mut precompiled.persistent_state),
         false,
         true,
         Some(startup_service),
@@ -1938,6 +2910,8 @@ fn drain_startup_scheduler(
 ) -> Result<SchedulerDrain, InitializationExecutionError> {
     let start_tick = state.scheduler_tick();
     let tick_limit = start_tick.saturating_add(limits.max_ticks);
+    let wall_clock_budget = scheduler_wall_clock_budget();
+    let drain_started = Instant::now();
     let mut drain = SchedulerDrain {
         final_tick: start_tick,
         ..SchedulerDrain::default()
@@ -1957,6 +2931,16 @@ fn drain_startup_scheduler(
             drain.termination = SchedulerDrainTermination::RoundLimit;
             break;
         }
+        let remaining_wall_budget = match wall_clock_budget {
+            Some(budget) => match budget.checked_sub(drain_started.elapsed()) {
+                Some(remaining) => Some(remaining),
+                None => {
+                    drain.termination = SchedulerDrainTermination::RoundLimit;
+                    break;
+                }
+            },
+            None => None,
+        };
         let next_tick = state
             .next_scheduled_tick()
             .expect("a non-empty scheduler has an earliest task");
@@ -1968,7 +2952,11 @@ fn drain_startup_scheduler(
         match advance_scheduler(
             executable.module(),
             advance,
-            ExecutionLimits::default(),
+            ExecutionLimits {
+                max_steps: startup_scheduler_max_steps(),
+                wall_clock_budget: remaining_wall_budget,
+                ..ExecutionLimits::default()
+            },
             state,
         ) {
             Ok(completed) => {
@@ -1977,6 +2965,14 @@ fn drain_startup_scheduler(
                 drop(completed);
             }
             Err(error) => {
+                if !startup_fail_fast_on_error()
+                    && scheduler_budget_exhausted(&error)
+                {
+                    drain.rounds += 1;
+                    state.release_host_value_roots();
+                    drain.final_tick = state.scheduler_tick();
+                    continue;
+                }
                 if startup_fail_fast_on_error() {
                     return Err(InitializationExecutionError::Scheduler(error));
                 }
@@ -2034,6 +3030,14 @@ fn startup_fail_fast_on_error() -> bool {
     })
 }
 
+fn scheduler_budget_exhausted(error: &RuntimeError) -> bool {
+    error
+        .message
+        .strip_prefix("instruction budget of ")
+        .and_then(|rest| rest.strip_suffix(" exhausted"))
+        .is_some()
+}
+
 /// Advances persistent scheduled server work in a bounded host-loop slice.
 /// Pending continuations remain in the runtime image for the next slice.
 pub fn advance_persistent_scheduler(
@@ -2074,11 +3078,30 @@ pub fn advance_persistent_scheduler_responsive(
         limits,
         ExecutionLimits {
             max_steps: max_steps_per_round.max(1),
+            wall_clock_budget: scheduler_wall_clock_budget(),
             ..ExecutionLimits::default()
         },
     );
     precompiled.persistent_state = Some(state);
     Ok(result)
+}
+
+fn scheduler_wall_clock_budget() -> Option<Duration> {
+    const DEFAULT_MILLIS: u64 = 50;
+    let millis = std::env::var("DREAM64_SCHEDULER_WALL_BUDGET_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MILLIS);
+    (millis > 0).then(|| Duration::from_millis(millis))
+}
+
+fn startup_scheduler_max_steps() -> u64 {
+    const DEFAULT_STEPS: u64 = 100_000;
+    std::env::var("DREAM64_STARTUP_SCHEDULER_MAX_STEPS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STEPS)
+        .max(1)
 }
 
 fn drain_persistent_scheduler(
@@ -2115,6 +3138,11 @@ fn drain_persistent_scheduler(
                 state.release_host_value_roots();
             }
             Err(error) => {
+                if scheduler_budget_exhausted(&error) {
+                    state.release_host_value_roots();
+                    drain.final_tick = state.scheduler_tick();
+                    continue;
+                }
                 // `advance_scheduler` drops only the failing continuation and
                 // restores every later due task to scheduler state. Match the
                 // server scheduler's thread isolation here: report the full
@@ -2159,7 +3187,16 @@ fn drain_persistent_scheduler(
     drain
 }
 
-fn readiness_probe_matches(state: &dm_vm::ExecutionState, probe: &HeadlessReadinessProbe) -> bool {
+/// Returns whether a codebase-owned lifecycle marker currently matches.
+///
+/// Hosts use this at generation-activation boundaries as well as during the
+/// initial scheduler drain. Keeping the comparison here ensures restored and
+/// cold worlds follow the same datum/static-storage semantics.
+#[must_use]
+pub fn readiness_probe_matches(
+    state: &dm_vm::ExecutionState,
+    probe: &HeadlessReadinessProbe,
+) -> bool {
     let storage = probe.qualified_storage.as_ref().unwrap_or(&probe.global);
     let Some(mut value) = state.global(storage).cloned() else {
         return false;
@@ -2523,8 +3560,8 @@ fn plan_map_atoms(
             .get(cell.key.as_str())
             .expect("retained world templates have shared lifecycle metadata");
         for (initializer_index, initializer) in template.initializers.iter().enumerate() {
-            let (node, category) = match initializer.resolution {
-                InitializerResolution::Resolved { node, category } => (node, category),
+            let category = match initializer.resolution {
+                InitializerResolution::Resolved { category } => category,
                 InitializerResolution::Unknown | InitializerResolution::NonType { .. } => {
                     diagnostics.push(LifecycleDiagnostic {
                         kind: LifecycleDiagnosticKind::UnsupportedMapInitializer,
@@ -2540,7 +3577,7 @@ fn plan_map_atoms(
                     continue;
                 }
             };
-            let Some(type_index) = index.index_for_node(node) else {
+            let Some(type_index) = index.by_path.get(&initializer.path).copied() else {
                 diagnostics.push(LifecycleDiagnostic {
                     kind: LifecycleDiagnosticKind::MissingTypeLifecycle,
                     message: format!(
@@ -2780,13 +3817,42 @@ fn initialization_events(
 
 fn project_manages_atom_initialization(index: &LifecycleIndex) -> bool {
     index
-        .find_path("/datum/controller/subsystem/atoms")
-        .is_some_and(|lifecycle| {
+        .types
+        .iter()
+        .enumerate()
+        .filter(|&(type_index, _)| {
+            inherits_from_subsystem_atoms(index, type_index)
+        })
+        .any(|(type_index, _)| {
             matches!(
-                lifecycle.targets.get(LifecycleKind::Initialize),
+                index.types[type_index].targets.get(LifecycleKind::Initialize),
+                LifecycleResolution::Resolved(_)
+            ) || matches!(
+                index.types[type_index].targets.get(LifecycleKind::LateInitialize),
                 LifecycleResolution::Resolved(_)
             )
         })
+}
+
+fn inherits_from_subsystem_atoms(index: &LifecycleIndex, type_index: usize) -> bool {
+    let mut current = type_index;
+    let mut seen = BTreeSet::<usize>::new();
+    loop {
+        if !seen.insert(current) {
+            return false;
+        }
+        let lifecycle = &index.types[current];
+        if lifecycle.path == "/datum/controller/subsystem/atoms" {
+            return true;
+        }
+        let Some(parent) = lifecycle.parent.as_deref() else {
+            return false;
+        };
+        let Some(parent_index) = index.by_path.get(parent) else {
+            return false;
+        };
+        current = *parent_index;
+    }
 }
 
 fn has_target(index: &LifecycleIndex, type_index: usize, kind: LifecycleKind) -> bool {
@@ -2800,33 +3866,142 @@ fn has_target(index: &LifecycleIndex, type_index: usize, kind: LifecycleKind) ->
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use dm_compiler::{Compilation, CompilerDatabase};
     use dm_map::parse;
     use dm_runtime::RuntimeImage;
     use dm_semantics::{ExecutableProcedures, ProcedureRegistry};
+    use dm_syntax::parse as parse_dm;
     use dm_value::{FieldName, TypePath, Value};
     use dm_vm::{
-        ExecutionContext, ExecutionState, execute_module_in_context, execute_module_in_state,
+        ExecutionContext, ExecutionState, compile_module, execute_module_in_context,
+        execute_module_in_state,
     };
     use dm_world::{WorldCoordinate, allocate_world, build_plan};
 
     use super::{
         EventSubject, HeadlessReadinessProbe, HostSliceBudget, InitializationEvent,
         InitializationExecutionError, LifecycleIndex, LifecycleKind, LifecycleResolution,
-        SchedulerDrainLimits, SchedulerDrainTermination, advance_persistent_scheduler,
-        audit_initialization_plan_with_precompiled, build_initialization_plan, construct_datum,
-        delete_datum, execute_boot_initialization_plan_with_precompiled_and_startup_service,
+        PortableDmmMeasurement, SchedulerDrainLimits, SchedulerDrainTermination,
+        advance_persistent_scheduler, audit_initialization_plan_with_precompiled,
+        build_dmm_measurements, build_initialization_plan, build_parsed_dmm_cache, construct_datum,
+        decode_and_attach_procedure_semantics, decode_dmm_measurements, decode_parsed_dmm_cache,
+        delete_datum, encode_dmm_measurements, encode_parsed_dmm_cache, encode_procedure_semantics,
+        execute_boot_initialization_plan_with_precompiled,
+        execute_boot_initialization_plan_with_precompiled_and_startup_service,
         execute_initialization_plan, execute_initialization_plan_with_precompiled,
-        precompile_lifecycle_for_world, sweep_lifecycle_compatibility,
+        measure_dmm_source, precompile_lifecycle_for_world, sweep_lifecycle_compatibility,
     };
 
     static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn procedure_semantic_directory_is_stable_and_rejects_body_changes_and_corruption() {
+        let build = |source: &str| compile_module(&parse_dm(source).unwrap().definitions).unwrap();
+        let first = build("/proc/example(value)\n\treturn value + 1\n");
+        let equivalent = build("/proc/example(value)\n\n\treturn value + 1\n");
+        let mut changed = build("/proc/example(value)\n\treturn value + 2\n");
+        let first_digest = first.compute_all_procedure_semantic_digests().unwrap()[0];
+        assert_eq!(
+            first_digest,
+            equivalent.compute_all_procedure_semantic_digests().unwrap()[0]
+        );
+        assert_ne!(
+            first_digest,
+            changed.compute_all_procedure_semantic_digests().unwrap()[0]
+        );
+
+        let encoded = encode_procedure_semantics(&first).unwrap();
+        let mut restored = first.clone();
+        decode_and_attach_procedure_semantics(&encoded, &mut restored).unwrap();
+        let procedure = restored.procedure_id("/proc/example").unwrap();
+        assert_eq!(
+            restored.procedure_semantic_digest(procedure),
+            Some(first_digest)
+        );
+        assert!(decode_and_attach_procedure_semantics(&encoded, &mut changed).is_err());
+        let mut corrupt = encoded;
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(decode_and_attach_procedure_semantics(&corrupt, &mut restored).is_err());
+    }
+
+    #[test]
+    fn portable_dmm_measurements_match_dmm_and_tgm_bounds() {
+        let dmm = "\"a\" = (/turf)\n(3,5,2) = {\"\naa\naa\n\"}\n";
+        let tgm = "\"aa\" = (\n/turf,\n/area)\n(7,9,4) = {\"\naaaa\naaaa\naaaa\n\"}\n";
+        assert_eq!(measure_dmm_source(dmm).unwrap().bounds, [3, 5, 2, 4, 6, 2]);
+        assert_eq!(measure_dmm_source(tgm).unwrap().bounds, [7, 9, 4, 8, 11, 4]);
+
+        let mut catalog = BTreeMap::new();
+        catalog.insert(
+            "_maps/example.dmm".to_owned(),
+            PortableDmmMeasurement {
+                digest: md5::compute(dmm).0,
+                measurement: measure_dmm_source(dmm).unwrap(),
+            },
+        );
+        let encoded = encode_dmm_measurements(&catalog).unwrap();
+        assert_eq!(decode_dmm_measurements(&encoded).unwrap(), catalog);
+        let mut corrupt = encoded;
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(decode_dmm_measurements(&corrupt).is_err());
+    }
+
+    #[test]
+    fn dmm_measurement_discovery_includes_unincluded_nested_resources() {
+        let (fixture, compilation) = Fixture::compile("/proc/run()\n\treturn 1\n");
+        let nested = fixture.0.join("_maps").join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("Unincluded.DMM"),
+            "\"a\" = (/turf)\n(2,3,4) = {\"\naa\naa\n\"}\n",
+        )
+        .unwrap();
+        let measurements = build_dmm_measurements(&compilation).unwrap();
+        assert_eq!(
+            measurements
+                .get("_maps/nested/unincluded.dmm")
+                .unwrap()
+                .measurement
+                .bounds,
+            [2, 3, 4, 3, 4, 4]
+        );
+        let parsed = build_parsed_dmm_cache(&compilation).unwrap();
+        let entry = parsed.get("_maps/nested/unincluded.dmm").unwrap();
+        assert!(!entry.tgm);
+        assert_eq!(entry.models, vec![("a".to_owned(), "/turf".to_owned())]);
+        assert_eq!(entry.grids[0].lines, vec!["aa", "aa"]);
+        let encoded = encode_parsed_dmm_cache(&parsed).unwrap();
+        assert_eq!(decode_parsed_dmm_cache(&encoded).unwrap(), parsed);
+        let mut corrupt = encoded;
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(decode_parsed_dmm_cache(&corrupt).is_err());
+    }
+
+    #[test]
+    fn parsed_tgm_grid_y_is_the_top_source_row() {
+        let (fixture, compilation) = Fixture::compile("/proc/run()\n\treturn 1\n");
+        let maps = fixture.0.join("_maps");
+        fs::create_dir_all(&maps).unwrap();
+        fs::write(
+            maps.join("column.dmm"),
+            "\"aa\" = (\n/turf,\n/area)\n(7,9,4) = {\"\naaaa\naaaa\naaaa\n\"}\n",
+        )
+        .unwrap();
+
+        let parsed = build_parsed_dmm_cache(&compilation).unwrap();
+        let entry = parsed.get("_maps/column.dmm").unwrap();
+        assert!(entry.tgm);
+        assert_eq!(entry.grids[0].lines, vec!["aaaa", "aaaa", "aaaa"]);
+        assert_eq!(entry.grids[0].y, 11, "reader.dm advances y by len - 1");
+        assert_eq!(entry.bounds, [7, 9, 4, 8, 11, 4]);
+    }
 
     struct Fixture(PathBuf);
 
@@ -2866,6 +4041,69 @@ mod tests {
         let index = LifecycleIndex::build_compile_only(&compilation, &procedures);
         assert!(index.find_path("/world").is_some());
         assert!(!procedures.dependencies_initialized());
+    }
+
+    #[test]
+    fn portable_lifecycle_directory_roundtrips_without_compiler_node_ids() {
+        let (_fixture, compilation) = Fixture::compile(concat!(
+            "/world/New()\n\treturn ..()\n",
+            "/obj/example\n\tInitialize()\n\t\treturn 7\n",
+        ));
+        let procedures = ProcedureRegistry::build(&compilation);
+        let index = LifecycleIndex::build_compile_only(&compilation, &procedures);
+        let bytes = index.encode_portable().expect("directory should encode");
+        let restored = LifecycleIndex::decode_portable(&bytes).expect("directory should decode");
+        assert_eq!(
+            restored
+                .types()
+                .iter()
+                .map(|ty| ty.path.as_str())
+                .collect::<Vec<_>>(),
+            index
+                .types()
+                .iter()
+                .map(|ty| ty.path.as_str())
+                .collect::<Vec<_>>()
+        );
+        let original = index
+            .find_path("/obj/example")
+            .unwrap()
+            .targets
+            .get(LifecycleKind::Initialize);
+        let decoded = restored
+            .find_path("/obj/example")
+            .unwrap()
+            .targets
+            .get(LifecycleKind::Initialize);
+        let (LifecycleResolution::Resolved(original), LifecycleResolution::Resolved(decoded)) =
+            (original, decoded)
+        else {
+            panic!("Initialize should remain resolved")
+        };
+        assert_eq!(decoded.procedure.index(), original.procedure.index());
+        assert_eq!(
+            decoded.implementation.index(),
+            original.implementation.index()
+        );
+        assert_eq!(decoded.procedure_path, original.procedure_path);
+    }
+
+    #[test]
+    fn portable_boot_manifest_roundtrips_and_rejects_corruption() {
+        let probe = HeadlessReadinessProbe {
+            qualified_storage: None,
+            global: FieldName::parse("SSticker").unwrap(),
+            fields: vec![FieldName::parse("current_state").unwrap()],
+            expected: Value::number(2.0),
+        };
+        let bytes = probe.encode_portable_manifest().unwrap();
+        assert_eq!(
+            HeadlessReadinessProbe::decode_portable_manifest(&bytes).unwrap(),
+            probe
+        );
+        let mut corrupt = bytes;
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(HeadlessReadinessProbe::decode_portable_manifest(&corrupt).is_err());
     }
 
     #[test]
@@ -3188,6 +4426,145 @@ mod tests {
         .expect("one-cell subsystem-managed map should parse");
         let world = build_plan(&map, &compilation);
         let plan = build_initialization_plan(&runtime, &index, &world, "managed.dmm");
+        let lifecycle: Vec<_> = plan
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                InitializationEvent::Lifecycle { subject, kind, .. } => Some((*subject, *kind)),
+                InitializationEvent::Globals => None,
+            })
+            .collect();
+
+        assert_eq!(lifecycle[0], (EventSubject::World, LifecycleKind::Genesis));
+        let world_new = lifecycle
+            .iter()
+            .position(|event| *event == (EventSubject::World, LifecycleKind::New))
+            .expect("world New should be planned");
+        assert!(
+            lifecycle[1..world_new]
+                .iter()
+                .all(
+                    |(subject, kind)| matches!(subject, EventSubject::MapAtom(_))
+                        && *kind == LifecycleKind::New
+                )
+        );
+        assert!(lifecycle[world_new + 1..].is_empty());
+        assert!(!lifecycle.iter().any(|(_, kind)| matches!(
+            kind,
+            LifecycleKind::Initialize | LifecycleKind::LateInitialize
+        )));
+    }
+
+    #[test]
+    fn monk_pipeline_defers_lateinitialize_to_ssatoms_even_without_atoms_initialize_override() {
+        let source = concat!(
+            "/world/Genesis()\n/world/New()\n",
+            "/atom/New(loc)\n/atom/LateInitialize()\n",
+            "/datum/controller/subsystem/atoms/LateInitialize()\n",
+            "/area/test\n/turf/test\n/obj/test\n",
+        );
+        let (_fixture, compilation, runtime, index) = index(source);
+        let map = parse(concat!(
+            "\"a\" = (/obj/test, /turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .expect("one-cell subsystem-managed map should parse");
+        let world = build_plan(&map, &compilation);
+        let plan = build_initialization_plan(&runtime, &index, &world, "managed-lateonly.dmm");
+        let lifecycle: Vec<_> = plan
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                InitializationEvent::Lifecycle { subject, kind, .. } => Some((*subject, *kind)),
+                InitializationEvent::Globals => None,
+            })
+            .collect();
+
+        assert_eq!(lifecycle[0], (EventSubject::World, LifecycleKind::Genesis));
+        let world_new = lifecycle
+            .iter()
+            .position(|event| *event == (EventSubject::World, LifecycleKind::New))
+            .expect("world New should be planned");
+        assert!(
+            lifecycle[1..world_new]
+                .iter()
+                .all(
+                    |(subject, kind)| matches!(subject, EventSubject::MapAtom(_))
+                        && *kind == LifecycleKind::New
+                )
+        );
+        assert!(lifecycle[world_new + 1..].is_empty());
+        assert!(!lifecycle.iter().any(|(_, kind)| matches!(kind, LifecycleKind::Initialize | LifecycleKind::LateInitialize)));
+    }
+
+    #[test]
+    fn monk_pipeline_defers_atom_lifecycle_to_atoms_descendant() {
+        let source = concat!(
+            "/world/Genesis()\n/world/New()\n",
+            "/atom/New(loc)\n/atom/Initialize()\n",
+            "/atom/LateInitialize()\n",
+            "/datum/controller/subsystem/atoms\n",
+            "/datum/controller/subsystem/atoms/descendant/Initialize()\n",
+            "/datum/controller/subsystem/atoms/descendant/LateInitialize()\n",
+            "/area/test\n/turf/test\n/obj/test\n",
+        );
+        let (_fixture, compilation, runtime, index) = index(source);
+        let map = parse(concat!(
+            "\"a\" = (/obj/test, /turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .expect("one-cell subsystem-managed descendant map should parse");
+        let world = build_plan(&map, &compilation);
+        let plan = build_initialization_plan(&runtime, &index, &world, "managed-derivative.dmm");
+        let lifecycle: Vec<_> = plan
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                InitializationEvent::Lifecycle { subject, kind, .. } => Some((*subject, *kind)),
+                InitializationEvent::Globals => None,
+            })
+            .collect();
+
+        assert_eq!(lifecycle[0], (EventSubject::World, LifecycleKind::Genesis));
+        let world_new = lifecycle
+            .iter()
+            .position(|event| *event == (EventSubject::World, LifecycleKind::New))
+            .expect("world New should be planned");
+        assert!(
+            lifecycle[1..world_new]
+                .iter()
+                .all(
+                    |(subject, kind)| matches!(subject, EventSubject::MapAtom(_))
+                        && *kind == LifecycleKind::New
+                )
+        );
+        assert!(lifecycle[world_new + 1..].is_empty());
+        assert!(!lifecycle.iter().any(|(_, kind)| matches!(
+            kind,
+            LifecycleKind::Initialize | LifecycleKind::LateInitialize
+        )));
+    }
+
+    #[test]
+    fn monk_pipeline_defers_atom_lifecycle_to_atoms_granddescendant() {
+        let source = concat!(
+            "/world/Genesis()\n/world/New()\n",
+            "/atom/New(loc)\n/atom/Initialize()\n",
+            "/atom/LateInitialize()\n",
+            "/datum/controller/subsystem/atoms\n",
+            "/datum/controller/subsystem/atoms/branch\n",
+            "/datum/controller/subsystem/atoms/branch/leaf/Initialize()\n",
+            "/datum/controller/subsystem/atoms/branch/leaf/LateInitialize()\n",
+            "/area/test\n/turf/test\n/obj/test\n",
+        );
+        let (_fixture, compilation, runtime, index) = index(source);
+        let map = parse(concat!(
+            "\"a\" = (/obj/test, /turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .expect("one-cell subsystem-managed grand-descendant map should parse");
+        let world = build_plan(&map, &compilation);
+        let plan = build_initialization_plan(&runtime, &index, &world, "managed-granddescendant.dmm");
         let lifecycle: Vec<_> = plan
             .events
             .iter()
@@ -3698,6 +5075,70 @@ mod tests {
     }
 
     #[test]
+    fn production_boot_without_readiness_retains_pending_scheduler_state() {
+        let source = concat!(
+            "var/global/finished = 0\n",
+            "/world/New()\n\tset waitfor = FALSE\n\tsleep(2)\n\tglobal.finished = 1\n",
+            "/area/test\n/turf/test\n",
+        );
+        let (_fixture, compilation) = Fixture::compile(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .unwrap();
+        let world = build_plan(&map, &compilation);
+        let compile_index = LifecycleIndex::build_compile_only(&compilation, &procedures);
+        let mut precompiled =
+            precompile_lifecycle_for_world(&compilation, &procedures, &compile_index, &world)
+                .unwrap();
+        let mut runtime = RuntimeImage::from_compilation(&compilation).unwrap();
+        let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
+        let plan = build_initialization_plan(&runtime, &index, &world, "test.dmm");
+        let allocation = allocate_world(&world, &mut runtime).unwrap();
+        let execution = execute_boot_initialization_plan_with_precompiled(
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+            SchedulerDrainLimits {
+                max_ticks: 10,
+                max_rounds: 0,
+            },
+            None,
+            &mut precompiled,
+        )
+        .unwrap();
+        assert_eq!(
+            execution.scheduler.termination,
+            SchedulerDrainTermination::RoundLimit
+        );
+        assert_eq!(execution.scheduler.pending_tasks, 1);
+        assert!(precompiled.persistent_state.is_some());
+
+        let resumed = advance_persistent_scheduler(
+            &mut precompiled,
+            &mut runtime,
+            SchedulerDrainLimits {
+                max_ticks: 5,
+                max_rounds: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(resumed.termination, SchedulerDrainTermination::StableIdle);
+        assert_eq!(resumed.pending_tasks, 0);
+        assert_eq!(
+            precompiled
+                .persistent_state
+                .as_ref()
+                .unwrap()
+                .global(&FieldName::parse("finished").unwrap()),
+            Some(&Value::number(1.0)),
+        );
+    }
+
+    #[test]
     fn startup_service_attaches_client_before_readiness_and_preserves_session() {
         let source = concat!(
             "var/global/ready = 0\nvar/global/client_started = 0\n",
@@ -4008,6 +5449,81 @@ mod tests {
                 .as_ref()
                 .and_then(|state| state.global(&FieldName::parse("trace").unwrap())),
             Some(&Value::text("L")),
+        );
+    }
+
+    #[test]
+    fn pre_readiness_scheduler_drain_is_wall_bounded_and_resumable() {
+        let source = concat!(
+            "var/global/ready = 0\n",
+            "var/global/progress = 0\n",
+            "/proc/finish_startup()\n",
+            "\tvar/local_progress = 0\n",
+            "\twhile(local_progress < 200000)\n",
+            "\t\tlocal_progress += 1\n",
+            "\tglobal.progress = local_progress\n",
+            "\tglobal.ready = 1\n",
+            "/world/New()\n",
+            "\tspawn(0) finish_startup()\n",
+            "/area/test\n/turf/test\n",
+        );
+        let (_fixture, compilation) = Fixture::compile(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let map = parse(concat!(
+            "\"a\" = (/turf/test, /area/test)\n",
+            "(1,1,1) = {\"\na\n\"}\n",
+        ))
+        .unwrap();
+        let world = build_plan(&map, &compilation);
+        let compile_index = LifecycleIndex::build_compile_only(&compilation, &procedures);
+        let mut precompiled =
+            precompile_lifecycle_for_world(&compilation, &procedures, &compile_index, &world)
+                .unwrap();
+        let mut runtime = RuntimeImage::from_compilation(&compilation).unwrap();
+        let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
+        let plan = build_initialization_plan(&runtime, &index, &world, "test.dmm");
+        let allocation = allocate_world(&world, &mut runtime).unwrap();
+        let readiness = HeadlessReadinessProbe {
+            qualified_storage: None,
+            global: FieldName::parse("ready").unwrap(),
+            fields: vec![],
+            expected: Value::number(1.0),
+        };
+        let started = Instant::now();
+        let execution = execute_initialization_plan_with_precompiled(
+            &index,
+            &plan,
+            &allocation,
+            &mut runtime,
+            SchedulerDrainLimits::default(),
+            Some(&readiness),
+            &mut precompiled,
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            execution.scheduler.termination,
+            SchedulerDrainTermination::RoundLimit
+        );
+        assert!(execution.scheduler.pending_tasks > 0);
+
+        let resumed = advance_persistent_scheduler(
+            &mut precompiled,
+            &mut runtime,
+            SchedulerDrainLimits {
+                max_ticks: 1,
+                max_rounds: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(resumed.termination, SchedulerDrainTermination::StableIdle);
+        assert_eq!(
+            precompiled
+                .persistent_state
+                .as_ref()
+                .unwrap()
+                .global(&FieldName::parse("progress").unwrap()),
+            Some(&Value::number(200000.0)),
         );
     }
 

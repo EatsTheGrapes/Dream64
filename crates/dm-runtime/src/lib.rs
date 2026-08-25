@@ -21,7 +21,9 @@ use dm_globals::{
 use dm_lexer::{TokenKind, lex};
 use dm_object_tree::NodeKind;
 use dm_semantics::ProcedureRegistry;
-use dm_value::{DatumDefaults, DatumId, FieldName, TypePath, Value, ValueError, ValueHeap};
+use dm_value::{
+    DatumDefaults, DatumId, FieldName, HeapSnapshotValue, TypePath, Value, ValueError, ValueHeap,
+};
 use dm_vm::{
     ExecutionContext, ExecutionState, InitializerBinding, InitializerProgram, InstanceInitializer,
     Module, RuntimeError, append_initializer_program, compile_initializer,
@@ -871,7 +873,424 @@ pub struct RuntimeImage {
     datum_allocation_plans: BTreeMap<TypePath, DatumAllocationPlan>,
     procedure_static_locals: BTreeMap<(String, u16), Value>,
     project_root: PathBuf,
+    dmm_measurements: Arc<BTreeMap<String, dm_vm::DmmMeasurement>>,
+    parsed_dmm_cache: Arc<BTreeMap<String, dm_vm::ParsedDmm>>,
     stats: RuntimeImageStats,
+}
+
+/// Fully linked runtime metadata independent of compiler syntax and object trees.
+///
+/// This is the ownership boundary used by the vNext runtime artifact. It owns
+/// every datum-default, global, binding, initializer, and procedure-static
+/// structure needed to reconstruct a [`RuntimeImage`] without a
+/// [`Compilation`]. Encoding is deliberately layered separately so artifact
+/// schema evolution does not leak compiler identities back into runtime state.
+pub struct RuntimeLinkedMetadata {
+    heap: ValueHeap,
+    random_state: u64,
+    compact_default_datums: HashSet<DatumId>,
+    variables: Vec<RuntimeVariable>,
+    types: BTreeMap<TypePath, RuntimeType>,
+    type_paths: Arc<BTreeSet<TypePath>>,
+    type_parents: Arc<BTreeMap<TypePath, Option<TypePath>>>,
+    initial_values: Arc<BTreeMap<TypePath, BTreeMap<FieldName, Value>>>,
+    shared_fields: Arc<BTreeMap<TypePath, BTreeMap<FieldName, FieldName>>>,
+    global_types: BTreeMap<String, TypePath>,
+    world_name: String,
+    canonical_world: Option<DatumId>,
+    binding_index: RuntimeBindingIndex,
+    runtime_variable_indices: BTreeMap<String, usize>,
+    global_variable_indices: BTreeMap<FieldName, usize>,
+    diagnostics: Vec<RuntimeInitializerDiagnostic>,
+    instance_initializers: Vec<InstanceInitializerCandidate>,
+    instance_initializer_indices_by_owner: BTreeMap<TypePath, Vec<usize>>,
+    compiled_instance_initializers: BTreeMap<usize, CompiledInstanceInitializer>,
+    vm_instance_initializers: Arc<BTreeMap<TypePath, Vec<InstanceInitializer>>>,
+    vm_instance_initializer_module: Option<Arc<Module>>,
+    instance_initializer_plans: BTreeMap<TypePath, Arc<[CompiledInstanceInitializer]>>,
+    datum_allocation_plans: BTreeMap<TypePath, DatumAllocationPlan>,
+    procedure_static_locals: BTreeMap<(String, u16), Value>,
+    project_root: PathBuf,
+    stats: RuntimeImageStats,
+}
+
+impl RuntimeImage {
+    /// Moves this fully materialized image into compiler-independent linked metadata.
+    #[must_use]
+    pub fn into_linked_metadata(self) -> RuntimeLinkedMetadata {
+        RuntimeLinkedMetadata {
+            heap: self.heap,
+            random_state: self.random_state,
+            compact_default_datums: self.compact_default_datums,
+            variables: self.variables,
+            types: self.types,
+            type_paths: self.type_paths,
+            type_parents: self.type_parents,
+            initial_values: self.initial_values,
+            shared_fields: self.shared_fields,
+            global_types: self.global_types,
+            world_name: self.world_name,
+            canonical_world: self.canonical_world,
+            binding_index: self.binding_index,
+            runtime_variable_indices: self.runtime_variable_indices,
+            global_variable_indices: self.global_variable_indices,
+            diagnostics: self.diagnostics,
+            instance_initializers: self.instance_initializers,
+            instance_initializer_indices_by_owner: self.instance_initializer_indices_by_owner,
+            compiled_instance_initializers: self.compiled_instance_initializers,
+            vm_instance_initializers: self.vm_instance_initializers,
+            vm_instance_initializer_module: self.vm_instance_initializer_module,
+            instance_initializer_plans: self.instance_initializer_plans,
+            datum_allocation_plans: self.datum_allocation_plans,
+            procedure_static_locals: self.procedure_static_locals,
+            project_root: self.project_root,
+            stats: self.stats,
+        }
+    }
+
+    /// Reconstructs a runtime image without consulting compiler state.
+    #[must_use]
+    pub fn from_linked_metadata(metadata: RuntimeLinkedMetadata) -> Self {
+        Self {
+            heap: metadata.heap,
+            random_state: metadata.random_state,
+            compact_default_datums: metadata.compact_default_datums,
+            variables: metadata.variables,
+            types: metadata.types,
+            type_paths: metadata.type_paths,
+            type_parents: metadata.type_parents,
+            initial_values: metadata.initial_values,
+            shared_fields: metadata.shared_fields,
+            global_types: metadata.global_types,
+            world_name: metadata.world_name,
+            canonical_world: metadata.canonical_world,
+            binding_index: metadata.binding_index,
+            runtime_variable_indices: metadata.runtime_variable_indices,
+            global_variable_indices: metadata.global_variable_indices,
+            diagnostics: metadata.diagnostics,
+            instance_initializers: metadata.instance_initializers,
+            instance_initializer_indices_by_owner: metadata.instance_initializer_indices_by_owner,
+            compiled_instance_initializers: metadata.compiled_instance_initializers,
+            vm_instance_initializers: metadata.vm_instance_initializers,
+            vm_instance_initializer_module: metadata.vm_instance_initializer_module,
+            instance_initializer_plans: metadata.instance_initializer_plans,
+            datum_allocation_plans: metadata.datum_allocation_plans,
+            procedure_static_locals: metadata.procedure_static_locals,
+            project_root: metadata.project_root,
+            dmm_measurements: Arc::new(BTreeMap::new()),
+            parsed_dmm_cache: Arc::new(BTreeMap::new()),
+            stats: metadata.stats,
+        }
+    }
+
+    /// Encodes a pointer-free runtime image artifact and restores this image in place.
+    pub fn encode_linked_artifact(&mut self, executable: &Module) -> Result<Vec<u8>, String> {
+        use bincode::Options as _;
+        const MAGIC: &[u8; 8] = b"D64RIMG\0";
+        let host = RuntimeLinkedHostSnapshot {
+            variables: self
+                .variables
+                .iter()
+                .enumerate()
+                .map(|(index, variable)| RuntimeLinkedVariableSnapshot {
+                    path: variable.path.clone(),
+                    storage: match variable.storage {
+                        StorageClass::Global => 0,
+                        StorageClass::Static => 1,
+                        StorageClass::Instance => 2,
+                    },
+                    value: HeapSnapshotValue::from(&variable.value),
+                    ordinal: variable.ordinal as u64,
+                    runtime_field: self.global_variable_indices.iter().find_map(
+                        |(field, candidate)| {
+                            (*candidate == index).then(|| field.as_str().to_owned())
+                        },
+                    ),
+                })
+                .collect(),
+            global_types: self
+                .global_types
+                .iter()
+                .map(|(name, path)| (name.clone(), path.as_str().to_owned()))
+                .collect(),
+            world_name: self.world_name.clone(),
+        };
+        let host = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(1024 * 1024 * 1024)
+            .serialize(&host)
+            .map_err(|error| error.to_string())?;
+        let state = self.take_execution_state();
+        let encoded = (|| {
+            let missing = executable
+                .referenced_static_globals()
+                .into_iter()
+                .filter(|field| state.global(field).is_none())
+                .take(32)
+                .map(|field| field.as_str().to_owned())
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "linked runtime image is missing executable static globals: {}",
+                    missing.join(", ")
+                ));
+            }
+            let mut catalog = Vec::new();
+            state
+                .write_runtime_catalog_to(&mut catalog)
+                .map_err(|error| error.to_string())?;
+            let mut ready = Vec::new();
+            state
+                .write_ready_world_snapshot_to(&mut ready)
+                .map_err(|error| error.to_string())?;
+            let mut output = MAGIC.to_vec();
+            output.extend_from_slice(&2_u32.to_le_bytes());
+            for length in [host.len(), catalog.len(), ready.len()] {
+                output.extend_from_slice(&(length as u64).to_le_bytes());
+            }
+            output.extend_from_slice(&host);
+            output.extend_from_slice(&catalog);
+            output.extend_from_slice(&ready);
+            let checksum = crc32fast::hash(&output);
+            output.extend_from_slice(&checksum.to_le_bytes());
+            Ok(output)
+        })();
+        self.restore_execution_state(state);
+        let _ = executable;
+        encoded
+    }
+
+    /// Materializes every deferred runtime-initializer body before portable encoding.
+    pub fn materialize_linked_artifact_initializers(
+        &mut self,
+        diagnostic_limit: usize,
+    ) -> Result<(), String> {
+        let Some(module) = self.vm_instance_initializer_module.as_mut() else {
+            return Ok(());
+        };
+        Arc::make_mut(module)
+            .materialize_fully_eager_bounded(diagnostic_limit)
+            .map_err(|error| error.to_string())?;
+        if module.deferred_procedure_count() != 0 {
+            return Err("runtime initializer module retained deferred procedures".to_owned());
+        }
+        self.stats.initializer_module_deferred_procedures = 0;
+        self.stats.initializer_module_materialized_procedures = 0;
+        self.stats.initializer_module_procedures = module.procedure_count();
+        Ok(())
+    }
+
+    /// Decodes a pointer-free runtime image without a compiler frontend snapshot.
+    pub fn decode_linked_artifact(bytes: &[u8], executable: &Module) -> Result<Self, String> {
+        use bincode::Options as _;
+        const MAGIC: &[u8; 8] = b"D64RIMG\0";
+        const MAX_PART: u64 = 4 * 1024 * 1024 * 1024;
+        if bytes.len() < 8 + 4 + 24 + 4 {
+            return Err("linked runtime image is truncated".to_owned());
+        }
+        let body = bytes.len() - 4;
+        if crc32fast::hash(&bytes[..body]) != u32::from_le_bytes(bytes[body..].try_into().unwrap())
+        {
+            return Err("linked runtime image checksum mismatch".to_owned());
+        }
+        if &bytes[..8] != MAGIC || u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != 2 {
+            return Err("linked runtime image header is unsupported".to_owned());
+        }
+        let lengths = [12, 20, 28]
+            .map(|offset| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()));
+        if lengths.iter().any(|length| *length > MAX_PART) {
+            return Err("linked runtime image part exceeds its bound".to_owned());
+        }
+        let mut offset = 36_usize;
+        let mut part = |length: u64| -> Result<&[u8], String> {
+            let length = usize::try_from(length).map_err(|_| "runtime image length overflow")?;
+            let end = offset
+                .checked_add(length)
+                .filter(|end| *end <= body)
+                .ok_or("linked runtime image part is truncated")?;
+            let result = &bytes[offset..end];
+            offset = end;
+            Ok(result)
+        };
+        let host_bytes = part(lengths[0])?;
+        let catalog = part(lengths[1])?;
+        let ready = part(lengths[2])?;
+        if offset != body {
+            return Err("linked runtime image has trailing bytes".to_owned());
+        }
+        let host: RuntimeLinkedHostSnapshot = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(1024 * 1024 * 1024)
+            .deserialize(host_bytes)
+            .map_err(|error| error.to_string())?;
+        let mut state = ExecutionState::new();
+        state
+            .restore_runtime_catalog_from(&mut catalog.as_ref())
+            .map_err(|error| error.to_string())?;
+        state
+            .restore_ready_world_snapshot_from(&mut ready.as_ref(), executable)
+            .map_err(|error| error.to_string())?;
+        Self::from_linked_state(host, state)
+    }
+
+    fn from_linked_state(
+        host: RuntimeLinkedHostSnapshot,
+        mut state: ExecutionState,
+    ) -> Result<Self, String> {
+        let type_paths = state.shared_type_paths();
+        let type_parents = state.shared_type_parents();
+        let initial_values = state.shared_initial_values();
+        let shared_fields = state.shared_fields();
+        let (vm_instance_initializers, vm_instance_initializer_module) =
+            state.shared_instance_initializers();
+        let project_root = state
+            .project_root()
+            .map_or_else(PathBuf::new, Path::to_path_buf);
+        let random_state = state.random_state();
+        let canonical_world = state
+            .global(&FieldName::parse("world").unwrap())
+            .and_then(|value| match value {
+                Value::Datum(datum) => Some(*datum),
+                _ => None,
+            });
+        let compact_default_datums = state.take_compact_default_datums();
+        let procedure_static_locals = state.take_procedure_static_locals();
+        let mut types = BTreeMap::new();
+        for path in type_paths.iter() {
+            let mut defaults = DatumDefaults::new(path.clone());
+            if let Some(values) = initial_values.get(path) {
+                for (field, value) in values {
+                    defaults.set(field.clone(), value.clone());
+                }
+            }
+            types.insert(
+                path.clone(),
+                RuntimeType {
+                    path: path.clone(),
+                    parent: type_parents.get(path).cloned().flatten(),
+                    defaults,
+                },
+            );
+        }
+        let runtime_fields = host
+            .variables
+            .iter()
+            .enumerate()
+            .filter(|(_, variable)| variable.runtime_field.is_some())
+            .map(|(index, variable)| {
+                FieldName::parse(variable.runtime_field.as_deref().unwrap())
+                    .map(|field| (field, index))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(|error| error.to_string())?;
+        let variables = host
+            .variables
+            .into_iter()
+            .map(|variable| {
+                Ok(RuntimeVariable {
+                    path: variable.path,
+                    storage: match variable.storage {
+                        0 => StorageClass::Global,
+                        1 => StorageClass::Static,
+                        2 => StorageClass::Instance,
+                        _ => return Err("linked runtime variable storage is invalid"),
+                    },
+                    value: variable
+                        .value
+                        .into_value()
+                        .map_err(|_| "linked runtime value")?,
+                    ordinal: usize::try_from(variable.ordinal)
+                        .map_err(|_| "linked runtime ordinal")?,
+                })
+            })
+            .collect::<Result<Vec<_>, &str>>()
+            .map_err(str::to_owned)?;
+        let runtime_variable_indices = variables
+            .iter()
+            .enumerate()
+            .map(|(index, variable)| (variable.path.clone(), index))
+            .collect();
+        let global_variable_indices = runtime_fields;
+        let mut globals = BTreeMap::new();
+        let mut statics = BTreeMap::new();
+        for (variable_index, variable) in variables.iter().enumerate() {
+            let field = global_variable_indices
+                .iter()
+                .find_map(|(field, index)| (*index == variable_index).then(|| field.clone()))
+                .unwrap_or(variable_field(&variable.path).map_err(|error| error.to_string())?);
+            match variable.storage {
+                StorageClass::Global if field.as_str().starts_with("__dm_static_") => {
+                    statics.insert(variable.path.clone(), field);
+                }
+                StorageClass::Global => {
+                    globals.insert(field.as_str().to_owned(), field);
+                }
+                StorageClass::Static => {
+                    statics.insert(
+                        variable.path.clone(),
+                        FieldName::static_storage(&variable.path),
+                    );
+                }
+                StorageClass::Instance => {}
+            }
+        }
+        let global_types = host
+            .global_types
+            .into_iter()
+            .map(|(name, path)| Ok((name, TypePath::parse(&path)?)))
+            .collect::<Result<_, ValueError>>()
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            heap: state.into_heap(),
+            random_state,
+            compact_default_datums,
+            variables,
+            types,
+            type_paths,
+            type_parents,
+            initial_values,
+            shared_fields,
+            global_types,
+            world_name: host.world_name,
+            canonical_world,
+            binding_index: RuntimeBindingIndex {
+                globals,
+                statics,
+                instance_fields: BTreeMap::new(),
+            },
+            runtime_variable_indices,
+            global_variable_indices,
+            diagnostics: vec![],
+            instance_initializers: vec![],
+            instance_initializer_indices_by_owner: BTreeMap::new(),
+            compiled_instance_initializers: BTreeMap::new(),
+            vm_instance_initializers,
+            vm_instance_initializer_module,
+            instance_initializer_plans: BTreeMap::new(),
+            datum_allocation_plans: BTreeMap::new(),
+            procedure_static_locals,
+            project_root,
+            dmm_measurements: Arc::new(BTreeMap::new()),
+            parsed_dmm_cache: Arc::new(BTreeMap::new()),
+            stats: RuntimeImageStats::default(),
+        })
+    }
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct RuntimeLinkedHostSnapshot {
+    variables: Vec<RuntimeLinkedVariableSnapshot>,
+    global_types: Vec<(String, String)>,
+    world_name: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct RuntimeLinkedVariableSnapshot {
+    path: String,
+    storage: u8,
+    value: HeapSnapshotValue,
+    ordinal: u64,
+    runtime_field: Option<String>,
 }
 
 /// Immutable frontend-derived type inventory reusable across cold starts.
@@ -883,20 +1302,28 @@ pub struct RuntimeImage {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeStructuralSeed {
     types: BTreeMap<TypePath, RuntimeType>,
+    type_ids: BTreeMap<TypePath, u32>,
     world_name: String,
 }
 
 impl RuntimeStructuralSeed {
     const MAGIC: &'static [u8; 16] = b"D64-RUNTIME-SEED";
-    const SCHEMA: u16 = 1;
+    const SCHEMA: u16 = 2;
     const MAX_TYPES: usize = 4_000_000;
     const MAX_TEXT: usize = 16 * 1024 * 1024;
 
     /// Builds the deterministic structural inventory without materializing
     /// globals or executing DM code.
     pub fn build(compilation: &Compilation) -> Result<Self, RuntimeImageError> {
+        let types = runtime_types(compilation)?;
+        let type_ids = types
+            .keys()
+            .enumerate()
+            .map(|(index, path)| (path.clone(), u32::try_from(index).expect("bounded types")))
+            .collect();
         Ok(Self {
-            types: runtime_types(compilation)?,
+            types,
+            type_ids,
             world_name: compilation
                 .project()
                 .files
@@ -906,6 +1333,48 @@ impl RuntimeStructuralSeed {
                 .unwrap_or("world")
                 .to_owned(),
         })
+    }
+
+    /// Builds the structural inventory in authoritative persistent type-ID order.
+    pub fn build_with_stable_ids(
+        compilation: &Compilation,
+        stable_ids: &BTreeMap<String, u64>,
+    ) -> Result<Self, RuntimeImageError> {
+        let mut seed = Self::build(compilation)?;
+        if stable_ids.len() != seed.types.len() {
+            return Err(RuntimeImageError::PersistentIdentity(
+                "persistent type IDs do not match the runtime type inventory".to_owned(),
+            ));
+        }
+        let mut ordered = stable_ids.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|(_, id)| **id);
+        let mut type_ids = BTreeMap::new();
+        for (runtime_id, (path, persistent_id)) in ordered.into_iter().enumerate() {
+            u32::try_from(*persistent_id).map_err(|_| {
+                RuntimeImageError::PersistentIdentity(format!(
+                    "persistent type ID for {path} exceeds u32"
+                ))
+            })?;
+            let path = TypePath::parse(path).map_err(|error| {
+                RuntimeImageError::PersistentIdentity(format!(
+                    "invalid persistent type path: {error}"
+                ))
+            })?;
+            if !seed.types.contains_key(&path) {
+                return Err(RuntimeImageError::PersistentIdentity(format!(
+                    "persistent type ID references unknown type {path}"
+                )));
+            }
+            type_ids.insert(path, u32::try_from(runtime_id).expect("bounded types"));
+        }
+        seed.type_ids = type_ids;
+        Ok(seed)
+    }
+
+    /// Returns the bounded runtime type ID assigned to a canonical path.
+    #[must_use]
+    pub fn type_id(&self, path: &TypePath) -> Option<u32> {
+        self.type_ids.get(path).copied()
     }
 
     /// Encodes a bounded, versioned structural payload for a compiled artifact.
@@ -918,6 +1387,7 @@ impl RuntimeStructuralSeed {
         seed_write_u32(&mut output, self.types.len());
         for runtime_type in self.types.values() {
             seed_write_text(&mut output, runtime_type.path.as_str());
+            output.extend_from_slice(&self.type_ids[&runtime_type.path].to_le_bytes());
             match &runtime_type.parent {
                 Some(parent) => {
                     output.push(1);
@@ -960,9 +1430,16 @@ impl RuntimeStructuralSeed {
             return Err("runtime structural seed type count exceeds limit".to_owned());
         }
         let mut types = BTreeMap::new();
+        let mut type_ids = BTreeMap::new();
+        let mut assigned_ids = BTreeSet::new();
         for _ in 0..count {
             let path = TypePath::parse(&seed_read_text(&mut input, Self::MAX_TEXT)?)
                 .map_err(|error| error.to_string())?;
+            let runtime_id = u32::try_from(seed_read_u32(&mut input)?)
+                .map_err(|_| "runtime structural seed type ID exceeds u32".to_owned())?;
+            if !assigned_ids.insert(runtime_id) || runtime_id as usize >= count {
+                return Err("runtime structural seed has an invalid type ID".to_owned());
+            }
             let parent = match seed_read_byte(&mut input)? {
                 0 => None,
                 1 => Some(
@@ -971,6 +1448,7 @@ impl RuntimeStructuralSeed {
                 ),
                 _ => return Err("runtime structural seed has invalid optional tag".to_owned()),
             };
+            type_ids.insert(path.clone(), runtime_id);
             if types
                 .insert(
                     path.clone(),
@@ -996,7 +1474,11 @@ impl RuntimeStructuralSeed {
         }) {
             return Err("runtime structural seed references an unknown parent".to_owned());
         }
-        Ok(Self { types, world_name })
+        Ok(Self {
+            types,
+            type_ids,
+            world_name,
+        })
     }
 }
 
@@ -1620,6 +2102,50 @@ fn initializer_binding_references(
 }
 
 impl RuntimeImage {
+    /// Conservatively prepares one field expression without reading runtime state.
+    ///
+    /// The returned constant can be reused for every placement of an interned map
+    /// prototype. No DM procedures are executed.
+    #[must_use]
+    pub fn prepare_constant_field_expression(expression: &str) -> ConstantEvaluation {
+        let tokens = match lex(expression) {
+            Ok(tokens) => tokens
+                .into_iter()
+                .filter(|token| {
+                    !matches!(
+                        token.kind,
+                        TokenKind::LineStart { .. }
+                            | TokenKind::Newline
+                            | TokenKind::LineContinuation
+                    )
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                return ConstantEvaluation::Unsupported(UnsupportedConstant {
+                    category: UnsupportedCategory::InvalidSyntax,
+                    span: error.span,
+                });
+            }
+        };
+        evaluate_constant(&tokens)
+    }
+
+    /// Applies one previously proven constant in a caller-owned execution state.
+    ///
+    /// This is the allocation-side counterpart of
+    /// [`Self::prepare_constant_field_expression`].
+    pub fn apply_prepared_constant_field_in_state(
+        &mut self,
+        state: &mut ExecutionState,
+        datum: DatumId,
+        field: FieldName,
+        constant: &ConstantValue,
+    ) -> Result<(), RuntimeImageError> {
+        let value = self.convert_constant_in(constant, state.heap_mut())?;
+        state.heap_mut().set_datum_field(datum, field, value)?;
+        Ok(())
+    }
+
     fn refresh_execution_metadata(&mut self) {
         let (type_parents, initial_values) = execution_metadata(&self.types, &self.world_name);
         self.type_parents = Arc::new(type_parents);
@@ -1789,6 +2315,8 @@ impl RuntimeImage {
             datum_allocation_plans: BTreeMap::new(),
             procedure_static_locals: BTreeMap::new(),
             project_root: compilation.project().root_directory.clone(),
+            dmm_measurements: Arc::new(BTreeMap::new()),
+            parsed_dmm_cache: Arc::new(BTreeMap::new()),
             stats: RuntimeImageStats {
                 variables: registry.entries().len(),
                 shared_reflection_entries,
@@ -2363,6 +2891,8 @@ impl RuntimeImage {
             self.vm_instance_initializer_module.clone(),
         );
         state.set_project_root(self.project_root.clone());
+        state.set_dmm_measurements(Arc::clone(&self.dmm_measurements));
+        state.set_parsed_dmm_cache(Arc::clone(&self.parsed_dmm_cache));
         state.set_procedure_static_locals(std::mem::take(&mut self.procedure_static_locals));
         if let Some(world) = self.canonical_world {
             state.set_global(
@@ -2399,6 +2929,8 @@ impl RuntimeImage {
     /// Values written to globals unknown to this image are retained only by the
     /// supplied state; declared globals are synchronized by their DM field name.
     pub fn restore_execution_state(&mut self, mut state: ExecutionState) {
+        self.dmm_measurements = state.dmm_measurements();
+        self.parsed_dmm_cache = state.parsed_dmm_cache();
         self.random_state = state.random_state();
         for (field, index) in &self.global_variable_indices {
             if let Some(value) = state.global(field) {
@@ -2408,6 +2940,19 @@ impl RuntimeImage {
         self.procedure_static_locals = state.take_procedure_static_locals();
         self.compact_default_datums = state.take_compact_default_datums();
         self.heap = state.into_heap();
+    }
+
+    /// Installs artifact-time measurements for immutable project DMM resources.
+    pub fn set_dmm_measurements(
+        &mut self,
+        measurements: Arc<BTreeMap<String, dm_vm::DmmMeasurement>>,
+    ) {
+        self.dmm_measurements = measurements;
+    }
+
+    /// Installs complete artifact-time parsed-map products.
+    pub fn set_parsed_dmm_cache(&mut self, cache: Arc<BTreeMap<String, dm_vm::ParsedDmm>>) {
+        self.parsed_dmm_cache = cache;
     }
 
     /// Installs the random seed that the next transferred execution state will
@@ -2857,26 +3402,7 @@ impl RuntimeImage {
         field: FieldName,
         expression: &str,
     ) -> Result<ConstantFieldApplication, RuntimeImageError> {
-        let tokens = match lex(expression) {
-            Ok(tokens) => tokens
-                .into_iter()
-                .filter(|token| {
-                    !matches!(
-                        token.kind,
-                        TokenKind::LineStart { .. }
-                            | TokenKind::Newline
-                            | TokenKind::LineContinuation
-                    )
-                })
-                .collect::<Vec<_>>(),
-            Err(error) => {
-                return Ok(ConstantFieldApplication::Unsupported(UnsupportedConstant {
-                    category: UnsupportedCategory::InvalidSyntax,
-                    span: error.span,
-                }));
-            }
-        };
-        match evaluate_constant(&tokens) {
+        match Self::prepare_constant_field_expression(expression) {
             ConstantEvaluation::Value(constant) => {
                 let mut heap = std::mem::take(&mut self.heap);
                 let result = self.convert_constant_in(&constant, &mut heap);
@@ -2904,26 +3430,7 @@ impl RuntimeImage {
         field: FieldName,
         expression: &str,
     ) -> Result<ConstantFieldApplication, RuntimeImageError> {
-        let tokens = match lex(expression) {
-            Ok(tokens) => tokens
-                .into_iter()
-                .filter(|token| {
-                    !matches!(
-                        token.kind,
-                        TokenKind::LineStart { .. }
-                            | TokenKind::Newline
-                            | TokenKind::LineContinuation
-                    )
-                })
-                .collect::<Vec<_>>(),
-            Err(error) => {
-                return Ok(ConstantFieldApplication::Unsupported(UnsupportedConstant {
-                    category: UnsupportedCategory::InvalidSyntax,
-                    span: error.span,
-                }));
-            }
-        };
-        match evaluate_constant(&tokens) {
+        match Self::prepare_constant_field_expression(expression) {
             ConstantEvaluation::Value(constant) => {
                 let value = self.convert_constant_in(&constant, state.heap_mut())?;
                 state.heap_mut().set_datum_field(datum, field, value)?;
@@ -3522,6 +4029,8 @@ pub enum RuntimeImageError {
     UnknownType(TypePath),
     /// Retained type metadata contained an inheritance cycle.
     InheritanceCycle(TypePath),
+    /// Persistent linker identities did not match the runtime inventory.
+    PersistentIdentity(String),
     /// An initialization plan referred to a missing initializer.
     MissingInitializer(String),
     /// An instance-default plan referred to a variable without an owner.
@@ -3554,6 +4063,9 @@ impl fmt::Display for RuntimeImageError {
             Self::UnknownType(path) => write!(formatter, "runtime type {path} is absent"),
             Self::InheritanceCycle(path) => {
                 write!(formatter, "runtime inheritance cycle at {path}")
+            }
+            Self::PersistentIdentity(message) => {
+                write!(formatter, "invalid persistent linker identity: {message}")
             }
             Self::MissingInitializer(path) => {
                 write!(
@@ -3599,6 +4111,7 @@ impl std::error::Error for RuntimeImageError {
             Self::InvalidVariablePath(_)
             | Self::UnknownType(_)
             | Self::InheritanceCycle(_)
+            | Self::PersistentIdentity(_)
             | Self::MissingInitializer(_)
             | Self::MissingOwner(_)
             | Self::InstanceInitializer { .. }
@@ -3651,7 +4164,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use dm_compiler::CompilerDatabase;
-    use dm_globals::{StorageClass, UnsupportedCategory, VariableRegistry};
+    use dm_globals::{ConstantEvaluation, StorageClass, UnsupportedCategory, VariableRegistry};
     use dm_lexer::{TokenKind, lex};
     use dm_semantics::{ProcedureRegistry, standard_instance_field_names};
     use dm_value::{FieldName, TypePath, Value};
@@ -5730,6 +6243,38 @@ mod tests {
     }
 
     #[test]
+    fn prepared_field_constants_apply_with_fresh_list_identity() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write("types.dm", "/datum/example\n\tvar/value\n");
+        let mut image = fixture.image();
+        let first = image.allocate_datum(&type_path("/datum/example")).unwrap();
+        let second = image.allocate_datum(&type_path("/datum/example")).unwrap();
+        let ConstantEvaluation::Value(prepared) =
+            RuntimeImage::prepare_constant_field_expression("list(1, \"key\" = 2)")
+        else {
+            panic!("list expression should prepare as a constant");
+        };
+        let mut state = image.take_execution_state();
+
+        for datum in [first, second] {
+            image
+                .apply_prepared_constant_field_in_state(
+                    &mut state,
+                    datum,
+                    field("value"),
+                    &prepared,
+                )
+                .unwrap();
+        }
+
+        let first_value = state.heap().datum_field(first, &field("value")).unwrap();
+        let second_value = state.heap().datum_field(second, &field("value")).unwrap();
+        assert!(matches!((first_value, second_value), (Value::List(a), Value::List(b)) if a != b));
+        image.restore_execution_state(state);
+    }
+
+    #[test]
     fn evaluates_live_datum_expressions_with_materialized_globals() {
         let fixture = Fixture::new();
         fixture.write("world.dme", "#include \"types.dm\"\n");
@@ -6222,5 +6767,71 @@ mod tests {
         let mut corrupt = bytes;
         corrupt[20] ^= 0x40;
         assert!(RuntimeStructuralSeed::decode_compiled_artifact(&corrupt).is_err());
+    }
+
+    #[test]
+    fn linked_metadata_reconstructs_runtime_without_compilation() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "world.dme",
+            "/proc/runtime_value()\n\treturn 7\n/datum/base\n\tvar/value = runtime_value()\n/world\n\tvar/static/shared = 9\n\tGenesis()\n\t\treturn shared\n/var/global/count = 3\n",
+        );
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.0.join("world.dme"))
+            .expect("fixture should compile");
+        let mut image = RuntimeImage::from_compilation(&compilation).unwrap();
+        let expected_types = image.types.clone();
+        let expected_variables = image.variables.clone();
+        let expected_initial_values = Arc::clone(&image.initial_values);
+        let expected_global_types = image.global_types.clone();
+        let expected_stats = image.stats;
+        assert!(image.stats().initializer_module_deferred_procedures > 0);
+        image
+            .materialize_linked_artifact_initializers(8)
+            .expect("deferred initializer module should become portable");
+        assert_eq!(image.stats().initializer_module_deferred_procedures, 0);
+        let executable = ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("fixture procedures should lower");
+        let encoded = image.encode_linked_artifact(executable.module()).unwrap();
+        drop(compilation);
+
+        let mut restored =
+            RuntimeImage::decode_linked_artifact(&encoded, executable.module()).unwrap();
+        assert_eq!(
+            restored.types.keys().collect::<Vec<_>>(),
+            expected_types.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(restored.variables, expected_variables);
+        assert_eq!(restored.initial_values, expected_initial_values);
+        assert_eq!(restored.global_types, expected_global_types);
+        assert_eq!(expected_stats.runtime_types, restored.types.len());
+        let shared_path = restored
+            .variables()
+            .iter()
+            .find(|variable| variable.path.ends_with("/shared"))
+            .expect("static variable should survive")
+            .path
+            .clone();
+        let mut state = restored.take_execution_state();
+        let shared = FieldName::static_storage(&shared_path);
+        assert_eq!(state.global(&shared), Some(&Value::number(9.0)));
+        assert!(
+            executable
+                .module()
+                .referenced_static_globals()
+                .contains(&shared)
+        );
+        let read_shared = executable
+            .module()
+            .procedure_paths()
+            .enumerate()
+            .find(|(_, path)| path.contains("Genesis"))
+            .and_then(|(index, _)| executable.module().procedure_id_at(index))
+            .expect("static reader should be linked");
+        assert_eq!(
+            execute_module_in_state(executable.module(), read_shared, &[], &mut state).unwrap(),
+            Value::number(9.0),
+        );
     }
 }

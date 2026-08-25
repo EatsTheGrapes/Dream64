@@ -108,7 +108,13 @@ const NATIVE_PARENT_BUILTINS: &str = concat!(
     "/datum/New(...)\n\treturn null\n",
     "/datum/Del()\n\treturn null\n",
     "/datum/Topic(href, list/href_list)\n\treturn null\n",
-    "/client/Click(object, location, control, params)\n\treturn null\n",
+    // BYOND's terminal client Click implementation dispatches the addressed
+    // atom after project overrides finish their rate-limit/signal handling.
+    // TG/Monkestation explicitly rely on `..()` here for every HUD button.
+    "/client/Click(atom/object, atom/location, control, params)\n",
+    "\tif(object)\n",
+    "\t\treturn object.Click(location, control, params)\n",
+    "\treturn null\n",
     // BYOND owns the terminal movable Bump implementation. Its ordinary
     // obstacle path has no action and returns null; retaining the entry is
     // nevertheless required so a source override can legally call `..()`.
@@ -178,6 +184,12 @@ fn native_member_index(
 pub struct ProcedureId(u32);
 
 impl ProcedureId {
+    /// Reconstructs an identity from a validated persistent procedure index.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_index(index: usize) -> Self {
+        Self(u32::try_from(index).expect("procedure index exceeds u32"))
+    }
     /// Returns this identity's index in [`ProcedureRegistry::procedures`].
     #[must_use]
     pub const fn index(self) -> usize {
@@ -193,6 +205,15 @@ pub struct ProcedureImplementationId {
 }
 
 impl ProcedureImplementationId {
+    /// Reconstructs an implementation identity from validated persistent indices.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_indices(procedure: usize, implementation: usize) -> Self {
+        Self {
+            procedure: ProcedureId::from_index(procedure),
+            index: u32::try_from(implementation).expect("implementation index exceeds u32"),
+        }
+    }
     /// Returns the canonical procedure containing this implementation.
     #[must_use]
     pub const fn procedure(self) -> ProcedureId {
@@ -590,6 +611,31 @@ fn executable_artifact_read_string(input: &mut Cursor<&[u8]>) -> Result<String, 
 }
 
 impl ProcedureRegistry {
+    /// Computes a procedure-only semantic digest for persistent executable reuse.
+    #[must_use]
+    pub fn persistent_semantic_digest(&self, compilation: &Compilation) -> [u8; 32] {
+        let mut first = md5::Context::new();
+        first.consume(b"dream64-procedure-semantics-v1");
+        for procedure in &self.procedures {
+            first.consume(procedure.path.to_string().as_bytes());
+            for implementation in &procedure.implementations {
+                first.consume((implementation.id.index() as u64).to_le_bytes());
+                if let Some(definition) = compilation
+                    .syntax(implementation.file_id)
+                    .and_then(|syntax| syntax.definitions.get(implementation.definition_index))
+                {
+                    first.consume(format!("{definition:?}").as_bytes());
+                }
+            }
+        }
+        let first = first.compute().0;
+        let second = md5::compute(first).0;
+        let mut digest = [0; 32];
+        digest[..16].copy_from_slice(&first);
+        digest[16..].copy_from_slice(&second);
+        digest
+    }
+
     /// Builds stable procedure identities and dispatch inventory without
     /// analyzing individual bodies. Dependency closure and linking methods
     /// initialize the exact eager dependency indexes on first use.
@@ -704,14 +750,50 @@ impl ProcedureRegistry {
     /// Builds a registry from the compiler's accepted canonical declarations.
     #[must_use]
     pub fn build(compilation: &Compilation) -> Self {
+        Self::build_with_stable_ids(compilation, &BTreeMap::new())
+            .expect("object-tree procedure order is always representable")
+    }
+
+    /// Builds a registry in authoritative persistent linker-ID order.
+    ///
+    /// Persistent IDs may be sparse 64-bit identities. The semantic and VM
+    /// layers use bounded dense `u32` indices, so their ordering is the stable
+    /// ID ordering rather than the current lexical object-tree ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing, duplicate, or out-of-range stable IDs.
+    pub fn build_with_stable_ids(
+        compilation: &Compilation,
+        stable_ids: &BTreeMap<String, u64>,
+    ) -> Result<Self, String> {
         let profile = std::env::var_os("DREAM64_PROFILE_REGISTRY").is_some();
         let build_started = Instant::now();
         let tree = compilation.code_tree();
-        let procedure_nodes: Vec<_> = tree
+        let mut procedure_nodes: Vec<_> = tree
             .nodes()
             .iter()
             .filter(|node| matches!(node.kind, NodeKind::Procedure | NodeKind::Verb))
             .collect();
+        if !stable_ids.is_empty() {
+            let mut assigned = BTreeSet::new();
+            for node in &procedure_nodes {
+                let path = node.path.to_string();
+                let id = stable_ids
+                    .get(&path)
+                    .copied()
+                    .ok_or_else(|| format!("persistent procedure ID is missing for {path}"))?;
+                u32::try_from(id)
+                    .map_err(|_| format!("persistent procedure ID for {path} exceeds u32"))?;
+                if !assigned.insert(id) {
+                    return Err(format!("duplicate persistent procedure ID {id}"));
+                }
+            }
+            if stable_ids.len() != procedure_nodes.len() {
+                return Err("persistent procedure IDs contain unknown paths".to_owned());
+            }
+            procedure_nodes.sort_by_key(|node| stable_ids[&node.path.to_string()]);
+        }
         let by_node: BTreeMap<_, _> = procedure_nodes
             .iter()
             .enumerate()
@@ -956,7 +1038,7 @@ impl ProcedureRegistry {
                 construction_elapsed.as_millis(),
             );
         }
-        Self {
+        Ok(Self {
             procedures,
             by_node,
             by_path,
@@ -969,7 +1051,7 @@ impl ProcedureRegistry {
                 typed_virtual_targets,
                 build_stats,
             }),
-        }
+        })
     }
 
     /// Returns canonical procedures in object-tree node order.
@@ -1691,6 +1773,15 @@ impl ProcedureRegistry {
                 let mut static_calls: BTreeMap<_, _> = selectors
                     .iter()
                     .filter_map(|selector| {
+                        // These spellings are language intrinsics, not
+                        // overrideable global procedures. Leaving them out of
+                        // the static call table lets the bytecode compiler emit
+                        // one TypePredicate instruction instead of a call into
+                        // the synthetic builtin inventory. This is especially
+                        // important in typed world loops such as ruin placement.
+                        if compiler_type_predicate(selector) {
+                            return None;
+                        }
                         let project_target =
                             self.static_call_target(implementation.id, selector, compilation);
                         let project_member = project_target.filter(|target| {
@@ -1956,6 +2047,21 @@ impl ProcedureRegistry {
             stats,
         })
     }
+}
+
+fn compiler_type_predicate(selector: &str) -> bool {
+    matches!(
+        selector,
+        "isnull"
+            | "isnum"
+            | "ispath"
+            | "islist"
+            | "ismovable"
+            | "isturf"
+            | "isloc"
+            | "isicon"
+            | "istype"
+    )
 }
 
 fn normalize_upward_paths(
@@ -6784,6 +6890,37 @@ GLOBAL_REAL(Master, /datum/controller/master)
     }
 
     #[test]
+    fn compiler_predicates_bypass_synthetic_static_call_targets() {
+        let compilation = TestProject::compile(
+            "/proc/check(atom/value)\n\treturn isturf(value) + isnull(value) + istype(value, /atom)\n",
+        );
+        let executable = ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("compiler predicates should link");
+        let entry = executable
+            .module()
+            .effective_procedure_id("/proc/check")
+            .expect("check procedure");
+        let program = executable.module().procedure(entry).expect("check body");
+        assert_eq!(
+            program
+                .instructions
+                .iter()
+                .filter(|instruction| matches!(instruction, Instruction::TypePredicate { .. }))
+                .count(),
+            3
+        );
+        assert!(
+            !program
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::Call { .. })),
+            "language predicates must not pay a synthetic procedure call: {:?}",
+            program.instructions
+        );
+    }
+
+    #[test]
     fn lowers_standard_datum_type_field_for_all_datums() {
         let compilation =
             TestProject::compile("/datum/example\n\tproc/read()\n\t\treturn list(type, tag)\n");
@@ -8885,6 +9022,17 @@ GLOBAL_REAL(Master, /datum/controller/master)
         assert_eq!(
             execute_effective(&compilation, "/proc/run", &[]),
             Ok(Value::number(2.0)),
+        );
+    }
+
+    #[test]
+    fn engine_owned_client_click_dispatches_the_addressed_atom() {
+        let compilation = TestProject::compile(
+            "var/global/clicked = 0\n/atom/Click(location, control, params)\n\tclicked = (control == \"map\" && params == \"left=1\")\n\treturn 7\n/client/Click(object, location, control, params)\n\treturn ..()\n/proc/run()\n\tvar/atom/target = new\n\tvar/client/user = new\n\treturn user.Click(target, null, \"map\", \"left=1\") + clicked * 10\n",
+        );
+        assert_eq!(
+            execute_effective(&compilation, "/proc/run", &[]),
+            Ok(Value::number(17.0)),
         );
     }
 

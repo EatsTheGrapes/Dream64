@@ -3,11 +3,13 @@
 #![cfg_attr(not(test), deny(missing_docs))]
 
 mod builtins;
+mod compact_wordcode;
 mod module_codec;
 mod ready_snapshot;
 pub mod tgm_planner;
 pub mod worker_lane;
 
+pub use compact_wordcode::{CompactProcedureRecord, CompactWordcodeError, CompactWordcodeImage};
 pub use module_codec::ModuleCodecError;
 pub use ready_snapshot::ReadyWorldCoreSnapshot;
 
@@ -17,6 +19,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use builtins::{
@@ -38,7 +41,9 @@ use dm_jit::{
 use dm_lexer::{SpannedToken, TokenKind, lex};
 use dm_syntax::{Definition, DefinitionKind, SourceLine};
 pub use dm_value::Value;
-use dm_value::{DatumId, FieldName, ListId, ModifiedTypePath, TypePath, ValueError, ValueHeap};
+use dm_value::{
+    DatumId, FieldName, ListId, ModifiedTypePath, PackedValue, TypePath, ValueError, ValueHeap,
+};
 use smallvec::SmallVec;
 
 // Dream Maker compiles text macros to non-printing format characters. Keep
@@ -728,7 +733,9 @@ impl ProcedureId {
             .map_err(|_| compile_error("module has more than u32::MAX procedures"))
     }
 
-    const fn index(self) -> usize {
+    /// Returns this module-local portable procedure-table index.
+    #[must_use]
+    pub const fn index(self) -> usize {
         self.0 as usize
     }
 }
@@ -792,6 +799,8 @@ pub struct Module {
     deferred: Arc<HashMap<ProcedureId, DeferredProcedure>>,
     procedure_types: Vec<TypePath>,
     initializer_call_names: Option<InitializerCallNameIndex>,
+    compact_wordcode: CompactWordcodeAttachment,
+    semantic_digests: ProcedureSemanticDigestAttachment,
 }
 
 static NEXT_MODULE_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -809,6 +818,30 @@ impl PartialEq for ModuleIdentity {
 }
 
 impl Eq for ModuleIdentity {}
+
+#[derive(Clone, Debug, Default)]
+struct CompactWordcodeAttachment(Option<Arc<CompactWordcodeImage>>);
+
+#[derive(Clone, Debug, Default)]
+struct ProcedureSemanticDigestAttachment(Option<Arc<[[u8; 32]]>>);
+
+impl PartialEq for ProcedureSemanticDigestAttachment {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ProcedureSemanticDigestAttachment {}
+
+// Compact wordcode is a rebuildable execution cache, not part of the portable
+// module semantics. Its presence must not change structural module equality.
+impl PartialEq for CompactWordcodeAttachment {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for CompactWordcodeAttachment {}
 
 fn next_module_identity() -> ModuleIdentity {
     ModuleIdentity(NEXT_MODULE_IDENTITY.fetch_add(1, Ordering::Relaxed))
@@ -898,6 +931,74 @@ impl InitializerProgram {
 }
 
 impl Module {
+    /// Builds, validates, and installs the immutable compact dispatch image.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this module still contains deferred procedures or
+    /// cannot be represented by the bounded compact directory.
+    pub fn install_compact_wordcode(&mut self) -> Result<(), CompactWordcodeError> {
+        let image = CompactWordcodeImage::build(self)?;
+        self.compact_wordcode.0 = Some(Arc::new(image));
+        Ok(())
+    }
+
+    /// Installs a decoded compact image after exact validation against this
+    /// module's authoritative rich instructions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any procedure, metadata, range, path, or selector
+    /// mismatch.
+    pub fn attach_compact_wordcode(
+        &mut self,
+        image: CompactWordcodeImage,
+    ) -> Result<(), CompactWordcodeError> {
+        image.validate_against(self)?;
+        self.compact_wordcode.0 = Some(Arc::new(image));
+        Ok(())
+    }
+
+    /// Returns the installed immutable compact dispatch image, when present.
+    #[must_use]
+    pub fn compact_wordcode(&self) -> Option<&CompactWordcodeImage> {
+        self.compact_wordcode.0.as_deref()
+    }
+
+    /// Returns the artifact-validated semantic digest for one procedure.
+    #[must_use]
+    pub fn procedure_semantic_digest(&self, procedure: ProcedureId) -> Option<[u8; 32]> {
+        self.semantic_digests
+            .0
+            .as_ref()?
+            .get(procedure.index())
+            .copied()
+    }
+
+    /// Attaches semantic identities after exact count and body validation.
+    pub fn attach_procedure_semantic_digests(
+        &mut self,
+        digests: Vec<[u8; 32]>,
+    ) -> Result<(), String> {
+        if digests.len() != self.procedure_count() {
+            return Err("procedure semantic digest count does not match module".to_owned());
+        }
+        for (index, digest) in digests.iter().enumerate() {
+            let procedure = ProcedureId(index as u32);
+            if self.compute_procedure_semantic_digest(procedure)? != *digest {
+                return Err(format!(
+                    "procedure semantic digest mismatch at index {index}"
+                ));
+            }
+        }
+        self.semantic_digests.0 = Some(Arc::from(digests));
+        Ok(())
+    }
+
+    fn clear_compact_wordcode(&mut self) {
+        self.compact_wordcode.0 = None;
+    }
+
     fn resolve_procedure(&self, procedure: ProcedureId) -> Result<&Program, String> {
         if let Some(deferred) = self.deferred.get(&procedure) {
             let pending = deferred.compiled.get().is_none();
@@ -968,6 +1069,25 @@ impl Module {
     #[must_use]
     pub fn deferred_procedure_count(&self) -> usize {
         self.deferred.len()
+    }
+
+    /// Returns canonical static-storage globals referenced by executable instructions.
+    #[must_use]
+    pub fn referenced_static_globals(&self) -> BTreeSet<FieldName> {
+        self.procedures
+            .iter()
+            .flat_map(|program| &program.instructions)
+            .filter_map(|instruction| match instruction {
+                Instruction::LoadGlobal(field)
+                | Instruction::LoadInitialGlobal(field)
+                | Instruction::StoreGlobal(field)
+                | Instruction::LogicalOrEmptyListGlobal(field) => Some(field),
+                Instruction::MutateGlobal { name, .. } => Some(name),
+                _ => None,
+            })
+            .filter(|field| field.as_str().starts_with("__dm_static_"))
+            .cloned()
+            .collect()
     }
 
     /// Number of deferred bodies materialized by execution or inspection.
@@ -1388,6 +1508,8 @@ pub fn compile_initializer(
         deferred: Arc::new(HashMap::new()),
         procedure_types: Vec::new(),
         initializer_call_names: None,
+        compact_wordcode: Default::default(),
+        semantic_digests: Default::default(),
     });
     let entry = compile_initializer_into_module(tokens, bindings, &mut module)?;
     Ok(InitializerProgram { module, entry })
@@ -1400,6 +1522,9 @@ pub fn compile_initializer_into_module(
     bindings: &BTreeMap<String, InitializerBinding>,
     module: &mut Module,
 ) -> Result<ProcedureId, CompileError> {
+    // Appending changes procedure IDs and instruction ranges, so a previously
+    // validated sidecar can no longer be trusted.
+    module.clear_compact_wordcode();
     let context = initializer_compile_context(module);
     let program = compile_initializer_program(tokens, bindings, &context)?;
     append_initializer_program(module, program)
@@ -1555,6 +1680,8 @@ pub fn compile_module_with_global_fields(
             .filter_map(|definition| TypePath::parse(&definition.path.to_string()).ok())
             .collect(),
         initializer_call_names: None,
+        compact_wordcode: Default::default(),
+        semantic_digests: Default::default(),
     })
 }
 
@@ -1632,6 +1759,8 @@ pub fn compile_module_specs_with_global_types(
         deferred: Arc::new(HashMap::new()),
         procedure_types: procedure_type_catalog_from_specs(specs),
         initializer_call_names: None,
+        compact_wordcode: Default::default(),
+        semantic_digests: Default::default(),
     })
 }
 
@@ -1747,6 +1876,8 @@ pub fn compile_module_specs_selective_with_errors(
         deferred: Arc::new(deferred),
         procedure_types: procedure_type_catalog_from_specs(specs),
         initializer_call_names: None,
+        compact_wordcode: Default::default(),
+        semantic_digests: Default::default(),
     })
 }
 
@@ -2059,6 +2190,16 @@ fn compile_procedure_with_resolver_and_fields(
     }
 
     specialize_local_list_iteration_headers(&mut instructions);
+    if locals.slot_count > u16::MAX as usize {
+        return Err(compile_error(
+            "procedure exceeds the VM ABI limit of 65535 local slots",
+        ));
+    }
+    if instructions.len() > u16::MAX as usize {
+        return Err(compile_error(
+            "procedure exceeds the VM ABI limit of 65535 instructions",
+        ));
+    }
     Ok(Program {
         wait_for: procedure_wait_for(definition),
         parameter_count: definition.parameters.len(),
@@ -9617,6 +9758,9 @@ pub struct ExecutionLimits {
     /// interpreter dispatch. Standalone exhaustion is an error; scheduled
     /// exhaustion retains the continuation for a same-tick dispatch slice.
     pub max_steps: u64,
+    /// Optional host wall-clock budget for one scheduled continuation slice.
+    /// Standalone execution ignores this limit to remain deterministic.
+    pub wall_clock_budget: Option<Duration>,
 }
 
 impl Default for ExecutionLimits {
@@ -9624,6 +9768,7 @@ impl Default for ExecutionLimits {
         Self {
             max_call_depth: 1_024,
             max_steps: 10_000_000,
+            wall_clock_budget: None,
         }
     }
 }
@@ -9685,6 +9830,76 @@ const MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES: usize = 524_288;
 const MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE: usize = 8;
 const MAX_INSTANCE_INITIALIZER_PLAN_CACHE_ENTRIES: usize = 16_384;
 
+/// Dense per-world storage for DM globals.
+///
+/// Compiled instructions still carry symbolic names while the runtime-image
+/// migration is in progress, but each name resolves once to a stable numeric
+/// slot. Reads and writes then touch a contiguous value table instead of a
+/// tree node. The ordered name set preserves deterministic reflection and
+/// snapshot output independently of the hot lookup representation.
+#[derive(Default)]
+struct GlobalStore {
+    names: std::collections::BTreeSet<FieldName>,
+    slots_by_name: HashMap<FieldName, u32>,
+    slots: Vec<Option<Value>>,
+    free_slots: Vec<u32>,
+}
+
+impl GlobalStore {
+    fn get(&self, name: &FieldName) -> Option<&Value> {
+        let slot = usize::try_from(*self.slots_by_name.get(name)?).ok()?;
+        self.slots.get(slot)?.as_ref()
+    }
+
+    fn insert(&mut self, name: FieldName, value: Value) -> Option<Value> {
+        if let Some(slot) = self.slots_by_name.get(&name).copied() {
+            return self.slots[slot as usize].replace(value);
+        }
+        let slot = self.free_slots.pop().unwrap_or_else(|| {
+            let slot = u32::try_from(self.slots.len())
+                .expect("DM global slot count exceeds the 32-bit runtime identity space");
+            self.slots.push(None);
+            slot
+        });
+        self.slots[slot as usize] = Some(value);
+        self.names.insert(name.clone());
+        self.slots_by_name.insert(name, slot);
+        None
+    }
+
+    fn remove(&mut self, name: &FieldName) -> Option<Value> {
+        let slot = self.slots_by_name.remove(name)?;
+        self.names.remove(name);
+        let value = self.slots[slot as usize].take();
+        self.free_slots.push(slot);
+        value
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &FieldName> {
+        self.names.iter()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &Value> {
+        self.slots.iter().filter_map(Option::as_ref)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&FieldName, &Value)> {
+        self.names
+            .iter()
+            .filter_map(|name| self.get(name).map(|value| (name, value)))
+    }
+}
+
+impl FromIterator<(FieldName, Value)> for GlobalStore {
+    fn from_iter<T: IntoIterator<Item = (FieldName, Value)>>(iter: T) -> Self {
+        let mut globals = Self::default();
+        for (name, value) in iter {
+            globals.insert(name, value);
+        }
+        globals
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Result of a host-requested heap collection at a quiescent VM boundary.
 pub struct QuiescentHeapCompaction {
@@ -9696,12 +9911,55 @@ pub struct QuiescentHeapCompaction {
     pub elapsed: Duration,
 }
 
+/// Exact bounds measured from one immutable project DMM resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DmmMeasurement {
+    /// MD5 identity of the exact map bytes measured at artifact construction.
+    pub digest: [u8; 16],
+    /// Minimum and maximum X, Y, and Z coordinates in BYOND bounds order.
+    pub bounds: [i32; 6],
+}
+
+/// One immutable parsed-map coordinate record supplied by a runtime artifact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedDmmGrid {
+    /// One-based starting X coordinate.
+    pub x: i32,
+    /// One-based starting Y coordinate.
+    pub y: i32,
+    /// One-based Z coordinate.
+    pub z: i32,
+    /// Top-to-bottom encoded map-key lines.
+    pub lines: Vec<String>,
+}
+
+/// Complete immutable parser product for one project DMM resource.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedDmm {
+    /// MD5 identity of the exact source bytes.
+    pub digest: [u8; 16],
+    /// Whether the source uses TGM model formatting.
+    pub tgm: bool,
+    /// Uniform map-key byte width.
+    pub key_len: u32,
+    /// Encoded grid-line byte width.
+    pub line_len: u32,
+    /// Bounds in MAP_MINX..MAP_MAXZ order.
+    pub bounds: [i32; 6],
+    /// Source-ordered model key/body pairs.
+    pub models: Vec<(String, String)>,
+    /// Source-ordered coordinate records.
+    pub grids: Vec<ParsedDmmGrid>,
+}
+
 /// Mutable heap state shared by executions in one runtime world.
 ///
 /// Values contain only stable logical handles. All mutable list and datum
 /// storage remains here so aliases across calls resolve to one identity.
-#[derive(Default)]
 pub struct ExecutionState {
+    // Live DM state has one authoritative mutation thread. This identity is
+    // process-local runtime state and is deliberately absent from snapshots.
+    owner_thread: OnceLock<ThreadId>,
     heap: ValueHeap,
     associative_lists: HashSet<ListId>,
     reference_lists: HashSet<ListId>,
@@ -9732,7 +9990,7 @@ pub struct ExecutionState {
     initial_prototypes: BTreeMap<TypePath, DatumId>,
     initial_prototypes_initializing: HashSet<TypePath>,
     instance_initializer_module: Option<Arc<Module>>,
-    globals: BTreeMap<FieldName, Value>,
+    globals: GlobalStore,
     initial_globals: BTreeMap<FieldName, Value>,
     type_paths: Arc<std::collections::BTreeSet<TypePath>>,
     type_parents: Arc<BTreeMap<TypePath, Option<TypePath>>>,
@@ -9747,6 +10005,11 @@ pub struct ExecutionState {
     // re-hashing full type-path and selector strings on every invocation. The
     // retained TypePath keeps the process-local storage identity collision-free.
     dynamic_callsite_targets: HashMap<(u64, ProcedureId, usize, usize), (TypePath, ProcedureId)>,
+    // Static field-read sites can retain a dense datum slot. Every hit still
+    // validates both the field name and current layout, and engine-special
+    // fields never enter this path.
+    declared_field_slots: HashMap<(u64, ProcedureId, u16), u16>,
+    declared_field_quickening: DeclaredFieldQuickeningMetrics,
     initial_values: Arc<BTreeMap<TypePath, BTreeMap<FieldName, Value>>>,
     // The initial-value catalog is immutable but can contain millions of
     // scalar values. Derive the only heap handles it can retain when the
@@ -9770,6 +10033,8 @@ pub struct ExecutionState {
     // but are rooted only by the normal DM object graph.
     compact_default_datums: HashSet<DatumId>,
     project_root: Option<Arc<PathBuf>>,
+    dmm_measurements: Arc<BTreeMap<String, DmmMeasurement>>,
+    parsed_dmm_cache: Arc<BTreeMap<String, ParsedDmm>>,
     random_state: u64,
     scheduler_tick: u64,
     scheduler_sequence: u64,
@@ -9788,6 +10053,8 @@ pub struct ExecutionState {
     scheduler_tick_started: Option<Instant>,
     // Optional production sampler spanning every scheduler slice of SSatoms.
     atoms_profile: Option<AtomsProfile>,
+    // Independent exact `_tgm_load` subtree profiler.
+    tgm_profile: Option<TgmProfile>,
     // Datums whose BYOND `Del()` hook is currently executing. This prevents a
     // reentrant `del(src)` from dispatching the same hook indefinitely.
     deleting_datums: HashSet<DatumId>,
@@ -9815,8 +10082,18 @@ pub struct ExecutionState {
     // companion index makes the map loader's locate(x,y,z) hot path O(1).
     world_turf_lookup: Vec<Option<DatumId>>,
     world_turf_lookup_dimensions: (i32, i32, i32),
+    // Successful NO_RUINS witnesses are safe to reuse only after revalidating
+    // both the coordinate identity and its current flag value. We never cache
+    // a successful rectangle, so newly-added flags cannot create a false pass.
+    ruin_rejection_witnesses: BTreeMap<i32, BTreeMap<(i32, i32), DatumId>>,
     world_areas: BTreeMap<(i32, i32, i32), DatumId>,
     default_world_area: Option<DatumId>,
+}
+
+impl Default for ExecutionState {
+    fn default() -> Self {
+        Self::from_heap(ValueHeap::default())
+    }
 }
 
 /// A local client could not be created from the supplied DMF skin.
@@ -9857,6 +10134,11 @@ pub struct LocalClientState {
 /// One authoritative UI operation emitted by DM for a connected local client.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LocalClientUiEvent {
+    /// Open a URL requested by BYOND's `link()` builtin.
+    Link {
+        /// Absolute URL supplied by game code.
+        url: String,
+    },
     /// Mutate named DMF control properties.
     Winset {
         /// Target DMF control address.
@@ -9985,6 +10267,10 @@ pub struct LocalClientAppearance {
     pub layer: f32,
     /// Draw plane.
     pub plane: f32,
+    /// BYOND appearance behavior bitfield, kept at the VM's narrow integer width.
+    pub appearance_flags: i32,
+    /// BYOND mouse hit-test policy value.
+    pub mouse_opacity: i32,
     /// X pixel offset.
     pub pixel_x: f32,
     /// Y pixel offset.
@@ -10074,7 +10360,9 @@ impl ExecutionState {
     /// Creates an execution state with an empty value heap.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        let state = Self::default();
+        let _ = state.owner_thread.set(std::thread::current().id());
+        state
     }
 
     /// Decodes a BYOND parameter string into its associative list representation.
@@ -10089,6 +10377,7 @@ impl ExecutionState {
     #[must_use]
     pub fn from_heap(heap: ValueHeap) -> Self {
         let mut state = Self {
+            owner_thread: OnceLock::from(std::thread::current().id()),
             heap,
             associative_lists: HashSet::new(),
             reference_lists: HashSet::new(),
@@ -10116,13 +10405,15 @@ impl ExecutionState {
             initial_prototypes: BTreeMap::new(),
             initial_prototypes_initializing: HashSet::new(),
             instance_initializer_module: None,
-            globals: BTreeMap::new(),
+            globals: GlobalStore::default(),
             initial_globals: BTreeMap::new(),
             type_paths: Arc::new(std::collections::BTreeSet::new()),
             type_parents: Arc::new(BTreeMap::new()),
             type_intervals: Arc::new(BTreeMap::new()),
             dynamic_receiver_targets: HashMap::new(),
             dynamic_callsite_targets: HashMap::new(),
+            declared_field_slots: HashMap::new(),
+            declared_field_quickening: DeclaredFieldQuickeningMetrics::default(),
             initial_values: Arc::new(BTreeMap::new()),
             initial_value_datum_roots: Arc::default(),
             initial_value_list_roots: Arc::default(),
@@ -10132,6 +10423,8 @@ impl ExecutionState {
             initial_field_value_cache_entries: 0,
             compact_default_datums: HashSet::new(),
             project_root: None,
+            dmm_measurements: Arc::new(BTreeMap::new()),
+            parsed_dmm_cache: Arc::new(BTreeMap::new()),
             random_state: 0,
             scheduler_tick: 0,
             scheduler_sequence: 0,
@@ -10140,6 +10433,7 @@ impl ExecutionState {
             scheduler_inflight: Vec::new(),
             scheduler_tick_started: None,
             atoms_profile: None,
+            tgm_profile: None,
             deleting_datums: HashSet::new(),
             last_animation_target: None,
             environment_overrides: BTreeMap::new(),
@@ -10155,11 +10449,23 @@ impl ExecutionState {
             world_turfs: BTreeMap::new(),
             world_turf_lookup: Vec::new(),
             world_turf_lookup_dimensions: (0, 0, 0),
+            ruin_rejection_witnesses: BTreeMap::new(),
             world_areas: BTreeMap::new(),
             default_world_area: None,
         };
         state.rebuild_world_geometry();
         state
+    }
+
+    fn assert_owner_thread(&self) {
+        let owner = self
+            .owner_thread
+            .get_or_init(|| std::thread::current().id());
+        assert_eq!(
+            *owner,
+            std::thread::current().id(),
+            "live DM state mutation attempted off its owner thread"
+        );
     }
 
     /// Allocates one inert map datum with sparse inherited scalar defaults.
@@ -10292,11 +10598,16 @@ impl ExecutionState {
         name: &str,
         fallback: &str,
     ) -> Result<TypePath, String> {
-        match self.heap.datum_field(
-            world,
-            &FieldName::parse(name).expect("built-in world type field"),
-        ) {
-            Ok(Value::TypePath(path)) => Ok(path.clone()),
+        let field = FieldName::parse(name).expect("built-in world type field");
+        // Runtime images deliberately keep unchanged declared fields sparse.
+        // World geometry creation must therefore observe the effective DM
+        // initial value before applying the engine fallback, just like an
+        // ordinary `world.area` or `world.turf` field read. Falling straight
+        // back from a missing heap slot created dynamic z-levels as `/area`
+        // and `/turf`, ignoring project declarations such as Monke's
+        // `/area/space` and `/turf/open/space/basic`.
+        match datum_field_or_initial(self, world, &field) {
+            Ok(Value::TypePath(path)) => Ok(path),
             Ok(Value::ModifiedTypePath(path)) => Ok(path.base().clone()),
             Ok(Value::Null) | Err(_) => {
                 TypePath::parse(fallback).map_err(|error| error.to_string())
@@ -10554,12 +10865,15 @@ impl ExecutionState {
     }
 
     fn default_area_for_world(&mut self, world: DatumId) -> Result<DatumId, String> {
+        let path = self.world_type_field(world, "area", "/area")?;
         if let Some(area) = self.default_world_area
-            && self.heap.datum(area).is_ok()
+            && self
+                .heap
+                .datum(area)
+                .is_ok_and(|datum| datum.type_path() == &path)
         {
             return Ok(area);
         }
-        let path = self.world_type_field(world, "area", "/area")?;
         let existing = self
             .heap
             .datums()
@@ -10630,6 +10944,28 @@ impl ExecutionState {
         let area = self.default_area_for_world(world)?;
         let turf_path = self.world_type_field(world, "turf", "/turf")?;
         let area_contents = self.ensure_contents(area)?;
+        // Constant initializer actions are deliberately omitted for fresh
+        // compact engine turfs: their values remain in the shared initial
+        // catalog. Only runtime initializer programs can make allocation
+        // observable and require the general per-cell path.
+        let turf_has_runtime_initializers = instance_initializer_plan(self, &turf_path)
+            .iter()
+            .any(|initializer| matches!(initializer, InstanceInitializer::Program { .. }));
+        let mut bulk_area_members = Vec::new();
+        let bulk_world_contents = (!turf_has_runtime_initializers)
+            .then(|| {
+                self.global(&FieldName::parse("world").ok()?)
+                    .and_then(|value| (value == &Value::Datum(world)).then_some(()))?;
+                self.heap
+                    .datum_field(world, &FieldName::parse("contents").ok()?)
+                    .ok()
+                    .and_then(|value| match value {
+                        Value::List(list) => Some(*list),
+                        _ => None,
+                    })
+            })
+            .flatten();
+        let mut bulk_world_members = Vec::new();
         let coordinate_fields = ["x", "y", "z"]
             .map(|name| FieldName::parse(name).expect("built-in coordinate field is valid"));
         let loc = FieldName::parse("loc").expect("built-in loc field is valid");
@@ -10640,7 +10976,11 @@ impl ExecutionState {
                     if self.world_turfs.contains_key(&coordinate) {
                         continue;
                     }
-                    let turf = allocate_initialized_datum(self, turf_path.clone())?;
+                    let turf = if turf_has_runtime_initializers {
+                        allocate_initialized_datum(self, turf_path.clone())?
+                    } else {
+                        self.heap.allocate_datum(turf_path.clone())
+                    };
                     for (field, value) in coordinate_fields.iter().zip([x, y, z]) {
                         self.heap
                             .set_datum_field(turf, field.clone(), Value::number(value as f32))
@@ -10649,14 +10989,35 @@ impl ExecutionState {
                     self.heap
                         .set_datum_field(turf, loc.clone(), Value::Datum(area))
                         .map_err(|error| error.to_string())?;
-                    self.heap
-                        .list_mut(area_contents)
-                        .map_err(|error| error.to_string())?
-                        .add(Value::Datum(turf));
+                    if turf_has_runtime_initializers {
+                        self.heap
+                            .list_mut(area_contents)
+                            .map_err(|error| error.to_string())?
+                            .add(Value::Datum(turf));
+                    } else {
+                        bulk_area_members.push(Value::Datum(turf));
+                        if bulk_world_contents.is_some() {
+                            bulk_world_members.push(Value::Datum(turf));
+                        }
+                    }
                     self.world_turfs.insert(coordinate, turf);
                     self.world_areas.insert(coordinate, area);
                 }
             }
+        }
+        if !bulk_area_members.is_empty() {
+            self.heap
+                .list_mut(area_contents)
+                .map_err(|error| error.to_string())?
+                .extend_positional(bulk_area_members);
+        }
+        if let Some(world_contents) = bulk_world_contents
+            && !bulk_world_members.is_empty()
+        {
+            self.heap
+                .list_mut(world_contents)
+                .map_err(|error| error.to_string())?
+                .extend_positional(bulk_world_members);
         }
         for (name, value) in [("maxx", maxx), ("maxy", maxy), ("maxz", maxz)] {
             self.heap
@@ -10781,7 +11142,8 @@ impl ExecutionState {
 
     /// Returns the shared mutable value heap.
     #[must_use]
-    pub const fn heap_mut(&mut self) -> &mut ValueHeap {
+    pub fn heap_mut(&mut self) -> &mut ValueHeap {
+        self.assert_owner_thread();
         &mut self.heap
     }
 
@@ -12005,6 +12367,8 @@ impl ExecutionState {
             dir: numeric("dir", 2.0) as i32,
             layer: numeric("layer", 0.0),
             plane: numeric("plane", 0.0),
+            appearance_flags: numeric("appearance_flags", 0.0) as i32,
+            mouse_opacity: numeric("mouse_opacity", 1.0) as i32,
             pixel_x: numeric("pixel_x", 0.0),
             pixel_y: numeric("pixel_y", 0.0),
             pixel_w: numeric("pixel_w", 0.0),
@@ -12179,7 +12543,8 @@ impl ExecutionState {
 
     /// Inserts or replaces a persistent runtime global.
     pub fn set_global(&mut self, name: FieldName, value: Value) -> Option<Value> {
-        let is_new = !self.globals.contains_key(&name);
+        self.assert_owner_thread();
+        let is_new = self.globals.get(&name).is_none();
         let previous = self.globals.insert(name.clone(), value);
         if is_new
             && let Some(list) = self.global_vars_proxy
@@ -12314,6 +12679,28 @@ impl ExecutionState {
         self.project_root = Some(Arc::new(root));
     }
 
+    /// Installs immutable artifact-time measurements for project DMM resources.
+    pub fn set_dmm_measurements(&mut self, measurements: Arc<BTreeMap<String, DmmMeasurement>>) {
+        self.dmm_measurements = measurements;
+    }
+
+    /// Returns the immutable project DMM measurement catalog.
+    #[must_use]
+    pub fn dmm_measurements(&self) -> Arc<BTreeMap<String, DmmMeasurement>> {
+        Arc::clone(&self.dmm_measurements)
+    }
+
+    /// Installs immutable artifact-time full parsed-map products.
+    pub fn set_parsed_dmm_cache(&mut self, cache: Arc<BTreeMap<String, ParsedDmm>>) {
+        self.parsed_dmm_cache = cache;
+    }
+
+    /// Returns the immutable full parsed-map catalog.
+    #[must_use]
+    pub fn parsed_dmm_cache(&self) -> Arc<BTreeMap<String, ParsedDmm>> {
+        Arc::clone(&self.parsed_dmm_cache)
+    }
+
     /// Returns a type's runtime parent when the catalog contains that type.
     #[must_use]
     pub fn type_parent(&self, path: &TypePath) -> Option<&TypePath> {
@@ -12416,6 +12803,44 @@ impl ExecutionState {
         self.project_root.as_deref().map(PathBuf::as_path)
     }
 
+    /// Returns the shared immutable runtime type catalog.
+    #[must_use]
+    pub fn shared_type_paths(&self) -> Arc<BTreeSet<TypePath>> {
+        Arc::clone(&self.type_paths)
+    }
+
+    /// Returns the shared immutable runtime inheritance catalog.
+    #[must_use]
+    pub fn shared_type_parents(&self) -> Arc<BTreeMap<TypePath, Option<TypePath>>> {
+        Arc::clone(&self.type_parents)
+    }
+
+    /// Returns the shared immutable direct initial-value catalog.
+    #[must_use]
+    pub fn shared_initial_values(&self) -> Arc<BTreeMap<TypePath, BTreeMap<FieldName, Value>>> {
+        Arc::clone(&self.initial_values)
+    }
+
+    /// Returns the shared immutable reflection field catalog.
+    #[must_use]
+    pub fn shared_fields(&self) -> Arc<BTreeMap<TypePath, BTreeMap<FieldName, FieldName>>> {
+        Arc::clone(&self.shared_fields)
+    }
+
+    /// Returns linked per-instance initializer actions and their portable module.
+    #[must_use]
+    pub fn shared_instance_initializers(
+        &self,
+    ) -> (
+        Arc<BTreeMap<TypePath, Vec<InstanceInitializer>>>,
+        Option<Arc<Module>>,
+    ) {
+        (
+            Arc::clone(&self.instance_initializers),
+            self.instance_initializer_module.clone(),
+        )
+    }
+
     /// Iterates globals in canonical field-name order for snapshots.
     pub fn globals(&self) -> impl Iterator<Item = (&FieldName, &Value)> {
         self.globals.iter()
@@ -12447,6 +12872,51 @@ impl ExecutionState {
     #[must_use]
     pub fn scheduled_task_count(&self) -> usize {
         self.scheduled_spawns.len() + self.pending_local_prompts.len()
+    }
+
+    /// Returns allocation-neutral suspended-frame metrics for runtime benchmarks.
+    #[must_use]
+    pub fn continuation_metrics(&self) -> ContinuationMetrics {
+        let mut metrics = ContinuationMetrics {
+            frame_header_bytes: std::mem::size_of::<CallFrame>(),
+            rare_inline_bytes_avoided: std::mem::size_of::<Option<Value>>()
+                + std::mem::size_of::<Option<Box<CallFrame>>>()
+                + std::mem::size_of::<Option<NumericExecutionState>>(),
+            ..ContinuationMetrics::default()
+        };
+        for continuation in self
+            .scheduled_spawns
+            .iter()
+            .chain(self.scheduler_inflight.iter())
+            .map(|spawn| &spawn.frames)
+        {
+            metrics.continuations += 1;
+            metrics.frames += continuation.len();
+            for frame in continuation {
+                metrics.cold_frames += usize::from(frame.cold.is_some());
+                metrics.retained_values += frame.locals.len()
+                    + frame.stack.len()
+                    + frame.arguments.len()
+                    + frame.pending_argument_roots().len()
+                    + frame.retained_call_roots().len()
+                    + 3
+                    + usize::from(frame.args_list.is_some())
+                    + usize::from(frame.caller_result_override().is_some());
+            }
+        }
+        metrics
+    }
+
+    /// Returns static-field quickening counters for this owner-thread VM state.
+    #[must_use]
+    pub const fn declared_field_quickening_metrics(&self) -> DeclaredFieldQuickeningMetrics {
+        self.declared_field_quickening
+    }
+
+    /// Preferred name for the static-field quickening telemetry.
+    #[must_use]
+    pub const fn static_field_quickening_metrics(&self) -> DeclaredFieldQuickeningMetrics {
+        self.declared_field_quickening
     }
 
     /// Formats a bounded snapshot of suspended DM continuations for shutdown diagnostics.
@@ -12482,7 +12952,8 @@ impl ExecutionState {
                 });
                 let map_progress = map_loader_progress(frame, path, &self.heap);
                 lines.push(format!(
-                    "task={task_index} due_tick={} sequence={} depth={} frame={} procedure={} instruction={} source={} stack={} locals={} parameters=[{}]{}",
+                    "task={task_index} continuation={} due_tick={} sequence={} depth={} frame={} procedure={} instruction={} source={} stack={} locals={} parameters=[{}]{}",
+                    task.frames.id.get(),
                     task.due_tick,
                     task.sequence,
                     task.frames.len(),
@@ -12645,20 +13116,27 @@ impl ExecutionState {
                 extend_heap_root_ids(
                     &mut datum_roots,
                     &mut list_roots,
-                    &current.pending_argument_roots,
+                    current.pending_argument_roots(),
                 );
                 extend_heap_root_ids(
                     &mut datum_roots,
                     &mut list_roots,
-                    &current.retained_call_roots,
+                    current.retained_call_roots(),
                 );
+                if let Some(tgm) = current.cold().and_then(|cold| cold.tgm_load.as_ref()) {
+                    extend_heap_root_ids(&mut datum_roots, &mut list_roots, tgm.roots());
+                }
+                if let Some(scan) = current.cold().and_then(|cold| cold.ruin_scan.as_ref()) {
+                    datum_roots.extend(scan.turfs.iter().copied());
+                    extend_heap_root_ids(&mut datum_roots, &mut list_roots, &scan.areas);
+                }
                 list_roots.extend(current.args_list);
                 extend_heap_root_ids(
                     &mut datum_roots,
                     &mut list_roots,
-                    current.caller_result_override.iter(),
+                    current.caller_result_override().into_iter(),
                 );
-                frame = current.engine_post_return.as_deref();
+                frame = current.engine_post_return();
             }
         };
         for frame in active_frames {
@@ -13038,8 +13516,104 @@ struct CallFrame {
     // not rescan parameter_names for every ordinary local assignment.
     declared_argument_count: usize,
     supplied_parameters: SmallVec<[bool; 8]>,
-    // Runtime names produced by arglist(list). This is consumed by the
-    // immediately following call/constructor instruction.
+    // Rare argument-name, exception, diagnostic, and shuttle continuation
+    // state lives outside the hot frame header.
+    cold: Option<Box<CallFrameCold>>,
+    // A waitfor=FALSE boundary detaches from its caller only once. Later
+    // sleeps in the already-detached continuation yield normally.
+    detached_waitfor: bool,
+    static_locals: SmallVec<[u16; 2]>,
+    atoms_profile_entry_counted: bool,
+    atoms_profile_root: bool,
+    tgm_profile_root: bool,
+}
+
+/// Stable, native-width-independent identity for one suspended VM continuation.
+///
+/// The identity is serialized as an explicit `u64`; it never contains a host
+/// pointer or depends on the 32-bit layout of BYOND's native runtime.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct VmContinuationId(u64);
+
+impl VmContinuationId {
+    /// Returns the portable integer representation used by snapshots and diagnostics.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OwnedContinuation {
+    id: VmContinuationId,
+    frames: Vec<CallFrame>,
+}
+
+impl OwnedContinuation {
+    fn new(id: VmContinuationId, frames: Vec<CallFrame>) -> Self {
+        debug_assert!(!frames.is_empty());
+        Self { id, frames }
+    }
+
+    fn into_frames(self) -> Vec<CallFrame> {
+        self.frames
+    }
+}
+
+impl std::ops::Deref for OwnedContinuation {
+    type Target = [CallFrame];
+
+    fn deref(&self) -> &Self::Target {
+        &self.frames
+    }
+}
+
+impl<'a> IntoIterator for &'a OwnedContinuation {
+    type Item = &'a CallFrame;
+    type IntoIter = std::slice::Iter<'a, CallFrame>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.frames.iter()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PackedNumericState {
+    locals: SmallVec<[PackedValue; 8]>,
+    stack: SmallVec<[PackedValue; 8]>,
+    result: PackedValue,
+}
+
+impl PackedNumericState {
+    fn from_rich(frame: &CallFrame) -> Option<Self> {
+        fn numeric(value: &Value) -> Option<PackedValue> {
+            let packed = PackedValue::try_from_value(value)?;
+            packed.as_number_or_null()?;
+            Some(packed)
+        }
+        Some(Self {
+            locals: frame.locals.iter().map(numeric).collect::<Option<_>>()?,
+            stack: frame.stack.iter().map(numeric).collect::<Option<_>>()?,
+            result: numeric(&frame.result)?,
+        })
+    }
+
+    fn materialize(self, frame: &mut CallFrame) {
+        frame.locals.clear();
+        frame
+            .locals
+            .extend(self.locals.into_iter().map(PackedValue::into_value));
+        frame.stack.clear();
+        frame
+            .stack
+            .extend(self.stack.into_iter().map(PackedValue::into_value));
+        frame.result = self.result.into_value();
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct CallFrameCold {
     pending_argument_names: Option<Vec<Option<String>>>,
     // Source lists consumed by arglist expansion. Re-entrant engine execution
     // cannot always see the outer caller's frames, so transfer these roots to
@@ -13047,28 +13621,312 @@ struct CallFrame {
     pending_argument_roots: SmallVec<[Value; 2]>,
     retained_call_roots: SmallVec<[Value; 2]>,
     exception_handlers: Vec<ExceptionHandler>,
-    // A waitfor=FALSE boundary detaches from its caller only once. Later
-    // sleeps in the already-detached continuation yield normally.
-    detached_waitfor: bool,
-    // Engine constructors return the allocated value to their caller rather
-    // than exposing the value returned by New(). Keeping this on the callee
-    // frame preserves that continuation across sleep()/scheduler resumption.
-    caller_result_override: Option<Value>,
-    // Engine connection construction runs mob Login only after the complete
-    // New/Initialize frame chain, while still returning to client/New's
-    // parent-call continuation as one engine operation.
-    engine_post_return: Option<Box<CallFrame>>,
-    static_locals: SmallVec<[u16; 2]>,
+    shuttle_trace_target: Option<DatumId>,
+    shuttle_trace_post_return: Option<ShuttleTracePostReturn>,
     boot_trace_started: Option<Instant>,
     boot_trace_heap: Option<(usize, usize, usize)>,
     boot_trace_step: u64,
-    atoms_profile_entry_counted: bool,
-    atoms_profile_root: bool,
-    shuttle_trace_target: Option<DatumId>,
-    shuttle_trace_post_return: Option<ShuttleTracePostReturn>,
-    // Materialized native numeric continuation. The PC, locals, and operand
-    // stack survive scheduler slices exactly like the interpreter frame.
+    // Engine constructors return the allocated value rather than New()'s
+    // result. This is rare outside constructor continuations.
+    caller_result_override: Option<Value>,
+    // Connection construction may defer Login until the complete New chain.
+    engine_post_return: Option<Box<CallFrame>>,
+    // Native numeric state exists only while a guarded trace is suspended.
     numeric_jit_state: Option<NumericExecutionState>,
+    // Null/number-only interpreter state stays packed across budget yields.
+    // Pointer-bearing values side-exit before entering this domain, so the
+    // ordinary rich frame remains the complete GC root set.
+    packed_numeric_state: Option<PackedNumericState>,
+    tgm_load: Option<TgmLoadContinuation>,
+    ruin_scan: Option<RuinCandidateScan>,
+    tgm_route_trace_mask: u8,
+}
+
+#[derive(Clone, Debug)]
+struct RuinCandidateScan {
+    low: (i32, i32, i32),
+    next: (i32, i32, i32),
+    high: (i32, i32, i32),
+    empty: bool,
+    turfs: Vec<DatumId>,
+    areas: Vec<Value>,
+    validating: bool,
+    validate_index: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TgmLoadPhase {
+    Commit,
+    AwaitCoordinate,
+    Tick,
+}
+
+#[derive(Clone, Debug)]
+struct TgmLoadContinuation {
+    plan: Arc<tgm_planner::Plan>,
+    cursor: tgm_planner::CommitCursor,
+    phase: TgmLoadPhase,
+    model_cache: Value,
+    models: BTreeMap<Arc<str>, Value>,
+    bounds: Value,
+    coordinate_target: Option<(TypePath, ProcedureId)>,
+}
+
+impl TgmLoadContinuation {
+    fn roots(&self) -> impl Iterator<Item = &Value> {
+        std::iter::once(&self.model_cache)
+            .chain(std::iter::once(&self.bounds))
+            .chain(self.models.values())
+    }
+}
+
+impl CallFrameCold {
+    fn is_empty(&self) -> bool {
+        self.pending_argument_names.is_none()
+            && self.pending_argument_roots.is_empty()
+            && self.retained_call_roots.is_empty()
+            && self.exception_handlers.is_empty()
+            && self.shuttle_trace_target.is_none()
+            && self.shuttle_trace_post_return.is_none()
+            && self.boot_trace_started.is_none()
+            && self.boot_trace_heap.is_none()
+            && self.boot_trace_step == 0
+            && self.caller_result_override.is_none()
+            && self.engine_post_return.is_none()
+            && self.numeric_jit_state.is_none()
+            && self.packed_numeric_state.is_none()
+            && self.tgm_load.is_none()
+            && self.ruin_scan.is_none()
+            && self.tgm_route_trace_mask == 0
+    }
+}
+
+impl CallFrame {
+    fn prune_empty_cold(&mut self) {
+        if self.cold.as_deref().is_some_and(CallFrameCold::is_empty) {
+            self.cold = None;
+        }
+    }
+
+    fn cold(&self) -> Option<&CallFrameCold> {
+        self.cold.as_deref()
+    }
+
+    fn cold_mut(&mut self) -> &mut CallFrameCold {
+        self.cold
+            .get_or_insert_with(|| Box::new(CallFrameCold::default()))
+    }
+
+    fn pending_argument_names(&self) -> Option<&Vec<Option<String>>> {
+        self.cold()
+            .and_then(|cold| cold.pending_argument_names.as_ref())
+    }
+
+    fn set_pending_argument_names(&mut self, names: Vec<Option<String>>) {
+        self.cold_mut().pending_argument_names = Some(names);
+    }
+
+    fn take_pending_argument_names(&mut self) -> Option<Vec<Option<String>>> {
+        self.cold
+            .as_deref_mut()
+            .and_then(|cold| cold.pending_argument_names.take())
+    }
+
+    fn clear_pending_argument_names(&mut self) {
+        if let Some(cold) = self.cold.as_deref_mut() {
+            cold.pending_argument_names = None;
+        }
+    }
+
+    fn pending_argument_roots(&self) -> &[Value] {
+        self.cold()
+            .map_or(&[], |cold| cold.pending_argument_roots.as_slice())
+    }
+
+    fn set_pending_argument_roots(&mut self, roots: SmallVec<[Value; 2]>) {
+        if !roots.is_empty() || self.cold.is_some() {
+            self.cold_mut().pending_argument_roots = roots;
+        }
+    }
+
+    fn take_pending_argument_roots(&mut self) -> SmallVec<[Value; 2]> {
+        self.cold.as_deref_mut().map_or_else(SmallVec::new, |cold| {
+            std::mem::take(&mut cold.pending_argument_roots)
+        })
+    }
+
+    fn clear_pending_argument_roots(&mut self) {
+        if let Some(cold) = self.cold.as_deref_mut() {
+            cold.pending_argument_roots.clear();
+        }
+    }
+
+    fn retained_call_roots(&self) -> &[Value] {
+        self.cold()
+            .map_or(&[], |cold| cold.retained_call_roots.as_slice())
+    }
+
+    fn set_retained_call_roots(&mut self, roots: SmallVec<[Value; 2]>) {
+        if !roots.is_empty() || self.cold.is_some() {
+            self.cold_mut().retained_call_roots = roots;
+        }
+    }
+
+    fn exception_handlers(&self) -> &[ExceptionHandler] {
+        self.cold()
+            .map_or(&[], |cold| cold.exception_handlers.as_slice())
+    }
+
+    fn exception_handlers_mut(&mut self) -> &mut Vec<ExceptionHandler> {
+        &mut self.cold_mut().exception_handlers
+    }
+
+    fn shuttle_trace_target(&self) -> Option<DatumId> {
+        self.cold().and_then(|cold| cold.shuttle_trace_target)
+    }
+
+    fn set_shuttle_trace_target(&mut self, target: Option<DatumId>) {
+        if target.is_some() || self.cold.is_some() {
+            self.cold_mut().shuttle_trace_target = target;
+        }
+    }
+
+    fn take_shuttle_trace_post_return(&mut self) -> Option<ShuttleTracePostReturn> {
+        self.cold
+            .as_deref_mut()
+            .and_then(|cold| cold.shuttle_trace_post_return.take())
+    }
+
+    fn set_shuttle_trace_post_return(&mut self, value: Option<ShuttleTracePostReturn>) {
+        if value.is_some() || self.cold.is_some() {
+            self.cold_mut().shuttle_trace_post_return = value;
+        }
+    }
+
+    fn shuttle_trace_post_return(&self) -> Option<&ShuttleTracePostReturn> {
+        self.cold()
+            .and_then(|cold| cold.shuttle_trace_post_return.as_ref())
+    }
+
+    fn caller_result_override(&self) -> Option<&Value> {
+        self.cold()
+            .and_then(|cold| cold.caller_result_override.as_ref())
+    }
+
+    fn set_caller_result_override(&mut self, value: Option<Value>) {
+        if value.is_some() || self.cold.is_some() {
+            self.cold_mut().caller_result_override = value;
+            self.prune_empty_cold();
+        }
+    }
+
+    fn engine_post_return(&self) -> Option<&CallFrame> {
+        self.cold()
+            .and_then(|cold| cold.engine_post_return.as_deref())
+    }
+
+    fn set_engine_post_return(&mut self, frame: Option<Box<CallFrame>>) {
+        if frame.is_some() || self.cold.is_some() {
+            self.cold_mut().engine_post_return = frame;
+        }
+    }
+
+    fn take_engine_post_return(&mut self) -> Option<Box<CallFrame>> {
+        let frame = self
+            .cold
+            .as_deref_mut()
+            .and_then(|cold| cold.engine_post_return.take());
+        self.prune_empty_cold();
+        frame
+    }
+
+    fn numeric_jit_state(&self) -> Option<&NumericExecutionState> {
+        self.cold().and_then(|cold| cold.numeric_jit_state.as_ref())
+    }
+
+    fn numeric_jit_state_mut(&mut self) -> Option<&mut NumericExecutionState> {
+        self.cold
+            .as_deref_mut()
+            .and_then(|cold| cold.numeric_jit_state.as_mut())
+    }
+
+    fn set_numeric_jit_state(&mut self, state: Option<NumericExecutionState>) {
+        if state.is_some() || self.cold.is_some() {
+            self.cold_mut().numeric_jit_state = state;
+            self.prune_empty_cold();
+        }
+    }
+
+    fn take_packed_numeric_state(&mut self) -> Option<PackedNumericState> {
+        self.cold
+            .as_deref_mut()
+            .and_then(|cold| cold.packed_numeric_state.take())
+    }
+
+    fn set_packed_numeric_state(&mut self, state: Option<PackedNumericState>) {
+        if state.is_some() || self.cold.is_some() {
+            self.cold_mut().packed_numeric_state = state;
+        }
+        self.prune_empty_cold();
+    }
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "explicit call-frame layout measurement"]
+fn call_frame_layout_measurement() {
+    eprintln!(
+        "call-frame-layout value_bytes={} frame_bytes={} rare_inline_bytes_avoided={}",
+        std::mem::size_of::<Value>(),
+        std::mem::size_of::<CallFrame>(),
+        std::mem::size_of::<Option<Value>>()
+            + std::mem::size_of::<Option<Box<CallFrame>>>()
+            + std::mem::size_of::<Option<NumericExecutionState>>(),
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn call_frame_hot_header_stays_within_one_kibibyte() {
+    assert!(
+        std::mem::size_of::<CallFrame>() <= 1_024,
+        "cold state leaked back into the hot call-frame header"
+    );
+}
+
+#[cfg(all(test, target_pointer_width = "64"))]
+#[test]
+fn call_frame_cold_split_reduces_the_hot_header_to_768_bytes() {
+    assert_eq!(std::mem::size_of::<CallFrame>(), 768);
+    let avoided = std::mem::size_of::<Option<Value>>()
+        + std::mem::size_of::<Option<Box<CallFrame>>>()
+        + std::mem::size_of::<Option<NumericExecutionState>>();
+    assert!(
+        avoided >= 200,
+        "rare state no longer provides a useful split"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn rare_frame_state_allocates_cold_storage_only_while_live() {
+    let program = Program {
+        wait_for: true,
+        parameter_count: 0,
+        parameter_names: Vec::new(),
+        verb_parameter_types: Vec::new(),
+        verb_name: None,
+        local_count: 0,
+        source_spans: vec![SourceSpan::new(0, 1)],
+        instructions: vec![Instruction::Return],
+    };
+    let mut frame = make_frame(ProcedureId(0), &program, &[], &ExecutionContext::default());
+    assert!(frame.cold.is_none());
+    frame.set_caller_result_override(Some(Value::number(7.0)));
+    assert_eq!(frame.caller_result_override(), Some(&Value::number(7.0)));
+    assert!(frame.cold.is_some());
+    frame.set_caller_result_override(None);
+    assert!(frame.cold.is_none());
 }
 
 trait InlineValueStackExt {
@@ -13093,17 +13951,26 @@ fn preserve_reentrant_frame_roots(state: &mut ExecutionState, frames: &[CallFram
             .extend(frame.arguments.iter().cloned());
         state
             .host_value_roots
-            .extend(frame.pending_argument_roots.iter().cloned());
+            .extend(frame.pending_argument_roots().iter().cloned());
         state
             .host_value_roots
-            .extend(frame.retained_call_roots.iter().cloned());
+            .extend(frame.retained_call_roots().iter().cloned());
+        if let Some(tgm) = frame.cold().and_then(|cold| cold.tgm_load.as_ref()) {
+            state.host_value_roots.extend(tgm.roots().cloned());
+        }
+        if let Some(scan) = frame.cold().and_then(|cold| cold.ruin_scan.as_ref()) {
+            state
+                .host_value_roots
+                .extend(scan.turfs.iter().copied().map(Value::Datum));
+            state.host_value_roots.extend(scan.areas.iter().cloned());
+        }
         if let Some(list) = frame.args_list {
             state.host_value_roots.push(Value::List(list));
         }
-        if let Some(value) = &frame.caller_result_override {
+        if let Some(value) = frame.caller_result_override() {
             state.host_value_roots.push(value.clone());
         }
-        if let Some(frame) = &frame.engine_post_return {
+        if let Some(frame) = frame.engine_post_return() {
             preserve_frame(state, frame);
         }
     }
@@ -13138,6 +14005,59 @@ struct AtomsProfile {
     instruction_samples: HashMap<AtomsProfileInstruction, u64>,
     instruction_wall_nanos: HashMap<AtomsProfileInstruction, u128>,
     instruction_labels: HashMap<AtomsProfileInstruction, String>,
+}
+
+#[derive(Debug)]
+struct TgmProfile {
+    started: Instant,
+    total_instructions: u64,
+    procedure_samples: HashMap<AtomsProfileProcedure, u64>,
+    instruction_samples: HashMap<AtomsProfileInstruction, u64>,
+    paths: HashMap<AtomsProfileProcedure, String>,
+    instruction_labels: HashMap<AtomsProfileInstruction, String>,
+}
+
+fn tgm_profiling_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DREAM64_PROFILE_TGM").is_some())
+}
+
+fn emit_tgm_profile(profile: &TgmProfile) {
+    let mut procedures = profile.procedure_samples.iter().collect::<Vec<_>>();
+    procedures.sort_by_key(|(_, samples)| std::cmp::Reverse(**samples));
+    eprintln!(
+        "boot-vm: tgm-profile-summary elapsed_ms={} instructions={} procedures={}",
+        profile.started.elapsed().as_millis(),
+        profile.total_instructions,
+        procedures.len()
+    );
+    for (key, samples) in procedures.into_iter().take(32) {
+        eprintln!(
+            "boot-vm: tgm-profile-procedure samples={} path={}",
+            samples,
+            profile.paths.get(key).map_or("<missing>", String::as_str)
+        );
+    }
+    let mut instructions = profile.instruction_samples.iter().collect::<Vec<_>>();
+    instructions.sort_by_key(|(_, samples)| std::cmp::Reverse(**samples));
+    for (key, samples) in instructions.into_iter().take(64) {
+        eprintln!(
+            "boot-vm: tgm-profile-opcode samples={} path={} pc={} instruction={}",
+            samples,
+            profile
+                .paths
+                .get(&AtomsProfileProcedure {
+                    module_identity: key.module_identity,
+                    procedure: key.procedure,
+                })
+                .map_or("<missing>", String::as_str),
+            key.instruction,
+            profile
+                .instruction_labels
+                .get(key)
+                .map_or("<missing>", String::as_str),
+        );
+    }
 }
 
 const STARTUP_INSTRUCTION_CATEGORY_COUNT: usize = 7;
@@ -13210,7 +14130,39 @@ struct ExceptionHandler {
 struct ScheduledSpawn {
     due_tick: u64,
     sequence: u64,
-    frames: Vec<CallFrame>,
+    frames: OwnedContinuation,
+}
+
+/// Allocation-neutral scheduler metrics for continuation-layout benchmarks.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ContinuationMetrics {
+    /// Suspended continuations in scheduled and currently due queues.
+    pub continuations: usize,
+    /// Total call frames retained by those continuations.
+    pub frames: usize,
+    /// Frames carrying allocated cold exception/debug/argument state.
+    pub cold_frames: usize,
+    /// Rich values retained in locals, operand stacks, and argument vectors.
+    pub retained_values: usize,
+    /// Current native hot-frame header size, useful as a migration baseline.
+    pub frame_header_bytes: usize,
+    /// Header bytes avoided by moving rare state behind the cold allocation.
+    pub rare_inline_bytes_avoided: usize,
+}
+
+/// Runtime counters for invalidation-safe static-field slot quickening.
+///
+/// The historical type name is retained for API compatibility. Counters now
+/// include ordinary `datum.field` bytecode as well as statically declared
+/// reads; dynamic `datum.vars[name]` accesses are not included.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DeclaredFieldQuickeningMetrics {
+    /// Reads served by a validated dense slot.
+    pub hits: u64,
+    /// Reads that resolved and installed or refreshed a slot.
+    pub misses: u64,
+    /// Cached slots rejected after a datum layout mutation.
+    pub invalidations: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -13515,6 +14467,8 @@ pub fn execute_in_context(
         deferred: Arc::new(HashMap::new()),
         procedure_types: Vec::new(),
         initializer_call_names: None,
+        compact_wordcode: Default::default(),
+        semantic_digests: Default::default(),
     };
     execute_module_with_limits_in_context(
         &module,
@@ -13563,6 +14517,8 @@ pub fn execute_with_limits_in_state(
         deferred: Arc::new(HashMap::new()),
         procedure_types: Vec::new(),
         initializer_call_names: None,
+        compact_wordcode: Default::default(),
+        semantic_digests: Default::default(),
     };
     execute_module_with_limits_in_state(&module, entry, arguments, limits, state)
 }
@@ -13676,6 +14632,7 @@ pub fn execute_module_with_limits_in_context(
     state: &mut ExecutionState,
     context: &ExecutionContext,
 ) -> Result<Value, RuntimeError> {
+    state.assert_owner_thread();
     let program = module
         .resolve_procedure(entry)
         .map_err(|message| RuntimeError {
@@ -13736,19 +14693,21 @@ pub fn advance_scheduler(
     limits: ExecutionLimits,
     state: &mut ExecutionState,
 ) -> Result<Vec<Value>, RuntimeError> {
+    state.assert_owner_thread();
     state.scheduler_tick = state.scheduler_tick.saturating_add(ticks);
     advance_headless_world_clock(state, ticks);
     advance_native_walks(state);
-    state
-        .scheduled_spawns
-        .sort_by_key(|spawn| (spawn.due_tick, spawn.sequence));
-    let due_count = state
-        .scheduled_spawns
-        .partition_point(|spawn| spawn.due_tick <= state.scheduler_tick);
-    let mut due = state
-        .scheduled_spawns
-        .drain(..due_count)
-        .collect::<Vec<_>>();
+    let mut due = Vec::new();
+    let mut future = Vec::with_capacity(state.scheduled_spawns.len());
+    for spawn in state.scheduled_spawns.drain(..) {
+        if spawn.due_tick <= state.scheduler_tick {
+            due.push(spawn);
+        } else {
+            future.push(spawn);
+        }
+    }
+    state.scheduled_spawns = future;
+    due.sort_unstable_by_key(|spawn| (spawn.due_tick, spawn.sequence));
     // Pop in source order while retaining every not-yet-run due continuation
     // inside ExecutionState, where the collector can traverse its frame roots.
     due.reverse();
@@ -13760,13 +14719,24 @@ pub fn advance_scheduler(
     // MAPLOADING_CHECK_TICK from ever reaching stoplag(). Track the actual
     // dispatch slice instead, sampling outside the per-instruction hot path.
     state.scheduler_tick_started = (!state.scheduler_inflight.is_empty()).then(Instant::now);
+    let dispatch_started = Instant::now();
     set_world_numeric_field(state, "tick_usage", 0.0);
     let mut completed = Vec::new();
     while let Some(spawn) = state.scheduler_inflight.pop() {
+        let mut slice_limits = limits;
+        if let Some(budget) = limits.wall_clock_budget {
+            let Some(remaining) = budget.checked_sub(dispatch_started.elapsed()) else {
+                state.scheduler_inflight.push(spawn);
+                let remaining = std::mem::take(&mut state.scheduler_inflight);
+                state.scheduled_spawns.extend(remaining.into_iter().rev());
+                break;
+            };
+            slice_limits.wall_clock_budget = Some(remaining);
+        }
         let outcome = match run_frames(
             module,
-            spawn.frames,
-            limits,
+            spawn.frames.into_frames(),
+            slice_limits,
             StepBudgetBehavior::YieldScheduledContinuation,
             state,
         ) {
@@ -13819,7 +14789,7 @@ fn schedule_frames(state: &mut ExecutionState, frames: Vec<CallFrame>, delay: f3
     state.scheduled_spawns.push(ScheduledSpawn {
         due_tick: state.scheduler_tick.saturating_add(delay_ticks),
         sequence,
-        frames,
+        frames: OwnedContinuation::new(VmContinuationId(sequence), frames),
     });
 }
 
@@ -14350,6 +15320,249 @@ fn try_run_numeric_dispatch_block(
     max_steps: u64,
     state: &ExecutionState,
 ) -> Option<u64> {
+    static PACKED_FORCED: OnceLock<bool> = OnceLock::new();
+    static PACKED_DISABLED: OnceLock<bool> = OnceLock::new();
+    let disabled = *PACKED_DISABLED.get_or_init(|| {
+        std::env::var_os("DREAM64_DISABLE_PACKED_VALUE_STACK").is_some_and(|value| {
+            !matches!(value.to_string_lossy().trim(), "" | "0" | "false" | "no")
+        })
+    });
+    let forced = *PACKED_FORCED.get_or_init(|| {
+        std::env::var_os("DREAM64_ENABLE_PACKED_VALUE_STACK").is_some_and(|value| {
+            !matches!(value.to_string_lossy().trim(), "" | "0" | "false" | "no")
+        })
+    });
+    if !disabled {
+        let retained = frame
+            .cold()
+            .is_some_and(|cold| cold.packed_numeric_state.is_some());
+        if retained || forced || predicts_profitable_packed_run(program, frame.instruction) {
+            PACKED_ADAPTIVE_ENTRIES.fetch_add(1, Ordering::Relaxed);
+            if let Some(steps) =
+                try_run_packed_numeric_dispatch_block(program, frame, max_steps, state)
+            {
+                return Some(steps);
+            }
+        } else {
+            PACKED_ADAPTIVE_DECLINES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    try_run_rich_numeric_dispatch_block(program, frame, max_steps, state)
+}
+
+const PACKED_ADAPTIVE_MIN_STEPS: usize = 24;
+static PACKED_ADAPTIVE_ENTRIES: AtomicU64 = AtomicU64::new(0);
+static PACKED_ADAPTIVE_DECLINES: AtomicU64 = AtomicU64::new(0);
+
+/// Counts adaptive packed-dispatch entry attempts and short-run declines.
+#[must_use]
+pub fn packed_dispatch_counters() -> (u64, u64) {
+    (
+        PACKED_ADAPTIVE_ENTRIES.load(Ordering::Relaxed),
+        PACKED_ADAPTIVE_DECLINES.load(Ordering::Relaxed),
+    )
+}
+
+fn predicts_profitable_packed_run(program: &Program, start: usize) -> bool {
+    let mut instruction = start;
+    for _ in 0..PACKED_ADAPTIVE_MIN_STEPS {
+        let Some(opcode) = program.instructions.get(instruction) else {
+            return false;
+        };
+        if !numeric_dispatch_candidate(opcode)
+            || matches!(
+                opcode,
+                Instruction::PushText(_) | Instruction::ListLengthLocal(_)
+            )
+        {
+            return false;
+        }
+        match opcode {
+            Instruction::Jump(target) => instruction = *target,
+            // Conditional control needs runtime stack information; require an
+            // already-retained packed state instead of guessing profitability.
+            Instruction::JumpIfFalse(_) => return false,
+            _ => instruction += 1,
+        }
+    }
+    true
+}
+
+fn try_run_packed_numeric_dispatch_block(
+    program: &Program,
+    frame: &mut CallFrame,
+    max_steps: u64,
+    _state: &ExecutionState,
+) -> Option<u64> {
+    if max_steps == 0 {
+        return None;
+    }
+    let mut packed = frame
+        .take_packed_numeric_state()
+        .or_else(|| PackedNumericState::from_rich(frame))?;
+    let mut steps = 0_u64;
+    while steps < max_steps {
+        let Some(instruction) = program.instructions.get(frame.instruction) else {
+            break;
+        };
+        let mut advance = true;
+        match instruction {
+            Instruction::PushNull => packed.stack.push(PackedValue::null()),
+            Instruction::PushNumber(number) => {
+                packed.stack.push(PackedValue::number_bits(*number));
+            }
+            Instruction::LoadLocal(slot) => {
+                let Some(value) = packed.locals.get(usize::from(*slot)).copied() else {
+                    break;
+                };
+                packed.stack.push(value);
+            }
+            Instruction::StoreLocal(slot) => {
+                let local_index = usize::from(*slot);
+                let Some(local) = packed.locals.get_mut(local_index) else {
+                    break;
+                };
+                if local_index < frame.declared_argument_count || frame.static_locals.contains(slot)
+                {
+                    break;
+                }
+                let Some(value) = packed.stack.pop() else {
+                    break;
+                };
+                *local = value;
+            }
+            Instruction::LoadResult => {
+                packed.stack.push(packed.result);
+            }
+            Instruction::StoreResult => {
+                let Some(value) = packed.stack.pop() else {
+                    break;
+                };
+                packed.result = value;
+            }
+            Instruction::Duplicate => {
+                let Some(value) = packed.stack.last().copied() else {
+                    break;
+                };
+                packed.stack.push(value);
+            }
+            Instruction::Pop => {
+                if packed.stack.pop().is_none() {
+                    break;
+                }
+            }
+            Instruction::ListLengthLocal(_) => break,
+            Instruction::Add
+            | Instruction::Subtract
+            | Instruction::Multiply
+            | Instruction::Divide
+            | Instruction::And
+            | Instruction::Or
+            | Instruction::Less
+            | Instruction::LessEqual
+            | Instruction::Greater
+            | Instruction::GreaterEqual => {
+                let len = packed.stack.len();
+                if len < 2 {
+                    break;
+                }
+                let (Some(left), Some(right)) = (
+                    packed.stack[len - 2].as_number_or_null(),
+                    packed.stack[len - 1].as_number_or_null(),
+                ) else {
+                    break;
+                };
+                if matches!(
+                    instruction,
+                    Instruction::Less
+                        | Instruction::LessEqual
+                        | Instruction::Greater
+                        | Instruction::GreaterEqual
+                ) && left.partial_cmp(&right).is_none()
+                {
+                    break;
+                }
+                let value = match instruction {
+                    Instruction::Add => left + right,
+                    Instruction::Subtract => left - right,
+                    Instruction::Multiply => left * right,
+                    Instruction::Divide => left / right,
+                    Instruction::And => f32::from(left != 0.0 && right != 0.0),
+                    Instruction::Or => f32::from(left != 0.0 || right != 0.0),
+                    Instruction::Less => f32::from(left < right),
+                    Instruction::LessEqual => f32::from(left <= right),
+                    Instruction::Greater => f32::from(left > right),
+                    Instruction::GreaterEqual => f32::from(left >= right),
+                    _ => unreachable!(),
+                };
+                packed.stack.truncate(len - 2);
+                packed.stack.push(PackedValue::number(value));
+            }
+            Instruction::Negate | Instruction::Not => {
+                let Some(last) = packed.stack.last_mut() else {
+                    break;
+                };
+                let Some(value) = last.as_number_or_null() else {
+                    break;
+                };
+                let value = if matches!(instruction, Instruction::Negate) {
+                    -value
+                } else {
+                    f32::from(value == 0.0)
+                };
+                *last = PackedValue::number(value);
+            }
+            Instruction::JumpIfFalse(target) => {
+                let Some(condition) = packed
+                    .stack
+                    .last()
+                    .and_then(|value| value.as_number_or_null())
+                else {
+                    break;
+                };
+                if *target >= program.instructions.len() {
+                    break;
+                }
+                packed.stack.pop();
+                if condition == 0.0 {
+                    frame.instruction = *target;
+                    advance = false;
+                }
+            }
+            Instruction::Jump(target) => {
+                if *target >= program.instructions.len() {
+                    break;
+                }
+                frame.instruction = *target;
+                advance = false;
+            }
+            _ => break,
+        }
+        steps += 1;
+        if advance {
+            frame.instruction += 1;
+        }
+    }
+    if steps == 0 {
+        packed.materialize(frame);
+        frame.set_packed_numeric_state(None);
+        return None;
+    }
+    if steps == max_steps {
+        frame.set_packed_numeric_state(Some(packed));
+    } else {
+        packed.materialize(frame);
+        frame.set_packed_numeric_state(None);
+    }
+    Some(steps)
+}
+
+fn try_run_rich_numeric_dispatch_block(
+    program: &Program,
+    frame: &mut CallFrame,
+    max_steps: u64,
+    state: &ExecutionState,
+) -> Option<u64> {
     if max_steps == 0 {
         return None;
     }
@@ -14587,6 +15800,1606 @@ fn canonical_type2parent_program(program: &Program) -> bool {
         && program.instructions == canonical.instructions
 }
 
+const CANONICAL_MONKE_TGM_LOAD_DIGEST: [u8; 32] = [
+    0x14, 0xf7, 0x2e, 0x36, 0x1e, 0x09, 0xa4, 0x7b, 0x78, 0x60, 0x4d, 0x87, 0x1a, 0x22, 0xdb, 0x79,
+    0xc1, 0x1f, 0xd6, 0x05, 0x03, 0xa7, 0x31, 0x8a, 0x22, 0xac, 0x4b, 0xab, 0xac, 0xfa, 0xfb, 0x72,
+];
+const CANONICAL_MONKE_BUILD_COORDINATE_DIGEST: [u8; 32] = [
+    0x9d, 0xae, 0x83, 0x67, 0x40, 0x60, 0x6e, 0xaf, 0xa9, 0x0d, 0x8b, 0xc3, 0xa6, 0x4b, 0xfc, 0x23,
+    0x3a, 0x6a, 0x3f, 0x35, 0x55, 0x7f, 0x4b, 0x52, 0xb8, 0xc2, 0xbc, 0xf5, 0xb2, 0xe2, 0x66, 0x79,
+];
+static NATIVE_TGM_LOAD_ACTIVATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NATIVE_TGM_PLANNED_CELLS: AtomicU64 = AtomicU64::new(0);
+static NATIVE_TGM_PLANNED_SAFEPOINTS: AtomicU64 = AtomicU64::new(0);
+static NATIVE_TGM_COMMITTED_CELLS: AtomicU64 = AtomicU64::new(0);
+static NATIVE_TGM_BUILD_CACHE_MEMBERS: AtomicU64 = AtomicU64::new(0);
+static NATIVE_TGM_BUILD_CACHE_LOGICAL_STEPS: AtomicU64 = AtomicU64::new(0);
+static NATIVE_TGM_TARGET_RESOLUTIONS: AtomicU64 = AtomicU64::new(0);
+static NATIVE_TGM_TARGET_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static NATIVE_TGM_COMMIT_SAMPLES: OnceLock<std::sync::Mutex<Vec<String>>> = OnceLock::new();
+static NATIVE_BUILD_COORDINATE_PREFIX_ACTIVATIONS: AtomicU64 = AtomicU64::new(0);
+static NATIVE_BUILD_COORDINATE_PREFIX_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static NATIVE_RUIN_BATCH_ACTIVATIONS: AtomicU64 = AtomicU64::new(0);
+static NATIVE_RUIN_BATCH_LOGICAL_STEPS: AtomicU64 = AtomicU64::new(0);
+static NATIVE_DISCOVER_OFFSET_ACTIVATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the process-wide number of canonical `_tgm_load` frames that
+/// actually installed the native commit sidecar.
+#[must_use]
+pub fn native_tgm_load_activations() -> u64 {
+    NATIVE_TGM_LOAD_ACTIVATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Returns `(planned cells, elided-space safepoints, completed cell commits)`.
+#[must_use]
+pub fn native_tgm_load_metrics() -> (u64, u64, u64) {
+    (
+        NATIVE_TGM_PLANNED_CELLS.load(Ordering::Relaxed),
+        NATIVE_TGM_PLANNED_SAFEPOINTS.load(Ordering::Relaxed),
+        NATIVE_TGM_COMMITTED_CELLS.load(Ordering::Relaxed),
+    )
+}
+
+/// Returns `(simple canonical members, replaced logical instructions)`.
+#[must_use]
+pub fn native_tgm_build_cache_metrics() -> (u64, u64) {
+    (
+        NATIVE_TGM_BUILD_CACHE_MEMBERS.load(Ordering::Relaxed),
+        NATIVE_TGM_BUILD_CACHE_LOGICAL_STEPS.load(Ordering::Relaxed),
+    )
+}
+
+/// Returns `(dynamic build_coordinate resolutions, validated cache hits)`.
+#[must_use]
+pub fn native_tgm_target_cache_metrics() -> (u64, u64) {
+    (
+        NATIVE_TGM_TARGET_RESOLUTIONS.load(Ordering::Relaxed),
+        NATIVE_TGM_TARGET_CACHE_HITS.load(Ordering::Relaxed),
+    )
+}
+
+/// Returns bounded post-commit samples from native TGM loading.
+#[must_use]
+pub fn native_tgm_commit_samples() -> Vec<String> {
+    NATIVE_TGM_COMMIT_SAMPLES
+        .get()
+        .and_then(|samples| samples.lock().ok().map(|samples| samples.clone()))
+        .unwrap_or_default()
+}
+
+/// Returns `(activations, guarded fallbacks)` for the canonical map-cell prefix.
+#[must_use]
+pub fn native_build_coordinate_prefix_metrics() -> (u64, u64) {
+    (
+        NATIVE_BUILD_COORDINATE_PREFIX_ACTIVATIONS.load(Ordering::Relaxed),
+        NATIVE_BUILD_COORDINATE_PREFIX_FALLBACKS.load(Ordering::Relaxed),
+    )
+}
+static NATIVE_RUIN_SCAN_ACTIVATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NATIVE_RUIN_SCAN_CELLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NATIVE_RUIN_SCAN_REJECTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NATIVE_RUIN_SCAN_SUCCESSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NATIVE_RUIN_REJECTION_CACHE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NATIVE_RUIN_FLAG_REJECTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NATIVE_RUIN_AREA_REJECTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NATIVE_RUIN_AREA_REJECTION_SAMPLES: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::OnceLock::new();
+
+/// Process-wide guarded ruin-candidate scan counters.
+#[must_use]
+pub fn native_ruin_scan_metrics() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        NATIVE_RUIN_SCAN_ACTIVATIONS.load(Relaxed),
+        NATIVE_RUIN_SCAN_CELLS.load(Relaxed),
+        NATIVE_RUIN_SCAN_REJECTIONS.load(Relaxed),
+        NATIVE_RUIN_SCAN_SUCCESSES.load(Relaxed),
+    )
+}
+
+/// Returns the number of ruin candidates rejected by a revalidated cached witness.
+#[must_use]
+pub fn native_ruin_rejection_cache_hits() -> u64 {
+    NATIVE_RUIN_REJECTION_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Returns `(NO_RUINS flag rejects, area-whitelist rejects)`.
+#[must_use]
+pub fn native_ruin_rejection_causes() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        NATIVE_RUIN_FLAG_REJECTIONS.load(Relaxed),
+        NATIVE_RUIN_AREA_REJECTIONS.load(Relaxed),
+    )
+}
+
+/// Returns bounded diagnostics captured for area-whitelist rejection.
+#[must_use]
+pub fn native_ruin_area_rejection_samples() -> Vec<String> {
+    NATIVE_RUIN_AREA_REJECTION_SAMPLES
+        .get()
+        .and_then(|samples| samples.lock().ok().map(|samples| samples.clone()))
+        .unwrap_or_default()
+}
+
+/// Returns process-wide guarded ruin-scan batch and logical-step counters.
+#[must_use]
+pub fn native_ruin_batch_metrics() -> (u64, u64) {
+    (
+        NATIVE_RUIN_BATCH_ACTIVATIONS.load(Ordering::Relaxed),
+        NATIVE_RUIN_BATCH_LOGICAL_STEPS.load(Ordering::Relaxed),
+    )
+}
+
+/// Returns the process-wide number of guarded map-template offset scans.
+#[must_use]
+pub fn native_discover_offset_activations() -> u64 {
+    NATIVE_DISCOVER_OFFSET_ACTIVATIONS.load(Ordering::Relaxed)
+}
+
+const CANONICAL_MONKE_RUIN_TRY_TO_PLACE_DIGEST: [u8; 32] = [
+    0x03, 0xab, 0x38, 0x41, 0x98, 0x62, 0xc9, 0xdb, 0xd2, 0x19, 0x01, 0x39, 0xdb, 0x4c, 0x9d, 0xa5,
+    0xc9, 0xe3, 0x02, 0x3b, 0x65, 0xce, 0xe8, 0x9c, 0x8c, 0xd4, 0x65, 0xf7, 0xf6, 0x9f, 0x5b, 0x5e,
+];
+const CANONICAL_MONKE_GET_AFFECTED_TURFS_DIGEST: [u8; 32] = [
+    0x45, 0x27, 0xea, 0x56, 0x5d, 0xcc, 0xc3, 0xef, 0xd6, 0x5d, 0xbb, 0xfe, 0xf5, 0x85, 0x92, 0xd1,
+    0x08, 0xe4, 0xa9, 0x04, 0x02, 0x1e, 0x7c, 0x8a, 0xf3, 0xcd, 0x46, 0x20, 0x98, 0x9a, 0x70, 0x80,
+];
+
+fn trusted_get_affected_turfs_target(module: &Module) -> bool {
+    let procedure = ProcedureId(19_821);
+    let Some(program) = module.procedure(procedure) else {
+        return false;
+    };
+    module.procedure_path(procedure).is_some_and(|path| {
+        path.split('@').next() == Some("/datum/map_template/proc/get_affected_turfs")
+    }) && program.parameter_count == 2
+        && program.local_count == 5
+        && program.instructions.len() == 51
+        && matches!(
+            program.instructions.get(25),
+            Some(Instruction::Locate { argument_count: 3 })
+        )
+        && matches!(
+            program.instructions.get(49),
+            Some(Instruction::Block { argument_count: 2 })
+        )
+        && matches!(program.instructions.get(50), Some(Instruction::Return))
+        && module.procedure_semantic_digest(procedure)
+            == Some(CANONICAL_MONKE_GET_AFFECTED_TURFS_DIGEST)
+}
+
+fn trusted_ruin_try_to_place_target(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+) -> bool {
+    module.procedure_path(procedure).is_some_and(|path| {
+        path.split('@').next() == Some("/datum/map_template/ruin/proc/try_to_place")
+    }) && program.parameter_count == 4
+        && program.local_count == 29
+        && program.instructions.len() == 244
+        && matches!(
+            program.instructions.get(74),
+            Some(Instruction::NextLocalListIteration {
+                list_slot: 13,
+                index_slot: 14,
+                item_slot: 12,
+                exit: 116
+            })
+        )
+        && matches!(program.instructions.get(85), Some(Instruction::LoadDeclaredField(field)) if field.as_str() == "turf_flags")
+        && matches!(program.instructions.get(95), Some(Instruction::Call { procedure, argument_count: 1, .. }) if procedure.index() == 68_206)
+        && matches!(
+            program.instructions.get(110),
+            Some(Instruction::SetListIndex)
+        )
+        && matches!(program.instructions.get(115), Some(Instruction::Jump(74)))
+        && module.procedure_semantic_digest(procedure)
+            == Some(CANONICAL_MONKE_RUIN_TRY_TO_PLACE_DIGEST)
+}
+
+fn try_run_ruin_affected_turfs_batch(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+    frame: &mut CallFrame,
+    budget: u64,
+    state: &mut ExecutionState,
+) -> Option<u64> {
+    if !trusted_ruin_try_to_place_target(module, procedure, program) {
+        return None;
+    }
+    let steps = run_ruin_affected_turfs_batch(frame, budget, state)?;
+    NATIVE_RUIN_BATCH_ACTIVATIONS.fetch_add(1, Ordering::Relaxed);
+    NATIVE_RUIN_BATCH_LOGICAL_STEPS.fetch_add(steps, Ordering::Relaxed);
+    Some(steps)
+}
+
+fn run_ruin_affected_turfs_batch(
+    frame: &mut CallFrame,
+    budget: u64,
+    state: &mut ExecutionState,
+) -> Option<u64> {
+    if frame.instruction != 74 || budget < 15 || !frame.stack.is_empty() {
+        return None;
+    }
+    let Value::List(snapshot) = frame.locals.get(13)?.clone() else {
+        return None;
+    };
+    let Value::List(affected_areas) = frame.locals.get(11)?.clone() else {
+        return None;
+    };
+    let turf = TypePath::parse("/turf").ok()?;
+    let turf_flags = FieldName::parse("turf_flags").ok()?;
+    let loc = FieldName::parse("loc").ok()?;
+    let mut steps = 0_u64;
+    loop {
+        let index = tgm_number(frame.locals.get(14)?)?;
+        let values = state.heap.list(snapshot).ok()?;
+        if index < 1 || index as usize > values.len() {
+            if budget - steps < 1 {
+                break;
+            }
+            frame.instruction = 116;
+            steps += 1;
+            break;
+        }
+        let check = read_list_value(
+            &state.heap,
+            snapshot,
+            &Value::number(index as f32),
+            state.is_associative_list(snapshot),
+        )
+        .ok()?;
+        let is_turf = matches!(check, Value::Datum(datum) if state.heap.datum(datum).is_ok_and(|record| is_subtype(state, record.type_path(), &turf)));
+        let flags = match check {
+            Value::Datum(datum) if is_turf => datum_field_or_initial(state, datum, &turf_flags)
+                .ok()?
+                .as_number()
+                .unwrap_or(0.0) as i32,
+            _ => 0,
+        };
+        let cost = if !is_turf {
+            15
+        } else if flags & (1 << 4) != 0 {
+            20
+        } else {
+            // PC95's canonical isarea body executes its builtin and Return in
+            // addition to the parent Call instruction represented in the dump.
+            41
+        };
+        if budget - steps < cost {
+            break;
+        }
+        frame.locals[12] = check.clone();
+        if !is_turf {
+            frame.locals[14] = Value::number((index + 1) as f32);
+            steps += cost;
+            continue;
+        }
+        if flags & (1 << 4) != 0 {
+            frame.locals[9] = Value::number(0.0);
+            frame.instruction = 116;
+            steps += cost;
+            break;
+        }
+        let stepped = get_step_builtin(&check, &Value::number(0.0), state).ok()?;
+        let area = match stepped {
+            Value::Datum(datum) => datum_field_or_initial(state, datum, &loc)
+                .ok()
+                .unwrap_or(Value::Null),
+            _ => Value::Null,
+        };
+        frame.locals[15] = area.clone();
+        let associative = state.is_associative_list(affected_areas);
+        write_list_value(
+            &mut state.heap,
+            affected_areas,
+            area,
+            Value::number(1.0),
+            associative,
+        )
+        .ok()?;
+        frame.locals[14] = Value::number((index + 1) as f32);
+        steps += cost;
+        if budget - steps < 15 {
+            break;
+        }
+    }
+    (steps != 0).then_some(steps)
+}
+
+fn canonical_tgm_load_path(module: &Module, procedure: ProcedureId) -> bool {
+    module
+        .procedure_path(procedure)
+        .is_some_and(|path| path.split('@').next() == Some("/datum/parsed_map/proc/_tgm_load"))
+}
+
+const CANONICAL_MONKE_TGM_BUILD_CACHE_DIGEST: [u8; 32] = [
+    0x9f, 0x69, 0xa0, 0x56, 0xaf, 0xb4, 0xbf, 0xb2, 0x88, 0x92, 0x3a, 0x17, 0x9b, 0x59, 0x8d, 0xc5,
+    0xe6, 0x2f, 0x3a, 0x3b, 0xac, 0xac, 0xaa, 0x5d, 0x6f, 0x96, 0xf8, 0x97, 0x21, 0xf5, 0xdb, 0xbc,
+];
+
+fn trusted_tgm_load_target(module: &Module, procedure: ProcedureId, program: &Program) -> bool {
+    canonical_tgm_load_path(module, procedure)
+        && program.parameter_count == 13
+        && program.local_count >= 13
+        && module.procedure_semantic_digest(procedure) == Some(CANONICAL_MONKE_TGM_LOAD_DIGEST)
+}
+
+fn trusted_tgm_build_cache_target(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+) -> bool {
+    let shape = module.procedure_path(procedure).is_some_and(|path| {
+        path.split('@').next() == Some("/datum/parsed_map/proc/tgm_build_cache")
+    }) && program.parameter_count == 2
+        && program.local_count == 24
+        && program.instructions.len() == 338;
+    if !shape {
+        return false;
+    }
+    thread_local! {
+        static TRUSTED: std::cell::RefCell<HashMap<(u64, ProcedureId), bool>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    TRUSTED.with(|trusted| {
+        *trusted
+            .borrow_mut()
+            .entry((module.identity.0, procedure))
+            .or_insert_with(|| {
+                module.procedure_semantic_digest(procedure)
+                    == Some(CANONICAL_MONKE_TGM_BUILD_CACHE_DIGEST)
+            })
+    })
+}
+
+fn run_tgm_build_cache_simple_member(
+    frame: &mut CallFrame,
+    state: &mut ExecutionState,
+) -> Option<usize> {
+    if frame.instruction != 98 || !frame.stack.is_empty() {
+        return None;
+    }
+    if runtime_truthy(&state.heap, frame.locals.get(10).unwrap_or(&Value::Null)).unwrap_or(true) {
+        return None;
+    }
+    let Some(Value::Text(line)) = frame.locals.get(17) else {
+        return None;
+    };
+    let line = Arc::clone(line);
+    if line.is_empty() || !line.is_ascii() {
+        return None;
+    }
+    let last = line.as_bytes()[line.len() - 1];
+    if matches!(last, b';' | b'{' | b'}') {
+        return None;
+    }
+    // `lines` is produced by splittext(model, "\n"), so this is exactly one
+    // member. A comma may only be its terminal TGM delimiter; an interior
+    // comma is unsupported syntax and must remain on the rich path.
+    let path_text = line.strip_suffix(',').unwrap_or(line.as_ref());
+    if path_text.is_empty()
+        || !path_text.starts_with('/')
+        || path_text.trim() != path_text
+        || path_text.contains(',')
+    {
+        return None;
+    }
+    let Some(path) = state.type_paths.get(path_text).cloned() else {
+        return None;
+    };
+    static ATOM_PATH: OnceLock<TypePath> = OnceLock::new();
+    let atom = ATOM_PATH.get_or_init(|| TypePath::parse("/atom").expect("built-in atom path"));
+    if !builtins::is_subtype(state, &path, atom) {
+        return None;
+    }
+    let (
+        Some(Value::List(default_list)),
+        Some(Value::List(wrapped_default)),
+        Some(Value::List(members)),
+        Some(Value::List(attributes)),
+    ) = (
+        frame.locals.get(5),
+        frame.locals.get(6),
+        frame.locals.get(15),
+        frame.locals.get(16),
+    )
+    else {
+        return None;
+    };
+    let (default_list, wrapped_default, members, attributes) =
+        (*default_list, *wrapped_default, *members, *attributes);
+    if members == attributes
+        || members == default_list
+        || members == wrapped_default
+        || attributes == default_list
+        || attributes == wrapped_default
+        || state.heap.list(default_list).is_err()
+        || state.heap.list(members).is_err()
+        || state.heap.list(attributes).is_err()
+    {
+        return None;
+    }
+    let Ok(wrapper) = state.heap.list(wrapped_default) else {
+        return None;
+    };
+    if wrapper.len() != 1
+        || wrapper.associations().next().is_some()
+        || wrapper
+            .positions()
+            .next()
+            .is_none_or(|(_, value)| value != &Value::List(default_list))
+    {
+        return None;
+    }
+    state
+        .heap
+        .list_mut(attributes)
+        .expect("validated attributes list")
+        .add(Value::List(default_list));
+    state
+        .heap
+        .list_mut(members)
+        .expect("validated members list")
+        .add(Value::TypePath(path.clone()));
+    frame.locals[20] = Value::text((last as char).to_string());
+    frame.locals[8] = Value::text(path_text);
+    frame.locals[23] = Value::TypePath(path);
+    // Continue the rich inner iterator. PC265 is only valid after every
+    // newline-delimited member has naturally exhausted.
+    frame.instruction = 260;
+    Some(1)
+}
+
+#[inline]
+fn try_run_tgm_build_cache_simple_member(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+    frame: &mut CallFrame,
+    remaining_steps: u64,
+    state: &mut ExecutionState,
+) -> Option<u64> {
+    // Charge one guarded native engine operation. The rich MAPLOADING tick
+    // already ran at PCs75-97 and retains its exact scheduler/yield behavior.
+    const LOGICAL_STEPS: u64 = 32;
+    if frame.instruction != 98
+        || remaining_steps < LOGICAL_STEPS
+        || !trusted_tgm_build_cache_target(module, procedure, program)
+    {
+        return None;
+    }
+    let members = run_tgm_build_cache_simple_member(frame, state)?;
+    NATIVE_TGM_BUILD_CACHE_MEMBERS.fetch_add(members as u64, Ordering::Relaxed);
+    NATIVE_TGM_BUILD_CACHE_LOGICAL_STEPS.fetch_add(LOGICAL_STEPS, Ordering::Relaxed);
+    Some(LOGICAL_STEPS)
+}
+
+fn tgm_number(value: &Value) -> Option<i32> {
+    value.as_number().map(|value| value as i32)
+}
+
+fn try_run_build_coordinate_prefix(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+    frame: &mut CallFrame,
+    state: &mut ExecutionState,
+) -> bool {
+    if frame.instruction != 0
+        || !frame.stack.is_empty()
+        || program.parameter_count != 5
+        || program.local_count != 31
+        || program.instructions.len() != 405
+        || !module.procedure_path(procedure).is_some_and(|path| {
+            path.split('@').next() == Some("/datum/parsed_map/proc/build_coordinate")
+        })
+        || module.procedure_semantic_digest(procedure)
+            != Some(CANONICAL_MONKE_BUILD_COORDINATE_DIGEST)
+    {
+        return false;
+    }
+    let fallback = || {
+        NATIVE_BUILD_COORDINATE_PREFIX_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        false
+    };
+    let Value::Datum(src) = frame.src else {
+        return fallback();
+    };
+    if !state.heap.datum(src).is_ok_and(|datum| {
+        let path = datum.type_path().as_str();
+        path == "/datum/parsed_map" || path.starts_with("/datum/parsed_map/")
+    }) {
+        return fallback();
+    }
+    let Some(Value::Datum(turf)) = frame.locals.get(1).cloned() else {
+        return fallback();
+    };
+    if !state
+        .heap
+        .datum(turf)
+        .is_ok_and(|datum| is_turf_type_path(datum.type_path()))
+        || !runtime_truthy(&state.heap, frame.locals.get(4).unwrap_or(&Value::Null))
+            .is_ok_and(|value| value)
+    {
+        return fallback();
+    }
+    let Value::List(model) = frame.locals.first().cloned().unwrap_or(Value::Null) else {
+        return fallback();
+    };
+    let Ok(model) = state.heap.list(model) else {
+        return fallback();
+    };
+    let (Ok(Value::List(members)), Ok(Value::List(attributes))) = (model.get(1), model.get(2))
+    else {
+        return fallback();
+    };
+    let (members, attributes) = (*members, *attributes);
+    let Ok(members_list) = state.heap.list(members) else {
+        return fallback();
+    };
+    let len = members_list.len();
+    if len < 2 || state.heap.list(attributes).is_err() {
+        return fallback();
+    }
+    let Ok(Value::TypePath(area_path)) = members_list.get(len).cloned() else {
+        return fallback();
+    };
+    if area_path.as_str() == "/area/template_noop" || !is_area_type_path(&area_path) {
+        return fallback();
+    }
+    let default_name = FieldName::parse("__dm_static_2f646174756d2f636f6e74726f6c6c65722f676c6f62616c5f766172732f7661722f6d61705f6d6f64656c5f64656661756c74").expect("canonical map default global");
+    let Some(Value::List(default_list)) = state.global(&default_name).cloned() else {
+        return fallback();
+    };
+    if state.heap.list(default_list).is_err()
+        || state
+            .heap
+            .list(attributes)
+            .ok()
+            .and_then(|list| list.get(len).ok())
+            != Some(&Value::List(default_list))
+    {
+        return fallback();
+    }
+    let preloader_name = FieldName::parse("__dm_static_2f646174756d2f636f6e74726f6c6c65722f676c6f62616c5f766172732f7661722f7573655f7072656c6f61646572").expect("canonical preloader global");
+    if state
+        .global(&preloader_name)
+        .is_none_or(|value| runtime_truthy(&state.heap, value).unwrap_or(true))
+    {
+        return fallback();
+    }
+    let blacklist = FieldName::parse("turf_blacklist").expect("canonical blacklist field");
+    match datum_field_or_initial(state, src, &blacklist).ok() {
+        None | Some(Value::Null) => {}
+        Some(Value::List(list)) => {
+            let Ok(value) = read_list_value(
+                &state.heap,
+                list,
+                &Value::Datum(turf),
+                state.is_associative_list(list),
+            ) else {
+                return fallback();
+            };
+            if runtime_truthy(&state.heap, &value).unwrap_or(true) {
+                return fallback();
+            }
+        }
+        _ => return fallback(),
+    }
+    let loaded = FieldName::parse("loaded_areas").expect("canonical loaded areas field");
+    let Ok(Value::List(loaded)) = datum_field_or_initial(state, src, &loaded) else {
+        return fallback();
+    };
+    let Ok(Value::Datum(area)) = read_list_value(
+        &state.heap,
+        loaded,
+        &Value::TypePath(area_path),
+        state.is_associative_list(loaded),
+    ) else {
+        return fallback();
+    };
+    if !state
+        .heap
+        .datum(area)
+        .is_ok_and(|datum| is_area_type_path(datum.type_path()))
+    {
+        return fallback();
+    }
+
+    // Every fallible shape check precedes the first mutation. This is the
+    // engine behavior behind canonical area.contents.Add(crds).
+    if builtins::move_turf_to_area(state, turf, area).is_err() {
+        return fallback();
+    }
+    frame.locals[6] = Value::number((len - 1) as f32);
+    frame.locals[7] = Value::List(members);
+    frame.locals[8] = Value::List(attributes);
+    frame.locals[9] = Value::List(default_list);
+    frame.locals[10] = Value::Null;
+    frame.locals[11] = Value::Datum(area);
+    frame.locals[12] = Value::Null;
+    frame.locals[27] = Value::Null;
+    frame.instruction = 235;
+    NATIVE_BUILD_COORDINATE_PREFIX_ACTIVATIONS.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+static NATIVE_TGM_CONTINUATION_REJECTIONS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::OnceLock::new();
+static NATIVE_TGM_CONTINUATION_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static NATIVE_TGM_ROUTE_SAMPLES: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::OnceLock::new();
+
+/// Returns bounded diagnostics for canonical `_tgm_load` frames that safely
+/// fell back at the native continuation attachment seam.
+#[must_use]
+pub fn native_tgm_continuation_rejections() -> Vec<String> {
+    NATIVE_TGM_CONTINUATION_REJECTIONS
+        .get()
+        .and_then(|samples| samples.lock().ok().map(|samples| samples.clone()))
+        .unwrap_or_default()
+}
+
+/// Returns bounded canonical `_dmm_load`/`_tgm_load` route diagnostics.
+#[must_use]
+pub fn native_tgm_route_samples() -> Vec<String> {
+    NATIVE_TGM_ROUTE_SAMPLES
+        .get()
+        .and_then(|samples| samples.lock().ok().map(|samples| samples.clone()))
+        .unwrap_or_default()
+}
+
+fn canonical_tgm_route_kind(module: &Module, procedure: ProcedureId) -> Option<bool> {
+    match module.procedure_path(procedure)?.split('@').next()? {
+        "/datum/parsed_map/proc/_tgm_load" => Some(true),
+        "/datum/parsed_map/proc/_dmm_load" => Some(false),
+        _ => None,
+    }
+}
+
+fn trace_tgm_route(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+    frame: &mut CallFrame,
+    state: &ExecutionState,
+) {
+    let Some(is_tgm) = canonical_tgm_route_kind(module, procedure) else {
+        return;
+    };
+    let path = if is_tgm {
+        "/datum/parsed_map/proc/_tgm_load"
+    } else {
+        "/datum/parsed_map/proc/_dmm_load"
+    };
+    let milestone = if frame.instruction == 0 {
+        1
+    } else if is_tgm && matches!(frame.instruction, 274 | 279) {
+        2
+    } else if program
+        .instructions
+        .get(frame.instruction)
+        .is_some_and(|instruction| matches!(instruction, Instruction::Return))
+    {
+        4
+    } else {
+        return;
+    };
+    if frame
+        .cold()
+        .is_some_and(|cold| cold.tgm_route_trace_mask & milestone != 0)
+    {
+        return;
+    }
+    frame.cold_mut().tgm_route_trace_mask |= milestone;
+    let list_len = |value: Option<&Value>| match value {
+        Some(Value::List(list)) => state.heap.list(*list).ok().map(|list| list.len()),
+        _ => None,
+    };
+    let src_field = |name: &str| match frame.src {
+        Value::Datum(src) => state
+            .heap
+            .datum_field(src, &FieldName::parse(name).ok()?)
+            .ok()
+            .cloned(),
+        _ => None,
+    };
+    let sample = format!(
+        "path={path} procedure={} pc={} milestone={} src={:?} args={:?} map_format={:?} src_gridSets_len={:?} local38_len={:?} local14_len={:?} local15={:?} result={:?}",
+        procedure.index(),
+        frame.instruction,
+        match milestone {
+            1 => "entry",
+            2 => "pre-loop",
+            _ => "return",
+        },
+        frame.src,
+        frame
+            .locals
+            .iter()
+            .take(program.parameter_count)
+            .collect::<Vec<_>>(),
+        src_field("map_format"),
+        list_len(src_field("gridSets").as_ref()),
+        list_len(frame.locals.get(38)),
+        list_len(frame.locals.get(14)),
+        frame.locals.get(15),
+        frame.result,
+    );
+    let samples = NATIVE_TGM_ROUTE_SAMPLES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    if let Ok(mut samples) = samples.lock()
+        && samples.len() < 64
+    {
+        samples.push(sample);
+    }
+}
+
+fn record_tgm_continuation_rejection(frame: &CallFrame, state: &ExecutionState) {
+    let attempt = NATIVE_TGM_CONTINUATION_ATTEMPTS.fetch_add(1, Ordering::Relaxed) + 1;
+    let kind = |value: Option<&Value>| match value {
+        Some(Value::Null) => "null",
+        Some(Value::Number(_)) => "number",
+        Some(Value::Text(_)) => "text",
+        Some(Value::File(_)) => "file",
+        Some(Value::TypePath(_)) => "typepath",
+        Some(Value::ModifiedTypePath(_)) => "modified-typepath",
+        Some(Value::Datum(_)) => "datum",
+        Some(Value::List(_)) => "list",
+        None => "missing",
+    };
+    let reason = match (
+        frame.locals.get(38),
+        frame.locals.get(14),
+        frame.locals.get(15),
+    ) {
+        (Some(Value::List(_)), Some(Value::List(_)), Some(Value::Text(_) | Value::Null)) => {
+            let grid_count = frame
+                .locals
+                .get(38)
+                .and_then(|value| match value {
+                    Value::List(list) => state.heap.list(*list).ok(),
+                    _ => None,
+                })
+                .map_or(0, |list| list.len());
+            let (model_positions, model_associations) = frame
+                .locals
+                .get(14)
+                .and_then(|value| match value {
+                    Value::List(list) => state.heap.list(*list).ok(),
+                    _ => None,
+                })
+                .map_or((0, 0), |list| {
+                    (list.positions().count(), list.associations().count())
+                });
+            let grid_list = match frame.locals.get(38) {
+                Some(Value::List(list)) => state.heap.list(*list).ok(),
+                _ => None,
+            };
+            let mut detail = None;
+            if let Some(grids) = grid_list {
+                let fields = ["xcrd", "ycrd", "zcrd", "gridLines"]
+                    .map(|name| FieldName::parse(name).unwrap());
+                for (index, value) in grids.positions() {
+                    let Value::Datum(grid) = value else {
+                        detail = Some(format!("grid[{index}]-kind={}", kind(Some(value))));
+                        break;
+                    };
+                    for field in &fields {
+                        let value = state.heap.datum_field(*grid, field).ok();
+                        let valid = if field.as_str() == "gridLines" {
+                            matches!(value, Some(Value::List(_)))
+                        } else {
+                            value.and_then(Value::as_number).is_some()
+                        };
+                        if !valid {
+                            detail = Some(format!(
+                                "grid[{index}].{}-kind={}",
+                                field.as_str(),
+                                kind(value)
+                            ));
+                            break;
+                        }
+                    }
+                    if detail.is_some() {
+                        break;
+                    }
+                    if let Ok(Value::List(lines)) = state.heap.datum_field(*grid, &fields[3]) {
+                        if let Ok(lines) = state.heap.list(*lines) {
+                            if let Some((line, value)) = lines
+                                .positions()
+                                .find(|(_, value)| !matches!(value, Value::Text(_)))
+                            {
+                                detail = Some(format!(
+                                    "grid[{index}].gridLines[{line}]-kind={}",
+                                    kind(Some(value))
+                                ));
+                                break;
+                            }
+                        } else {
+                            detail = Some(format!("grid[{index}].gridLines-stale"));
+                            break;
+                        }
+                    }
+                }
+            } else {
+                detail = Some("grid-list-stale".to_owned());
+            }
+            if detail.is_none() {
+                for slot in [0_usize, 1, 2, 5, 6, 7, 8, 39] {
+                    if frame.locals.get(slot).and_then(Value::as_number).is_none() {
+                        detail = Some(format!(
+                            "numeric-local[{slot}]-kind={}",
+                            kind(frame.locals.get(slot))
+                        ));
+                        break;
+                    }
+                }
+            }
+            format!(
+                "{} grids={grid_count} model_positions={model_positions} model_associations={model_associations} space_key_kind={} detail={}",
+                detail.as_deref().unwrap_or("late-shape-or-missing-model"),
+                kind(frame.locals.get(15)),
+                detail.as_deref().unwrap_or("none")
+            )
+        }
+        (Some(Value::List(_)), Some(Value::List(_)), _) => {
+            format!("space-key-shape value={:?}", frame.locals.get(15))
+        }
+        (Some(Value::List(_)), _, _) => {
+            format!("model-cache-shape value={:?}", frame.locals.get(14))
+        }
+        _ => format!("grid-sets-shape value={:?}", frame.locals.get(38)),
+    };
+    let samples =
+        NATIVE_TGM_CONTINUATION_REJECTIONS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    if let Ok(mut samples) = samples.lock()
+        && samples.len() < 32
+    {
+        samples.push(format!("attempt={attempt} {reason}"));
+    }
+}
+
+fn build_tgm_load_continuation(
+    frame: &CallFrame,
+    state: &ExecutionState,
+) -> Option<TgmLoadContinuation> {
+    // Slot 13 is the compiler-owned return value (`.`). The canonical DM
+    // locals declared by `_tgm_load` therefore begin at 14; keep these slot
+    // numbers aligned with the executable dump rather than the source-local
+    // ordinal.
+    let Value::List(grid_sets) = frame.locals.get(38)? else {
+        return None;
+    };
+    let Value::List(model_cache) = frame.locals.get(14)? else {
+        return None;
+    };
+    let space_key = match frame.locals.get(15)? {
+        Value::Text(value) => Some(Arc::clone(value)),
+        Value::Null => None,
+        _ => return None,
+    };
+    let mut models = BTreeMap::new();
+    let mut model_keys = BTreeSet::new();
+    for (key, value) in state.heap.list(*model_cache).ok()?.associations() {
+        let Value::Text(key) = key else { continue };
+        model_keys.insert(Arc::clone(key));
+        models.insert(Arc::clone(key), value.clone());
+    }
+    let xcrd = FieldName::parse("xcrd").ok()?;
+    let ycrd = FieldName::parse("ycrd").ok()?;
+    let zcrd = FieldName::parse("zcrd").ok()?;
+    let grid_lines = FieldName::parse("gridLines").ok()?;
+    let mut grids = Vec::new();
+    for (_, value) in state.heap.list(*grid_sets).ok()?.positions() {
+        let Value::Datum(grid) = value else {
+            return None;
+        };
+        let Value::List(lines) = state.heap.datum_field(*grid, &grid_lines).ok()? else {
+            return None;
+        };
+        let lines = state
+            .heap
+            .list(*lines)
+            .ok()?
+            .positions()
+            .map(|(_, value)| match value {
+                Value::Text(value) => Some(Arc::clone(value)),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        grids.push(tgm_planner::GridSet {
+            x: tgm_number(state.heap.datum_field(*grid, &xcrd).ok()?)?,
+            y: tgm_number(state.heap.datum_field(*grid, &ycrd).ok()?)?,
+            z: tgm_number(state.heap.datum_field(*grid, &zcrd).ok()?)?,
+            lines: lines.into(),
+        });
+    }
+    let finite_bound = |value: &Value| {
+        value
+            .as_number()
+            // tg/Monke defines INFINITY as the finite sentinel 1e31 rather
+            // than IEEE infinity. A direct Rust float-to-int cast saturates
+            // those defaults to i32::{MIN,MAX}, incorrectly turning an
+            // unbounded load into an enormous Z translation.
+            .filter(|value| {
+                value.is_finite() && *value > i32::MIN as f32 && *value < i32::MAX as f32
+            })
+            .map(|value| value as i32)
+    };
+    let config = tgm_planner::Config {
+        x_offset: tgm_number(frame.locals.first()?)?,
+        y_offset: tgm_number(frame.locals.get(1)?)?,
+        z_offset: tgm_number(frame.locals.get(2)?)?,
+        crop_map: runtime_truthy(&state.heap, frame.locals.get(3)?).ok()?,
+        no_changeturf: runtime_truthy(&state.heap, frame.locals.get(4)?).ok()?,
+        x_lower: tgm_number(frame.locals.get(5)?)?,
+        x_upper: tgm_number(frame.locals.get(6)?)?,
+        y_lower: tgm_number(frame.locals.get(7)?)?,
+        y_upper: tgm_number(frame.locals.get(8)?)?,
+        z_lower: finite_bound(frame.locals.get(9)?),
+        z_upper: finite_bound(frame.locals.get(10)?),
+        world_max_x: world_numeric_field(state, "maxx")? as i32,
+        world_max_y: world_numeric_field(state, "maxy")? as i32,
+        // Local 39 is the pre-expansion z threshold captured by the canonical
+        // setup; using world.maxz here would incorrectly enable AfterChange on
+        // levels that `_tgm_load` created immediately before this loop.
+        world_max_z: tgm_number(frame.locals.get(39)?)?,
+        space_key,
+        model_keys: Arc::new(model_keys),
+    };
+    let plan = tgm_planner::prepare(&grids, &config);
+    let original_path = match frame.src {
+        Value::Datum(src) => state
+            .heap
+            .datum_field(src, &FieldName::parse("original_path").ok()?)
+            .ok()
+            .cloned(),
+        _ => None,
+    };
+    let grid_summary = |grid: Option<&tgm_planner::GridSet>| {
+        grid.map(|grid| (grid.x, grid.y, grid.z, grid.lines.len()))
+    };
+    let samples = NATIVE_TGM_ROUTE_SAMPLES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    if let Ok(mut samples) = samples.lock()
+        && samples.len() < 64
+    {
+        samples.push(format!(
+            "planned-sidecar original_path={original_path:?} grids={} first={:?} last={:?} offsets=({},{},{}) crop={} no_changeturf={} x_bounds=({}, {}) y_bounds=({}, {}) z_bounds={:?}..{:?} world=({},{},{}) space_key={:?} model_keys={} events={} cells={} safepoints={} missing={} bounds={:?}",
+            grids.len(),
+            grid_summary(grids.first()),
+            grid_summary(grids.last()),
+            config.x_offset,
+            config.y_offset,
+            config.z_offset,
+            config.crop_map,
+            config.no_changeturf,
+            config.x_lower,
+            config.x_upper,
+            config.y_lower,
+            config.y_upper,
+            config.z_lower,
+            config.z_upper,
+            config.world_max_x,
+            config.world_max_y,
+            config.world_max_z,
+            config.space_key,
+            config.model_keys.len(),
+            plan.events.len(),
+            plan.cells.len(),
+            plan.events.len().saturating_sub(plan.cells.len() + plan.missing_models.len()),
+            plan.missing_models.len(),
+            plan.bounds,
+        ));
+    }
+    // The rich failure branch first calls map_loader_stop and then CRASHes.
+    // Until that callback is represented as an ordered native event, retain
+    // the complete bytecode path whenever validation found a missing model.
+    if !plan.missing_models.is_empty() {
+        let missing = &plan.missing_models[0];
+        let samples =
+            NATIVE_TGM_CONTINUATION_REJECTIONS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+        if let Ok(mut samples) = samples.lock()
+            && samples.len() < 32
+        {
+            samples.push(format!(
+                "missing-model key={:?} coordinate=({},{},{}) missing_count={} model_count={}",
+                missing.model_key,
+                missing.x,
+                missing.y,
+                missing.z,
+                plan.missing_models.len(),
+                models.len()
+            ));
+        }
+        return None;
+    }
+    Some(TgmLoadContinuation {
+        plan: Arc::new(plan),
+        cursor: tgm_planner::CommitCursor::default(),
+        phase: TgmLoadPhase::Commit,
+        model_cache: Value::List(*model_cache),
+        models,
+        bounds: frame.locals.get(16)?.clone(),
+        coordinate_target: None,
+    })
+}
+
+enum TgmDrive {
+    None,
+    Continue,
+    Push(CallFrame),
+    Error(String),
+}
+
+fn advance_ruin_scan_coordinate(scan: &mut RuinCandidateScan) {
+    if scan.next.0 < scan.high.0 {
+        scan.next.0 += 1;
+    } else if scan.next.1 < scan.high.1 {
+        scan.next.0 = scan.low.0;
+        scan.next.1 += 1;
+    } else if scan.next.2 < scan.high.2 {
+        scan.next.0 = scan.low.0;
+        scan.next.1 = scan.low.1;
+        scan.next.2 += 1;
+    } else {
+        scan.empty = true;
+    }
+}
+
+fn ruin_scan_attach_at_call(frame: &CallFrame) -> Option<bool> {
+    if frame.instruction == 63 && frame.stack.is_empty() {
+        return Some(false);
+    }
+    (frame.instruction == 65
+        && frame.stack.len() == 2
+        && frame.stack.first() == frame.locals.get(8)
+        && frame
+            .stack
+            .get(1)
+            .is_some_and(|value| value.as_number() == Some(1.0)))
+    .then_some(true)
+}
+
+fn revalidated_ruin_rejection(
+    state: &mut ExecutionState,
+    bounds: (i32, i32, i32, i32, i32, i32),
+    turf_flags: &FieldName,
+) -> bool {
+    let (low_x, low_y, z, high_x, high_y, _) = bounds;
+    let Some(by_coordinate) = state.ruin_rejection_witnesses.get(&z) else {
+        return false;
+    };
+    let candidates = by_coordinate
+        .range((low_y, i32::MIN)..=(high_y, i32::MAX))
+        .filter(|((_, x), _)| (low_x..=high_x).contains(x))
+        .map(|(&(y, x), &turf)| ((x, y, z), turf))
+        .collect::<Vec<_>>();
+    for (coordinate, witness) in candidates {
+        let still_rejects = state.turf_at(coordinate.0, coordinate.1, coordinate.2)
+            == Some(witness)
+            && datum_field_or_initial(state, witness, turf_flags)
+                .ok()
+                .and_then(|value| value.as_number())
+                .is_some_and(|flags| flags as i32 & (1 << 4) != 0);
+        if still_rejects {
+            return true;
+        }
+        if let Some(by_coordinate) = state.ruin_rejection_witnesses.get_mut(&z) {
+            by_coordinate.remove(&(coordinate.1, coordinate.0));
+        }
+    }
+    false
+}
+
+fn drive_ruin_candidate_scan(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+    frame: &mut CallFrame,
+    state: &mut ExecutionState,
+    remaining_steps: u64,
+) -> TgmDrive {
+    if remaining_steps == 0 {
+        return TgmDrive::None;
+    }
+    if frame
+        .cold()
+        .and_then(|cold| cold.ruin_scan.as_ref())
+        .is_none()
+    {
+        // Compact numeric dispatch can execute the two argument-producing
+        // instructions at 63-64 before side-exiting on the call at 65.
+        // Accept that equivalent, fully verified entry state as well.
+        let Some(attach_at_call) = ruin_scan_attach_at_call(frame) else {
+            return TgmDrive::None;
+        };
+        if !trusted_ruin_try_to_place_target(module, procedure, program)
+            || !trusted_get_affected_turfs_target(module)
+        {
+            return TgmDrive::None;
+        }
+        if attach_at_call {
+            frame.stack.clear();
+        }
+        let Value::Datum(center) = frame.locals.get(8).cloned().unwrap_or(Value::Null) else {
+            return TgmDrive::None;
+        };
+        let coordinate = |name: &str| {
+            datum_field_or_initial(state, center, &FieldName::parse(name).ok()?)
+                .ok()?
+                .as_number()
+                .map(|value| value as i32)
+        };
+        let dimension = |name: &str| {
+            let Value::Datum(src) = frame.src else {
+                return None;
+            };
+            datum_field_or_initial(state, src, &FieldName::parse(name).ok()?)
+                .ok()?
+                .as_number()
+                .map(|value| value.round() as i32)
+        };
+        let center_coordinate = (coordinate("x"), coordinate("y"), coordinate("z"));
+        let (Some(center_x), Some(center_y), Some(center_z)) = center_coordinate else {
+            return TgmDrive::None;
+        };
+        let (Some(width), Some(height)) = (dimension("width"), dimension("height")) else {
+            return TgmDrive::None;
+        };
+        let requested_low = (
+            center_x - (width as f32 / 2.0).round() as i32,
+            center_y - (height as f32 / 2.0).round() as i32,
+            center_z,
+        );
+        let low = state
+            .turf_at(requested_low.0, requested_low.1, requested_low.2)
+            .map_or((center_x, center_y, center_z), |_| requested_low);
+        let high = (low.0 + width - 1, low.1 + height - 1, low.2);
+        let empty = state.turf_at(high.0, high.1, high.2).is_none();
+        let bounds = (low.0, low.1, low.2, high.0, high.1, high.2);
+        if revalidated_ruin_rejection(state, bounds, &FieldName::parse("turf_flags").unwrap()) {
+            frame.locals[9] = Value::number(0.0);
+            frame.instruction = 14;
+            NATIVE_RUIN_SCAN_ACTIVATIONS.fetch_add(1, Ordering::Relaxed);
+            NATIVE_RUIN_SCAN_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            NATIVE_RUIN_FLAG_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            NATIVE_RUIN_REJECTION_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return TgmDrive::Continue;
+        }
+        frame.cold_mut().ruin_scan = Some(RuinCandidateScan {
+            low,
+            next: low,
+            high,
+            empty,
+            turfs: Vec::new(),
+            areas: Vec::new(),
+            validating: false,
+            validate_index: 0,
+        });
+        NATIVE_RUIN_SCAN_ACTIVATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let turf_flags = FieldName::parse("turf_flags").unwrap();
+    let loc = FieldName::parse("loc").unwrap();
+    for _ in 0..256 {
+        let (validating, empty, next) = {
+            let scan = frame.cold().unwrap().ruin_scan.as_ref().unwrap();
+            (scan.validating, scan.empty, scan.next)
+        };
+        if !validating && !empty {
+            if let Some(turf) = state.turf_at(next.0, next.1, next.2) {
+                NATIVE_RUIN_SCAN_CELLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let flags = datum_field_or_initial(state, turf, &turf_flags)
+                    .ok()
+                    .and_then(|value| value.as_number())
+                    .unwrap_or(0.0) as i32;
+                if flags & (1 << 4) != 0 {
+                    let witness_count: usize = state
+                        .ruin_rejection_witnesses
+                        .values()
+                        .map(BTreeMap::len)
+                        .sum();
+                    if witness_count >= 131_072 {
+                        state.ruin_rejection_witnesses.clear();
+                    }
+                    state
+                        .ruin_rejection_witnesses
+                        .entry(next.2)
+                        .or_default()
+                        .insert((next.1, next.0), turf);
+                    frame.cold_mut().ruin_scan = None;
+                    frame.locals[9] = Value::number(0.0);
+                    frame.instruction = 14;
+                    NATIVE_RUIN_SCAN_REJECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    NATIVE_RUIN_FLAG_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                    return TgmDrive::Continue;
+                }
+                let area = datum_field_or_initial(state, turf, &loc)
+                    .ok()
+                    .unwrap_or(Value::Null);
+                let scan = frame.cold_mut().ruin_scan.as_mut().unwrap();
+                scan.turfs.push(turf);
+                if !scan
+                    .areas
+                    .iter()
+                    .any(|existing| values_equal(&state.heap, existing, &area))
+                {
+                    scan.areas.push(area);
+                }
+            }
+            let scan = frame.cold_mut().ruin_scan.as_mut().unwrap();
+            advance_ruin_scan_coordinate(scan);
+            continue;
+        }
+        if !validating {
+            frame.cold_mut().ruin_scan.as_mut().unwrap().validating = true;
+            continue;
+        }
+        let (index, area) = {
+            let scan = frame.cold().unwrap().ruin_scan.as_ref().unwrap();
+            (
+                scan.validate_index,
+                scan.areas.get(scan.validate_index).cloned(),
+            )
+        };
+        let Some(area) = area else {
+            let scan = frame.cold_mut().ruin_scan.take().unwrap();
+            let affected_turfs = state.heap.allocate_list();
+            let affected_areas = state.heap.allocate_list();
+            state
+                .heap
+                .list_mut(affected_turfs)
+                .ok()
+                .map(|list| list.extend_positional(scan.turfs.into_iter().map(Value::Datum)));
+            for area in scan.areas {
+                let associative = state.is_associative_list(affected_areas);
+                if write_list_value(
+                    &mut state.heap,
+                    affected_areas,
+                    area,
+                    Value::number(1.0),
+                    associative,
+                )
+                .is_err()
+                {
+                    return TgmDrive::Error("ruin affected-area materialization failed".to_owned());
+                }
+            }
+            frame.locals[9] = Value::number(1.0);
+            frame.locals[10] = Value::List(affected_turfs);
+            frame.locals[11] = Value::List(affected_areas);
+            frame.instruction = 145;
+            NATIVE_RUIN_SCAN_SUCCESSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return TgmDrive::Continue;
+        };
+        let allowed = match frame.locals.get(1).cloned() {
+            Some(Value::List(list)) => list,
+            _ => {
+                frame.cold_mut().ruin_scan = None;
+                frame.instruction = 63;
+                return TgmDrive::None;
+            }
+        };
+        let area_type = match area {
+            Value::Datum(area) => state
+                .heap
+                .datum(area)
+                .ok()
+                .map(|datum| Value::TypePath(datum.type_path().clone()))
+                .unwrap_or(Value::Null),
+            _ => Value::Null,
+        };
+        let allowed_value = read_list_value(
+            &state.heap,
+            allowed,
+            &area_type,
+            state.is_associative_list(allowed),
+        )
+        .unwrap_or(Value::Null);
+        if !runtime_truthy(&state.heap, &allowed_value).unwrap_or(false) {
+            NATIVE_RUIN_AREA_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            let samples = NATIVE_RUIN_AREA_REJECTION_SAMPLES
+                .get_or_init(|| std::sync::Mutex::new(Vec::new()));
+            if let Ok(mut samples) = samples.lock()
+                && samples.len() < 16
+            {
+                let z = frame
+                    .cold()
+                    .and_then(|cold| cold.ruin_scan.as_ref())
+                    .map_or(0, |scan| scan.low.2);
+                let allowed_entries = state
+                    .heap
+                    .list(allowed)
+                    .ok()
+                    .map(|list| {
+                        list.associations()
+                            .take(8)
+                            .map(|(key, value)| format!("{key:?}={value:?}"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_else(|| "<stale>".to_owned());
+                samples.push(format!(
+                    "z={z} actual={area_type:?} lookup={allowed_value:?} allowed=[{allowed_entries}]"
+                ));
+            }
+            frame.cold_mut().ruin_scan = None;
+            frame.locals[9] = Value::number(0.0);
+            frame.instruction = 14;
+            NATIVE_RUIN_SCAN_REJECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return TgmDrive::Continue;
+        }
+        frame.cold_mut().ruin_scan.as_mut().unwrap().validate_index = index + 1;
+    }
+    TgmDrive::Continue
+}
+
+fn drive_tgm_load(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+    frame: &mut CallFrame,
+    state: &mut ExecutionState,
+    remaining_steps: u64,
+) -> TgmDrive {
+    if remaining_steps == 0 {
+        return TgmDrive::None;
+    }
+    if frame
+        .cold()
+        .and_then(|cold| cold.tgm_load.as_ref())
+        .is_none()
+    {
+        let Some(attach_before_iterator) = tgm_attach_location(frame) else {
+            return TgmDrive::None;
+        };
+        if !trusted_tgm_load_target(module, procedure, program) {
+            if !canonical_tgm_load_path(module, procedure) {
+                return TgmDrive::None;
+            }
+            let samples = NATIVE_TGM_CONTINUATION_REJECTIONS
+                .get_or_init(|| std::sync::Mutex::new(Vec::new()));
+            if let Ok(mut samples) = samples.lock()
+                && samples.len() < 32
+            {
+                samples.push(format!(
+                    "guard-mismatch procedure={} path={:?} params={} locals={} instructions={} digest={:?}",
+                    procedure.index(),
+                    module.procedure_path(procedure),
+                    program.parameter_count,
+                    program.local_count,
+                    program.instructions.len(),
+                    module.procedure_semantic_digest(procedure)
+                ));
+            }
+            return TgmDrive::None;
+        }
+        let Some(sidecar) = build_tgm_load_continuation(frame, state) else {
+            record_tgm_continuation_rejection(frame, state);
+            return TgmDrive::None;
+        };
+        let (cells, safepoints) = sidecar.plan.events.iter().fold(
+            (0_u64, 0_u64),
+            |(cells, safepoints), event| match event {
+                tgm_planner::CommitEvent::Cell(_) => (cells + 1, safepoints),
+                tgm_planner::CommitEvent::SafepointOnly(_) => (cells, safepoints + 1),
+                tgm_planner::CommitEvent::MissingModel(_) => (cells, safepoints),
+            },
+        );
+        NATIVE_TGM_PLANNED_CELLS.fetch_add(cells, Ordering::Relaxed);
+        NATIVE_TGM_PLANNED_SAFEPOINTS.fetch_add(safepoints, Ordering::Relaxed);
+        frame.cold_mut().tgm_load = Some(sidecar);
+        if attach_before_iterator {
+            // PCs 274-278 only initialize rich iterator locals. The native
+            // plan owns the same grid snapshot and never consumes those slots.
+            frame.instruction = 279;
+        }
+        NATIVE_TGM_LOAD_ACTIVATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let phase = frame
+        .cold()
+        .and_then(|cold| cold.tgm_load.as_ref())
+        .map(|sidecar| sidecar.phase.clone())
+        .expect("TGM sidecar exists");
+    match phase {
+        TgmLoadPhase::AwaitCoordinate if frame.instruction == 280 => {
+            let _ = frame.stack.pop();
+            let committed_cell = frame
+                .cold()
+                .and_then(|cold| cold.tgm_load.as_ref())
+                .and_then(|sidecar| sidecar.cursor.peek(&sidecar.plan))
+                .and_then(|event| match event {
+                    tgm_planner::CommitEvent::Cell(cell) => Some(cell.clone()),
+                    _ => None,
+                });
+            if let Some(cell) = committed_cell {
+                NATIVE_TGM_COMMITTED_CELLS.fetch_add(1, Ordering::Relaxed);
+                let samples =
+                    NATIVE_TGM_COMMIT_SAMPLES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+                if let Ok(mut samples) = samples.lock()
+                    && samples.len() < 16
+                {
+                    let turf = state.turf_at(cell.x, cell.y, cell.z);
+                    let (turf_type, area_type) = turf.map_or_else(
+                        || ("<missing>".to_owned(), "<missing>".to_owned()),
+                        |turf| {
+                            let turf_type = state
+                                .heap
+                                .datum(turf)
+                                .map_or("<stale>".to_owned(), |datum| {
+                                    datum.type_path().to_string()
+                                });
+                            let area_type = state
+                                .world_areas
+                                .get(&(cell.x, cell.y, cell.z))
+                                .and_then(|area| state.heap.datum(*area).ok())
+                                .map_or("<missing>".to_owned(), |area| {
+                                    area.type_path().to_string()
+                                });
+                            (turf_type, area_type)
+                        },
+                    );
+                    samples.push(format!(
+                        "coord=({},{},{}) model={} turf={} area={}",
+                        cell.x, cell.y, cell.z, cell.model_key, turf_type, area_type
+                    ));
+                }
+            }
+            let sidecar = frame.cold_mut().tgm_load.as_mut().unwrap();
+            sidecar.phase = TgmLoadPhase::Tick;
+            frame.instruction = 423;
+            TgmDrive::Continue
+        }
+        // PC446 is the first instruction after MAPLOADING_CHECK_TICK. Do not
+        // execute the rich loop's PC446-450 index increment/jump or it would
+        // re-enter PC334 and commit the same grid cells a second time.
+        TgmLoadPhase::Tick if frame.instruction == 446 => {
+            let sidecar = frame.cold_mut().tgm_load.as_mut().unwrap();
+            sidecar.cursor.acknowledge(&sidecar.plan);
+            sidecar.phase = TgmLoadPhase::Commit;
+            frame.instruction = 279;
+            TgmDrive::Continue
+        }
+        TgmLoadPhase::Commit if frame.instruction == 279 => {
+            let event = {
+                let sidecar = frame.cold().unwrap().tgm_load.as_ref().unwrap();
+                sidecar.cursor.peek(&sidecar.plan).cloned()
+            };
+            match event {
+                Some(tgm_planner::CommitEvent::Cell(cell)) => {
+                    let model = frame
+                        .cold()
+                        .unwrap()
+                        .tgm_load
+                        .as_ref()
+                        .unwrap()
+                        .models
+                        .get(&cell.model_key)
+                        .cloned()
+                        .expect("planner validated model key");
+                    let coordinate = state
+                        .turf_at(cell.x, cell.y, cell.z)
+                        .map_or(Value::Null, Value::Datum);
+                    let context = frame_context(frame);
+                    let receiver_type = match frame.src {
+                        Value::Datum(src) => state
+                            .heap
+                            .datum(src)
+                            .ok()
+                            .map(|datum| datum.type_path().clone()),
+                        _ => None,
+                    };
+                    let cached_target = frame
+                        .cold()
+                        .and_then(|cold| cold.tgm_load.as_ref())
+                        .and_then(|sidecar| sidecar.coordinate_target.as_ref())
+                        .filter(|(cached_type, _)| Some(cached_type) == receiver_type.as_ref())
+                        .map(|(_, target)| *target);
+                    let (target, context) = if let Some(target) = cached_target {
+                        NATIVE_TGM_TARGET_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+                        (
+                            target,
+                            ExecutionContext::new(frame.src.clone(), context.usr.clone()),
+                        )
+                    } else {
+                        NATIVE_TGM_TARGET_RESOLUTIONS.fetch_add(1, Ordering::Relaxed);
+                        let Ok((target, context)) = dynamic_call_target_named(
+                            module,
+                            state,
+                            &frame.src,
+                            "build_coordinate",
+                            &context,
+                            false,
+                        ) else {
+                            return TgmDrive::Error(
+                                "TGM build_coordinate target disappeared".to_owned(),
+                            );
+                        };
+                        if let Some(receiver_type) = receiver_type {
+                            frame
+                                .cold_mut()
+                                .tgm_load
+                                .as_mut()
+                                .unwrap()
+                                .coordinate_target = Some((receiver_type, target));
+                        }
+                        (target, context)
+                    };
+                    let Ok(target_program) = module.resolve_procedure(target) else {
+                        return TgmDrive::Error("TGM build_coordinate body disappeared".to_owned());
+                    };
+                    let child = make_frame(
+                        target,
+                        target_program,
+                        &[
+                            model,
+                            coordinate,
+                            Value::number(f32::from(cell.no_afterchange)),
+                            frame.locals[11].clone(),
+                            frame.locals[12].clone(),
+                        ],
+                        &context,
+                    );
+                    frame.cold_mut().tgm_load.as_mut().unwrap().phase =
+                        TgmLoadPhase::AwaitCoordinate;
+                    TgmDrive::Push(child)
+                }
+                Some(tgm_planner::CommitEvent::SafepointOnly(_)) => {
+                    frame.cold_mut().tgm_load.as_mut().unwrap().phase = TgmLoadPhase::Tick;
+                    frame.instruction = 423;
+                    TgmDrive::Continue
+                }
+                Some(tgm_planner::CommitEvent::MissingModel(missing)) => {
+                    TgmDrive::Error(format!("Undefined model key in DMM: {}", missing.model_key))
+                }
+                None => {
+                    let sidecar = frame.cold_mut().tgm_load.take().unwrap();
+                    if let (Value::List(bounds), Some(measured)) =
+                        (sidecar.bounds, sidecar.plan.bounds)
+                    {
+                        if let Ok(values) = state.heap.list_mut(bounds) {
+                            for (index, value) in [
+                                measured.min_x,
+                                measured.min_y,
+                                measured.min_z,
+                                measured.max_x,
+                                measured.max_y,
+                                measured.max_z,
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            {
+                                let _ = values.set(index + 1, Value::number(value as f32));
+                            }
+                        }
+                    }
+                    frame.stack.push(Value::number(1.0));
+                    frame.instruction = 506;
+                    TgmDrive::Continue
+                }
+            }
+        }
+        _ => TgmDrive::None,
+    }
+}
+
+fn tgm_attach_location(frame: &CallFrame) -> Option<bool> {
+    if frame.instruction == 279 {
+        return Some(false);
+    }
+    (frame.instruction == 274 && frame.stack.is_empty()).then_some(true)
+}
+
 fn canonical_type2parent_target(
     module: &Module,
     procedure: ProcedureId,
@@ -14693,6 +17506,45 @@ fn canonical_istext(value: &Value) -> Value {
     )))
 }
 
+#[inline(always)]
+fn execute_compact_fast_instruction(
+    operation: compact_wordcode::CompactFastInstruction,
+    frame: &mut CallFrame,
+    state: &ExecutionState,
+) -> Result<(), String> {
+    use compact_wordcode::CompactFastInstruction;
+
+    match operation {
+        CompactFastInstruction::PushNull => frame.stack.push(Value::Null),
+        CompactFastInstruction::LoadSrc => {
+            frame
+                .stack
+                .push(canonicalize_value(&state.heap, &frame.src));
+        }
+        CompactFastInstruction::StoreSrc => frame.src = pop(&mut frame.stack)?,
+        CompactFastInstruction::LoadUsr => {
+            frame
+                .stack
+                .push(canonicalize_value(&state.heap, &frame.usr));
+        }
+        CompactFastInstruction::StoreUsr => frame.usr = pop(&mut frame.stack)?,
+        CompactFastInstruction::LoadResult => frame.stack.push(frame.result.clone()),
+        CompactFastInstruction::StoreResult => frame.result = pop(&mut frame.stack)?,
+        CompactFastInstruction::Pop => {
+            pop(&mut frame.stack)?;
+        }
+        CompactFastInstruction::Duplicate => {
+            let value = frame
+                .stack
+                .last()
+                .cloned()
+                .ok_or_else(|| "bytecode stack underflow".to_owned())?;
+            frame.stack.push(value);
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_frames(
     module: &Module,
@@ -14710,18 +17562,37 @@ fn run_frames(
     let startup_profiling_enabled = startup_profile_enabled();
     let ordinary_field_fast_path_enabled =
         std::env::var_os("DREAM64_DISABLE_ORDINARY_FIELD_FAST_PATH").is_none();
+    let compact_wordcode = std::env::var_os("DREAM64_DISABLE_COMPACT_WORDCODE")
+        .is_none()
+        .then(|| module.compact_wordcode())
+        .flatten();
     let mut remaining_steps = limits.max_steps;
     let mut executed_steps = 0u64;
     let mut heartbeat = Instant::now();
     let mut instruction_batch = Instant::now();
     let mut slow_batch_report = Instant::now();
     let mut prior_instruction: Option<(Instant, ProcedureId, usize)> = None;
+    let wall_clock_started = Instant::now();
+    let wall_clock_budget = (step_budget_behavior
+        == StepBudgetBehavior::YieldScheduledContinuation)
+        .then_some(limits.wall_clock_budget)
+        .flatten();
+    let mut next_wall_clock_poll = 0_u64;
     // A frame retains only its stable procedure identity so scheduled continuations
     // remain self-contained. Cache the immutable program for the currently executing
     // identity within one dispatch, resolving again only after a call/return switches
     // procedures or when a continuation starts a new dispatch.
     let mut active_program: Option<(ProcedureId, &Program)> = None;
     loop {
+        if let Some(budget) = wall_clock_budget
+            && executed_steps >= next_wall_clock_poll
+        {
+            if wall_clock_started.elapsed() >= budget {
+                state.maybe_collect_unreachable_lists(&frames);
+                return Ok(FrameRunOutcome::Yielded { frames, delay: 0.0 });
+            }
+            next_wall_clock_poll = executed_steps.saturating_add(256);
+        }
         if trace_enabled
             && let Some((started, prior_procedure, prior_index)) = prior_instruction.take()
             && started.elapsed().as_millis() >= 250
@@ -14749,6 +17620,97 @@ fn run_frames(
                 program
             }
         };
+        if tgm_profiling_enabled()
+            && state.tgm_profile.is_none()
+            && instruction_index == 0
+            && canonical_tgm_load_path(module, procedure)
+        {
+            state.tgm_profile = Some(TgmProfile {
+                started: Instant::now(),
+                total_instructions: 0,
+                procedure_samples: HashMap::new(),
+                instruction_samples: HashMap::new(),
+                paths: HashMap::new(),
+                instruction_labels: HashMap::new(),
+            });
+            frames[frame_index].tgm_profile_root = true;
+            eprintln!(
+                "boot-vm: tgm-profile-begin procedure={}",
+                module.procedure_path(procedure).unwrap_or("<missing>")
+            );
+        }
+        if let Some(profile) = &mut state.tgm_profile {
+            let procedure_key = AtomsProfileProcedure {
+                module_identity: module.identity.0,
+                procedure,
+            };
+            let instruction_key = AtomsProfileInstruction {
+                module_identity: module.identity.0,
+                procedure,
+                instruction: instruction_index,
+            };
+            profile.total_instructions = profile.total_instructions.saturating_add(1);
+            *profile.procedure_samples.entry(procedure_key).or_default() += 1;
+            *profile
+                .instruction_samples
+                .entry(instruction_key)
+                .or_default() += 1;
+            profile.paths.entry(procedure_key).or_insert_with(|| {
+                module
+                    .procedure_path(procedure)
+                    .unwrap_or("<missing>")
+                    .to_owned()
+            });
+            profile
+                .instruction_labels
+                .entry(instruction_key)
+                .or_insert_with(|| {
+                    program
+                        .instructions
+                        .get(instruction_index)
+                        .map_or_else(|| "<missing>".to_owned(), |value| format!("{value:?}"))
+                });
+        }
+        trace_tgm_route(module, procedure, program, &mut frames[frame_index], state);
+        if let Some(accounted_steps) = try_run_tgm_build_cache_simple_member(
+            module,
+            procedure,
+            program,
+            &mut frames[frame_index],
+            remaining_steps,
+            state,
+        ) {
+            let scheduler_batches_before = executed_steps / 4_096;
+            remaining_steps = remaining_steps.saturating_sub(accounted_steps);
+            executed_steps += accounted_steps;
+            for _ in scheduler_batches_before..(executed_steps / 4_096) {
+                account_scheduler_tick_usage(state);
+            }
+            if let Some(profile) = &mut state.atoms_profile {
+                profile.total_instructions =
+                    profile.total_instructions.saturating_add(accounted_steps);
+            }
+            if let Some(profile) = &mut state.tgm_profile {
+                // PC98 was sampled above; retain exact aggregate logical work.
+                profile.total_instructions = profile
+                    .total_instructions
+                    .saturating_add(accounted_steps.saturating_sub(1));
+            }
+            continue;
+        }
+        if remaining_steps >= 32
+            && try_run_build_coordinate_prefix(
+                module,
+                procedure,
+                program,
+                &mut frames[frame_index],
+                state,
+            )
+        {
+            remaining_steps -= 32;
+            executed_steps += 32;
+            continue;
+        }
         if instruction_index == 0
             && !frames[frame_index].atoms_profile_entry_counted
             && (atoms_profiling_enabled
@@ -14809,16 +17771,108 @@ fn run_frames(
                 *profile.frame_entries.entry(key).or_default() += 1;
             }
         }
+        match drive_ruin_candidate_scan(
+            module,
+            procedure,
+            program,
+            &mut frames[frame_index],
+            state,
+            remaining_steps,
+        ) {
+            TgmDrive::None => {}
+            TgmDrive::Continue => {
+                remaining_steps = remaining_steps.saturating_sub(1);
+                executed_steps = executed_steps.saturating_add(1);
+                continue;
+            }
+            TgmDrive::Push(child) => {
+                frames.push(child);
+                continue;
+            }
+            TgmDrive::Error(message) => {
+                return Err(execution_error(module, &frames, message));
+            }
+        }
+        match drive_tgm_load(
+            module,
+            procedure,
+            program,
+            &mut frames[frame_index],
+            state,
+            remaining_steps,
+        ) {
+            TgmDrive::None => {}
+            TgmDrive::Continue => {
+                remaining_steps = remaining_steps.saturating_sub(1);
+                executed_steps = executed_steps.saturating_add(1);
+                continue;
+            }
+            TgmDrive::Push(child) => {
+                remaining_steps = remaining_steps.saturating_sub(1);
+                executed_steps = executed_steps.saturating_add(1);
+                frames.push(child);
+                continue;
+            }
+            TgmDrive::Error(message) => {
+                return Err(execution_error(module, &frames, message));
+            }
+        }
         // Canonical camera chunk lookup tier. The plane-offset branch contains
         // world-coordinate resolution and stays in bytecode; the ordinary
         // branch is pure coordinate bucketing plus one associative lookup.
+        if instruction_index == 0
+            && let Some(accounted_steps) = try_run_discover_offset_fast_path(
+                module,
+                procedure,
+                program,
+                &mut frames[frame_index],
+                remaining_steps,
+                state,
+            )
+        {
+            remaining_steps = remaining_steps.saturating_sub(accounted_steps);
+            executed_steps += accounted_steps;
+            continue;
+        }
+        if instruction_index == 0
+            && let Some(accounted_steps) = try_run_parsed_dmm_new_fast_path(
+                module,
+                procedure,
+                program,
+                &mut frames[frame_index],
+                remaining_steps,
+                state,
+            )
+        {
+            remaining_steps = remaining_steps.saturating_sub(accounted_steps);
+            executed_steps += accounted_steps;
+            continue;
+        }
+        if instruction_index == 0
+            && let Some(accounted_steps) = try_run_dmm_preload_measurement_fast_path(
+                module,
+                procedure,
+                program,
+                &mut frames[frame_index],
+                remaining_steps,
+                state,
+            )
+        {
+            remaining_steps = remaining_steps.saturating_sub(accounted_steps);
+            executed_steps += accounted_steps;
+            continue;
+        }
         if instruction_index == 0
             && let Some(accounted_steps) = try_run_camera_chunk_fast_path(
                 module,
                 procedure,
                 program,
                 &mut frames[frame_index],
-                remaining_steps,
+                if wall_clock_budget.is_some() {
+                    remaining_steps.min(256)
+                } else {
+                    remaining_steps
+                },
                 state,
             )
         {
@@ -14918,7 +17972,7 @@ fn run_frames(
                     profile.total_instructions.saturating_add(accounted_steps);
             }
             if let Some(result) = result {
-                frames[frame_index].numeric_jit_state = None;
+                frames[frame_index].set_numeric_jit_state(None);
                 frames[frame_index].stack.push(if returns_null {
                     Value::Null
                 } else {
@@ -14927,21 +17981,33 @@ fn run_frames(
                 frames[frame_index].instruction = program.instructions.len() - 1;
             }
         }
-        let numeric_loop_steps = (!trace_enabled
-            && !dashboard_enabled
-            && state.atoms_profile.is_none())
-        .then(|| {
-            try_run_numeric_loop_branch(program, &mut frames[frame_index], remaining_steps, state)
-                .or_else(|| {
-                    try_run_numeric_local_update(
+        let numeric_loop_steps =
+            (!trace_enabled && !dashboard_enabled && state.atoms_profile.is_none())
+                .then(|| {
+                    try_run_numeric_loop_branch(
                         program,
                         &mut frames[frame_index],
-                        remaining_steps,
+                        if wall_clock_budget.is_some() {
+                            remaining_steps.min(256)
+                        } else {
+                            remaining_steps
+                        },
                         state,
                     )
+                    .or_else(|| {
+                        try_run_numeric_local_update(
+                            program,
+                            &mut frames[frame_index],
+                            if wall_clock_budget.is_some() {
+                                remaining_steps.min(256)
+                            } else {
+                                remaining_steps
+                            },
+                            state,
+                        )
+                    })
                 })
-        })
-        .flatten();
+                .flatten();
         if let Some(accounted_steps) = numeric_loop_steps {
             static REPORTED: OnceLock<()> = OnceLock::new();
             REPORTED.get_or_init(|| {
@@ -14952,6 +18018,45 @@ fn run_frames(
             let scheduler_batches_before = executed_steps / 4_096;
             remaining_steps -= accounted_steps;
             executed_steps += accounted_steps;
+            for _ in scheduler_batches_before..(executed_steps / 4_096) {
+                account_scheduler_tick_usage(state);
+            }
+            continue;
+        }
+        let ruin_batch_steps =
+            (!trace_enabled && !dashboard_enabled && state.atoms_profile.is_none())
+                .then(|| {
+                    try_run_ruin_affected_turfs_batch(
+                        module,
+                        procedure,
+                        program,
+                        &mut frames[frame_index],
+                        if wall_clock_budget.is_some() {
+                            // This guarded loop is a native superinstruction.
+                            // Its own bounded work quantum is independent of the
+                            // legacy instruction ceiling; the outer deadline
+                            // remains the production latency authority.
+                            256
+                        } else {
+                            remaining_steps
+                        },
+                        state,
+                    )
+                })
+                .flatten();
+        if let Some(accounted_steps) = ruin_batch_steps {
+            // Retain rich-equivalent work in the native metrics, but charge one
+            // VM step under a wall-clock-bounded production run, matching the
+            // way an engine builtin hides its internal host work. Non-wall runs
+            // preserve exact rich instruction accounting for parity tests.
+            let charged_steps = if wall_clock_budget.is_some() {
+                1
+            } else {
+                accounted_steps
+            };
+            let scheduler_batches_before = executed_steps / 4_096;
+            remaining_steps -= charged_steps;
+            executed_steps += charged_steps;
             for _ in scheduler_batches_before..(executed_steps / 4_096) {
                 account_scheduler_tick_usage(state);
             }
@@ -15130,6 +18235,22 @@ fn run_frames(
             heartbeat = Instant::now();
         }
 
+        if let Some(compact_wordcode) = compact_wordcode {
+            // Compact wordcode is a validated acceleration cache, not semantic
+            // state. Runtime-appended initializer procedures can legitimately
+            // be absent from an older attached image; missing coverage must
+            // side-exit to the rich instruction already resolved above.
+            if let Some(operation) = compact_wordcode
+                .word(procedure, instruction_index)
+                .and_then(CompactWordcodeImage::fast_instruction)
+            {
+                execute_compact_fast_instruction(operation, &mut frames[frame_index], state)
+                    .map_err(|message| execution_error(module, &frames, message))?;
+                frames[frame_index].instruction += 1;
+                continue;
+            }
+        }
+
         // Local-list superinstructions keep ordinary IndexList and ListLength
         // as their single semantic implementations. Materialize the receiver
         // here without LoadLocal's redundant dispatch and canonicalization.
@@ -15304,18 +18425,18 @@ fn run_frames(
                 let stack = &mut frames[frame_index].stack;
                 stack.extend(expanded);
                 stack.push(Value::number(f32::from(expanded_count)));
-                frames[frame_index].pending_argument_names = Some(expanded_names);
-                frames[frame_index].pending_argument_roots = expanded_roots;
+                frames[frame_index].set_pending_argument_names(expanded_names);
+                frames[frame_index].set_pending_argument_roots(expanded_roots);
             }
             Instruction::AllocateDatum {
                 argument_count,
                 argument_names,
             } => {
                 let expanded_argument_names = (*argument_count == EXPANDED_ARGUMENT_COUNT)
-                    .then(|| frames[frame_index].pending_argument_names.take())
+                    .then(|| frames[frame_index].take_pending_argument_names())
                     .flatten();
                 let expanded_argument_roots = (*argument_count == EXPANDED_ARGUMENT_COUNT)
-                    .then(|| std::mem::take(&mut frames[frame_index].pending_argument_roots))
+                    .then(|| frames[frame_index].take_pending_argument_roots())
                     .unwrap_or_default();
                 let count_result =
                     runtime_argument_count(&mut frames[frame_index].stack, *argument_count);
@@ -15472,8 +18593,8 @@ fn run_frames(
                         } else {
                             make_frame_owned(constructor, constructor_program, arguments, &context)
                         };
-                        constructor_frame.retained_call_roots = expanded_argument_roots;
-                        constructor_frame.caller_result_override = Some(allocated.clone());
+                        constructor_frame.set_retained_call_roots(expanded_argument_roots);
+                        constructor_frame.set_caller_result_override(Some(allocated.clone()));
                         mark_boot_trace_frame(
                             &mut constructor_frame,
                             module,
@@ -15488,10 +18609,10 @@ fn run_frames(
             }
             Instruction::AllocateCurrentDatum { argument_count } => {
                 let expanded_argument_names = (*argument_count == EXPANDED_ARGUMENT_COUNT)
-                    .then(|| frames[frame_index].pending_argument_names.take())
+                    .then(|| frames[frame_index].take_pending_argument_names())
                     .flatten();
                 let expanded_argument_roots = (*argument_count == EXPANDED_ARGUMENT_COUNT)
-                    .then(|| std::mem::take(&mut frames[frame_index].pending_argument_roots))
+                    .then(|| frames[frame_index].take_pending_argument_roots())
                     .unwrap_or_default();
                 let count = runtime_argument_count(&mut frames[frame_index].stack, *argument_count)
                     .map_err(|message| execution_error(module, &frames, message))?;
@@ -15564,8 +18685,8 @@ fn run_frames(
                     } else {
                         make_frame_owned(constructor, constructor_program, arguments, &context)
                     };
-                    constructor_frame.retained_call_roots = expanded_argument_roots;
-                    constructor_frame.caller_result_override = Some(Value::Datum(datum));
+                    constructor_frame.set_retained_call_roots(expanded_argument_roots);
+                    constructor_frame.set_caller_result_override(Some(Value::Datum(datum)));
                     mark_boot_trace_frame(&mut constructor_frame, module, state, executed_steps);
                     frames.push(constructor_frame);
                     continue;
@@ -16094,8 +19215,8 @@ fn run_frames(
                             .is_some_and(|program| !program.wait_for)
                 }) {
                     let detached_result = frames[detach_at]
-                        .caller_result_override
-                        .clone()
+                        .caller_result_override()
+                        .cloned()
                         .unwrap_or_else(|| frames[detach_at].result.clone());
                     let mut detached = frames.split_off(detach_at);
                     detached[0].detached_waitfor = true;
@@ -16308,8 +19429,8 @@ fn run_frames(
                 frames[frame_index].stack.push(value);
             }
             Instruction::PickExpandedArguments => {
-                frames[frame_index].pending_argument_names = None;
-                frames[frame_index].pending_argument_roots.clear();
+                frames[frame_index].clear_pending_argument_names();
+                frames[frame_index].clear_pending_argument_roots();
                 let count =
                     runtime_argument_count(&mut frames[frame_index].stack, EXPANDED_ARGUMENT_COUNT)
                         .map_err(|message| execution_error(module, &frames, message))?;
@@ -16900,19 +20021,30 @@ fn run_frames(
                         "local list iteration received a non-numeric index",
                     ));
                 };
-                let length = state
+                // PrepareIteration always places a private positional snapshot
+                // in this compiler-owned local. Read its length and current
+                // value through one arena lookup instead of re-entering the
+                // general associative IndexList path after the bounds check.
+                // Keep the binary32 length comparison before index conversion:
+                // very large and fractional indices must fail in the same
+                // order as the unspecialized seven-instruction header.
+                let values = state
                     .heap
                     .list(list)
-                    .map_err(|error| execution_error(module, &frames, error.to_string()))?
-                    .len();
+                    .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                let length = values.len();
                 if index.to_f32() > dm_list_length_number(length) {
                     frames[frame_index].instruction = *exit;
                     continue;
                 }
                 let key = Value::Number(index);
-                let value =
-                    read_list_value(&state.heap, list, &key, state.is_associative_list(list))
-                        .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                let positional_index = value_to_list_index(&key)
+                    .map_err(|error| execution_error(module, &frames, error))?;
+                let value = values
+                    .get(positional_index)
+                    .cloned()
+                    .map_err(|error| execution_error(module, &frames, error.to_string()))?;
+                let value = canonicalize_owned_value(&state.heap, value);
                 let Some(item) = frames[frame_index].locals.get(item_slot) else {
                     return Err(execution_error(
                         module,
@@ -17404,22 +20536,80 @@ fn run_frames(
                         Value::number(dm_list_length_number(len))
                     }
                     Value::Datum(datum) => {
-                        let ordinary_value = match state.heap.datum(datum) {
-                            Ok(record)
-                                if ordinary_field_fast_path_enabled
-                                    && !datum_field_requires_special_read(
-                                        record.type_path(),
-                                        name,
-                                    ) =>
-                            {
-                                Some(datum_field_or_shared(state, datum, name))
+                        // Both declared and ordinary static member reads have
+                        // an immutable field name at this callsite. Cache the
+                        // physical slot for either form; the record validates
+                        // the name/layout on every hit, while special engine
+                        // fields stay on the rich path below.
+                        let quickening_key = ordinary_field_fast_path_enabled
+                            .then(|| {
+                                u16::try_from(instruction_index).ok().map(|instruction| {
+                                    (
+                                        module.identity.0,
+                                        frames[frame_index].procedure,
+                                        instruction,
+                                    )
+                                })
+                            })
+                            .flatten();
+                        let quickened_value = quickening_key.and_then(|key| {
+                            let slot = state.declared_field_slots.get(&key).copied()?;
+                            let record = state.heap.datum(datum).ok()?;
+                            if datum_field_requires_special_read(record.type_path(), name) {
+                                return None;
                             }
-                            Ok(_) => None,
-                            Err(error) => {
-                                return Err(execution_error(module, &frames, error.to_string()));
+                            match record.field_at_validated_slot(usize::from(slot), name) {
+                                Some(value) => {
+                                    state.declared_field_quickening.hits =
+                                        state.declared_field_quickening.hits.saturating_add(1);
+                                    Some(value.clone())
+                                }
+                                None => {
+                                    state.declared_field_quickening.invalidations = state
+                                        .declared_field_quickening
+                                        .invalidations
+                                        .saturating_add(1);
+                                    state.declared_field_slots.remove(&key);
+                                    None
+                                }
+                            }
+                        });
+                        let ordinary_value = if quickened_value.is_some() {
+                            None
+                        } else {
+                            match state.heap.datum(datum) {
+                                Ok(record)
+                                    if ordinary_field_fast_path_enabled
+                                        && !datum_field_requires_special_read(
+                                            record.type_path(),
+                                            name,
+                                        ) =>
+                                {
+                                    Some(datum_field_or_shared(state, datum, name))
+                                }
+                                Ok(_) => None,
+                                Err(error) => {
+                                    return Err(execution_error(
+                                        module,
+                                        &frames,
+                                        error.to_string(),
+                                    ));
+                                }
                             }
                         };
-                        if let Some(value) = ordinary_value {
+                        if let Some(value) = quickened_value {
+                            value
+                        } else if let Some(value) = ordinary_value {
+                            if let Some(key) = quickening_key {
+                                state.declared_field_quickening.misses =
+                                    state.declared_field_quickening.misses.saturating_add(1);
+                                if let Ok(record) = state.heap.datum(datum)
+                                    && let Some(slot) = record.field_slot(name)
+                                    && let Ok(slot) = u16::try_from(slot)
+                                {
+                                    state.declared_field_slots.insert(key, slot);
+                                }
+                            }
                             match value {
                                 Ok(value) => value,
                                 Err(ValueError::MissingField(_)) if statically_declared => {
@@ -18368,7 +21558,7 @@ fn run_frames(
                 }
                 let stack_depth = frames[frame_index].stack.len();
                 frames[frame_index]
-                    .exception_handlers
+                    .exception_handlers_mut()
                     .push(ExceptionHandler {
                         start: instruction_index + 1,
                         end,
@@ -18378,7 +21568,7 @@ fn run_frames(
                     });
             }
             Instruction::EndTry => {
-                if frames[frame_index].exception_handlers.pop().is_none() {
+                if frames[frame_index].exception_handlers_mut().pop().is_none() {
                     return Err(execution_error(
                         module,
                         &frames,
@@ -18393,7 +21583,7 @@ fn run_frames(
                 for candidate_frame in (0..frames.len()).rev() {
                     let current = frames[candidate_frame].instruction;
                     if let Some(position) = frames[candidate_frame]
-                        .exception_handlers
+                        .exception_handlers()
                         .iter()
                         .rposition(|handler| handler.start <= current && current <= handler.end)
                     {
@@ -18410,10 +21600,10 @@ fn run_frames(
                 };
                 frames.truncate(handler_frame + 1);
                 let handler = frames[handler_frame]
-                    .exception_handlers
+                    .exception_handlers_mut()
                     .remove(handler_position);
                 frames[handler_frame]
-                    .exception_handlers
+                    .exception_handlers_mut()
                     .truncate(handler_position);
                 frames[handler_frame].stack.truncate(handler.stack_depth);
                 if let Some(slot) = handler.local {
@@ -18872,10 +22062,10 @@ fn run_frames(
                     ));
                 }
                 let expanded_argument_names = (argument_count == EXPANDED_ARGUMENT_COUNT)
-                    .then(|| frames[frame_index].pending_argument_names.take())
+                    .then(|| frames[frame_index].take_pending_argument_names())
                     .flatten();
                 let expanded_argument_roots = (argument_count == EXPANDED_ARGUMENT_COUNT)
-                    .then(|| std::mem::take(&mut frames[frame_index].pending_argument_roots))
+                    .then(|| frames[frame_index].take_pending_argument_roots())
                     .unwrap_or_default();
                 let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
                     .map_err(|message| execution_error(module, &frames, message))?;
@@ -18951,7 +22141,7 @@ fn run_frames(
                 } else {
                     make_frame_named(target, target_program, &arguments, names, &context)
                 };
-                target_frame.retained_call_roots = expanded_argument_roots;
+                target_frame.set_retained_call_roots(expanded_argument_roots);
                 if shuttle_trace_enabled() {
                     let slot = shuttle_trace_slot_from_arguments(&target_frame.arguments);
                     shuttle_trace_prepare_call(
@@ -18978,10 +22168,10 @@ fn run_frames(
                 }
                 let expanded_argument_names = argument_count
                     .filter(|count| *count == EXPANDED_ARGUMENT_COUNT)
-                    .and_then(|_| frames[frame_index].pending_argument_names.take());
+                    .and_then(|_| frames[frame_index].take_pending_argument_names());
                 let expanded_argument_roots = argument_count
                     .filter(|count| *count == EXPANDED_ARGUMENT_COUNT)
-                    .map(|_| std::mem::take(&mut frames[frame_index].pending_argument_roots))
+                    .map(|_| frames[frame_index].take_pending_argument_roots())
                     .unwrap_or_default();
                 let arguments = if let Some(argument_count) = argument_count {
                     let count =
@@ -19012,7 +22202,7 @@ fn run_frames(
                         &context,
                     )
                 };
-                target_frame.retained_call_roots = expanded_argument_roots;
+                target_frame.set_retained_call_roots(expanded_argument_roots);
                 if shuttle_trace_enabled() {
                     let slot = shuttle_trace_slot_from_arguments(&target_frame.arguments);
                     shuttle_trace_prepare_call(
@@ -19125,10 +22315,10 @@ fn run_frames(
                 };
                 let expanded_argument_names = argument_count
                     .filter(|count| *count == EXPANDED_ARGUMENT_COUNT)
-                    .and_then(|_| frames[frame_index].pending_argument_names.take());
+                    .and_then(|_| frames[frame_index].take_pending_argument_names());
                 let expanded_argument_roots = argument_count
                     .filter(|count| *count == EXPANDED_ARGUMENT_COUNT)
-                    .map(|_| std::mem::take(&mut frames[frame_index].pending_argument_roots))
+                    .map(|_| frames[frame_index].take_pending_argument_roots())
                     .unwrap_or_default();
                 let arguments = if let Some(argument_count) = argument_count {
                     let count =
@@ -19163,7 +22353,7 @@ fn run_frames(
                         &context,
                     )
                 };
-                target_frame.retained_call_roots = expanded_argument_roots;
+                target_frame.set_retained_call_roots(expanded_argument_roots);
                 if shuttle_trace_enabled() {
                     let slot = shuttle_trace_slot_from_arguments(&target_frame.arguments);
                     shuttle_trace_prepare_call(
@@ -19175,7 +22365,7 @@ fn run_frames(
                         &mut target_frame,
                     );
                 }
-                target_frame.engine_post_return = engine_post_parent_frame.map(Box::new);
+                target_frame.set_engine_post_return(engine_post_parent_frame.map(Box::new));
                 frames.push(target_frame);
                 continue;
             }
@@ -19188,10 +22378,10 @@ fn run_frames(
                 let argument_count = *argument_count;
                 let null_receiver_is_global = *null_receiver_is_global;
                 let expanded_argument_names = (argument_count == EXPANDED_ARGUMENT_COUNT)
-                    .then(|| frames[frame_index].pending_argument_names.take())
+                    .then(|| frames[frame_index].take_pending_argument_names())
                     .flatten();
                 let expanded_argument_roots = (argument_count == EXPANDED_ARGUMENT_COUNT)
-                    .then(|| std::mem::take(&mut frames[frame_index].pending_argument_roots))
+                    .then(|| frames[frame_index].take_pending_argument_roots())
                     .unwrap_or_default();
                 let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
                     .map_err(|message| execution_error(module, &frames, message))?;
@@ -19275,7 +22465,7 @@ fn run_frames(
                                 &context,
                             )
                         };
-                    target_frame.retained_call_roots = expanded_argument_roots;
+                    target_frame.set_retained_call_roots(expanded_argument_roots);
                     if shuttle_trace_enabled() {
                         let slot = shuttle_trace_slot_from_arguments(&target_frame.arguments);
                         shuttle_trace_prepare_call(
@@ -19491,7 +22681,8 @@ fn run_frames(
                 };
                 let mut finished = frames.pop().expect("returning frame exists");
                 let finish_atoms_profile = finished.atoms_profile_root;
-                let result = finished.caller_result_override.clone().unwrap_or(result);
+                let finish_tgm_profile = finished.tgm_profile_root;
+                let result = finished.caller_result_override().cloned().unwrap_or(result);
                 if trace_enabled
                     && module
                         .procedure_path(finished.procedure)
@@ -19501,17 +22692,19 @@ fn run_frames(
                 {
                     eprintln!("boot-vm: dcs-get-element-result value={result}");
                 }
-                if let Some(started) = finished.boot_trace_started {
-                    let (datum_delta, list_delta, deferred_delta) = finished
-                        .boot_trace_heap
-                        .map_or((0, 0, 0), |(datums, lists, deferred)| {
-                            (
-                                state.heap.live_datum_count() as i128 - datums as i128,
-                                state.heap.live_list_count() as i128 - lists as i128,
-                                module.materialized_deferred_procedure_count() as i128
-                                    - deferred as i128,
-                            )
-                        });
+                if let Some(cold) = finished.cold()
+                    && let Some(started) = cold.boot_trace_started
+                {
+                    let (datum_delta, list_delta, deferred_delta) =
+                        cold.boot_trace_heap
+                            .map_or((0, 0, 0), |(datums, lists, deferred)| {
+                                (
+                                    state.heap.live_datum_count() as i128 - datums as i128,
+                                    state.heap.live_list_count() as i128 - lists as i128,
+                                    module.materialized_deferred_procedure_count() as i128
+                                        - deferred as i128,
+                                )
+                            });
                     eprintln!(
                         "boot-vm: initializer-end path={} elapsed_ms={} steps={} datum_delta={} list_delta={} deferred_delta={}",
                         module
@@ -19519,7 +22712,7 @@ fn run_frames(
                             .get(finished.procedure.index())
                             .map_or("<missing>", String::as_str),
                         started.elapsed().as_millis(),
-                        executed_steps.saturating_sub(finished.boot_trace_step),
+                        executed_steps.saturating_sub(cold.boot_trace_step),
                         datum_delta,
                         list_delta,
                         deferred_delta,
@@ -19528,7 +22721,10 @@ fn run_frames(
                 if finish_atoms_profile && let Some(profile) = state.atoms_profile.take() {
                     emit_atoms_profile(&profile);
                 }
-                if let Some(post_return) = finished.shuttle_trace_post_return.take() {
+                if finish_tgm_profile && let Some(profile) = state.tgm_profile.take() {
+                    emit_tgm_profile(&profile);
+                }
+                if let Some(post_return) = finished.take_shuttle_trace_post_return() {
                     if let Value::Datum(component) = finished.src {
                         match post_return {
                             ShuttleTracePostReturn::NullifyNode { slot } => {
@@ -19550,9 +22746,9 @@ fn run_frames(
                         }
                     }
                 }
-                if let Some(post_return) = finished.engine_post_return.take() {
+                if let Some(post_return) = finished.take_engine_post_return() {
                     let mut post_return = *post_return;
-                    post_return.caller_result_override = Some(result);
+                    post_return.set_caller_result_override(Some(result));
                     frames.push(post_return);
                     continue;
                 }
@@ -19566,6 +22762,402 @@ fn run_frames(
         }
         frames[frame_index].instruction += 1;
     }
+}
+
+fn normalized_dmm_cache_path(path: &str) -> Option<String> {
+    let path = path.replace('\\', "/");
+    if path.is_empty() || path.starts_with('/') || path.contains(':') {
+        return None;
+    }
+    let mut normalized = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => return None,
+            component => normalized.push(component.to_ascii_lowercase()),
+        }
+    }
+    (!normalized.is_empty()).then(|| normalized.join("/"))
+}
+
+fn artifact_dmm_source_matches(state: &ExecutionState, path: &str, digest: [u8; 16]) -> bool {
+    let Some(root) = state.project_root() else {
+        return true;
+    };
+    let candidate = root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+    if !candidate.exists() {
+        return true;
+    }
+    if !candidate.is_file() {
+        return false;
+    }
+    let Some(canonical_root) = std::fs::canonicalize(root).ok() else {
+        return false;
+    };
+    let Some(canonical_candidate) = std::fs::canonicalize(candidate).ok() else {
+        return false;
+    };
+    canonical_candidate.starts_with(canonical_root)
+        && std::fs::read(canonical_candidate)
+            .ok()
+            .is_some_and(|bytes| md5::compute(bytes).0 == digest)
+}
+
+const CANONICAL_MONKE_DISCOVER_OFFSET_DIGEST: [u8; 32] = [
+    0xe4, 0xa0, 0xe8, 0x26, 0x6a, 0xf4, 0xdd, 0x8e, 0xec, 0x7d, 0x8a, 0x26, 0xc8, 0x68, 0x91, 0x1a,
+    0x61, 0xc8, 0xde, 0x87, 0xdd, 0xce, 0x68, 0xf0, 0xaf, 0x30, 0x2d, 0x16, 0xfc, 0xcd, 0x57, 0x6f,
+];
+
+fn trusted_discover_offset_target(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+) -> bool {
+    module.procedure_path(procedure).is_some_and(|path| {
+        path.split('@').next() == Some("/datum/map_template/proc/discover_offset")
+    }) && program.parameter_count == 1
+        && program.local_count == 18
+        && program.instructions.len() == 131
+        && matches!(program.instructions.get(23), Some(Instruction::StandardBuiltin { name, argument_count: 2, .. }) if name == "findtext")
+        && matches!(
+            program.instructions.get(54),
+            Some(Instruction::NextLocalListIteration { .. })
+        )
+        && matches!(
+            program.instructions.get(99),
+            Some(Instruction::CopyText {
+                argument_count: 3,
+                character_indices: false
+            })
+        )
+        && matches!(program.instructions.get(104), Some(Instruction::MakeListEntries(entries)) if entries.len() == 2)
+        && module.procedure_semantic_digest(procedure)
+            == Some(CANONICAL_MONKE_DISCOVER_OFFSET_DIGEST)
+}
+
+fn list_iteration_snapshot(state: &ExecutionState, list: ListId) -> Option<Vec<Value>> {
+    let list = state.heap.list(list).ok()?;
+    (1..=list.len())
+        .map(|index| list.get(index).ok().cloned())
+        .collect()
+}
+
+fn discover_offset_native(
+    src: DatumId,
+    marker: &Value,
+    state: &mut ExecutionState,
+) -> Option<Value> {
+    const MAX_MODEL_ENTRIES: usize = 1 << 20;
+    const MAX_GRID_LINES: usize = 1 << 20;
+    // Keep the synchronous native tier bounded and column arithmetic exactly
+    // representable in DM's f32 number domain. Larger/custom inputs side-exit.
+    const MAX_SCANNED_BYTES: usize = 8 * 1024 * 1024;
+    let field = |name| FieldName::parse(name).ok();
+    let Value::Datum(cached_map) =
+        datum_field_or_initial(state, src, &field("cached_map")?).ok()?
+    else {
+        return None;
+    };
+    let Value::List(models) =
+        datum_field_or_initial(state, cached_map, &field("grid_models")?).ok()?
+    else {
+        return None;
+    };
+    let model_keys = list_iteration_snapshot(state, models)?;
+    if model_keys.len() > MAX_MODEL_ENTRIES {
+        return None;
+    }
+    let marker = stringify_dm_value(marker, &state.heap).ok()?;
+    let mut selected_key = Value::Null;
+    for key in model_keys {
+        selected_key = key.clone();
+        let model =
+            read_list_value(&state.heap, models, &key, state.is_associative_list(models)).ok()?;
+        let found =
+            execute_standard_builtin("findtext", &[model, Value::text(marker.as_str())], state)
+                .ok()?;
+        if runtime_truthy(&state.heap, &found).ok()? {
+            break;
+        }
+    }
+
+    let Value::List(grid_sets) =
+        datum_field_or_initial(state, cached_map, &field("gridSets")?).ok()?
+    else {
+        return None;
+    };
+    let key_len = datum_field_or_initial(state, cached_map, &field("key_len")?)
+        .ok()?
+        .as_number()?;
+    if !key_len.is_finite() || key_len.fract() != 0.0 || !(1.0..=64.0).contains(&key_len) {
+        return None;
+    }
+    let key_len = key_len as usize;
+    let Value::Text(selected_key) = selected_key else {
+        return Some(Value::Null);
+    };
+    if !selected_key.is_ascii() || selected_key.len() != key_len {
+        return None;
+    }
+    let grids = list_iteration_snapshot(state, grid_sets)?;
+    let mut scanned_lines = 0_usize;
+    let mut scanned_bytes = 0_usize;
+    for grid in grids {
+        let Value::Datum(grid) = grid else {
+            return None;
+        };
+        let x = datum_field_or_initial(state, grid, &field("xcrd")?)
+            .ok()?
+            .as_number()?;
+        let mut y = datum_field_or_initial(state, grid, &field("ycrd")?)
+            .ok()?
+            .as_number()?;
+        let Value::List(lines) = datum_field_or_initial(state, grid, &field("gridLines")?).ok()?
+        else {
+            return None;
+        };
+        for line in list_iteration_snapshot(state, lines)? {
+            scanned_lines = scanned_lines.checked_add(1)?;
+            if scanned_lines > MAX_GRID_LINES {
+                return None;
+            }
+            let Value::Text(line) = line else {
+                return None;
+            };
+            if !line.is_ascii() {
+                return None;
+            }
+            scanned_bytes = scanned_bytes.checked_add(line.len())?;
+            if scanned_bytes > MAX_SCANNED_BYTES {
+                return None;
+            }
+            for (column, chunk) in line.as_bytes().chunks_exact(key_len).enumerate() {
+                if chunk == selected_key.as_bytes() {
+                    let result = state.heap.allocate_list();
+                    state
+                        .heap
+                        .list_mut(result)
+                        .ok()?
+                        .extend_positional([Value::number(x + column as f32), Value::number(y)]);
+                    return Some(Value::List(result));
+                }
+            }
+            y -= 1.0;
+        }
+    }
+    Some(Value::Null)
+}
+
+fn try_run_discover_offset_fast_path(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+    frame: &mut CallFrame,
+    remaining_steps: u64,
+    state: &mut ExecutionState,
+) -> Option<u64> {
+    if remaining_steps < 16
+        || !frame.stack.is_empty()
+        || !trusted_discover_offset_target(module, procedure, program)
+    {
+        return None;
+    }
+    let Value::Datum(src) = frame.src else {
+        return None;
+    };
+    let result = discover_offset_native(src, frame.locals.first()?, state)?;
+    let return_index = program
+        .instructions
+        .iter()
+        .rposition(|instruction| matches!(instruction, Instruction::Return))?;
+    frame.stack.push(result);
+    frame.instruction = return_index;
+    NATIVE_DISCOVER_OFFSET_ACTIVATIONS.fetch_add(1, Ordering::Relaxed);
+    Some(16)
+}
+
+fn try_run_parsed_dmm_new_fast_path(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+    frame: &mut CallFrame,
+    remaining_steps: u64,
+    state: &mut ExecutionState,
+) -> Option<u64> {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("DREAM64_DISABLE_PARSED_DMM_CACHE").is_some()) {
+        return None;
+    }
+    let canonical_path = module.procedure_path(procedure)?.split('@').next()?;
+    if remaining_steps < 32
+        || !matches!(
+            canonical_path,
+            "/datum/parsed_map/New" | "/datum/parsed_map/proc/New"
+        )
+        || program.parameter_count != 8
+        || frame.locals.len() < 8
+        || !frame.stack.is_empty()
+        || frame
+            .locals
+            .get(1..8)?
+            .iter()
+            .any(|value| !matches!(value, Value::Null))
+    {
+        return None;
+    }
+    let Value::Datum(src) = frame.src else {
+        return None;
+    };
+    if state.heap.datum(src).ok()?.type_path().as_str() != "/datum/parsed_map" {
+        return None;
+    }
+    let Value::File(file) = frame.locals.first()? else {
+        return None;
+    };
+    let normalized = normalized_dmm_cache_path(file)?;
+    let parsed = state.parsed_dmm_cache.get(&normalized)?.clone();
+    if !artifact_dmm_source_matches(state, file, parsed.digest) {
+        return None;
+    }
+
+    let allocate_bounds = |state: &mut ExecutionState| -> Option<ListId> {
+        let list = state.heap.allocate_list();
+        for coordinate in parsed.bounds {
+            state
+                .heap
+                .list_mut(list)
+                .ok()?
+                .add(Value::number(coordinate as f32));
+        }
+        Some(list)
+    };
+    let bounds = allocate_bounds(state)?;
+    let parsed_bounds = allocate_bounds(state)?;
+    let models = state.heap.allocate_list();
+    state.mark_associative_list(models);
+    for (key, model) in &parsed.models {
+        write_list_value(
+            &mut state.heap,
+            models,
+            Value::text(key.as_str()),
+            Value::text(model.as_str()),
+            true,
+        )
+        .ok()?;
+    }
+    let grid_sets = state.heap.allocate_list();
+    let grid_type = TypePath::parse("/datum/grid_set").ok()?;
+    let field = |name| FieldName::parse(name).ok();
+    for grid in &parsed.grids {
+        let datum = state.heap.allocate_datum(grid_type.clone());
+        let lines = state.heap.allocate_list();
+        for line in &grid.lines {
+            state
+                .heap
+                .list_mut(lines)
+                .ok()?
+                .add(Value::text(line.as_str()));
+        }
+        for (name, value) in [
+            ("xcrd", Value::number(grid.x as f32)),
+            ("ycrd", Value::number(grid.y as f32)),
+            ("zcrd", Value::number(grid.z as f32)),
+            ("gridLines", Value::List(lines)),
+        ] {
+            state
+                .heap
+                .set_datum_field(datum, field(name)?, value)
+                .ok()?;
+        }
+        state
+            .heap
+            .list_mut(grid_sets)
+            .ok()?
+            .add(Value::Datum(datum));
+    }
+    for (name, value) in [
+        ("original_path", Value::Text(Arc::clone(file))),
+        (
+            "map_format",
+            Value::text(if parsed.tgm { "tgm" } else { "dmm" }),
+        ),
+        ("key_len", Value::number(parsed.key_len as f32)),
+        ("line_len", Value::number(parsed.line_len as f32)),
+        ("grid_models", Value::List(models)),
+        ("gridSets", Value::List(grid_sets)),
+        ("bounds", Value::List(bounds)),
+        ("parsed_bounds", Value::List(parsed_bounds)),
+    ] {
+        state.heap.set_datum_field(src, field(name)?, value).ok()?;
+    }
+    let return_index = program
+        .instructions
+        .iter()
+        .rposition(|instruction| matches!(instruction, Instruction::Return))?;
+    frame.stack.push(Value::Null);
+    frame.instruction = return_index;
+    Some(32)
+}
+
+fn try_run_dmm_preload_measurement_fast_path(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+    frame: &mut CallFrame,
+    remaining_steps: u64,
+    state: &mut ExecutionState,
+) -> Option<u64> {
+    if remaining_steps < 8
+        || module.procedure_path(procedure)?.split('@').next()?
+            != "/datum/map_template/proc/preload_size"
+        || program.parameter_count != 2
+        || program.local_count < 2
+        || !frame.stack.is_empty()
+    {
+        return None;
+    }
+    let Value::Datum(src) = frame.src else {
+        return None;
+    };
+    let path = match frame.locals.first()? {
+        Value::File(path) | Value::Text(path) => path.as_ref(),
+        _ => return None,
+    };
+    // `cache=TRUE` must construct and retain the parsed-map datum.
+    if runtime_truthy(&state.heap, frame.locals.get(1)?).ok()? {
+        return None;
+    }
+    let measurement = *state
+        .dmm_measurements
+        .get(&normalized_dmm_cache_path(path)?)?;
+    if !artifact_dmm_source_matches(state, path, measurement.digest) {
+        return None;
+    }
+    let bounds = state.heap.allocate_list();
+    for coordinate in measurement.bounds {
+        state
+            .heap
+            .list_mut(bounds)
+            .ok()?
+            .add(Value::number(coordinate as f32));
+    }
+    let width = FieldName::parse("width").ok()?;
+    let height = FieldName::parse("height").ok()?;
+    state
+        .heap
+        .set_datum_field(src, width, Value::number(measurement.bounds[3] as f32))
+        .ok()?;
+    state
+        .heap
+        .set_datum_field(src, height, Value::number(measurement.bounds[4] as f32))
+        .ok()?;
+    let return_index = program
+        .instructions
+        .iter()
+        .rposition(|instruction| matches!(instruction, Instruction::Return))?;
+    frame.stack.push(Value::List(bounds));
+    frame.instruction = return_index;
+    Some(8)
 }
 
 thread_local! {
@@ -20318,18 +23910,20 @@ fn try_run_lumcount_jit(
         if state.heap.list(queue).is_err() {
             return None;
         }
-        if let Some(native) = frame.numeric_jit_state.as_mut() {
+        if let Some(native) = frame.numeric_jit_state_mut() {
             native.fields.copy_from_slice(&field_values);
         } else {
-            frame.numeric_jit_state = trace
-                .compiled
-                .initial_state_with_fields(&numeric_locals, &field_values);
+            frame.set_numeric_jit_state(
+                trace
+                    .compiled
+                    .initial_state_with_fields(&numeric_locals, &field_values),
+            );
         }
         let budget = u32::try_from(remaining_steps).unwrap_or(u32::MAX);
         let outcome = trace
             .compiled
-            .run_budgeted(frame.numeric_jit_state.as_mut()?, budget)?;
-        let native = frame.numeric_jit_state.as_mut()?;
+            .run_budgeted(frame.numeric_jit_state_mut()?, budget)?;
+        let native = frame.numeric_jit_state_mut()?;
         for (index, field) in trace.fields.iter().enumerate() {
             if native.dirty_fields & (1_u64 << index) != 0 {
                 state
@@ -20470,7 +24064,7 @@ fn try_run_numeric_jit(
             })
         });
         let trace = trace.as_ref()?;
-        if frame.numeric_jit_state.is_none() {
+        if frame.numeric_jit_state().is_none() {
             let mut numeric_locals = vec![0.0; program.local_count];
             for (index, local) in frame.locals.iter().enumerate() {
                 if let Some(value) = local.as_number() {
@@ -20482,10 +24076,10 @@ fn try_run_numeric_jit(
                     return None;
                 }
             }
-            frame.numeric_jit_state = trace.initial_state(&numeric_locals);
+            frame.set_numeric_jit_state(trace.initial_state(&numeric_locals));
         }
         let budget = u32::try_from(remaining_steps).unwrap_or(u32::MAX);
-        trace.run_budgeted(frame.numeric_jit_state.as_mut()?, budget)
+        trace.run_budgeted(frame.numeric_jit_state_mut()?, budget)
     })
 }
 
@@ -20738,8 +24332,8 @@ fn shuttle_trace_prepare_call(
     nullify_slot: Option<usize>,
     target_frame: &mut CallFrame,
 ) {
-    target_frame.shuttle_trace_target = caller.shuttle_trace_target;
-    target_frame.shuttle_trace_post_return = None;
+    target_frame.set_shuttle_trace_target(caller.shuttle_trace_target());
+    target_frame.set_shuttle_trace_post_return(None);
 
     if !shuttle_trace_enabled() {
         return;
@@ -20752,22 +24346,23 @@ fn shuttle_trace_prepare_call(
         && let Value::Datum(target) = target_frame.src
         && shuttle_trace_matches_target(state, target)
     {
-        target_frame.shuttle_trace_target = Some(target);
+        target_frame.set_shuttle_trace_target(Some(target));
         shuttle_trace_emit_snapshot(state, target, "lateShuttleMove-entry", None);
         return;
     }
 
-    let Some(shuttle_target) = target_frame.shuttle_trace_target else {
+    let Some(shuttle_target) = target_frame.shuttle_trace_target() else {
         return;
     };
     if shuttle_trace_is_nullify_node(path) {
         let slot = nullify_slot;
         shuttle_trace_emit_snapshot(state, shuttle_target, "nullify-node-before", slot);
-        target_frame.shuttle_trace_post_return = Some(ShuttleTracePostReturn::NullifyNode { slot });
+        target_frame
+            .set_shuttle_trace_post_return(Some(ShuttleTracePostReturn::NullifyNode { slot }));
     }
     if shuttle_trace_is_atmos_init(path) {
         shuttle_trace_emit_snapshot(state, shuttle_target, "atmos-init-before", None);
-        target_frame.shuttle_trace_post_return = Some(ShuttleTracePostReturn::AtmosInit);
+        target_frame.set_shuttle_trace_post_return(Some(ShuttleTracePostReturn::AtmosInit));
     }
 }
 
@@ -20925,22 +24520,12 @@ fn make_frame_inline(
         supplied_parameters: (0..program.parameter_count)
             .map(|index| index < supplied_argument_count)
             .collect(),
-        pending_argument_names: None,
-        pending_argument_roots: SmallVec::new(),
-        retained_call_roots: SmallVec::new(),
-        exception_handlers: Vec::new(),
+        cold: None,
         detached_waitfor: false,
-        caller_result_override: None,
-        engine_post_return: None,
-        shuttle_trace_target: None,
-        shuttle_trace_post_return: None,
-        numeric_jit_state: None,
         static_locals: SmallVec::new(),
-        boot_trace_started: None,
-        boot_trace_heap: None,
-        boot_trace_step: 0,
         atoms_profile_entry_counted: false,
         atoms_profile_root: false,
+        tgm_profile_root: false,
     }
 }
 
@@ -21248,13 +24833,14 @@ fn mark_boot_trace_frame(
         return;
     }
     eprintln!("boot-vm: initializer-begin path={path}");
-    frame.boot_trace_started = Some(Instant::now());
-    frame.boot_trace_heap = Some((
+    let cold = frame.cold_mut();
+    cold.boot_trace_started = Some(Instant::now());
+    cold.boot_trace_heap = Some((
         state.heap.live_datum_count(),
         state.heap.live_list_count(),
         module.materialized_deferred_procedure_count(),
     ));
-    frame.boot_trace_step = executed_steps;
+    cold.boot_trace_step = executed_steps;
 }
 
 fn boot_trace_describe_value(value: &Value, state: &ExecutionState) -> String {
@@ -23893,13 +27479,7 @@ fn block_builtin(arguments: &[Value], state: &mut ExecutionState) -> Result<Valu
         .heap
         .list_mut(list)
         .expect("a newly allocated list handle must be live");
-    // Full-z map passes such as Z_TURFS commonly return 65,025 cells. Reserve
-    // both positional and iteration-order storage once instead of repeatedly
-    // growing two vectors while constructing the DM-visible block list.
-    result.reserve_positional(matching.len());
-    for datum in matching {
-        result.add(Value::Datum(datum));
-    }
+    result.extend_positional(matching.into_iter().map(Value::Datum));
     Ok(Value::List(list))
 }
 
@@ -26291,7 +29871,7 @@ fn order_image_arguments(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use dm_core::{DmNumberBits, SourceSpan};
     use dm_dmf::{ControlTree, parse as parse_dmf};
@@ -26300,8 +29880,8 @@ mod tests {
     use dm_value::{DatumId, FieldName, ModifiedTypePath, TypePath, ValueError};
 
     use super::{
-        CANONICAL_TYPE2PARENT_SOURCE, CompoundListIndexOperator, ExecutionContext, ExecutionLimits,
-        ExecutionState, InitializerBinding, InstanceInitializer, Instruction,
+        CANONICAL_TYPE2PARENT_SOURCE, CallFrame, CompoundListIndexOperator, ExecutionContext,
+        ExecutionLimits, ExecutionState, InitializerBinding, InstanceInitializer, Instruction,
         LocalClientPromptKind, LocalClientPromptResponse, LocalClientUiEvent,
         MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES,
         MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE, MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH,
@@ -26318,8 +29898,10 @@ mod tests {
         execute_module_in_state, execute_module_with_limits, execute_module_with_limits_in_state,
         execute_with_limits, execute_with_limits_in_state, initial_value_or_engine_root,
         instance_initializer_plan, interpolated_expression_close, is_subtype, make_frame,
-        matrix_components, next_module_identity, prepare_iteration_consumes_fresh_block,
-        read_list_value, try_run_register_signal_fast_path,
+        matrix_components, next_module_identity, packed_dispatch_counters,
+        prepare_iteration_consumes_fresh_block, read_list_value, try_run_numeric_dispatch_block,
+        try_run_packed_numeric_dispatch_block, try_run_register_signal_fast_path,
+        try_run_rich_numeric_dispatch_block,
     };
 
     #[test]
@@ -27809,7 +31391,7 @@ mod tests {
         let parent = make_frame(procedure, program, &[], &parent_context);
         let child_context = ExecutionContext::new(Value::Null, Value::Null);
         let mut child = make_frame(procedure, program, &[], &child_context);
-        child.engine_post_return = Some(Box::new(parent));
+        child.set_engine_post_return(Some(Box::new(parent)));
 
         state.next_list_collection = 1;
         state.maybe_collect_unreachable_lists(&[child]);
@@ -28457,6 +32039,7 @@ mod tests {
         let limits = ExecutionLimits {
             max_call_depth: 16,
             max_steps: 7,
+            wall_clock_budget: None,
         };
         let mut false_state = make_state(40.0);
         assert_eq!(
@@ -28476,6 +32059,7 @@ mod tests {
                 ExecutionLimits {
                     max_call_depth: 16,
                     max_steps: 6,
+                    wall_clock_budget: None,
                 },
                 &mut exhausted_state,
             )
@@ -28501,6 +32085,7 @@ mod tests {
         let limits = ExecutionLimits {
             max_call_depth: 16,
             max_steps: 6,
+            wall_clock_budget: None,
         };
         assert_eq!(
             execute_with_limits(&bounded, &[Value::number(3.0), Value::number(4.0)], limits),
@@ -28517,6 +32102,7 @@ mod tests {
                 ExecutionLimits {
                     max_call_depth: 16,
                     max_steps: 5,
+                    wall_clock_budget: None,
                 },
             )
             .is_err(),
@@ -28601,6 +32187,7 @@ mod tests {
                 ExecutionLimits {
                     max_call_depth: 16,
                     max_steps: 53,
+                    wall_clock_budget: None,
                 },
             ),
             Ok(Value::number(4.0)),
@@ -28612,6 +32199,7 @@ mod tests {
                 ExecutionLimits {
                     max_call_depth: 16,
                     max_steps: 52,
+                    wall_clock_budget: None,
                 },
             )
             .is_err(),
@@ -28633,6 +32221,7 @@ mod tests {
                 ExecutionLimits {
                     max_call_depth: 16,
                     max_steps: 4,
+                    wall_clock_budget: None,
                 },
             ),
             Ok(Value::text("ab")),
@@ -28657,10 +32246,264 @@ mod tests {
                 ExecutionLimits {
                     max_call_depth: 16,
                     max_steps: 6,
+                    wall_clock_budget: None,
                 },
             ),
             Ok(Value::number(5.0)),
         );
+    }
+
+    #[test]
+    fn packed_numeric_dispatch_matches_rich_state_and_side_exits() {
+        let mut numeric = manual_program(
+            vec![
+                Instruction::LoadLocal(0),
+                Instruction::PushNumber(DmNumberBits::from_f32(2.0)),
+                Instruction::Multiply,
+                Instruction::StoreLocal(1),
+                Instruction::LoadLocal(1),
+                Instruction::PushNumber(DmNumberBits::from_f32(8.0)),
+                Instruction::GreaterEqual,
+                Instruction::StoreResult,
+                Instruction::LoadResult,
+                Instruction::Not,
+                Instruction::JumpIfFalse(13),
+                Instruction::PushNull,
+                Instruction::Pop,
+                Instruction::Return,
+            ],
+            1,
+        );
+        numeric.local_count = 2;
+        let state = ExecutionState::new();
+        let arguments = [Value::number(4.0)];
+        let context = ExecutionContext::default();
+        let mut rich = make_frame(ProcedureId(0), &numeric, &arguments, &context);
+        let mut packed = rich.clone();
+        let rich_steps = try_run_rich_numeric_dispatch_block(&numeric, &mut rich, 64, &state);
+        let packed_steps = try_run_packed_numeric_dispatch_block(&numeric, &mut packed, 64, &state);
+        assert_eq!(packed_steps, rich_steps);
+        assert_eq!(packed.instruction, rich.instruction);
+        assert_eq!(packed.locals, rich.locals);
+        assert_eq!(packed.stack, rich.stack);
+        assert_eq!(packed.result, rich.result);
+
+        let side_exit = manual_program(
+            vec![
+                Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+                Instruction::Pop,
+                Instruction::PushText(Arc::from("rich")),
+                Instruction::Return,
+            ],
+            0,
+        );
+        let mut rich = make_frame(ProcedureId(0), &side_exit, &[], &context);
+        let mut packed = rich.clone();
+        assert_eq!(
+            try_run_packed_numeric_dispatch_block(&side_exit, &mut packed, 64, &state),
+            Some(2)
+        );
+        assert_eq!(
+            try_run_rich_numeric_dispatch_block(&side_exit, &mut rich, 2, &state),
+            Some(2)
+        );
+        assert_eq!(packed.instruction, rich.instruction);
+        assert_eq!(packed.stack, rich.stack);
+    }
+
+    #[test]
+    fn packed_numeric_state_persists_across_budgets_and_materializes_on_side_exit() {
+        let mut program = manual_program(
+            vec![
+                Instruction::LoadLocal(0),
+                Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+                Instruction::Add,
+                Instruction::StoreLocal(0),
+                Instruction::Jump(0),
+                Instruction::Return,
+            ],
+            0,
+        );
+        program.local_count = 1;
+        let state = ExecutionState::new();
+        let mut frame = make_frame(ProcedureId(0), &program, &[], &ExecutionContext::default());
+        assert_eq!(
+            try_run_packed_numeric_dispatch_block(&program, &mut frame, 5, &state),
+            Some(5)
+        );
+        assert!(
+            frame
+                .cold()
+                .is_some_and(|cold| cold.packed_numeric_state.is_some())
+        );
+        assert_eq!(frame.locals[0], Value::Null);
+        assert_eq!(
+            try_run_packed_numeric_dispatch_block(&program, &mut frame, 5, &state),
+            Some(5)
+        );
+        frame.instruction = 5;
+        assert_eq!(
+            try_run_packed_numeric_dispatch_block(&program, &mut frame, 5, &state),
+            None
+        );
+        assert_eq!(frame.locals[0], Value::number(2.0));
+        assert!(
+            frame
+                .cold()
+                .is_none_or(|cold| cold.packed_numeric_state.is_none())
+        );
+    }
+
+    #[test]
+    fn adaptive_packed_entry_declines_short_procedures_and_enters_sustained_loops() {
+        let short = manual_program(
+            vec![
+                Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+                Instruction::StoreResult,
+                Instruction::Return,
+            ],
+            0,
+        );
+        let state = ExecutionState::new();
+        let mut short_frame = make_frame(ProcedureId(0), &short, &[], &ExecutionContext::default());
+        let (_, declines_before) = packed_dispatch_counters();
+        assert_eq!(
+            try_run_numeric_dispatch_block(&short, &mut short_frame, 100, &state),
+            Some(2)
+        );
+        let after_short = packed_dispatch_counters();
+        assert!(after_short.1 > declines_before);
+        assert!(
+            short_frame
+                .cold()
+                .is_none_or(|cold| cold.packed_numeric_state.is_none())
+        );
+
+        let sustained = manual_program(
+            vec![
+                Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+                Instruction::Pop,
+                Instruction::Jump(0),
+            ],
+            0,
+        );
+        let mut sustained_frame = make_frame(
+            ProcedureId(0),
+            &sustained,
+            &[],
+            &ExecutionContext::default(),
+        );
+        assert_eq!(
+            try_run_numeric_dispatch_block(&sustained, &mut sustained_frame, 100, &state),
+            Some(100)
+        );
+        let after_sustained = packed_dispatch_counters();
+        assert!(after_sustained.0 > after_short.0);
+        assert!(
+            sustained_frame
+                .cold()
+                .is_some_and(|cold| cold.packed_numeric_state.is_some())
+        );
+    }
+
+    #[test]
+    #[ignore = "release-only packed numeric dispatch microbenchmark"]
+    fn packed_numeric_dispatch_benchmark() {
+        const ROUNDS: usize = 1_000_000;
+        let program = manual_program(
+            vec![
+                Instruction::LoadLocal(0),
+                Instruction::PushNumber(DmNumberBits::from_f32(2.0)),
+                Instruction::Multiply,
+                Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+                Instruction::Add,
+                Instruction::StoreResult,
+                Instruction::Return,
+            ],
+            1,
+        );
+        let state = ExecutionState::new();
+        let context = ExecutionContext::default();
+        let arguments = [Value::number(20.5)];
+        let mut rich = make_frame(ProcedureId(0), &program, &arguments, &context);
+        let started = Instant::now();
+        for _ in 0..ROUNDS {
+            rich.instruction = 0;
+            rich.stack.clear();
+            std::hint::black_box(try_run_rich_numeric_dispatch_block(
+                &program, &mut rich, 32, &state,
+            ));
+        }
+        let rich_elapsed = started.elapsed();
+        let mut packed = make_frame(ProcedureId(0), &program, &arguments, &context);
+        let started = Instant::now();
+        for _ in 0..ROUNDS {
+            packed.instruction = 0;
+            packed.stack.clear();
+            std::hint::black_box(try_run_packed_numeric_dispatch_block(
+                &program,
+                &mut packed,
+                32,
+                &state,
+            ));
+        }
+        let packed_elapsed = started.elapsed();
+        eprintln!(
+            "packed-numeric rounds={ROUNDS} rich_ms={} packed_ms={} speedup={:.3}",
+            rich_elapsed.as_millis(),
+            packed_elapsed.as_millis(),
+            rich_elapsed.as_secs_f64() / packed_elapsed.as_secs_f64(),
+        );
+        assert_eq!(rich.result, packed.result);
+
+        const BLOCKS: usize = 100_000;
+        const STEPS_PER_BLOCK: u64 = 100;
+        let mut sustained = manual_program(
+            vec![
+                Instruction::LoadLocal(0),
+                Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+                Instruction::Add,
+                Instruction::StoreLocal(0),
+                Instruction::Jump(0),
+                Instruction::Return,
+            ],
+            0,
+        );
+        sustained.local_count = 1;
+        let mut rich = make_frame(ProcedureId(0), &sustained, &[], &context);
+        let started = Instant::now();
+        for _ in 0..BLOCKS {
+            std::hint::black_box(try_run_rich_numeric_dispatch_block(
+                &sustained,
+                &mut rich,
+                STEPS_PER_BLOCK,
+                &state,
+            ));
+        }
+        let rich_elapsed = started.elapsed();
+        let mut packed = make_frame(ProcedureId(0), &sustained, &[], &context);
+        let started = Instant::now();
+        for _ in 0..BLOCKS {
+            std::hint::black_box(try_run_packed_numeric_dispatch_block(
+                &sustained,
+                &mut packed,
+                STEPS_PER_BLOCK,
+                &state,
+            ));
+        }
+        let packed_elapsed = started.elapsed();
+        eprintln!(
+            "packed-persistent blocks={BLOCKS} steps_per_block={STEPS_PER_BLOCK} rich_ms={} packed_ms={} speedup={:.3}",
+            rich_elapsed.as_millis(),
+            packed_elapsed.as_millis(),
+            rich_elapsed.as_secs_f64() / packed_elapsed.as_secs_f64(),
+        );
+        packed.instruction = 5;
+        assert_eq!(
+            try_run_packed_numeric_dispatch_block(&sustained, &mut packed, 1, &state),
+            None
+        );
+        assert_eq!(rich.locals, packed.locals);
     }
 
     fn expression_tokens(source: &str) -> Vec<SpannedToken> {
@@ -28758,6 +32601,37 @@ mod tests {
 
         assert_eq!(module.initializer_call_name_index_builds(), 1);
         assert_eq!(module.initializer_call_name_symbols_scanned(), 64);
+    }
+
+    #[test]
+    fn compact_wordcode_is_a_cache_and_appending_invalidates_it() {
+        let syntax = parse("/proc/base()\n\treturn 7\n").expect("procedure should parse");
+        let mut module = compile_module(&syntax.definitions).expect("procedure should compile");
+        let semantic_copy = module.clone();
+        module
+            .install_compact_wordcode()
+            .expect("compact wordcode should install");
+        let stale_attachment = module.compact_wordcode.0.clone();
+
+        assert_eq!(module, semantic_copy, "execution caches are not semantics");
+        let initializer = compile_initializer_into_module(
+            &expression_tokens("base()"),
+            &BTreeMap::new(),
+            &mut module,
+        )
+        .expect("initializer should append");
+        assert!(
+            module.compact_wordcode().is_none(),
+            "appending must invalidate stale instruction ranges"
+        );
+        // Model an in-flight dispatcher that retained the immutable attachment
+        // before the append. Coverage absence is a cache miss, not corruption.
+        module.compact_wordcode.0 = stale_attachment;
+        assert_eq!(
+            execute_module(&module, initializer, &[]),
+            Ok(Value::number(7.0)),
+            "an initializer appended after compact attachment executes through rich fallback",
+        );
     }
 
     #[test]
@@ -29047,6 +32921,37 @@ mod tests {
                 .semantic_eq(&Value::number(5.0))
         );
         assert_eq!(state.globals().count(), 1);
+    }
+
+    #[test]
+    fn dense_globals_preserve_order_replacement_and_slot_reuse() {
+        let mut state = ExecutionState::new();
+        assert_eq!(state.set_global(field("zeta"), Value::number(1.0)), None);
+        assert_eq!(state.set_global(field("alpha"), Value::number(2.0)), None);
+        assert_eq!(
+            state.set_global(field("zeta"), Value::number(3.0)),
+            Some(Value::number(1.0))
+        );
+        assert_eq!(
+            state
+                .globals()
+                .map(|(name, value)| (name.as_str(), value.clone()))
+                .collect::<Vec<_>>(),
+            vec![("alpha", Value::number(2.0)), ("zeta", Value::number(3.0)),]
+        );
+        assert_eq!(
+            state.delete_global(&field("alpha")),
+            Some(Value::number(2.0))
+        );
+        assert_eq!(state.set_global(field("middle"), Value::number(4.0)), None);
+        assert_eq!(state.global(&field("zeta")), Some(&Value::number(3.0)));
+        assert_eq!(
+            state
+                .globals()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["middle", "zeta"]
+        );
     }
 
     #[test]
@@ -30109,6 +34014,149 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_orders_only_due_work_and_retains_future_work() {
+        let source = parse(concat!(
+            "/proc/entry()\n",
+            "\tspawn(3)\n\t\treturn 30\n",
+            "\tspawn(1)\n\t\treturn 10\n",
+            "\tspawn(1)\n\t\treturn 11\n",
+            "\tspawn(5)\n\t\treturn 50\n",
+        ))
+        .expect("scheduler ordering fixture should parse");
+        let module =
+            compile_module(&source.definitions).expect("scheduler ordering fixture should compile");
+        let entry = module.procedure_id("/proc/entry").unwrap();
+        let mut state = ExecutionState::new();
+
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::Null),
+        );
+        assert_eq!(state.scheduled_task_count(), 4);
+        let metrics = state.continuation_metrics();
+        assert_eq!(metrics.continuations, 4);
+        assert_eq!(metrics.frames, 4);
+        assert!(metrics.retained_values >= 4);
+        assert_eq!(metrics.frame_header_bytes, std::mem::size_of::<CallFrame>());
+        assert_eq!(
+            advance_scheduler(&module, 3, ExecutionLimits::default(), &mut state),
+            Ok(vec![
+                Value::number(10.0),
+                Value::number(11.0),
+                Value::number(30.0),
+            ]),
+        );
+        assert_eq!(state.scheduled_task_count(), 1);
+        assert_eq!(state.continuation_metrics().continuations, 1);
+        assert_eq!(state.next_scheduled_tick(), Some(5));
+        assert_eq!(
+            advance_scheduler(&module, 2, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::number(50.0)]),
+        );
+    }
+
+    #[test]
+    fn owned_continuation_preserves_exception_state_across_repeated_yields() {
+        let source = parse(concat!(
+            "/proc/entry()\n",
+            "\tspawn(1)\n\t\treturn guarded()\n",
+            "/proc/guarded()\n",
+            "\ttry\n",
+            "\t\tsleep(1)\n",
+            "\t\tthrow \"boom\"\n",
+            "\tcatch(var/error)\n",
+            "\t\treturn 77\n",
+        ))
+        .expect("continuation exception fixture should parse");
+        let module = compile_module(&source.definitions)
+            .expect("continuation exception fixture should compile");
+        let entry = module.procedure_id("/proc/entry").unwrap();
+        let mut state = ExecutionState::new();
+
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::Null),
+        );
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(Vec::new()),
+        );
+        let suspended = state.continuation_metrics();
+        assert_eq!(suspended.continuations, 1);
+        assert_eq!(suspended.frames, 2);
+        assert!(suspended.cold_frames >= 1);
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::number(77.0)]),
+        );
+        let empty = state.continuation_metrics();
+        assert_eq!(empty.continuations, 0);
+        assert_eq!(empty.frames, 0);
+        assert_eq!(empty.cold_frames, 0);
+        assert_eq!(empty.retained_values, 0);
+        assert_eq!(empty.frame_header_bytes, std::mem::size_of::<CallFrame>());
+        assert!(empty.rare_inline_bytes_avoided >= 200);
+    }
+
+    #[test]
+    fn scheduler_error_restores_unrun_due_work_in_fifo_order() {
+        let source = parse(concat!(
+            "/proc/entry()\n",
+            "\tspawn(1)\n\t\tthrow \"boom\"\n",
+            "\tspawn(1)\n\t\treturn 20\n",
+            "\tspawn(1)\n\t\treturn 30\n",
+        ))
+        .expect("scheduler error fixture should parse");
+        let module =
+            compile_module(&source.definitions).expect("scheduler error fixture should compile");
+        let entry = module.procedure_id("/proc/entry").unwrap();
+        let mut state = ExecutionState::new();
+
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::Null),
+        );
+        assert!(advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state).is_err());
+        assert_eq!(state.scheduled_task_count(), 2);
+        assert_eq!(
+            advance_scheduler(&module, 0, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::number(20.0), Value::number(30.0)]),
+        );
+    }
+
+    #[test]
+    fn execution_state_rejects_off_owner_thread_mutation_but_allows_reads() {
+        let state = ExecutionState::new();
+        let read = std::thread::spawn(move || state.heap().live_list_count());
+        assert_eq!(read.join().expect("immutable heap read should succeed"), 0);
+
+        let mut state = ExecutionState::new();
+        let mutation = std::thread::spawn(move || {
+            state.set_global(field("forbidden"), Value::number(1.0));
+        });
+        let panic = mutation
+            .join()
+            .expect_err("off-owner live mutation must panic");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(message.contains("off its owner thread"));
+    }
+
+    #[test]
+    fn scheduler_rejects_off_owner_thread_dispatch() {
+        let source = parse("/proc/entry()\n\treturn null\n").unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+        let mut state = ExecutionState::new();
+        let dispatch = std::thread::spawn(move || {
+            let _ = advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state);
+        });
+        assert!(dispatch.join().is_err());
+    }
+
+    #[test]
     fn scheduler_advances_world_clock_and_short_work_observes_fresh_tick_usage() {
         let source = parse(
             "/proc/entry()\n\tspawn(3)\n\t\treturn_usage()\n/proc/return_usage()\n\tworld.observed = world.tick_usage\n",
@@ -30294,6 +34342,94 @@ mod tests {
             scheduled.global(&field("progress")),
             Some(&Value::number(6.0)),
             "the resumed frame must retain its local values and exact instruction",
+        );
+    }
+
+    #[test]
+    fn scheduled_wall_budget_returns_to_host_and_resumes_exact_continuation() {
+        let source = parse(concat!(
+            "/proc/start()\n",
+            "\tspawn(0)\n",
+            "\t\tworker()\n",
+            "/proc/worker()\n",
+            "\tvar/local_progress = 0\n",
+            "\twhile(local_progress < 100000)\n",
+            "\t\tlocal_progress += 1\n",
+            "\tglobal.progress = local_progress\n",
+            "\treturn local_progress\n",
+        ))
+        .unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+        let start = module.procedure_id("/proc/start").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_global(field("progress"), Value::number(0.0));
+        execute_module_in_state(&module, start, &[], &mut state).unwrap();
+
+        let started = Instant::now();
+        assert_eq!(
+            advance_scheduler(
+                &module,
+                0,
+                ExecutionLimits {
+                    wall_clock_budget: Some(Duration::ZERO),
+                    ..ExecutionLimits::default()
+                },
+                &mut state,
+            ),
+            Ok(Vec::new()),
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(state.scheduled_task_count(), 1);
+        assert_eq!(state.global(&field("progress")), Some(&Value::number(0.0)));
+
+        assert_eq!(
+            advance_scheduler(&module, 0, ExecutionLimits::default(), &mut state),
+            Ok(vec![Value::Null]),
+        );
+        assert_eq!(state.scheduled_task_count(), 0);
+        assert_eq!(
+            state.global(&field("progress")),
+            Some(&Value::number(100000.0)),
+            "wall slicing must not skip or replay logical instructions",
+        );
+    }
+
+    #[test]
+    fn scheduler_wall_budget_bounds_the_whole_due_queue_and_preserves_fifo() {
+        let source = parse(concat!(
+            "/proc/start()\n",
+            "\tspawn(0)\n\t\treturn 1\n",
+            "\tspawn(0)\n\t\treturn 2\n",
+            "\tspawn(0)\n\t\treturn 3\n",
+        ))
+        .unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+        let start = module.procedure_id("/proc/start").unwrap();
+        let mut state = ExecutionState::new();
+        execute_module_in_state(&module, start, &[], &mut state).unwrap();
+
+        let started = Instant::now();
+        assert_eq!(
+            advance_scheduler(
+                &module,
+                0,
+                ExecutionLimits {
+                    wall_clock_budget: Some(Duration::ZERO),
+                    ..ExecutionLimits::default()
+                },
+                &mut state,
+            ),
+            Ok(Vec::new()),
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(state.scheduled_task_count(), 3);
+        assert_eq!(
+            advance_scheduler(&module, 0, ExecutionLimits::default(), &mut state),
+            Ok(vec![
+                Value::number(1.0),
+                Value::number(2.0),
+                Value::number(3.0),
+            ]),
         );
     }
 
@@ -31542,6 +35678,7 @@ mod tests {
         let limits = ExecutionLimits {
             max_call_depth: 64,
             max_steps: 3,
+            wall_clock_budget: None,
         };
         let mut slices = 0;
         loop {
@@ -31585,6 +35722,73 @@ mod tests {
             state.atoms_profile.is_none(),
             "returning the marked root must finish and remove its profiler"
         );
+    }
+
+    #[test]
+    fn tgm_profile_survives_yields_counts_nested_calls_and_finishes_with_root() {
+        let source = parse(
+            "/proc/child(value)\n\treturn value + 1\n/proc/root()\n\tvar/total = 0\n\tfor(var/i in 1 to 8)\n\t\ttotal += child(i)\n\treturn total\n",
+        )
+        .unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+        let root = module.procedure_id("/proc/root").unwrap();
+        let child = module.procedure_id("/proc/child").unwrap();
+        let mut frame = crate::make_frame(
+            root,
+            module.procedure(root).unwrap(),
+            &[],
+            &ExecutionContext::default(),
+        );
+        frame.tgm_profile_root = true;
+        let mut frames = vec![frame];
+        let mut state = ExecutionState::new();
+        state.tgm_profile = Some(crate::TgmProfile {
+            started: Instant::now(),
+            total_instructions: 0,
+            procedure_samples: HashMap::new(),
+            instruction_samples: HashMap::new(),
+            paths: HashMap::new(),
+            instruction_labels: HashMap::new(),
+        });
+        let limits = ExecutionLimits {
+            max_call_depth: 64,
+            max_steps: 3,
+            wall_clock_budget: None,
+        };
+        let mut saw_child = false;
+        loop {
+            match crate::run_frames(
+                &module,
+                frames,
+                limits,
+                crate::StepBudgetBehavior::YieldScheduledContinuation,
+                &mut state,
+            )
+            .unwrap()
+            {
+                crate::FrameRunOutcome::Yielded {
+                    frames: continuation,
+                    ..
+                } => {
+                    let profile = state.tgm_profile.as_ref().expect("profile survives yield");
+                    saw_child |=
+                        profile
+                            .procedure_samples
+                            .contains_key(&crate::AtomsProfileProcedure {
+                                module_identity: module.identity.0,
+                                procedure: child,
+                            });
+                    frames = continuation;
+                }
+                crate::FrameRunOutcome::Complete(value) => {
+                    assert_eq!(value, Value::number(44.0));
+                    break;
+                }
+                crate::FrameRunOutcome::Prompted { .. } => panic!("fixture cannot prompt"),
+            }
+        }
+        assert!(saw_child, "nested child procedure must be sampled");
+        assert!(state.tgm_profile.is_none(), "root return finishes profiler");
     }
 
     #[test]
@@ -32402,6 +36606,8 @@ mod tests {
             deferred: Arc::new(HashMap::new()),
             procedure_types: vec![TypePath::parse("/datum").unwrap()],
             initializer_call_names: None,
+            compact_wordcode: Default::default(),
+            semantic_digests: Default::default(),
         }
     }
 
@@ -34235,6 +38441,139 @@ mod tests {
             error
                 .message
                 .contains("field FieldName(\"cell\") is absent")
+        );
+    }
+
+    #[test]
+    fn declared_field_quickening_hits_and_revalidates_shifted_slots() {
+        let source = parse(concat!(
+            "/proc/read_quickened(obj/item/clothing/suit/space/target)\n",
+            "\treturn target.cell\n",
+        ))
+        .unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+        let entry = module.procedure_id("/proc/read_quickened").unwrap();
+        let mut state = ExecutionState::new();
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/item/clothing/suit/space").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(datum, field("prefix"), Value::number(1.0))
+            .unwrap();
+        state
+            .heap_mut()
+            .set_datum_field(datum, field("cell"), Value::number(42.0))
+            .unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(
+                execute_module_in_state(&module, entry, &[Value::Datum(datum)], &mut state),
+                Ok(Value::number(42.0))
+            );
+        }
+        let warm = state.declared_field_quickening_metrics();
+        assert_eq!(warm.misses, 1);
+        assert_eq!(warm.hits, 1);
+
+        state
+            .heap_mut()
+            .delete_datum_field(datum, &field("prefix"))
+            .unwrap();
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::Datum(datum)], &mut state),
+            Ok(Value::number(42.0))
+        );
+        let shifted = state.declared_field_quickening_metrics();
+        assert_eq!(shifted.invalidations, 1);
+        assert_eq!(shifted.misses, 2);
+    }
+
+    #[test]
+    fn ordinary_static_field_reads_quicken_without_changing_missing_field_errors() {
+        let source = parse(concat!(
+            "/proc/read_dynamic(target)\n",
+            "\treturn target.cell\n",
+        ))
+        .unwrap();
+        let module = compile_module(&source.definitions).unwrap();
+        let entry = module.procedure_id("/proc/read_dynamic").unwrap();
+        assert!(module
+            .resolve_procedure(entry)
+            .unwrap()
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::LoadField(name) if name.as_str() == "cell")));
+        let mut state = ExecutionState::new();
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/profiled").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(datum, field("cell"), Value::number(42.0))
+            .unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(
+                execute_module_in_state(&module, entry, &[Value::Datum(datum)], &mut state),
+                Ok(Value::number(42.0))
+            );
+        }
+        let warm = state.static_field_quickening_metrics();
+        assert_eq!(warm.misses, 1);
+        assert_eq!(warm.hits, 1);
+
+        state
+            .heap_mut()
+            .delete_datum_field(datum, &field("cell"))
+            .unwrap();
+        let error = execute_module_in_state(&module, entry, &[Value::Datum(datum)], &mut state)
+            .expect_err("ordinary missing fields must remain runtime errors");
+        assert!(
+            error
+                .message
+                .contains("field FieldName(\"cell\") is absent")
+        );
+        let invalidated = state.static_field_quickening_metrics();
+        assert_eq!(invalidated.invalidations, 1);
+    }
+
+    #[test]
+    #[ignore = "release-only declared-field dense-slot benchmark"]
+    fn declared_field_dense_slot_benchmark() {
+        const READS: usize = 5_000_000;
+        let mut state = ExecutionState::new();
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/profiled").unwrap());
+        for index in 0..64 {
+            state
+                .heap_mut()
+                .set_datum_field(
+                    datum,
+                    field(&format!("profiled_{index}")),
+                    Value::number(index as f32),
+                )
+                .unwrap();
+        }
+        let target = field("profiled_47");
+        let record = state.heap().datum(datum).unwrap();
+        let slot = record.field_slot(&target).unwrap();
+        let started = Instant::now();
+        for _ in 0..READS {
+            std::hint::black_box(record.field(&target).unwrap());
+        }
+        let named = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..READS {
+            std::hint::black_box(record.field_at_validated_slot(slot, &target).unwrap());
+        }
+        let quickened = started.elapsed();
+        eprintln!(
+            "declared-field reads={READS} named_ms={} quickened_ms={} speedup={:.3}",
+            named.as_millis(),
+            quickened.as_millis(),
+            named.as_secs_f64() / quickened.as_secs_f64(),
         );
     }
 
@@ -38140,6 +42479,96 @@ mod tests {
     }
 
     #[test]
+    fn world_geometry_honors_sparse_declared_area_and_turf_types_and_refreshes_area_cache() {
+        let world_path = TypePath::parse("/world").unwrap();
+        let space_area = TypePath::parse("/area/space").unwrap();
+        let replacement_area = TypePath::parse("/area/replacement").unwrap();
+        let space_turf = TypePath::parse("/turf/open/space/basic").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_initial_values(BTreeMap::from([(
+            world_path.clone(),
+            BTreeMap::from([
+                (field("area"), Value::TypePath(space_area.clone())),
+                (field("turf"), Value::TypePath(space_turf.clone())),
+            ]),
+        )]));
+        let world = state.heap_mut().allocate_datum(world_path);
+
+        state
+            .resize_world_geometry(world, (1, 1, 1))
+            .expect("sparse world defaults should create initial geometry");
+        let first_turf = state.turf_at(1, 1, 1).unwrap();
+        assert_eq!(
+            state.heap().datum(first_turf).unwrap().type_path(),
+            &space_turf
+        );
+        let Value::Datum(first_area) = datum_field_or_initial(&state, first_turf, &field("loc"))
+            .expect("new turf should have an area")
+        else {
+            panic!("new turf loc should be an area datum");
+        };
+        assert_eq!(
+            state.heap().datum(first_area).unwrap().type_path(),
+            &space_area
+        );
+
+        state
+            .heap_mut()
+            .set_datum_field(
+                world,
+                field("area"),
+                Value::TypePath(replacement_area.clone()),
+            )
+            .unwrap();
+        state
+            .resize_world_geometry(world, (1, 1, 2))
+            .expect("changed world.area should refresh cached default area");
+        let second_turf = state.turf_at(1, 1, 2).unwrap();
+        let Value::Datum(second_area) = datum_field_or_initial(&state, second_turf, &field("loc"))
+            .expect("expanded turf should have an area")
+        else {
+            panic!("expanded turf loc should be an area datum");
+        };
+        assert_eq!(
+            state.heap().datum(second_area).unwrap().type_path(),
+            &replacement_area
+        );
+    }
+
+    #[test]
+    fn world_geometry_preserves_runtime_turf_initializer_programs() {
+        let turf_path = TypePath::parse("/turf/runtime_initialized").unwrap();
+        let world_path = TypePath::parse("/world").unwrap();
+        let syntax = parse("/proc/initial_density()\n\treturn 7\n").unwrap();
+        let module = Arc::new(compile_module(&syntax.definitions).unwrap());
+        let entry = module.procedure_id("/proc/initial_density").unwrap();
+        let mut state = ExecutionState::new();
+        state.set_initial_values(BTreeMap::from([(
+            world_path.clone(),
+            BTreeMap::from([(field("turf"), Value::TypePath(turf_path.clone()))]),
+        )]));
+        state.set_instance_initializers(
+            Arc::new(BTreeMap::from([(
+                turf_path,
+                vec![InstanceInitializer::Program {
+                    field: field("density"),
+                    entry,
+                }],
+            )])),
+            Some(module),
+        );
+        let world = state.heap_mut().allocate_datum(world_path);
+        state.resize_world_geometry(world, (2, 1, 1)).unwrap();
+        for x in 1..=2 {
+            let turf = state.turf_at(x, 1, 1).unwrap();
+            assert_eq!(
+                state.heap().datum_field(turf, &field("density")).unwrap(),
+                &Value::number(7.0)
+            );
+        }
+    }
+
+    #[test]
     fn engine_created_turfs_share_effective_defaults_at_world_scale() {
         let syntax = parse(
             "/proc/observe(turf/cell)\n\tvar/list/reflection = cell.vars\n\tvar/before = cell.density + reflection[\"density\"]\n\tvar/declared = initial(cell.density)\n\tvar/native_bounds = bounds_dist(cell, cell)\n\t++cell.density\n\treturn list(before, declared, native_bounds, cell.density, reflection[\"density\"], cell.name)\n/proc/retype(turf/cell)\n\tvar/turf/replaced = new /turf/compact/changed(cell)\n\treturn list(replaced, replaced.density, replaced.name, replaced.x, replaced.vars[\"density\"])\n",
@@ -38846,6 +43275,1061 @@ mod tests {
             ),
             Ok(Value::number(114.0))
         );
+    }
+
+    #[test]
+    fn native_discover_offset_scans_fixed_width_grid_keys_in_source_order() {
+        let mut state = ExecutionState::new();
+        let field = |name| FieldName::parse(name).unwrap();
+        let template = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/map_template").unwrap());
+        let parsed = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/parsed_map").unwrap());
+        let models = state.heap_mut().allocate_list();
+        state.mark_associative_list(models);
+        state
+            .heap_mut()
+            .list_mut(models)
+            .unwrap()
+            .set_key(Value::text("aa"), Value::text("/turf,/obj/other"));
+        state.heap_mut().list_mut(models).unwrap().set_key(
+            Value::text("bb"),
+            Value::text("/turf,/OBJ/MODULAR_MAP_CONNECTOR"),
+        );
+        let lines = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(lines)
+            .unwrap()
+            .extend_positional([Value::text("aaaaaaaa"), Value::text("aabbbbaa")]);
+        let grid = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/grid_set").unwrap());
+        for (name, value) in [
+            ("xcrd", Value::number(10.0)),
+            ("ycrd", Value::number(20.0)),
+            ("gridLines", Value::List(lines)),
+        ] {
+            state
+                .heap_mut()
+                .set_datum_field(grid, field(name), value)
+                .unwrap();
+        }
+        let grids = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(grids)
+            .unwrap()
+            .add(Value::Datum(grid));
+        for (name, value) in [
+            ("grid_models", Value::List(models)),
+            ("gridSets", Value::List(grids)),
+            ("key_len", Value::number(2.0)),
+        ] {
+            state
+                .heap_mut()
+                .set_datum_field(parsed, field(name), value)
+                .unwrap();
+        }
+        state
+            .heap_mut()
+            .set_datum_field(template, field("cached_map"), Value::Datum(parsed))
+            .unwrap();
+
+        let result = super::discover_offset_native(
+            template,
+            &Value::TypePath(TypePath::parse("/obj/modular_map_connector").unwrap()),
+            &mut state,
+        )
+        .expect("canonical heap shape should use native scan");
+        let Value::List(result) = result else {
+            panic!("marker should produce an offset")
+        };
+        assert_eq!(
+            state.heap().list(result).unwrap().get(1),
+            Ok(&Value::number(11.0))
+        );
+        assert_eq!(
+            state.heap().list(result).unwrap().get(2),
+            Ok(&Value::number(19.0))
+        );
+    }
+
+    #[test]
+    fn canonical_preload_size_uses_artifact_measurement_and_updates_dimensions() {
+        let syntax = parse(
+            "/datum/map_template/proc/preload_size(path, cache = FALSE)\n\tvar/parsed\n\tvar/bounds\n\treturn bounds\n/proc/run(datum/map_template/template)\n\treturn template.preload_size(\"_maps/test.dmm\", FALSE)\n",
+        )
+        .unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let mut state = ExecutionState::new();
+        state.set_dmm_measurements(Arc::new(BTreeMap::from([(
+            "_maps/test.dmm".to_owned(),
+            super::DmmMeasurement {
+                digest: md5::compute(b"fixture map").0,
+                bounds: [3, 5, 2, 8, 11, 2],
+            },
+        )])));
+        let template = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/map_template").unwrap());
+        let result = execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/run").unwrap(),
+            &[Value::Datum(template)],
+            &mut state,
+        )
+        .unwrap();
+        let Value::List(bounds) = result else {
+            panic!("preload_size should return cached bounds");
+        };
+        let values = state
+            .heap()
+            .list(bounds)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.as_number().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![3.0, 5.0, 2.0, 8.0, 11.0, 2.0]);
+        assert_eq!(
+            state
+                .heap()
+                .datum_field(template, &FieldName::parse("width").unwrap())
+                .unwrap()
+                .as_number(),
+            Some(8.0)
+        );
+        assert_eq!(
+            state
+                .heap()
+                .datum_field(template, &FieldName::parse("height").unwrap())
+                .unwrap()
+                .as_number(),
+            Some(11.0)
+        );
+    }
+
+    #[test]
+    fn parsed_dmm_new_materializes_artifact_fields_and_changed_source_falls_back() {
+        let syntax = parse(
+            concat!(
+                "/datum/parsed_map/New(tfile, x_lower, x_upper, y_lower, y_upper, z_lower, z_upper, measureOnly = FALSE)\n\treturn 7\n",
+                "/proc/start(datum/parsed_map/parsed)\n\tspawn(0)\n\t\tworker(parsed)\n",
+                "/proc/worker(datum/parsed_map/parsed)\n\tparsed.New(file(\"_maps/test.dmm\"))\n\tsleep(1)\n\treturn parsed\n",
+            ),
+        )
+        .unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let procedure = module
+            .procedure_id("/datum/parsed_map/New")
+            .or_else(|| module.procedure_id("/datum/parsed_map/proc/New"))
+            .unwrap();
+        let digest = md5::compute(b"cached source").0;
+        let parsed = super::ParsedDmm {
+            digest,
+            tgm: true,
+            key_len: 1,
+            line_len: 2,
+            bounds: [2, 3, 4, 3, 4, 4],
+            models: vec![("a".to_owned(), "/turf".to_owned())],
+            grids: vec![super::ParsedDmmGrid {
+                x: 2,
+                y: 3,
+                z: 4,
+                lines: vec!["aa".to_owned(), "aa".to_owned()],
+            }],
+        };
+        let mut state = ExecutionState::new();
+        state.set_parsed_dmm_cache(Arc::new(BTreeMap::from([(
+            "_maps/test.dmm".to_owned(),
+            parsed,
+        )])));
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/parsed_map").unwrap());
+        let context = ExecutionContext::new(Value::Datum(datum), Value::Null);
+        let result = execute_module_in_context(
+            &module,
+            procedure,
+            &[Value::File(Arc::from("_maps/test.dmm"))],
+            &mut state,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(result, Value::Null);
+        let get = |state: &ExecutionState, name: &str| {
+            state
+                .heap()
+                .datum_field(datum, &FieldName::parse(name).unwrap())
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(get(&state, "map_format"), Value::text("tgm"));
+        assert_eq!(get(&state, "key_len"), Value::number(1.0));
+        assert_eq!(get(&state, "line_len"), Value::number(2.0));
+        let Value::List(bounds) = get(&state, "bounds") else {
+            panic!("bounds should be a list")
+        };
+        let Value::List(parsed_bounds) = get(&state, "parsed_bounds") else {
+            panic!("parsed_bounds should be a list")
+        };
+        assert_ne!(bounds, parsed_bounds);
+        let Value::List(grid_sets) = get(&state, "gridSets") else {
+            panic!("gridSets should be a list")
+        };
+        let Value::Datum(grid) = state.heap().list(grid_sets).unwrap().get(1).unwrap() else {
+            panic!("grid set should be a datum")
+        };
+        assert_eq!(
+            state.heap().datum(*grid).unwrap().type_path().as_str(),
+            "/datum/grid_set"
+        );
+
+        let yielded = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/parsed_map").unwrap());
+        execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/start").unwrap(),
+            &[Value::Datum(yielded)],
+            &mut state,
+        )
+        .unwrap();
+        assert!(
+            advance_scheduler(&module, 0, ExecutionLimits::default(), &mut state)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(state.scheduled_task_count(), 1);
+        assert_eq!(
+            advance_scheduler(&module, 1, ExecutionLimits::default(), &mut state)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(matches!(
+            state
+                .heap()
+                .datum_field(yielded, &FieldName::parse("gridSets").unwrap())
+                .unwrap(),
+            Value::List(_)
+        ));
+
+        let root = std::env::temp_dir().join(format!(
+            "dream64-parsed-dmm-fallback-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("_maps")).unwrap();
+        std::fs::write(root.join("_maps/test.dmm"), "changed source").unwrap();
+        let mut fallback = ExecutionState::new();
+        fallback.set_project_root(root.clone());
+        fallback.set_parsed_dmm_cache(state.parsed_dmm_cache());
+        let fallback_datum = fallback
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/parsed_map").unwrap());
+        let result = execute_module_in_context(
+            &module,
+            procedure,
+            &[Value::File(Arc::from("_maps/test.dmm"))],
+            &mut fallback,
+            &ExecutionContext::new(Value::Datum(fallback_datum), Value::Null),
+        )
+        .unwrap();
+        assert_eq!(result, Value::number(7.0));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tgm_tick_sidecar_resumes_through_tick_body_and_intercepts_before_rich_loop_jump() {
+        let syntax = parse("/proc/run()\n\treturn\n").unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let procedure = module.procedure_id("/proc/run").unwrap();
+        let program = module.procedure(procedure).unwrap();
+        let event = crate::tgm_planner::CommitEvent::SafepointOnly(crate::tgm_planner::Ordinal {
+            grid: 0,
+            line: 0,
+        });
+        for resumed_pc in 423..=445 {
+            let mut plan = crate::tgm_planner::Plan::default();
+            plan.events.push(event.clone());
+            let mut frame = make_frame(procedure, program, &[], &ExecutionContext::default());
+            frame.instruction = resumed_pc;
+            frame.cold_mut().tgm_load = Some(crate::TgmLoadContinuation {
+                plan: Arc::new(plan),
+                cursor: crate::tgm_planner::CommitCursor::default(),
+                phase: crate::TgmLoadPhase::Tick,
+                model_cache: Value::Null,
+                models: BTreeMap::new(),
+                bounds: Value::Null,
+                coordinate_target: None,
+            });
+            let mut state = ExecutionState::new();
+            assert!(matches!(
+                crate::drive_tgm_load(&module, procedure, program, &mut frame, &mut state, 1),
+                crate::TgmDrive::None
+            ));
+            frame.instruction = 446;
+            assert!(matches!(
+                crate::drive_tgm_load(&module, procedure, program, &mut frame, &mut state, 1),
+                crate::TgmDrive::Continue
+            ));
+            let sidecar = frame.cold().unwrap().tgm_load.as_ref().unwrap();
+            assert!(sidecar.cursor.is_complete(&sidecar.plan));
+            assert_eq!(frame.instruction, 279);
+        }
+    }
+
+    #[test]
+    fn tgm_rejection_diagnostics_ignore_unrelated_procedure_paths() {
+        let syntax =
+            parse("/proc/unrelated()\n\treturn\n/datum/parsed_map/proc/_tgm_load()\n\treturn\n")
+                .unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let unrelated = module.procedure_id("/proc/unrelated").unwrap();
+        let canonical = module
+            .procedure_id("/datum/parsed_map/proc/_tgm_load")
+            .unwrap();
+        assert!(!crate::canonical_tgm_load_path(&module, unrelated));
+        assert!(crate::canonical_tgm_load_path(&module, canonical));
+    }
+
+    #[test]
+    fn tgm_attach_accepts_pre_iterator_and_legacy_seams_only() {
+        let syntax = parse("/proc/run()\n\treturn\n").unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let procedure = module.procedure_id("/proc/run").unwrap();
+        let program = module.procedure(procedure).unwrap();
+        let mut frame = make_frame(procedure, program, &[], &ExecutionContext::default());
+        frame.instruction = 274;
+        assert_eq!(crate::tgm_attach_location(&frame), Some(true));
+        frame.stack.push(Value::number(1.0));
+        assert_eq!(crate::tgm_attach_location(&frame), None);
+        frame.stack.clear();
+        frame.instruction = 279;
+        assert_eq!(crate::tgm_attach_location(&frame), Some(false));
+        frame.instruction = 275;
+        assert_eq!(crate::tgm_attach_location(&frame), None);
+    }
+
+    #[test]
+    fn tgm_build_cache_simple_member_matches_unedited_effects_and_falls_back_cleanly() {
+        let syntax = parse("/proc/run()\n\treturn\n").unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let procedure = module.procedure_id("/proc/run").unwrap();
+        let program = module.procedure(procedure).unwrap();
+        let mut state = ExecutionState::new();
+        let paths =
+            ["/area/test", "/turf/test", "/obj/test"].map(|path| TypePath::parse(path).unwrap());
+        state.set_type_paths(
+            [TypePath::parse("/atom").unwrap()]
+                .into_iter()
+                .chain(paths.iter().cloned()),
+        );
+        state.set_type_parents(BTreeMap::from([
+            (paths[0].clone(), Some(TypePath::parse("/area").unwrap())),
+            (paths[1].clone(), Some(TypePath::parse("/turf").unwrap())),
+            (paths[2].clone(), Some(TypePath::parse("/obj").unwrap())),
+        ]));
+        let default = state.heap_mut().allocate_list();
+        let wrapped = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(wrapped)
+            .unwrap()
+            .add(Value::List(default));
+        let members = state.heap_mut().allocate_list();
+        let attributes = state.heap_mut().allocate_list();
+        let mut frame = make_frame(procedure, program, &[], &ExecutionContext::default());
+        frame.locals.resize(24, Value::Null);
+        frame.instruction = 98;
+        frame.locals[5] = Value::List(default);
+        frame.locals[6] = Value::List(wrapped);
+        frame.locals[10] = Value::number(0.0);
+        frame.locals[15] = Value::List(members);
+        frame.locals[16] = Value::List(attributes);
+        // A real TGM space model is newline-split before this loop. Each
+        // invocation must consume exactly one line and return to PC260 so the
+        // rich iterator can advance to the next member.
+        for (index, path) in paths.iter().enumerate() {
+            frame.instruction = 98;
+            frame.locals[17] = Value::text(if index + 1 == paths.len() {
+                path.as_str().to_owned()
+            } else {
+                format!("{},", path.as_str())
+            });
+            assert_eq!(
+                crate::run_tgm_build_cache_simple_member(&mut frame, &mut state),
+                Some(1)
+            );
+            assert_eq!(frame.instruction, 260);
+        }
+        assert_eq!(frame.locals[8], Value::text("/obj/test"));
+        assert_eq!(frame.locals[20], Value::text("t"));
+        assert_eq!(frame.locals[23], Value::TypePath(paths[2].clone()));
+        assert_eq!(
+            state
+                .heap()
+                .list(members)
+                .unwrap()
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>(),
+            paths
+                .iter()
+                .cloned()
+                .map(Value::TypePath)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            state
+                .heap()
+                .list(attributes)
+                .unwrap()
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>(),
+            vec![Value::List(default); 3]
+        );
+
+        for rejected in [
+            "name=\"edited\";",
+            "/area/test,/missing/path",
+            "/turf/test{",
+            "prefix/area/test,/obj/test",
+        ] {
+            let rejected_members = state.heap_mut().allocate_list();
+            let rejected_attributes = state.heap_mut().allocate_list();
+            frame.instruction = 98;
+            frame.locals[10] = Value::number(f32::from(rejected.contains(';')));
+            frame.locals[15] = Value::List(rejected_members);
+            frame.locals[16] = Value::List(rejected_attributes);
+            frame.locals[17] = Value::text(rejected);
+            assert_eq!(
+                crate::run_tgm_build_cache_simple_member(&mut frame, &mut state),
+                None
+            );
+            assert_eq!(frame.instruction, 98);
+            assert_eq!(state.heap().list(rejected_members).unwrap().len(), 0);
+            assert_eq!(state.heap().list(rejected_attributes).unwrap().len(), 0);
+        }
+    }
+
+    #[test]
+    #[ignore = "focused debug microbenchmark; run explicitly when changing the TGM cache tier"]
+    fn tgm_build_cache_simple_member_debug_benchmark() {
+        const MEMBERS: usize = 10_000;
+        let syntax = parse("/proc/run(n)\n\tvar/list/members = list()\n\tvar/list/attrs = list()\n\tvar/list/default = list()\n\tvar/list/wrapped = list(default)\n\tfor(var/i in 1 to n)\n\t\tattrs += wrapped\n\t\tmembers += /turf/test\n\treturn members.len\n").unwrap();
+        let rich_module = compile_module(&syntax.definitions).unwrap();
+        let rich_started = std::time::Instant::now();
+        let rich_result = execute_module(
+            &rich_module,
+            rich_module.procedure_id("/proc/run").unwrap(),
+            &[Value::number(MEMBERS as f32)],
+        )
+        .unwrap();
+        let rich_elapsed = rich_started.elapsed();
+        assert_eq!(rich_result, Value::number(MEMBERS as f32));
+
+        let procedure = rich_module.procedure_id("/proc/run").unwrap();
+        let program = rich_module.procedure(procedure).unwrap();
+        let mut state = ExecutionState::new();
+        let path = TypePath::parse("/turf/test").unwrap();
+        state.set_type_paths([TypePath::parse("/atom").unwrap(), path.clone()]);
+        state.set_type_parents(BTreeMap::from([(
+            path,
+            Some(TypePath::parse("/turf").unwrap()),
+        )]));
+        let default = state.heap_mut().allocate_list();
+        let wrapped = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(wrapped)
+            .unwrap()
+            .add(Value::List(default));
+        let members = state.heap_mut().allocate_list();
+        let attributes = state.heap_mut().allocate_list();
+        let mut frame = make_frame(procedure, program, &[], &ExecutionContext::default());
+        frame.locals.resize(24, Value::Null);
+        frame.locals[5] = Value::List(default);
+        frame.locals[6] = Value::List(wrapped);
+        frame.locals[10] = Value::number(0.0);
+        frame.locals[15] = Value::List(members);
+        frame.locals[16] = Value::List(attributes);
+        frame.locals[17] = Value::text("/turf/test,");
+        let native_started = std::time::Instant::now();
+        for _ in 0..MEMBERS {
+            frame.instruction = 98;
+            assert_eq!(
+                crate::run_tgm_build_cache_simple_member(&mut frame, &mut state),
+                Some(1)
+            );
+        }
+        let native_elapsed = native_started.elapsed();
+        assert_eq!(state.heap().list(members).unwrap().len(), MEMBERS);
+        assert_eq!(state.heap().list(attributes).unwrap().len(), MEMBERS);
+        eprintln!(
+            "tgm-build-cache plain-member rich_ms={} native_ms={} speedup={:.2}x",
+            rich_elapsed.as_millis(),
+            native_elapsed.as_millis(),
+            rich_elapsed.as_secs_f64() / native_elapsed.as_secs_f64()
+        );
+    }
+
+    #[test]
+    fn tgm_sidecar_reads_canonical_compiler_local_slots() {
+        let syntax = parse("/proc/run()\n\treturn\n").unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let procedure = module.procedure_id("/proc/run").unwrap();
+        let program = module.procedure(procedure).unwrap();
+        let mut frame = make_frame(procedure, program, &[], &ExecutionContext::default());
+        frame.locals.resize(41, Value::Null);
+        for slot in 0..=2 {
+            frame.locals[slot] = Value::number(1.0);
+        }
+        frame.locals[2] = Value::number(5.0);
+        for slot in 3..=4 {
+            frame.locals[slot] = Value::number(0.0);
+        }
+        for slot in 5..=8 {
+            frame.locals[slot] = Value::number(if slot % 2 == 0 { 10.0 } else { 1.0 });
+        }
+        // tg/Monke's INFINITY macro is the finite value 1e31.
+        frame.locals[9] = Value::number(-1e31_f32);
+        frame.locals[10] = Value::number(1e31_f32);
+
+        let mut state = ExecutionState::new();
+        let world = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/world").unwrap());
+        for name in ["maxx", "maxy"] {
+            state
+                .heap_mut()
+                .set_datum_field(world, FieldName::parse(name).unwrap(), Value::number(10.0))
+                .unwrap();
+        }
+        state.set_global(field("world"), Value::Datum(world));
+        let model_cache = state.heap_mut().allocate_list();
+        let _ = state
+            .heap_mut()
+            .list_mut(model_cache)
+            .unwrap()
+            .set_key(Value::text("a"), Value::number(1.0));
+        let lines = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(lines)
+            .unwrap()
+            .add(Value::text("a"));
+        let grid = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/grid_set").unwrap());
+        for (name, value) in [("xcrd", 1.0), ("ycrd", 1.0), ("zcrd", 1.0)] {
+            state
+                .heap_mut()
+                .set_datum_field(grid, FieldName::parse(name).unwrap(), Value::number(value))
+                .unwrap();
+        }
+        state
+            .heap_mut()
+            .set_datum_field(
+                grid,
+                FieldName::parse("gridLines").unwrap(),
+                Value::List(lines),
+            )
+            .unwrap();
+        let grid_sets = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(grid_sets)
+            .unwrap()
+            .add(Value::Datum(grid));
+        let bounds = state.heap_mut().allocate_list();
+
+        // The compiler reserves slot 13 for `.`, so source locals start at 14.
+        frame.locals[14] = Value::List(model_cache);
+        // Lavaland has no model matching world.area + world.turf, so
+        // build_cache leaves SPACE_KEY null. This must mean "skip nothing".
+        frame.locals[15] = Value::Null;
+        frame.locals[16] = Value::List(bounds);
+        frame.locals[38] = Value::List(grid_sets);
+        frame.locals[39] = Value::number(1.0);
+
+        let continuation = crate::build_tgm_load_continuation(&frame, &state)
+            .expect("canonical executable slots should install the TGM sidecar");
+        assert_eq!(continuation.model_cache, Value::List(model_cache));
+        assert_eq!(continuation.bounds, Value::List(bounds));
+        assert!(continuation.plan.missing_models.is_empty());
+        assert!(matches!(
+            continuation.plan.events.as_slice(),
+            [crate::tgm_planner::CommitEvent::Cell(cell)] if (cell.x, cell.y, cell.z) == (1, 1, 5)
+        ));
+    }
+
+    #[test]
+    fn tgm_area_then_turf_model_rehomes_the_indexed_cell() {
+        let mut state = ExecutionState::new();
+        let space = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/area/space").unwrap());
+        let lava = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/area/lavaland/surface/outdoors/unexplored").unwrap());
+        let turf = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/turf/open/space/basic").unwrap());
+        for (name, value) in [("x", 4.0), ("y", 7.0), ("z", 5.0)] {
+            state
+                .heap_mut()
+                .set_datum_field(turf, field(name), Value::number(value))
+                .unwrap();
+        }
+        state
+            .heap_mut()
+            .set_datum_field(turf, field("loc"), Value::Datum(space))
+            .unwrap();
+        state.world_turfs.insert((4, 7, 5), turf);
+        state.world_areas.insert((4, 7, 5), space);
+        let space_contents = state.ensure_contents(space).unwrap();
+        state
+            .heap_mut()
+            .list_mut(space_contents)
+            .unwrap()
+            .add(Value::Datum(turf));
+
+        // This is the observable engine portion of build_coordinate's model
+        // order: area.contents.Add(crds), followed by new turf_type(crds).
+        let lava_contents = state.ensure_contents(lava).unwrap();
+        super::builtins::execute_list_method(
+            "Add",
+            lava_contents,
+            &[Value::Datum(turf)],
+            &mut state,
+        )
+        .unwrap()
+        .unwrap();
+        let replaced = super::allocate_or_replace_engine_datum(
+            &mut state,
+            TypePath::parse("/turf/open/floor/plating/asteroid/basalt/lava_land_surface").unwrap(),
+            &[Value::Datum(turf)],
+        )
+        .unwrap();
+
+        assert_eq!(replaced, turf, "map turf replacement preserves identity");
+        assert_eq!(state.turf_at(4, 7, 5), Some(turf));
+        assert_eq!(state.world_areas.get(&(4, 7, 5)), Some(&lava));
+        assert_eq!(
+            state.heap().datum_field(turf, &field("loc")),
+            Ok(&Value::Datum(lava))
+        );
+        assert!(
+            state
+                .heap()
+                .list(lava_contents)
+                .unwrap()
+                .contains(&Value::Datum(turf))
+        );
+        assert!(
+            !state
+                .heap()
+                .list(space_contents)
+                .unwrap()
+                .contains(&Value::Datum(turf))
+        );
+    }
+
+    #[test]
+    fn build_coordinate_prefix_matches_rich_area_add_and_preserves_turf_seam() {
+        let syntax = parse("/proc/run(a,b,c,d,e)\n\treturn\n").unwrap();
+        let mut module = compile_module(&syntax.definitions).unwrap();
+        let procedure = module.procedure_id("/proc/run").unwrap();
+        let program = Program {
+            wait_for: true,
+            parameter_count: 5,
+            parameter_names: vec![String::new(); 5],
+            verb_parameter_types: vec![VerbParameterType::Unsupported; 5],
+            verb_name: None,
+            local_count: 31,
+            instructions: vec![Instruction::PushNull; 405],
+            source_spans: vec![SourceSpan::new(0, 0); 405],
+        };
+        module.procedures[procedure.index()] = Arc::new(program);
+        module.paths[procedure.index()] =
+            "/datum/parsed_map/proc/build_coordinate@fixture".to_owned();
+        module.semantic_digests = crate::ProcedureSemanticDigestAttachment(Some(Arc::from(vec![
+            crate::CANONICAL_MONKE_BUILD_COORDINATE_DIGEST,
+        ])));
+        let program = module.procedure(procedure).unwrap();
+
+        let mut state = ExecutionState::new();
+        let old_area = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/area/space").unwrap());
+        let new_area = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/area/lavaland/surface/outdoors/unexplored").unwrap());
+        let turf = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/turf/open/space/basic").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(turf, field("loc"), Value::Datum(old_area))
+            .unwrap();
+        let old_contents = state.ensure_contents(old_area).unwrap();
+        state
+            .heap_mut()
+            .list_mut(old_contents)
+            .unwrap()
+            .add(Value::Datum(turf));
+        let default_list = state.heap_mut().allocate_list();
+        let members = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(members)
+            .unwrap()
+            .extend_positional([
+                Value::TypePath(TypePath::parse("/turf/open/ashplanet/basalt").unwrap()),
+                Value::TypePath(
+                    TypePath::parse("/area/lavaland/surface/outdoors/unexplored").unwrap(),
+                ),
+            ]);
+        let attributes = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(attributes)
+            .unwrap()
+            .extend_positional([Value::List(default_list), Value::List(default_list)]);
+        let model = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(model)
+            .unwrap()
+            .extend_positional([Value::List(members), Value::List(attributes)]);
+        let loaded = state.heap_mut().allocate_list();
+        let _ = state.heap_mut().list_mut(loaded).unwrap().set_key(
+            Value::TypePath(TypePath::parse("/area/lavaland/surface/outdoors/unexplored").unwrap()),
+            Value::Datum(new_area),
+        );
+        let src = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/parsed_map").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(src, field("loaded_areas"), Value::List(loaded))
+            .unwrap();
+        state
+            .heap_mut()
+            .set_datum_field(src, field("turf_blacklist"), Value::Null)
+            .unwrap();
+        state.set_global(
+            FieldName::parse("__dm_static_2f646174756d2f636f6e74726f6c6c65722f676c6f62616c5f766172732f7661722f6d61705f6d6f64656c5f64656661756c74").unwrap(),
+            Value::List(default_list),
+        );
+        state.set_global(
+            FieldName::parse("__dm_static_2f646174756d2f636f6e74726f6c6c65722f676c6f62616c5f766172732f7661722f7573655f7072656c6f61646572").unwrap(),
+            Value::number(0.0),
+        );
+        let context = ExecutionContext::new(Value::Datum(src), Value::Null);
+        let mut frame = make_frame(
+            procedure,
+            program,
+            &[
+                Value::List(model),
+                Value::Datum(turf),
+                Value::number(1.0),
+                Value::number(0.0),
+                Value::number(1.0),
+            ],
+            &context,
+        );
+        assert!(crate::try_run_build_coordinate_prefix(
+            &module, procedure, program, &mut frame, &mut state
+        ));
+        assert_eq!(frame.instruction, 235, "ordinary turf/New seam is retained");
+        assert_eq!(frame.locals[6], Value::number(1.0));
+        assert_eq!(
+            state.heap().datum_field(turf, &field("loc")),
+            Ok(&Value::Datum(new_area))
+        );
+        let new_contents = state.ensure_contents(new_area).unwrap();
+        assert!(
+            state
+                .heap()
+                .list(new_contents)
+                .unwrap()
+                .contains(&Value::Datum(turf))
+        );
+
+        frame.instruction = 0;
+        frame.locals[4] = Value::number(0.0);
+        assert!(!crate::try_run_build_coordinate_prefix(
+            &module, procedure, program, &mut frame, &mut state
+        ));
+        assert_eq!(frame.instruction, 0, "new_z=false preserves rich fallback");
+    }
+
+    #[test]
+    fn ruin_affected_turfs_batch_is_atomic_at_budget_boundaries_and_stops_on_first_reject() {
+        let program = Program {
+            wait_for: true,
+            parameter_count: 4,
+            parameter_names: vec![String::new(); 4],
+            verb_parameter_types: vec![VerbParameterType::Unsupported; 4],
+            verb_name: None,
+            local_count: 29,
+            instructions: vec![Instruction::Return],
+            source_spans: vec![SourceSpan::new(0, 0)],
+        };
+        let make_state = || {
+            let mut state = ExecutionState::new();
+            let area = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/area/test").unwrap());
+            let normal = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/turf").unwrap());
+            let rejected = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/turf").unwrap());
+            for turf in [normal, rejected] {
+                state
+                    .heap_mut()
+                    .set_datum_field(turf, field("loc"), Value::Datum(area))
+                    .unwrap();
+            }
+            for (turf, x) in [(normal, 1.0), (rejected, 2.0)] {
+                for (name, value) in [("x", x), ("y", 1.0), ("z", 1.0)] {
+                    state
+                        .heap_mut()
+                        .set_datum_field(turf, field(name), Value::number(value))
+                        .unwrap();
+                }
+            }
+            state.world_turfs.insert((1, 1, 1), normal);
+            state.world_turfs.insert((2, 1, 1), rejected);
+            state.rebuild_world_turf_lookup();
+            state
+                .heap_mut()
+                .set_datum_field(normal, field("turf_flags"), Value::number(0.0))
+                .unwrap();
+            state
+                .heap_mut()
+                .set_datum_field(rejected, field("turf_flags"), Value::number(16.0))
+                .unwrap();
+            let affected = state.heap_mut().allocate_list();
+            state
+                .heap_mut()
+                .list_mut(affected)
+                .unwrap()
+                .add(Value::Datum(normal));
+            state
+                .heap_mut()
+                .list_mut(affected)
+                .unwrap()
+                .add(Value::Datum(rejected));
+            (state, area, affected)
+        };
+
+        for budget in 0..41 {
+            let (mut state, _, affected) = make_state();
+            let areas = state.heap_mut().allocate_list();
+            let mut frame = make_frame(ProcedureId(0), &program, &[], &ExecutionContext::default());
+            frame.instruction = 74;
+            frame.locals[9] = Value::number(1.0);
+            frame.locals[11] = Value::List(areas);
+            frame.locals[13] = Value::List(affected);
+            frame.locals[14] = Value::number(1.0);
+            assert_eq!(
+                crate::run_ruin_affected_turfs_batch(&mut frame, budget, &mut state),
+                None
+            );
+            assert_eq!(frame.locals[14], Value::number(1.0));
+            assert_eq!(state.heap().list(areas).unwrap().len(), 0);
+        }
+
+        let (mut state, area, affected) = make_state();
+        let areas = state.heap_mut().allocate_list();
+        let mut frame = make_frame(ProcedureId(0), &program, &[], &ExecutionContext::default());
+        frame.instruction = 74;
+        frame.locals[9] = Value::number(1.0);
+        frame.locals[11] = Value::List(areas);
+        frame.locals[13] = Value::List(affected);
+        frame.locals[14] = Value::number(1.0);
+        assert_eq!(
+            crate::run_ruin_affected_turfs_batch(&mut frame, 61, &mut state),
+            Some(61)
+        );
+        assert_eq!(frame.instruction, 116);
+        assert_eq!(frame.locals[9], Value::number(0.0));
+        assert_eq!(
+            state
+                .heap()
+                .list(areas)
+                .unwrap()
+                .get_key(&Value::Datum(area))
+                .unwrap(),
+            &Value::number(1.0)
+        );
+    }
+
+    #[test]
+    fn ruin_candidate_scan_accepts_compact_dispatch_call_side_exit() {
+        let syntax = parse("/proc/run()\n\treturn\n").unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let procedure = module.procedure_id("/proc/run").unwrap();
+        let program = module.procedure(procedure).unwrap();
+        let mut frame = make_frame(procedure, program, &[], &ExecutionContext::default());
+        frame.locals.resize(29, Value::Null);
+        frame.locals[8] = Value::number(42.0);
+
+        frame.instruction = 63;
+        assert_eq!(crate::ruin_scan_attach_at_call(&frame), Some(false));
+
+        frame.instruction = 65;
+        frame.stack = vec![Value::number(42.0), Value::number(1.0)].into();
+        assert_eq!(crate::ruin_scan_attach_at_call(&frame), Some(true));
+
+        frame.stack[1] = Value::number(0.0);
+        assert_eq!(crate::ruin_scan_attach_at_call(&frame), None);
+        frame.stack = vec![Value::number(42.0), Value::number(1.0), Value::Null].into();
+        assert_eq!(crate::ruin_scan_attach_at_call(&frame), None);
+    }
+
+    #[test]
+    fn ruin_rejection_witness_is_revalidated_and_never_caches_success() {
+        let mut state = ExecutionState::new();
+        let turf = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/turf/test").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(turf, field("turf_flags"), Value::number(16.0))
+            .unwrap();
+        state.world_turfs.insert((2, 3, 1), turf);
+        state.rebuild_world_turf_lookup();
+        let bounds = (1, 1, 1, 5, 5, 1);
+        state
+            .ruin_rejection_witnesses
+            .entry(1)
+            .or_default()
+            .insert((3, 2), turf);
+        let turf_flags = field("turf_flags");
+        assert!(crate::revalidated_ruin_rejection(
+            &mut state,
+            bounds,
+            &turf_flags
+        ));
+        assert!(crate::revalidated_ruin_rejection(
+            &mut state,
+            (2, 2, 1, 2, 3, 1),
+            &turf_flags
+        ));
+
+        state
+            .heap_mut()
+            .set_datum_field(turf, turf_flags.clone(), Value::number(0.0))
+            .unwrap();
+        assert!(!crate::revalidated_ruin_rejection(
+            &mut state,
+            bounds,
+            &turf_flags
+        ));
+        assert!(
+            state
+                .ruin_rejection_witnesses
+                .get(&1)
+                .is_none_or(BTreeMap::is_empty)
+        );
+        assert!(!crate::revalidated_ruin_rejection(
+            &mut state,
+            bounds,
+            &turf_flags
+        ));
+    }
+
+    #[test]
+    fn ruin_candidate_scan_preserves_first_rejection_and_success_materialization_order() {
+        let syntax = parse("/proc/run()\n\treturn\n").unwrap();
+        let module = compile_module(&syntax.definitions).unwrap();
+        let procedure = module.procedure_id("/proc/run").unwrap();
+        let program = module.procedure(procedure).unwrap();
+        for rejected in [Some(0), Some(2), Some(4), None] {
+            let mut state = ExecutionState::new();
+            let area = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/area/test").unwrap());
+            let allowed = state.heap_mut().allocate_list();
+            crate::write_list_value(
+                &mut state.heap,
+                allowed,
+                Value::TypePath(TypePath::parse("/area/test").unwrap()),
+                Value::number(1.0),
+                false,
+            )
+            .unwrap();
+            for x in 1..=5 {
+                let turf = state
+                    .heap_mut()
+                    .allocate_datum(TypePath::parse("/turf").unwrap());
+                for (name, value) in [("x", x as f32), ("y", 1.0), ("z", 1.0)] {
+                    state
+                        .heap_mut()
+                        .set_datum_field(turf, field(name), Value::number(value))
+                        .unwrap();
+                }
+                state
+                    .heap_mut()
+                    .set_datum_field(turf, field("loc"), Value::Datum(area))
+                    .unwrap();
+                state
+                    .heap_mut()
+                    .set_datum_field(
+                        turf,
+                        field("turf_flags"),
+                        Value::number(if rejected == Some(x - 1) { 16.0 } else { 0.0 }),
+                    )
+                    .unwrap();
+                state.world_turfs.insert((x, 1, 1), turf);
+            }
+            state.rebuild_world_turf_lookup();
+            let mut frame = make_frame(procedure, program, &[], &ExecutionContext::default());
+            frame.instruction = 63;
+            frame.locals.resize(29, Value::Null);
+            frame.locals[1] = Value::List(allowed);
+            frame.locals[9] = Value::number(1.0);
+            frame.cold_mut().ruin_scan = Some(crate::RuinCandidateScan {
+                low: (1, 1, 1),
+                next: (1, 1, 1),
+                high: (5, 1, 1),
+                empty: false,
+                turfs: Vec::new(),
+                areas: Vec::new(),
+                validating: false,
+                validate_index: 0,
+            });
+            assert!(matches!(
+                crate::drive_ruin_candidate_scan(
+                    &module, procedure, program, &mut frame, &mut state, 1
+                ),
+                crate::TgmDrive::Continue
+            ));
+            if rejected.is_some() {
+                assert_eq!(frame.instruction, 14);
+                assert_eq!(frame.locals[9], Value::number(0.0));
+                assert!(matches!(frame.locals[10], Value::Null));
+            } else {
+                assert_eq!(frame.instruction, 145);
+                let Value::List(turfs) = frame.locals[10] else {
+                    panic!("successful scan must materialize affected turfs")
+                };
+                assert_eq!(state.heap().list(turfs).unwrap().len(), 5);
+                let Value::List(areas) = frame.locals[11] else {
+                    panic!("successful scan must materialize affected areas")
+                };
+                assert_eq!(state.heap().list(areas).unwrap().len(), 1);
+            }
+        }
     }
 
     #[test]
@@ -43292,6 +48776,7 @@ mod tests {
             ExecutionLimits {
                 max_call_depth: 8,
                 max_steps: 4,
+                wall_clock_budget: None,
             },
             &mut state,
         )
@@ -43408,6 +48893,7 @@ mod tests {
             ExecutionLimits {
                 max_call_depth: 8,
                 max_steps: 4,
+                wall_clock_budget: None,
             },
             &mut state,
         )
@@ -43574,6 +49060,7 @@ mod tests {
         let limits = ExecutionLimits {
             max_call_depth: 8,
             max_steps: 5,
+            wall_clock_budget: None,
         };
         let mut native_continuation_seen = false;
         loop {
@@ -43587,7 +49074,7 @@ mod tests {
             .unwrap()
             {
                 crate::FrameRunOutcome::Yielded { frames: next, .. } => {
-                    native_continuation_seen |= next[0].numeric_jit_state.is_some();
+                    native_continuation_seen |= next[0].numeric_jit_state().is_some();
                     frames = next;
                 }
                 crate::FrameRunOutcome::Complete(value) => {
@@ -43929,6 +49416,7 @@ mod tests {
                 ExecutionLimits {
                     max_call_depth: 8,
                     max_steps: caller_steps,
+                    wall_clock_budget: None,
                 },
             )
             .unwrap()

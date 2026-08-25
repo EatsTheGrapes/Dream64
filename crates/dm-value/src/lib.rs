@@ -188,6 +188,124 @@ pub enum Value {
     List(ListId),
 }
 
+const PACKED_TAG_SHIFT: u32 = 62;
+const PACKED_PAYLOAD_MASK: u64 = (1_u64 << PACKED_TAG_SHIFT) - 1;
+const PACKED_NULL: u64 = 0;
+const PACKED_NUMBER: u64 = 1;
+const PACKED_DATUM: u64 = 2;
+const PACKED_LIST: u64 = 3;
+const PACKED_HANDLE_COMPONENT_MASK: u32 = (1_u32 << 31) - 1;
+
+/// Pointer-free runtime value used by bounded hot execution paths.
+///
+/// This first representation phase deliberately supports only values that fit
+/// without an intern table. Text, files, and paths remain rich values until a
+/// lifetime-safe runtime string/type pool is available.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PackedValue {
+    bits: u64,
+}
+
+impl PackedValue {
+    /// Creates packed DM null without crossing the rich-value boundary.
+    #[must_use]
+    pub const fn null() -> Self {
+        Self { bits: 0 }
+    }
+
+    /// Creates a packed compatibility number without crossing the rich-value boundary.
+    #[must_use]
+    pub const fn number_bits(number: DmNumberBits) -> Self {
+        Self {
+            bits: (PACKED_NUMBER << PACKED_TAG_SHIFT) | number.bits() as u64,
+        }
+    }
+
+    /// Creates a packed compatibility number without crossing the rich-value boundary.
+    #[must_use]
+    pub const fn number(value: f32) -> Self {
+        Self::number_bits(DmNumberBits::from_f32(value))
+    }
+
+    /// Packs a value when it has a pointer-free representation.
+    #[must_use]
+    pub const fn try_from_value(value: &Value) -> Option<Self> {
+        let (tag, payload) = match value {
+            Value::Null => (PACKED_NULL, 0),
+            Value::Number(number) => (PACKED_NUMBER, number.bits() as u64),
+            Value::Datum(datum) => {
+                if datum.index() > PACKED_HANDLE_COMPONENT_MASK
+                    || datum.generation() > PACKED_HANDLE_COMPONENT_MASK
+                {
+                    return None;
+                }
+                (
+                    PACKED_DATUM,
+                    datum.index() as u64 | ((datum.generation() as u64) << 31),
+                )
+            }
+            Value::List(list) => {
+                if list.index() > PACKED_HANDLE_COMPONENT_MASK
+                    || list.generation() > PACKED_HANDLE_COMPONENT_MASK
+                {
+                    return None;
+                }
+                (
+                    PACKED_LIST,
+                    list.index() as u64 | ((list.generation() as u64) << 31),
+                )
+            }
+            Value::Text(_) | Value::File(_) | Value::TypePath(_) | Value::ModifiedTypePath(_) => {
+                return None;
+            }
+        };
+        Some(Self {
+            bits: (tag << PACKED_TAG_SHIFT) | payload,
+        })
+    }
+
+    /// Restores the exact rich value represented by this record.
+    #[must_use]
+    pub fn into_value(self) -> Value {
+        let tag = self.bits >> PACKED_TAG_SHIFT;
+        let payload = self.bits & PACKED_PAYLOAD_MASK;
+        match tag {
+            PACKED_NULL => Value::Null,
+            PACKED_NUMBER => Value::Number(DmNumberBits::from_f32(f32::from_bits(payload as u32))),
+            PACKED_DATUM => Value::Datum(DatumId::from_parts(
+                payload as u32 & PACKED_HANDLE_COMPONENT_MASK,
+                (payload >> 31) as u32,
+            )),
+            PACKED_LIST => Value::List(ListId::from_parts(
+                payload as u32 & PACKED_HANDLE_COMPONENT_MASK,
+                (payload >> 31) as u32,
+            )),
+            _ => unreachable!("PackedValue tags are private and constructor-validated"),
+        }
+    }
+
+    /// Returns DM's numeric value for null/number arithmetic.
+    #[must_use]
+    pub fn as_number_or_null(self) -> Option<f32> {
+        match self.bits >> PACKED_TAG_SHIFT {
+            PACKED_NULL => Some(0.0),
+            PACKED_NUMBER => Some(f32::from_bits(self.bits as u32)),
+            _ => None,
+        }
+    }
+
+    /// Returns the heap identity carried by this record, when any.
+    #[must_use]
+    pub fn heap_handles(self) -> (Option<DatumId>, Option<ListId>) {
+        match self.into_value() {
+            Value::Datum(datum) => (Some(datum), None),
+            Value::List(list) => (None, Some(list)),
+            _ => (None, None),
+        }
+    }
+}
+
 impl Value {
     /// Creates a compatibility number without widening it.
     #[must_use]
@@ -813,6 +931,13 @@ impl DatumFields {
         }
     }
 
+    fn name(&self, index: usize) -> &FieldName {
+        match self {
+            Self::Owned(fields) => &fields[index].0,
+            Self::Shared { names, .. } => &names[index],
+        }
+    }
+
     fn value_mut(&mut self, index: usize) -> &mut Value {
         match self {
             Self::Owned(fields) => &mut fields[index].1,
@@ -985,6 +1110,16 @@ impl Datum {
             return field_index.get(name).copied();
         }
         self.fields.position(name)
+    }
+
+    /// Reads a cached positional slot only when it still names the expected field.
+    ///
+    /// Datum mutations can shift slots, so callers must retain and provide the
+    /// stable field identity rather than trusting a stale numeric offset.
+    #[must_use]
+    pub fn field_at_validated_slot(&self, slot: usize, name: &FieldName) -> Option<&Value> {
+        (slot < self.fields.len() && self.fields.name(slot) == name)
+            .then(|| self.fields.value(slot))
     }
 
     /// Inserts or updates a field while retaining first-insertion order.
@@ -1779,6 +1914,32 @@ impl DmList {
         self.order.push(ListOrder::positional(position));
         self.positional.push(value);
         self.len()
+    }
+
+    /// Appends positional values in iterator order with one storage mutation.
+    ///
+    /// This is semantically identical to repeated [`Self::add`] calls, but it
+    /// invalidates derived indexes and detaches shared copy-on-write storage
+    /// only once. Large engine-produced lists such as `block()` rectangles can
+    /// therefore fill both payload and iteration-order vectors in bulk.
+    /// Returns the resulting DM-visible list length.
+    pub fn extend_positional(&mut self, values: impl IntoIterator<Item = Value>) -> usize {
+        self.invalidate_positional_remove_index();
+        let mut values = values.into_iter();
+        // The lower bound cannot over-reserve even for a custom iterator that
+        // reports an untrusted upper hint. Exact-size Vec iterators still give
+        // us the full one-shot reservation used by engine bulk fills.
+        let (reserve, _) = values.size_hint();
+        let storage = &mut **self;
+        storage.positional.reserve(reserve);
+        storage.order.reserve(reserve);
+        let first = storage.positional.len();
+        storage.positional.extend(&mut values);
+        let end = storage.positional.len();
+        storage
+            .order
+            .extend((first..end).map(ListOrder::positional));
+        storage.order.len() - storage.prefix_head
     }
 
     /// Reads a 1-based positional entry.
@@ -5911,6 +6072,69 @@ mod tests {
     }
 
     #[test]
+    fn packed_values_are_pointer_free_and_round_trip_exact_bits_and_handles() {
+        assert_eq!(std::mem::size_of::<PackedValue>(), 8);
+        let values = [
+            Value::Null,
+            Value::Number(DmNumberBits::from_f32(f32::from_bits(0x8000_0000))),
+            Value::Number(DmNumberBits::from_f32(f32::from_bits(0x7fc1_2345))),
+            Value::Datum(DatumId::from_parts(
+                PACKED_HANDLE_COMPONENT_MASK,
+                PACKED_HANDLE_COMPONENT_MASK - 1,
+            )),
+            Value::List(ListId::from_parts(
+                PACKED_HANDLE_COMPONENT_MASK - 2,
+                PACKED_HANDLE_COMPONENT_MASK - 3,
+            )),
+        ];
+        for value in values {
+            let restored = PackedValue::try_from_value(&value)
+                .expect("pointer-free value should pack")
+                .into_value();
+            match (&value, &restored) {
+                (Value::Number(left), Value::Number(right)) => {
+                    assert_eq!(left.bits(), right.bits());
+                }
+                _ => assert_eq!(value, restored),
+            }
+        }
+        assert_eq!(
+            PackedValue::try_from_value(&Value::Datum(DatumId::from_parts(7, 9)))
+                .unwrap()
+                .heap_handles(),
+            (Some(DatumId::from_parts(7, 9)), None)
+        );
+    }
+
+    #[test]
+    fn packed_values_reject_handle_components_that_would_be_truncated() {
+        assert!(
+            PackedValue::try_from_value(&Value::Datum(DatumId::from_parts(1 << 31, 0))).is_none()
+        );
+        assert!(
+            PackedValue::try_from_value(&Value::List(ListId::from_parts(0, 1 << 31))).is_none()
+        );
+    }
+
+    #[test]
+    fn packed_values_reject_interned_and_owned_variants() {
+        let values = [
+            Value::text("text"),
+            Value::file("asset.dmi"),
+            Value::TypePath(TypePath::parse("/datum/example").unwrap()),
+            Value::ModifiedTypePath(Arc::new(ModifiedTypePath::new(
+                TypePath::parse("/obj/item").unwrap(),
+                Vec::new(),
+            ))),
+        ];
+        assert!(
+            values
+                .iter()
+                .all(|value| PackedValue::try_from_value(value).is_none())
+        );
+    }
+
+    #[test]
     fn canonicalize_deleted_refs_equal_null_and_are_falsy() {
         let mut heap = ValueHeap::new();
         let datum = heap.allocate_datum(TypePath::parse("/datum/example").unwrap());
@@ -5944,6 +6168,38 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list.get(1), Ok(&Value::number(1.0)));
         assert_eq!(list.get(2), Ok(&Value::number(2.0)));
+    }
+
+    #[test]
+    fn bulk_positional_extend_matches_add_and_detaches_shared_storage_once() {
+        let mut bulk = DmList::default();
+        bulk.add(Value::number(1.0));
+        bulk.set_key(Value::text("key"), Value::number(7.0));
+        let shared_before_extend = bulk.clone();
+        assert_eq!(
+            bulk.extend_positional([Value::number(2.0), Value::number(3.0), Value::number(4.0),]),
+            5
+        );
+
+        let mut repeated = shared_before_extend.clone();
+        for value in [2.0, 3.0, 4.0] {
+            repeated.add(Value::number(value));
+        }
+        assert_eq!(bulk.len(), repeated.len());
+        for index in 1..=bulk.len() {
+            assert!(
+                bulk.get(index)
+                    .unwrap()
+                    .semantic_eq(repeated.get(index).unwrap())
+            );
+        }
+        assert_eq!(
+            bulk.get_key(&Value::text("key")),
+            repeated.get_key(&Value::text("key"))
+        );
+        assert_eq!(shared_before_extend.len(), 2);
+        assert_eq!(shared_before_extend.get(1), Ok(&Value::number(1.0)));
+        assert_eq!(shared_before_extend.get(2), Ok(&Value::text("key")));
     }
 
     #[test]
@@ -6038,13 +6294,21 @@ mod tests {
             std::hint::black_box(list);
         }
         let reserved = started.elapsed();
+        let started = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            let mut list = DmList::default();
+            list.extend_positional((0..CELLS).map(|index| Value::number(index as f32)));
+            std::hint::black_box(list);
+        }
+        let bulk = started.elapsed();
         eprintln!(
-            "full-z-list-cells={} rounds={} unreserved_ms={} reserved_ms={} speedup={:.2}",
+            "full-z-list-cells={} rounds={} unreserved_ms={} reserved_ms={} bulk_ms={} bulk_vs_reserved={:.2}",
             CELLS,
             ROUNDS,
             unreserved.as_millis(),
             reserved.as_millis(),
-            unreserved.as_secs_f64() / reserved.as_secs_f64(),
+            bulk.as_millis(),
+            reserved.as_secs_f64() / bulk.as_secs_f64(),
         );
     }
 }

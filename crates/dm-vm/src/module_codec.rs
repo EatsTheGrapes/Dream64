@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use dm_core::{DmNumberBits, SourceSpan};
 use dm_value::{FieldName, TypePath};
+use sha2::{Digest as _, Sha256};
 
 use crate::{
     CompoundAssignmentOperator, CompoundListIndexOperator, Instruction, ListEntryKind, Module,
@@ -21,7 +22,7 @@ const INSTRUCTION_TAG_COUNT: u8 = 137;
 const MAX_ARTIFACT_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const MAX_PROCEDURES: usize = 1_000_000;
 const MAX_PROCEDURE_TYPES: usize = 1_000_000;
-const MAX_INSTRUCTIONS_PER_PROGRAM: usize = 32_000_000;
+const MAX_INSTRUCTIONS_PER_PROGRAM: usize = u16::MAX as usize;
 const MAX_TOTAL_INSTRUCTIONS: usize = 500_000_000;
 const MAX_STRING_BYTES: usize = 64 * 1024 * 1024;
 const MAX_VECTOR_ELEMENTS: usize = 1_000_000;
@@ -49,6 +50,37 @@ impl fmt::Display for ModuleCodecError {
 impl Error for ModuleCodecError {}
 
 impl Module {
+    /// Computes semantic digests in stable module procedure order.
+    pub fn compute_all_procedure_semantic_digests(&self) -> Result<Vec<[u8; 32]>, String> {
+        (0..self.procedure_count())
+            .map(|index| self.compute_procedure_semantic_digest(ProcedureId(index as u32)))
+            .collect()
+    }
+
+    /// Computes a stable digest of portable executable semantics for one procedure.
+    pub fn compute_procedure_semantic_digest(
+        &self,
+        procedure: ProcedureId,
+    ) -> Result<[u8; 32], String> {
+        let index = procedure.index();
+        let program = self
+            .resolve_procedure(procedure)
+            .map_err(|error| format!("resolve semantic procedure: {error}"))?;
+        let path = self
+            .paths
+            .get(index)
+            .ok_or_else(|| "semantic procedure path is missing".to_owned())?;
+        let owner = self.procedure_types.get(index).map_or("", TypePath::as_str);
+        let mut semantic = program.clone();
+        semantic.source_spans.clear();
+        let mut writer = Writer::new();
+        writer.bytes.extend_from_slice(b"D64-PROC-SEMANTIC\0\x01");
+        writer.string(path).map_err(|error| error.to_string())?;
+        writer.string(owner).map_err(|error| error.to_string())?;
+        encode_program(&mut writer, &semantic).map_err(|error| error.to_string())?;
+        Ok(Sha256::digest(&writer.bytes).into())
+    }
+
     /// Encodes this fully eager module into the versioned Dream64 module format.
     ///
     /// The format uses explicit little-endian scalars and tagged instruction
@@ -187,6 +219,8 @@ impl Module {
             deferred: Arc::new(HashMap::new()),
             procedure_types,
             initializer_call_names: None,
+            compact_wordcode: Default::default(),
+            semantic_digests: Default::default(),
         };
         validate_module(&module)?;
         Ok(module)
@@ -254,9 +288,9 @@ fn validate_program(program: &Program, procedure_count: usize) -> Result<(), Mod
             "parameter count exceeds local slot count",
         ));
     }
-    if program.parameter_count > u32::MAX as usize || program.local_count > u32::MAX as usize {
+    if program.parameter_count > u16::MAX as usize || program.local_count > u16::MAX as usize {
         return Err(ModuleCodecError::new(
-            "program slot count exceeds format limit",
+            "program slot count exceeds the u16 VM ABI limit",
         ));
     }
     for span in &program.source_spans {
@@ -417,6 +451,11 @@ fn decode_program(
         .then(|| reader.string("verb name"))
         .transpose()?;
     let local_count = reader.u32("local count")? as usize;
+    if local_count > u16::MAX as usize {
+        return Err(ModuleCodecError::new(
+            "local count exceeds the u16 VM ABI limit",
+        ));
+    }
     let instruction_count =
         reader.len_with_min(MAX_INSTRUCTIONS_PER_PROGRAM, "instruction count", 1)?;
     let mut instructions = Vec::with_capacity(instruction_count);
@@ -1795,6 +1834,8 @@ mod tests {
             deferred: Arc::new(HashMap::new()),
             procedure_types: vec![path("/datum/example/proc/run")],
             initializer_call_names: None,
+            compact_wordcode: Default::default(),
+            semantic_digests: Default::default(),
         }
     }
 

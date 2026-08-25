@@ -5,6 +5,7 @@
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::Path,
@@ -63,6 +64,167 @@ const LOCAL_SKIN: &str = "window \"main\"\n\
 \t\tsize = 318x618\n";
 
 const DEFAULT_RETAINED_OUTPUT_LINES: usize = 512;
+const MAX_UI_OWNER_COMMANDS: usize = 256;
+const MAX_SNAPSHOT_RESOURCES: usize = 4_096;
+const MAX_RESOURCE_BYTES: usize = 16 * 1024 * 1024;
+const RESOURCE_CHUNK_BYTES: u32 = 256 * 1024;
+const MAX_SNAPSHOT_RESOURCE_BYTES: usize = 128 * 1024 * 1024;
+static NEXT_CLIENT_GENERATION: AtomicU64 = AtomicU64::new(1);
+const AUDIO_BROWSER_CONTROL: &str = "__dream64_audio";
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SnapshotResourceBudget {
+    count: usize,
+    bytes: usize,
+}
+
+impl SnapshotResourceBudget {
+    fn reserve(&mut self, bytes: usize) -> Result<(), &'static str> {
+        self.count = self.count.checked_add(1).ok_or("resource count overflow")?;
+        if self.count > MAX_SNAPSHOT_RESOURCES {
+            return Err("snapshot resource count exceeds limit");
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or("snapshot resource byte accounting overflow")?;
+        if self.bytes > MAX_SNAPSHOT_RESOURCE_BYTES {
+            return Err("snapshot resource bytes exceed limit");
+        }
+        Ok(())
+    }
+}
+
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientReadiness {
+    Transport = 1 << 0,
+    LocalResources = 1 << 1,
+    Skin = 1 << 2,
+    ResourceManifest = 1 << 3,
+    ResourcePayload = 1 << 4,
+    MapRenderer = 1 << 5,
+    WebViewEnvironment = 1 << 6,
+    WebViewDocument = 1 << 7,
+}
+
+#[derive(Clone, Debug)]
+struct GenerationTagged<T> {
+    generation: u64,
+    command: T,
+}
+
+#[derive(Clone, Debug)]
+struct UiOwnerCommandQueue<T> {
+    generation: u64,
+    capacity: usize,
+    commands: VecDeque<GenerationTagged<T>>,
+    stale_dropped: u64,
+    overflow_rejected: u64,
+}
+
+impl<T> UiOwnerCommandQueue<T> {
+    fn new(generation: u64, capacity: usize) -> Self {
+        Self {
+            generation,
+            capacity,
+            commands: VecDeque::with_capacity(capacity),
+            stale_dropped: 0,
+            overflow_rejected: 0,
+        }
+    }
+
+    fn advance_generation(&mut self, generation: u64) {
+        self.generation = generation;
+        let before = self.commands.len();
+        self.commands
+            .retain(|command| command.generation == generation);
+        self.stale_dropped = self
+            .stale_dropped
+            .saturating_add((before - self.commands.len()) as u64);
+    }
+
+    fn push(&mut self, generation: u64, command: T) -> Result<(), T> {
+        if generation != self.generation {
+            self.stale_dropped = self.stale_dropped.saturating_add(1);
+            return Err(command);
+        }
+        if self.commands.len() == self.capacity {
+            self.overflow_rejected = self.overflow_rejected.saturating_add(1);
+            return Err(command);
+        }
+        self.commands.push_back(GenerationTagged {
+            generation,
+            command,
+        });
+        Ok(())
+    }
+
+    fn pop_current(&mut self) -> Option<T> {
+        while let Some(command) = self.commands.pop_front() {
+            if command.generation == self.generation {
+                return Some(command.command);
+            }
+            self.stale_dropped = self.stale_dropped.saturating_add(1);
+        }
+        None
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ClientReadinessCoordinator {
+    generation: u64,
+    reached: u16,
+    webview_required: bool,
+    audio_available: bool,
+    resources_sent: bool,
+    interactive_sent: bool,
+}
+
+impl ClientReadinessCoordinator {
+    fn new() -> Self {
+        Self {
+            generation: NEXT_CLIENT_GENERATION.fetch_add(1, Ordering::Relaxed),
+            reached: 0,
+            webview_required: false,
+            audio_available: false,
+            resources_sent: false,
+            interactive_sent: false,
+        }
+    }
+
+    fn rearm(&mut self) {
+        *self = Self::new();
+    }
+
+    fn mark(&mut self, generation: u64, readiness: ClientReadiness) -> Result<(), &'static str> {
+        if generation != self.generation {
+            return Err("stale-client-generation");
+        }
+        self.reached |= readiness as u16;
+        Ok(())
+    }
+
+    const fn has(&self, readiness: ClientReadiness) -> bool {
+        self.reached & readiness as u16 != 0
+    }
+
+    fn resources_ready(&self) -> bool {
+        self.has(ClientReadiness::Transport)
+            && self.has(ClientReadiness::LocalResources)
+            && self.has(ClientReadiness::Skin)
+            && self.has(ClientReadiness::ResourceManifest)
+            && self.has(ClientReadiness::ResourcePayload)
+    }
+
+    fn interactive_ready(&self) -> bool {
+        self.resources_ready()
+            && self.has(ClientReadiness::MapRenderer)
+            && (!self.webview_required
+                || (self.has(ClientReadiness::WebViewEnvironment)
+                    && self.has(ClientReadiness::WebViewDocument)))
+    }
+}
 
 #[cfg(windows)]
 const EMPTY_BROWSER_DOCUMENT: &str = "<!doctype html><html><head></head><body></body></html>";
@@ -491,6 +653,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (name, data) in &ui_presentation.browser_resources {
         browser_assets.insert(name.clone(), data.clone());
     }
+    let readiness = ClientReadinessCoordinator::new();
+    let ui_owner_commands = UiOwnerCommandQueue::new(readiness.generation, MAX_UI_OWNER_COMMANDS);
     let mut application = LocalClient {
         context,
         surface: None,
@@ -499,6 +663,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         local_input_events: 0,
         inbound_ui_events: 0,
         transport,
+        readiness,
+        ui_owner_commands,
         snapshot: initial_snapshot,
         sprites: SpriteCache::default(),
         layout,
@@ -525,6 +691,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         startup_browser_updates,
         browser_message_sender,
         browser_messages,
+        browser_generation: Arc::new(AtomicU64::new(0)),
         #[cfg(windows)]
         browsers: BTreeMap::new(),
         #[cfg(windows)]
@@ -1101,6 +1268,9 @@ fn qualified_control(tree: &ControlTree, needle: &dm_dmf::ControlNode) -> Option
 
 #[derive(Clone, Debug, PartialEq)]
 enum InboundUiCommand {
+    Link {
+        url: String,
+    },
     WinSet {
         control: String,
         parameters: String,
@@ -1166,10 +1336,18 @@ struct UiPresentation {
 
 #[derive(Debug, PartialEq)]
 enum BrowserUpdate {
+    Link(String),
     Html { control: String, html: String },
     Resource { control: String, path: String },
     Script { control: String, script: String },
     Sound(SoundUpdate),
+}
+
+#[derive(Debug)]
+enum UiOwnerCommand {
+    MapCommit(MapSnapshot),
+    BrowserCommit(BrowserUpdate),
+    ResourceCommit { name: String, data: Vec<u8> },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1486,6 +1664,7 @@ impl UiPresentation {
             return Ok(None);
         }
         let browser_update = match command {
+            InboundUiCommand::Link { url } => Some(BrowserUpdate::Link(url)),
             InboundUiCommand::WinSet {
                 control,
                 parameters,
@@ -1507,8 +1686,7 @@ impl UiPresentation {
                     .or_else(|| layout.output_controls.first().cloned())
                     .ok_or("skin has no OUTPUT control")?;
                 if let Some((target, function)) = control.split_once(':')
-                    && let Some(control) =
-                        resolve_browser_output_target(session.ui().tree(), target)
+                    && let Some(control) = resolve_browser_output_target(session.ui(), target)
                 {
                     Some(BrowserUpdate::Script {
                         control,
@@ -1526,8 +1704,8 @@ impl UiPresentation {
                             None
                         }
                         Err(output_error) => {
-                            if let Ok(control) = resolve_control_type(
-                                session.ui().tree(),
+                            if let Ok(control) = resolve_ui_control_type(
+                                session.ui(),
                                 &control,
                                 ControlType::Browser,
                             ) {
@@ -1551,11 +1729,16 @@ impl UiPresentation {
             }
             InboundUiCommand::Browse { control, html } => {
                 // BYOND calls this selector `window`: a skin control may be
-                // qualified or unqualified, while an unknown value names a
-                // future popup. Preserve popup documents without routing them
-                // into the skin's embedded browser.
+                // qualified or unqualified. An unknown value creates an
+                // implicit top-level browser window from the skin popup
+                // template, which TGUI immediately probes with winexists().
+                if !control.is_empty() && !session.ui().winexists(&control) {
+                    session
+                        .ensure_browser_window(&control)
+                        .map_err(|error| format!("browse window creation failed: {error:?}"))?;
+                }
                 let resolved =
-                    resolve_control_type(session.ui().tree(), &control, ControlType::Browser).ok();
+                    resolve_ui_control_type(session.ui(), &control, ControlType::Browser).ok();
                 let key = resolved.clone().unwrap_or(control);
                 self.browser_html.insert(key, html.clone());
                 resolved.map(|control| BrowserUpdate::Html { control, html })
@@ -1585,16 +1768,72 @@ fn output_line_limit(ui: &dm_dmf::UiState, control: &str) -> usize {
         .unwrap_or(DEFAULT_RETAINED_OUTPUT_LINES)
 }
 
-fn resolve_browser_output_target(tree: &ControlTree, target: &str) -> Option<String> {
-    resolve_control_type(tree, target, ControlType::Browser)
+fn resolve_browser_output_target(ui: &dm_dmf::UiState, target: &str) -> Option<String> {
+    resolve_ui_control_type(ui, target, ControlType::Browser)
         .ok()
         .or_else(|| {
             // BYOND's embedded-browser output address is
             // `<control>.browser:<javascript function>`. The `.browser`
             // segment names the browser document, not a DMF control.
             let control = target.strip_suffix(".browser")?;
-            resolve_control_type(tree, control, ControlType::Browser).ok()
+            resolve_ui_control_type(ui, control, ControlType::Browser).ok()
         })
+}
+
+fn resolve_ui_control_type(
+    ui: &dm_dmf::UiState,
+    address: &str,
+    expected: ControlType,
+) -> Result<String, String> {
+    if address.contains('.')
+        && ui
+            .winexists_type(address)
+            .eq_ignore_ascii_case(expected_name(expected))
+    {
+        return Ok(address.to_owned());
+    }
+    let mut window_ids = ui
+        .tree()
+        .windows
+        .iter()
+        .map(|window| window.id.clone())
+        .collect::<Vec<_>>();
+    window_ids.extend(ui.cloned_window_ids());
+    let matches = window_ids
+        .into_iter()
+        .flat_map(|window| {
+            ui.section_control_ids(&window)
+                .unwrap_or_default()
+                .into_iter()
+                .map(move |control| (window.clone(), control))
+        })
+        .filter_map(|(window, control)| {
+            let qualified = format!("{window}.{control}");
+            (control == address
+                && ui
+                    .winexists_type(&qualified)
+                    .eq_ignore_ascii_case(expected_name(expected)))
+            .then_some(qualified)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err(format!("{address} is not a {expected:?} control")),
+        _ => Err(format!("ambiguous {expected:?} control {address}")),
+    }
+}
+
+const fn expected_name(expected: ControlType) -> &'static str {
+    match expected {
+        ControlType::Main => "MAIN",
+        ControlType::Map => "MAP",
+        ControlType::Browser => "BROWSER",
+        ControlType::Input => "INPUT",
+        ControlType::Output => "OUTPUT",
+        ControlType::Label => "LABEL",
+        ControlType::Button => "BUTTON",
+        ControlType::Unknown => "UNKNOWN",
+    }
 }
 
 #[cfg(test)]
@@ -2215,7 +2454,6 @@ impl ClientTransport {
         match RemoteTransport::connect(pending.address, pending.record.as_deref()).and_then(
             |mut transport| {
                 transport.attach()?;
-                transport.send_readiness("skin_ready")?;
                 Ok(transport)
             },
         ) {
@@ -2291,6 +2529,13 @@ impl ClientTransport {
         match self {
             Self::Pending(_) | Self::Offline(_) => Ok(()),
             Self::Remote(transport) => transport.send_readiness("resources_ready"),
+        }
+    }
+
+    fn mark_skin_ready(&mut self) -> Result<(), String> {
+        match self {
+            Self::Pending(_) | Self::Offline(_) => Ok(()),
+            Self::Remote(transport) => transport.send_readiness("skin_ready"),
         }
     }
 
@@ -2558,16 +2803,84 @@ impl RemoteTransport {
         let session = self
             .client_token
             .as_deref()
-            .ok_or("server attach response did not identify the client")?;
+            .ok_or("server attach response did not identify the client")?
+            .to_owned();
+        // Protocol-2 recordings contain the historical whole-resource command.
+        // Live transports use bounded protocol-3 chunks so hex expansion can
+        // never exceed the server's 1 MiB frame limit.
+        if !self.is_replay() {
+            let mut bytes = Vec::new();
+            let mut expected_total = None;
+            loop {
+                let offset = u64::try_from(bytes.len())
+                    .map_err(|_| "resource offset exceeds 64-bit range".to_owned())?;
+                let response = self.exchange(&format!(
+                    "resource_chunk {session} {} {offset} {RESOURCE_CHUNK_BYTES}",
+                    encode_hex(path.as_bytes())
+                ))?;
+                require_ok(&response, "resource_chunk")?;
+                let fields = response_fields(&response);
+                let response_offset = fields
+                    .get("offset")
+                    .ok_or("resource chunk omitted offset")?
+                    .parse::<u64>()
+                    .map_err(|_| "resource chunk offset is invalid")?;
+                if response_offset != offset {
+                    return Err("resource chunk offset does not match request".to_owned());
+                }
+                let total = fields
+                    .get("total")
+                    .ok_or("resource chunk omitted total length")?
+                    .parse::<u64>()
+                    .map_err(|_| "resource chunk total length is invalid")?;
+                if total > MAX_RESOURCE_BYTES as u64 {
+                    return Err(format!(
+                        "invalid resource {path}: payload exceeds resource byte limit"
+                    ));
+                }
+                if expected_total
+                    .replace(total)
+                    .is_some_and(|old| old != total)
+                {
+                    return Err("resource length changed during transfer".to_owned());
+                }
+                let encoded = fields
+                    .get("datahex")
+                    .ok_or_else(|| format!("resource chunk omitted data for {path}"))?;
+                let chunk = decode_hex_bounded(encoded, RESOURCE_CHUNK_BYTES as usize)
+                    .map_err(|error| format!("invalid resource {path}: {error}"))?;
+                if chunk.is_empty() && offset != total {
+                    return Err("resource chunk made no progress".to_owned());
+                }
+                bytes.extend_from_slice(&chunk);
+                if bytes.len() as u64 > total {
+                    return Err("resource chunks exceed advertised length".to_owned());
+                }
+                let eof = match fields.get("eof").map(String::as_str) {
+                    Some("0") => false,
+                    Some("1") => true,
+                    _ => return Err("resource chunk EOF flag is invalid".to_owned()),
+                };
+                if eof {
+                    if bytes.len() as u64 != total {
+                        return Err("resource ended before advertised length".to_owned());
+                    }
+                    self.resource_cache.insert(path.to_owned(), bytes.clone());
+                    return Ok(bytes);
+                }
+            }
+        }
         let response = self.exchange(&format!(
             "resource {session} {}",
             encode_hex(path.as_bytes())
         ))?;
         require_ok(&response, "resource")?;
-        let bytes = response_fields(&response)
+        let fields = response_fields(&response);
+        let encoded = fields
             .get("datahex")
-            .and_then(|value| decode_hex(value))
             .ok_or_else(|| format!("resource response omitted data for {path}"))?;
+        let bytes = decode_hex_bounded(encoded, MAX_RESOURCE_BYTES)
+            .map_err(|error| format!("invalid resource {path}: {error}"))?;
         self.resource_cache.insert(path.to_owned(), bytes.clone());
         Ok(bytes)
     }
@@ -2854,9 +3167,17 @@ impl RemoteTransport {
                     .map(|appearance| appearance.resource.clone()),
             )
             .collect::<std::collections::BTreeSet<_>>();
+        if paths.len() > MAX_SNAPSHOT_RESOURCES {
+            return Err(format!(
+                "snapshot advertises {} resources; limit is {MAX_SNAPSHOT_RESOURCES}",
+                paths.len()
+            ));
+        }
+        let mut resource_budget = SnapshotResourceBudget::default();
         for path in paths {
             let path_text = path.to_string_lossy();
             let data = self.request_resource(&path_text)?;
+            resource_budget.reserve(data.len()).map_err(str::to_owned)?;
             resources.insert(path, data);
         }
         Ok(MapSnapshot {
@@ -2974,6 +3295,7 @@ fn parse_ui_event(line: &str) -> Result<(u64, InboundUiCommand), String> {
             .ok_or_else(|| "invalid UI event text".to_owned())
     };
     let command = match (fields[2], fields.len()) {
+        ("link", 4) => InboundUiCommand::Link { url: text(3)? },
         ("winset", 5) => InboundUiCommand::WinSet {
             control: text(3)?,
             parameters: text(4)?,
@@ -3238,7 +3560,7 @@ fn parse_appearance_tree_for(
     if fields.first() == Some(&"A") && fields.len() == 15 {
         fields.insert(4, "~");
     }
-    if fields.first() != Some(&"A") || !matches!(fields.len(), 16 | 21) {
+    if fields.first() != Some(&"A") || !matches!(fields.len(), 16 | 21 | 23) {
         return Err("invalid appearance row".to_owned());
     }
     let identity = fields[1]
@@ -3281,6 +3603,14 @@ fn parse_appearance_tree_for(
             frame: 1,
             layer: numeric(6).unwrap_or(0.0),
             plane: numeric(7).unwrap_or(0.0),
+            appearance_flags: fields
+                .get(21)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+            mouse_opacity: fields
+                .get(22)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1),
             pixel_x: numeric(8).unwrap_or(0.0).round() as i32,
             pixel_y: numeric(9).unwrap_or(0.0).round() as i32,
             color,
@@ -3329,6 +3659,17 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
                 .collect::<Option<Vec<_>>>()
         })
         .flatten()
+}
+
+fn decode_hex_bounded(value: &str, max_bytes: usize) -> Result<Vec<u8>, &'static str> {
+    if !value.len().is_multiple_of(2) {
+        return Err("hex payload has odd length");
+    }
+    let decoded_len = value.len() / 2;
+    if decoded_len > max_bytes {
+        return Err("payload exceeds resource byte limit");
+    }
+    decode_hex(value).ok_or("hex payload contains an invalid digit")
 }
 
 fn decode_hex_text(value: &str) -> Option<String> {
@@ -3585,6 +3926,8 @@ struct LocalClient {
     local_input_events: usize,
     inbound_ui_events: usize,
     transport: ClientTransport,
+    readiness: ClientReadinessCoordinator,
+    ui_owner_commands: UiOwnerCommandQueue<UiOwnerCommand>,
     snapshot: Option<MapSnapshot>,
     sprites: SpriteCache,
     layout: ClientLayout,
@@ -3609,8 +3952,9 @@ struct LocalClient {
     active_prompt: Option<ClientPrompt>,
     pending_screenshot: Option<PathBuf>,
     startup_browser_updates: Vec<BrowserUpdate>,
-    browser_message_sender: std::sync::mpsc::Sender<(String, String)>,
-    browser_messages: std::sync::mpsc::Receiver<(String, String)>,
+    browser_message_sender: std::sync::mpsc::Sender<(u64, String, String)>,
+    browser_messages: std::sync::mpsc::Receiver<(u64, String, String)>,
+    browser_generation: Arc<AtomicU64>,
     #[cfg(windows)]
     browsers: BTreeMap<String, WebView>,
     #[cfg(windows)]
@@ -3724,7 +4068,10 @@ impl LocalClient {
     }
 
     fn drain_browser_messages(&mut self) {
-        while let Ok((control, message)) = self.browser_messages.try_recv() {
+        while let Ok((generation, control, message)) = self.browser_messages.try_recv() {
+            if generation != self.readiness.generation {
+                continue;
+            }
             let Ok(message) = serde_json::from_str::<serde_json::Value>(&message) else {
                 eprintln!("client-browser-message-error: invalid JSON");
                 continue;
@@ -3755,6 +4102,17 @@ impl LocalClient {
                 }
                 Some("ready") => {
                     self.ready_browsers.insert(control.clone());
+                    if control != AUDIO_BROWSER_CONTROL {
+                        if let Err(error) = self
+                            .readiness
+                            .mark(generation, ClientReadiness::WebViewDocument)
+                        {
+                            eprintln!("client-readiness: {error}");
+                        }
+                        self.publish_client_readiness();
+                    } else {
+                        self.readiness.audio_available = true;
+                    }
                     let scripts = self
                         .pending_browser_scripts
                         .remove(&control)
@@ -3918,8 +4276,15 @@ impl LocalClient {
                     .apply(sequence, command, session, &mut self.layout)
                 {
                     Ok(Some(update)) => {
-                        #[cfg(windows)]
-                        self.apply_browser_update(update);
+                        let generation = self.readiness.generation;
+                        if self
+                            .ui_owner_commands
+                            .push(generation, UiOwnerCommand::BrowserCommit(update))
+                            .is_err()
+                        {
+                            eprintln!("client-ui-owner-queue-full: command=browser");
+                            break;
+                        }
                         true
                     }
                     Ok(None) => true,
@@ -3933,9 +4298,16 @@ impl LocalClient {
                 break;
             }
             acknowledged_sequence = Some(sequence);
-            #[cfg(windows)]
             if let Some((name, data)) = browser_resource {
-                self.browser_assets.insert(name, data);
+                let generation = self.readiness.generation;
+                if self
+                    .ui_owner_commands
+                    .push(generation, UiOwnerCommand::ResourceCommit { name, data })
+                    .is_err()
+                {
+                    eprintln!("client-ui-owner-queue-full: command=resource");
+                    break;
+                }
             }
             if let Some(control) = changed_macro
                 && let Some(session) = self.runtime.client_session(self.client)
@@ -3943,16 +4315,12 @@ impl LocalClient {
                 self.macro_bindings.refresh_control(session.ui(), &control);
             }
         }
+        self.drain_ui_owner_commands();
         if let Some(sequence) = acknowledged_sequence {
             match self.transport.acknowledge_ui(sequence) {
                 Ok(()) => {
-                    if let Err(error) = self.transport.mark_resources_ready() {
-                        eprintln!("client-ui: resource readiness failed: {error}");
-                    } else if self.snapshot.is_some()
-                        && let Err(error) = self.transport.mark_input_ready()
-                    {
-                        eprintln!("client-input-readiness-failed: {error}");
-                    }
+                    self.mark_client_ready(ClientReadiness::ResourceManifest);
+                    self.publish_client_readiness();
                 }
                 Err(error) => {
                     eprintln!("client-ui: acknowledgement {sequence} failed: {error}");
@@ -4245,18 +4613,25 @@ impl LocalClient {
                         );
                     }
                 }
-                self.snapshot = Some(snapshot);
+                let generation = self.readiness.generation;
+                if self
+                    .ui_owner_commands
+                    .push(generation, UiOwnerCommand::MapCommit(snapshot))
+                    .is_err()
+                {
+                    eprintln!("client-ui-owner-queue-full: command=map");
+                    return;
+                }
+                self.drain_ui_owner_commands();
                 if self.transport.is_live() {
                     // A reconnect to an already-running server may receive no
                     // new UI event batch. The accepted snapshot itself proves
                     // that its resource payload is installed, so advance both
                     // readiness phases here instead of waiting forever for an
                     // acknowledgement that will never be generated.
-                    if let Err(error) = self.transport.mark_resources_ready() {
-                        eprintln!("client-resource-readiness-failed: {error}");
-                    } else if let Err(error) = self.transport.mark_input_ready() {
-                        eprintln!("client-input-readiness-failed: {error}");
-                    }
+                    self.mark_client_ready(ClientReadiness::ResourceManifest);
+                    self.mark_client_ready(ClientReadiness::ResourcePayload);
+                    self.publish_client_readiness();
                 }
                 if let Some(surface) = &self.surface {
                     surface.window().set_title(&self.title());
@@ -4269,6 +4644,26 @@ impl LocalClient {
                     surface
                         .window()
                         .set_title(&format!("{} — snapshot error: {error}", self.title()));
+                }
+            }
+        }
+    }
+
+    fn drain_ui_owner_commands(&mut self) {
+        while let Some(command) = self.ui_owner_commands.pop_current() {
+            match command {
+                UiOwnerCommand::MapCommit(snapshot) => self.snapshot = Some(snapshot),
+                UiOwnerCommand::BrowserCommit(update) => {
+                    #[cfg(windows)]
+                    self.apply_browser_update(update);
+                    #[cfg(not(windows))]
+                    let _ = update;
+                }
+                UiOwnerCommand::ResourceCommit { name, data } => {
+                    #[cfg(windows)]
+                    self.browser_assets.insert(name, data);
+                    #[cfg(not(windows))]
+                    let _ = (name, data);
                 }
             }
         }
@@ -4339,7 +4734,7 @@ impl LocalClient {
             return BTreeMap::new();
         };
         let size = surface.window().inner_size();
-        resolve_pane_layout_in(session.ui(), Some((size.width, size.height)))
+        let mut browsers = resolve_pane_layout_in(session.ui(), Some((size.width, size.height)))
             .controls
             .into_iter()
             .filter(|(address, rect)| {
@@ -4347,7 +4742,93 @@ impl LocalClient {
                     && rect.height > 0
                     && control_has_type(session.ui().tree(), address, ControlType::Browser)
             })
-            .collect()
+            .collect::<BTreeMap<_, _>>();
+        let ui = session.ui();
+        let root_window = ui
+            .tree()
+            .windows
+            .iter()
+            .find(|window| {
+                window.controls.iter().any(|control| {
+                    control.control_type == ControlType::Main
+                        && control.property("is-default").is_some_and(dmf_truthy)
+                })
+            })
+            .map(|window| window.id.as_str());
+        let mut window_ids = ui
+            .tree()
+            .windows
+            .iter()
+            .map(|window| window.id.clone())
+            .collect::<Vec<_>>();
+        window_ids.extend(ui.cloned_window_ids());
+        for window_id in window_ids {
+            if root_window == Some(window_id.as_str()) {
+                continue;
+            }
+            let main_address = if ui.winexists(&window_id) {
+                window_id.clone()
+            } else {
+                format!("{window_id}.{window_id}")
+            };
+            if ui
+                .winget(&main_address, "is-pane")
+                .is_ok_and(|value| dmf_truthy(&value))
+                || ui
+                    .winget(&main_address, "is-visible")
+                    .is_ok_and(|value| dmf_false(&value))
+            {
+                continue;
+            }
+            let source_size = ui
+                .winget(&main_address, "size")
+                .ok()
+                .and_then(|value| parse_pair(&value, 'x'))
+                .unwrap_or((800, 600));
+            let overlay_width = source_size.0.min(size.width.saturating_mul(9) / 10).max(1);
+            let overlay_height = source_size.1.min(size.height.saturating_mul(9) / 10).max(1);
+            let overlay = PixelRect {
+                x: size.width.saturating_sub(overlay_width) / 2,
+                y: size.height.saturating_sub(overlay_height) / 2,
+                width: overlay_width,
+                height: overlay_height,
+            };
+            let Ok(control_ids) = ui.section_control_ids(&window_id) else {
+                continue;
+            };
+            for control_id in control_ids {
+                let address = format!("{window_id}.{control_id}");
+                if !ui.winexists_type(&address).eq_ignore_ascii_case("BROWSER")
+                    || ui
+                        .winget(&address, "is-visible")
+                        .is_ok_and(|value| dmf_false(&value))
+                {
+                    continue;
+                }
+                let local_pos = ui
+                    .winget(&address, "pos")
+                    .ok()
+                    .and_then(|value| parse_pair(&value, ','))
+                    .unwrap_or((0, 0));
+                let local_size = ui
+                    .winget(&address, "size")
+                    .ok()
+                    .and_then(|value| parse_pair(&value, 'x'))
+                    .unwrap_or(source_size);
+                browsers.insert(
+                    address,
+                    PixelRect {
+                        x: overlay.x
+                            + local_pos.0.saturating_mul(overlay.width) / source_size.0.max(1),
+                        y: overlay.y
+                            + local_pos.1.saturating_mul(overlay.height) / source_size.1.max(1),
+                        width: local_size.0.saturating_mul(overlay.width) / source_size.0.max(1),
+                        height: local_size.1.saturating_mul(overlay.height) / source_size.1.max(1),
+                    },
+                );
+            }
+        }
+        browsers
     }
 
     #[cfg(windows)]
@@ -4387,10 +4868,15 @@ impl LocalClient {
             .with_navigation_handler({
                 let sender = self.browser_message_sender.clone();
                 let control = control.to_owned();
+                let generation = Arc::clone(&self.browser_generation);
                 move |url| {
                     if url.to_ascii_lowercase().starts_with("byond://") {
                         let message = serde_json::json!({ "kind": "byond", "url": url });
-                        let _ = sender.send((control.clone(), message.to_string()));
+                        let _ = sender.send((
+                            generation.load(Ordering::Acquire),
+                            control.clone(),
+                            message.to_string(),
+                        ));
                         false
                     } else {
                         true
@@ -4400,8 +4886,13 @@ impl LocalClient {
             .with_ipc_handler({
                 let sender = self.browser_message_sender.clone();
                 let control = control.to_owned();
+                let generation = Arc::clone(&self.browser_generation);
                 move |request| {
-                    let _ = sender.send((control.clone(), request.body().clone()));
+                    let _ = sender.send((
+                        generation.load(Ordering::Acquire),
+                        control.clone(),
+                        request.body().clone(),
+                    ));
                 }
             })
             .build_as_child(&browser_window)
@@ -4410,6 +4901,13 @@ impl LocalClient {
             .set_bounds(bounds)
             .expect("the browser applies its initial DMF rectangle");
         self.browsers.insert(control.to_owned(), browser);
+        if control != AUDIO_BROWSER_CONTROL {
+            self.readiness.webview_required = true;
+            self.mark_client_ready(ClientReadiness::WebViewEnvironment);
+            self.publish_client_readiness();
+        } else {
+            self.readiness.audio_available = true;
+        }
         self.sync_browser_layout();
     }
 
@@ -4470,6 +4968,7 @@ impl LocalClient {
     #[cfg(windows)]
     fn apply_browser_update(&mut self, update: BrowserUpdate) {
         match update {
+            BrowserUpdate::Link(url) => open_external_url(&url),
             BrowserUpdate::Html { control, html } => {
                 self.load_browser_html(&control, &html);
             }
@@ -4485,7 +4984,6 @@ impl LocalClient {
 
     #[cfg(windows)]
     fn apply_sound_update(&mut self, sound: &SoundUpdate) {
-        const AUDIO_CONTROL: &str = "__dream64_audio";
         let url = match sound.file.as_deref() {
             Some(path) => {
                 let Some(path) = normalize_resource_path("", path) else {
@@ -4505,7 +5003,7 @@ impl LocalClient {
             }
             None => None,
         };
-        self.ensure_browser(AUDIO_CONTROL);
+        self.ensure_browser(AUDIO_BROWSER_CONTROL);
         let url = serde_json::to_string(&url).expect("sound URL serializes");
         let channel = sound.channel;
         let repeat = sound.repeat;
@@ -4549,7 +5047,7 @@ audio.addEventListener('ended', () => {{ if (channel !== 0 && state.channels.get
 audio.play().catch(error => console.error('Dream64 sound playback failed', error));
 }})();"#
         );
-        if let Some(browser) = self.browsers.get(AUDIO_CONTROL)
+        if let Some(browser) = self.browsers.get(AUDIO_BROWSER_CONTROL)
             && let Err(error) = browser.evaluate_script(&script)
         {
             eprintln!("client-sound-script-error: {error}");
@@ -4576,6 +5074,28 @@ audio.play().catch(error => console.error('Dream64 sound playback failed', error
             .unwrap_or_else(|| "Dream64".to_owned())
     }
 
+    fn mark_client_ready(&mut self, readiness: ClientReadiness) {
+        let generation = self.readiness.generation;
+        if let Err(error) = self.readiness.mark(generation, readiness) {
+            eprintln!("client-readiness: {error}");
+        }
+    }
+
+    fn publish_client_readiness(&mut self) {
+        if self.readiness.resources_ready() && !self.readiness.resources_sent {
+            match self.transport.mark_resources_ready() {
+                Ok(()) => self.readiness.resources_sent = true,
+                Err(error) => eprintln!("client-resource-readiness-failed: {error}"),
+            }
+        }
+        if self.readiness.interactive_ready() && !self.readiness.interactive_sent {
+            match self.transport.mark_input_ready() {
+                Ok(()) => self.readiness.interactive_sent = true,
+                Err(error) => eprintln!("client-input-readiness-failed: {error}"),
+            }
+        }
+    }
+
     fn resize(surface: &mut ClientSurface, width: u32, height: u32) {
         if let Err(error) = surface.resize(width, height) {
             eprintln!("client-surface-resize-error: {error}");
@@ -4595,7 +5115,7 @@ audio.play().catch(error => console.error('Dream64 sound playback failed', error
         active_prompt: Option<&ClientPrompt>,
         transport_status: &str,
         screenshot_path: Option<&Path>,
-    ) {
+    ) -> bool {
         if let Some(snapshot) = snapshot {
             for (path, bytes) in &snapshot.resources {
                 sprites.insert(path.clone(), bytes);
@@ -4706,7 +5226,24 @@ audio.play().catch(error => console.error('Dream64 sound playback failed', error
         }
         if let Err(error) = surface.present(&buffer, &gpu_dmi_sprites, &gpu_sprites) {
             eprintln!("client-surface-present-error: {error}");
+            false
+        } else {
+            true
         }
+    }
+}
+
+#[cfg(windows)]
+fn open_external_url(url: &str) {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        eprintln!("client-link-error: unsupported URL {url:?}");
+        return;
+    }
+    if let Err(error) = std::process::Command::new("rundll32.exe")
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn()
+    {
+        eprintln!("client-link-error: url={url:?} error={error}");
     }
 }
 
@@ -4788,6 +5325,36 @@ impl ApplicationHandler for LocalClient {
         self.drain_browser_messages();
         let previous_transport_status = self.transport.label().to_owned();
         if self.transport.try_connect() {
+            self.readiness.rearm();
+            self.ui_owner_commands
+                .advance_generation(self.readiness.generation);
+            self.browser_generation
+                .store(self.readiness.generation, Ordering::Release);
+            self.mark_client_ready(ClientReadiness::Transport);
+            self.mark_client_ready(ClientReadiness::LocalResources);
+            self.mark_client_ready(ClientReadiness::Skin);
+            #[cfg(windows)]
+            {
+                let has_browser = self
+                    .browsers
+                    .keys()
+                    .any(|control| control != AUDIO_BROWSER_CONTROL);
+                let has_ready_document = self
+                    .ready_browsers
+                    .iter()
+                    .any(|control| control != AUDIO_BROWSER_CONTROL);
+                self.readiness.webview_required = has_browser;
+                self.readiness.audio_available = self.browsers.contains_key(AUDIO_BROWSER_CONTROL);
+                if has_browser {
+                    self.mark_client_ready(ClientReadiness::WebViewEnvironment);
+                }
+                if has_ready_document {
+                    self.mark_client_ready(ClientReadiness::WebViewDocument);
+                }
+            }
+            if let Err(error) = self.transport.mark_skin_ready() {
+                eprintln!("client-skin-readiness-failed: {error}");
+            }
             self.startup_snapshot_visible = true;
             if self.startup_snapshot_active {
                 // Replay and live streams both start sequence numbering at 1.
@@ -4821,6 +5388,7 @@ impl ApplicationHandler for LocalClient {
         #[cfg(windows)]
         if received_ui {
             self.sync_native_menu();
+            self.sync_browser_layout();
         }
         if received_ui && self.snapshot_stage >= 2 && !self.hud_snapshot_refreshed {
             self.hud_snapshot_refreshed = true;
@@ -5247,9 +5815,10 @@ impl ApplicationHandler for LocalClient {
                     .startup_snapshot_visible
                     .then_some(self.snapshot.as_ref())
                     .flatten();
+                let snapshot_present = snapshot.is_some();
                 let layout = self.effective_layout();
                 let screenshot = self.pending_screenshot.take();
-                if let Some(surface) = &mut self.surface {
+                let presented = if let Some(surface) = &mut self.surface {
                     Self::redraw(
                         surface,
                         snapshot,
@@ -5263,7 +5832,13 @@ impl ApplicationHandler for LocalClient {
                         self.active_prompt.as_ref(),
                         self.transport.label(),
                         screenshot.as_deref(),
-                    );
+                    )
+                } else {
+                    false
+                };
+                if presented && snapshot_present {
+                    self.mark_client_ready(ClientReadiness::MapRenderer);
+                    self.publish_client_readiness();
                 }
                 // Present the native DMF shell once before the potentially
                 // expensive full snapshot/resource exchange. This guarantees
@@ -6123,6 +6698,8 @@ fn draw_map(
     let rows = usize::try_from(transform.rows).unwrap_or(0);
     let center_column = i32::try_from(columns / 2).expect("grid columns fit i32");
     let center_row = i32::try_from(rows / 2).expect("grid rows fit i32");
+    let snapshot_bounds =
+        snapshot.and_then(|snapshot| snapshot_bounds_at_z(snapshot, snapshot.center.z));
     for row in 0..rows {
         for column in 0..columns {
             let shade = snapshot
@@ -6132,18 +6709,27 @@ fn draw_map(
                         - center_column;
                     let y = snapshot.center.y + center_row
                         - i32::try_from(row).expect("grid row fits i32");
-                    snapshot.cells.get(&(x, y, snapshot.center.z)).copied()
+                    snapshot
+                        .cells
+                        .get(&(x, y, snapshot.center.z))
+                        .copied()
+                        .or_else(|| {
+                            let (min_x, max_x, min_y, max_y) = snapshot_bounds?;
+                            snapshot
+                                .cells
+                                .get(&(
+                                    x.clamp(min_x, max_x),
+                                    y.clamp(min_y, max_y),
+                                    snapshot.center.z,
+                                ))
+                                .copied()
+                        })
                 })
                 .unwrap_or_else(|| {
                     if snapshot.is_some() {
-                        // Sparse snapshot coordinates still occupy the full
-                        // BYOND viewport. Paint empty test cells instead of
-                        // leaving most of the render pane as a black void.
-                        if (row + column) % 2 == 0 {
-                            0xff3b_3b3b
-                        } else {
-                            0xff36_3636
-                        }
+                        // A malformed sparse row should not reintroduce the
+                        // Dream64 diagnostic checker into a live BYOND map.
+                        0xff3b_3b3b
                     } else if (row + column) % 2 == 0 {
                         0xff31566d
                     } else {
@@ -6310,6 +6896,21 @@ fn draw_map(
     }
 }
 
+fn snapshot_bounds_at_z(snapshot: &MapSnapshot, z: i32) -> Option<(i32, i32, i32, i32)> {
+    let mut coordinates = snapshot
+        .cells
+        .keys()
+        .filter(|coordinate| coordinate.2 == z)
+        .map(|coordinate| (coordinate.0, coordinate.1));
+    let (first_x, first_y) = coordinates.next()?;
+    Some(coordinates.fold(
+        (first_x, first_x, first_y, first_y),
+        |(min_x, max_x, min_y, max_y), (x, y)| {
+            (min_x.min(x), max_x.max(x), min_y.min(y), max_y.max(y))
+        },
+    ))
+}
+
 fn draw_appearance_maptext_signed(
     buffer: &mut [u32],
     width: usize,
@@ -6458,14 +7059,59 @@ fn screen_is_render_pipeline_helper(screen: &ScreenAppearance) -> bool {
         || screen
             .type_path
             .starts_with("/atom/movable/screen/fullscreen/lighting_backdrop")
-        || screen.appearances.iter().any(|appearance| {
-            appearance.state.eq_ignore_ascii_case("not_ready")
-                && appearance
-                    .resource
-                    .to_string_lossy()
-                    .replace('\\', "/")
-                    .ends_with("icons/hud/lobby/ready.dmi")
-        })
+}
+
+const PASS_MOUSE_APPEARANCE_FLAG: i32 = 1 << 12;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MousePickPolicy {
+    Transparent,
+    PixelOpaque,
+    Opaque,
+}
+
+impl MousePickPolicy {
+    fn from_mouse_opacity(mouse_opacity: i32) -> Self {
+        match mouse_opacity {
+            0 => Self::Transparent,
+            2 => Self::Opaque,
+            // `1` is BYOND's default. Retain the client's historical
+            // pixel-alpha behavior for malformed/unknown transported values.
+            _ => Self::PixelOpaque,
+        }
+    }
+}
+
+/// Applies BYOND's mouse policy after geometric bounds have been established.
+/// This is shared by world and screen picking so transport mode, viewport
+/// placement, and cross-turf sprite bounds cannot diverge semantically.
+fn appearance_hit_at(
+    appearance: &Appearance,
+    pixels: &[u32],
+    width: u32,
+    height: u32,
+    local_x: i32,
+    local_y: i32,
+) -> bool {
+    if local_x < 0
+        || local_y < 0
+        || local_x >= i32::try_from(width).unwrap_or(i32::MAX)
+        || local_y >= i32::try_from(height).unwrap_or(i32::MAX)
+    {
+        return false;
+    }
+    if appearance.appearance_flags & PASS_MOUSE_APPEARANCE_FLAG != 0 {
+        return false;
+    }
+    let pixel_index = usize::try_from(local_y).unwrap() * usize::try_from(width).unwrap()
+        + usize::try_from(local_x).unwrap();
+    match MousePickPolicy::from_mouse_opacity(appearance.mouse_opacity) {
+        MousePickPolicy::Transparent => false,
+        MousePickPolicy::PixelOpaque => pixels
+            .get(pixel_index)
+            .is_some_and(|pixel| *pixel >> 24 != 0),
+        MousePickPolicy::Opaque => true,
+    }
 }
 
 fn screen_hit_at(
@@ -6496,9 +7142,22 @@ fn screen_hit_at(
         {
             continue;
         }
-        let index = usize::try_from(local_y).ok()? * usize::try_from(width).ok()?
-            + usize::try_from(local_x).ok()?;
-        if pixels.get(index).is_some_and(|pixel| *pixel >> 24 != 0) {
+        let hit = screen.appearances.iter().rev().any(|appearance| {
+            let Ok((appearance_width, appearance_height, appearance_pixels)) =
+                rasterize_world_appearance(sprites, appearance)
+            else {
+                return false;
+            };
+            appearance_hit_at(
+                appearance,
+                &appearance_pixels,
+                appearance_width,
+                appearance_height,
+                local_x - appearance.pixel_x,
+                local_y + appearance.pixel_y,
+            )
+        });
+        if hit {
             return Some((
                 screen.datum_index,
                 screen.datum_generation,
@@ -6524,18 +7183,14 @@ fn map_hit_at(
         .into_iter()
         .rev()
         .find(|item| {
-            let local_x = screen_x - item.origin_x;
-            let local_y = screen_y - item.origin_y;
-            if local_x < 0
-                || local_y < 0
-                || local_x >= i32::try_from(item.width).unwrap_or(i32::MAX)
-                || local_y >= i32::try_from(item.height).unwrap_or(i32::MAX)
-            {
-                return false;
-            }
-            let index = usize::try_from(local_y).unwrap() * usize::try_from(item.width).unwrap()
-                + usize::try_from(local_x).unwrap();
-            item.pixels.get(index).is_some_and(|pixel| pixel >> 24 != 0)
+            appearance_hit_at(
+                &item.appearance,
+                &item.pixels,
+                item.width,
+                item.height,
+                screen_x - item.origin_x,
+                screen_y - item.origin_y,
+            )
         });
     let (target, target_coordinate) =
         display_hit
@@ -6687,6 +7342,136 @@ mod tests {
         LaunchOptions::parse_from(arguments.iter().map(std::ffi::OsString::from))
     }
 
+    fn mark_required_client_resources(coordinator: &mut ClientReadinessCoordinator) {
+        let generation = coordinator.generation;
+        for readiness in [
+            ClientReadiness::Transport,
+            ClientReadiness::LocalResources,
+            ClientReadiness::Skin,
+            ClientReadiness::ResourceManifest,
+            ClientReadiness::ResourcePayload,
+        ] {
+            coordinator.mark(generation, readiness).unwrap();
+        }
+    }
+
+    #[test]
+    fn client_readiness_is_generation_bound_and_monotonic() {
+        let mut coordinator = ClientReadinessCoordinator::new();
+        let generation = coordinator.generation;
+        coordinator
+            .mark(generation, ClientReadiness::Transport)
+            .unwrap();
+        coordinator
+            .mark(generation, ClientReadiness::Transport)
+            .unwrap();
+        assert!(coordinator.has(ClientReadiness::Transport));
+
+        coordinator.rearm();
+        assert_ne!(coordinator.generation, generation);
+        assert!(!coordinator.has(ClientReadiness::Transport));
+        assert_eq!(
+            coordinator.mark(generation, ClientReadiness::Skin),
+            Err("stale-client-generation")
+        );
+        assert!(!coordinator.has(ClientReadiness::Skin));
+    }
+
+    #[test]
+    fn ui_owner_queue_preserves_fifo_and_rejects_overflow() {
+        let mut queue = UiOwnerCommandQueue::new(7, 2);
+        assert_eq!(queue.push(7, "map"), Ok(()));
+        assert_eq!(queue.push(7, "browser"), Ok(()));
+        assert_eq!(queue.push(7, "resource"), Err("resource"));
+        assert_eq!(queue.pop_current(), Some("map"));
+        assert_eq!(queue.pop_current(), Some("browser"));
+        assert_eq!(queue.pop_current(), None);
+        assert_eq!(queue.overflow_rejected, 1);
+    }
+
+    #[test]
+    fn ui_owner_queue_drops_stale_generation_on_reconnect() {
+        let mut queue = UiOwnerCommandQueue::new(11, 4);
+        queue.push(11, 1).unwrap();
+        queue.push(11, 2).unwrap();
+        queue.advance_generation(12);
+        assert_eq!(queue.pop_current(), None);
+        assert_eq!(queue.stale_dropped, 2);
+        assert_eq!(queue.push(11, 3), Err(3));
+        assert_eq!(queue.push(12, 4), Ok(()));
+        assert_eq!(queue.pop_current(), Some(4));
+        assert_eq!(queue.stale_dropped, 3);
+    }
+
+    #[test]
+    fn resource_hex_decode_rejects_size_before_allocating() {
+        assert_eq!(decode_hex_bounded("00010203", 4), Ok(vec![0, 1, 2, 3]));
+        assert_eq!(
+            decode_hex_bounded("00010203", 3),
+            Err("payload exceeds resource byte limit")
+        );
+        assert_eq!(
+            decode_hex_bounded("0", 4),
+            Err("hex payload has odd length")
+        );
+        assert_eq!(
+            decode_hex_bounded("zz", 4),
+            Err("hex payload contains an invalid digit")
+        );
+    }
+
+    #[test]
+    fn snapshot_resource_budget_checks_aggregate_without_truncation() {
+        let mut budget = SnapshotResourceBudget::default();
+        budget.reserve(MAX_SNAPSHOT_RESOURCE_BYTES).unwrap();
+        assert_eq!(
+            budget.reserve(1),
+            Err("snapshot resource bytes exceed limit")
+        );
+        let mut overflow = SnapshotResourceBudget {
+            count: 0,
+            bytes: usize::MAX,
+        };
+        assert_eq!(
+            overflow.reserve(1),
+            Err("snapshot resource byte accounting overflow")
+        );
+    }
+
+    #[test]
+    fn client_readiness_waits_for_presented_map_but_not_audio() {
+        let mut coordinator = ClientReadinessCoordinator::new();
+        mark_required_client_resources(&mut coordinator);
+        assert!(coordinator.resources_ready());
+        assert!(!coordinator.interactive_ready());
+        assert!(!coordinator.audio_available);
+
+        let generation = coordinator.generation;
+        coordinator
+            .mark(generation, ClientReadiness::MapRenderer)
+            .unwrap();
+        assert!(coordinator.interactive_ready());
+    }
+
+    #[test]
+    fn client_readiness_waits_for_required_webview_document() {
+        let mut coordinator = ClientReadinessCoordinator::new();
+        coordinator.webview_required = true;
+        mark_required_client_resources(&mut coordinator);
+        let generation = coordinator.generation;
+        coordinator
+            .mark(generation, ClientReadiness::MapRenderer)
+            .unwrap();
+        coordinator
+            .mark(generation, ClientReadiness::WebViewEnvironment)
+            .unwrap();
+        assert!(!coordinator.interactive_ready());
+        coordinator
+            .mark(generation, ClientReadiness::WebViewDocument)
+            .unwrap();
+        assert!(coordinator.interactive_ready());
+    }
+
     #[test]
     fn launch_options_accept_each_supported_mode() {
         let live = launch_options(&[
@@ -6791,6 +7576,160 @@ mod tests {
                 .expect("png pixels");
         }
         bytes
+    }
+
+    fn solid_png(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut pixels = Vec::with_capacity(usize::try_from(width * height * 4).unwrap());
+        for _ in 0..width * height {
+            pixels.extend_from_slice(&rgba);
+        }
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .expect("png header")
+                .write_image_data(&pixels)
+                .expect("png pixels");
+        }
+        bytes
+    }
+
+    fn pick_appearance(
+        datum_index: u32,
+        resource: PathBuf,
+        layer: f32,
+        mouse_opacity: i32,
+        appearance_flags: i32,
+    ) -> Appearance {
+        Appearance {
+            datum_index,
+            datum_generation: 0,
+            resource,
+            state: String::new(),
+            direction: 2,
+            frame: 1,
+            plane: 0.0,
+            layer,
+            appearance_flags,
+            mouse_opacity,
+            pixel_x: 0,
+            pixel_y: 0,
+            color: [255; 3],
+            alpha: 255,
+            maptext: None,
+            maptext_width: 0,
+            maptext_height: 0,
+            maptext_x: 0,
+            maptext_y: 0,
+        }
+    }
+
+    #[test]
+    fn picking_modes_and_pass_mouse_share_one_policy() {
+        let pixels = [0x0000_0000, 0xffff_ffff];
+        let mut appearance = pick_appearance(1, PathBuf::new(), 0.0, 1, 0);
+        assert!(!appearance_hit_at(&appearance, &pixels, 2, 1, 0, 0));
+        assert!(appearance_hit_at(&appearance, &pixels, 2, 1, 1, 0));
+        appearance.mouse_opacity = 2;
+        assert!(appearance_hit_at(&appearance, &pixels, 2, 1, 0, 0));
+        appearance.mouse_opacity = 0;
+        assert!(!appearance_hit_at(&appearance, &pixels, 2, 1, 1, 0));
+        appearance.mouse_opacity = 2;
+        appearance.appearance_flags = PASS_MOUSE_APPEARANCE_FLAG;
+        assert!(!appearance_hit_at(&appearance, &pixels, 2, 1, 1, 0));
+        assert!(!appearance_hit_at(&appearance, &pixels, 2, 1, 2, 0));
+    }
+
+    #[test]
+    fn overlapping_world_sprite_transparency_falls_through_but_opaque_bounds_win() {
+        let bottom_resource = PathBuf::from("pick-bottom.png");
+        let top_resource = PathBuf::from("pick-top-transparent.png");
+        let mut sprites = SpriteCache::default();
+        sprites.insert(bottom_resource.clone(), &solid_png(1, 1, [255; 4]));
+        sprites.insert(top_resource.clone(), &solid_png(1, 1, [255, 255, 255, 0]));
+        let owner = WorldCoordinate { x: 1, y: 1, z: 1 };
+        let transform = MapTransform::new(
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 32,
+            },
+            32,
+            1.0,
+            "normal",
+            false,
+        );
+        let make_snapshot = |top_opacity| MapSnapshot {
+            center: owner,
+            cells: BTreeMap::new(),
+            turf_targets: BTreeMap::new(),
+            appearances: BTreeMap::from([(
+                (1, 1, 1),
+                vec![
+                    pick_appearance(10, bottom_resource.clone(), 1.0, 1, 0),
+                    pick_appearance(20, top_resource.clone(), 2.0, top_opacity, 0),
+                ],
+            )]),
+            screen: Vec::new(),
+            resources: BTreeMap::new(),
+        };
+        let pixel_fallthrough = map_hit_at(&make_snapshot(1), &mut sprites, transform, 0, 31)
+            .expect("bottom opaque pixel remains pickable");
+        assert_eq!(pixel_fallthrough.0, (10, 0));
+        let opaque_bounds = map_hit_at(&make_snapshot(2), &mut sprites, transform, 0, 31)
+            .expect("opaque bounds pick transparent pixels");
+        assert_eq!(opaque_bounds.0, (20, 0));
+    }
+
+    #[test]
+    fn world_and_screen_items_apply_the_same_mouse_policy() {
+        let resource = PathBuf::from("pick-parity-transparent.png");
+        let mut sprites = SpriteCache::default();
+        sprites.insert(resource.clone(), &solid_png(1, 1, [255, 255, 255, 0]));
+        let owner = WorldCoordinate { x: 1, y: 1, z: 1 };
+        let transform = MapTransform::new(
+            PixelRect {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 32,
+            },
+            32,
+            1.0,
+            "normal",
+            false,
+        );
+        for (mouse_opacity, expected) in [(0, false), (1, false), (2, true)] {
+            let appearance = pick_appearance(30, resource.clone(), 1.0, mouse_opacity, 0);
+            let snapshot = MapSnapshot {
+                center: owner,
+                cells: BTreeMap::new(),
+                turf_targets: BTreeMap::new(),
+                appearances: BTreeMap::from([((1, 1, 1), vec![appearance.clone()])]),
+                screen: vec![ScreenAppearance {
+                    datum_index: 30,
+                    datum_generation: 0,
+                    map_control: None,
+                    screen_loc: "1,1".to_owned(),
+                    type_path: "/atom/movable/screen/test".to_owned(),
+                    insertion: 0,
+                    appearances: vec![appearance],
+                }],
+                resources: BTreeMap::new(),
+            };
+            assert_eq!(
+                map_hit_at(&snapshot, &mut sprites, transform, 0, 31).is_some(),
+                expected
+            );
+            assert_eq!(
+                screen_hit_at(&snapshot, &mut sprites, transform, 0, 0).is_some(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -6969,6 +7908,15 @@ mod tests {
             map_control: None,
             screen_loc: "CENTER-9,CENTER-7".into(),
             type_path: "/atom/movable/screen/click_catcher".into(),
+            insertion: 0,
+            appearances: Vec::new(),
+        }));
+        assert!(!screen_is_render_pipeline_helper(&ScreenAppearance {
+            datum_index: 4,
+            datum_generation: 0,
+            map_control: None,
+            screen_loc: "TOP:-126,CENTER:62".into(),
+            type_path: "/atom/movable/screen/lobby/button/ready".into(),
             insertion: 0,
             appearances: Vec::new(),
         }));
@@ -8002,7 +8950,8 @@ mod tests {
                 .unwrap();
         }
         let resource_response = format!(
-            "ok resource protocol=2 pathhex=69636f6e2e646d69 datahex={}",
+            "ok resource_chunk protocol=3 pathhex=69636f6e2e646d69 offset=0 total={} eof=1 datahex={}",
+            png_bytes.len(),
             encode_hex(&png_bytes)
         );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -8022,7 +8971,10 @@ mod tests {
                     "map_snapshot c1",
                     "ok map_snapshot protocol=2 width=8 height=8 z=1 tiles=2\nT 4 5 2f747572662f6f70656e 233131323233  1\nA 1:0 2f6f626a 69636f6e2e646d69 - 2 00000000 00000000 00000000 00000000 00000000 00000000 - 437f0000 0 0\nT 5 5 2f747572662f6f70656e2f666c6f6f72 -  0\n",
                 ),
-                ("resource c1 69636f6e2e646d69", resource_response.as_str()),
+                (
+                    "resource_chunk c1 69636f6e2e646d69 0 262144",
+                    resource_response.as_str(),
+                ),
                 (
                     "map_pointer c1 1:0 4 5 1 6d61696e2e6d6170 6c6566743d31",
                     "ok map_pointer protocol=6 client=c1",
@@ -8049,6 +9001,9 @@ mod tests {
             snapshot.appearances.values().map(Vec::len).sum::<usize>(),
             1
         );
+        let legacy = &snapshot.appearances[&(4, 5, 1)][0];
+        assert_eq!(legacy.appearance_flags, 0);
+        assert_eq!(legacy.mouse_opacity, 1);
         assert_eq!(snapshot.resources.len(), 1);
         transport
             .send_map_pointer(
@@ -8061,6 +9016,68 @@ mod tests {
         let moved = transport.send_movement(1, 0).unwrap().unwrap();
         assert_eq!(moved.center, WorldCoordinate { x: 5, y: 5, z: 1 });
         assert_eq!(moved.cells.len(), 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn snapshot_v4_decodes_narrow_appearance_mouse_policy() {
+        let lines = [
+            "A 1:0 2f6f626a 69636f6e2e646d69 - 2 00000000 00000000 00000000 00000000 00000000 00000000 - 437f0000 0 0 - 00000000 00000000 00000000 00000000 4096 2",
+        ];
+        let mut cursor = 0;
+        let mut appearances = Vec::new();
+        parse_appearance_tree(&lines, &mut cursor, &mut appearances).unwrap();
+        assert_eq!(cursor, 1);
+        assert_eq!(appearances.len(), 1);
+        assert_eq!(appearances[0].appearance_flags, 4096);
+        assert_eq!(appearances[0].mouse_opacity, 2);
+    }
+
+    #[test]
+    fn remote_resource_transport_reassembles_bounded_chunks() {
+        let bytes = (0..RESOURCE_CHUNK_BYTES as usize + 3)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let first = format!(
+            "ok resource_chunk protocol=3 offset=0 total={} eof=0 datahex={}",
+            bytes.len(),
+            encode_hex(&bytes[..RESOURCE_CHUNK_BYTES as usize])
+        );
+        let second = format!(
+            "ok resource_chunk protocol=3 offset={} total={} eof=1 datahex={}",
+            RESOURCE_CHUNK_BYTES,
+            bytes.len(),
+            encode_hex(&bytes[RESOURCE_CHUNK_BYTES as usize..])
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for (expected, response) in [
+                (
+                    "attach".to_owned(),
+                    "ok attach protocol=1 client=c1".to_owned(),
+                ),
+                (
+                    "resource_chunk c1 69636f6e732f6c617267652e646d69 0 262144".to_owned(),
+                    first,
+                ),
+                (
+                    "resource_chunk c1 69636f6e732f6c617267652e646d69 262144 262144".to_owned(),
+                    second,
+                ),
+            ] {
+                let request = String::from_utf8(read_frame(&mut stream).unwrap()).unwrap();
+                assert_eq!(request, expected);
+                write_frame(&mut stream, response.as_bytes()).unwrap();
+            }
+        });
+        let mut transport = RemoteTransport::connect(address, None).unwrap();
+        transport.attach().unwrap();
+        assert_eq!(
+            transport.request_resource("icons/large.dmi").unwrap(),
+            bytes
+        );
         server.join().unwrap();
     }
 

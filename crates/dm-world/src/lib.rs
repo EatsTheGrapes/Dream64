@@ -20,7 +20,10 @@ pub use allocation::{
     CoordinateDatumSnapshot, WorldAllocation, WorldAllocationError, WorldAllocationStats,
     WorldAllocationWorkItem, WorldAllocationWorkKind, allocate_world, materialize_world_map_state,
 };
-pub use cache::{MapPlanCacheError, MapPlanCacheStats, load_or_build_cached_plan};
+pub use cache::{
+    MapPlanCacheError, MapPlanCacheStats, decode_named_portable_plan, decode_portable_plan,
+    encode_named_portable_plan, encode_portable_plan, load_or_build_cached_plan,
+};
 
 /// One stable integer world coordinate.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -51,8 +54,6 @@ pub enum AtomCategory {
 pub enum InitializerResolution {
     /// The path names an instantiable type.
     Resolved {
-        /// Stable object-tree type identity.
-        node: NodeId,
         /// Category derived from effective inheritance.
         category: AtomCategory,
     },
@@ -60,8 +61,6 @@ pub enum InitializerResolution {
     Unknown,
     /// The path exists but names a procedure, verb, or variable.
     NonType {
-        /// Stable identity of the non-type node.
-        node: NodeId,
         /// Namespace occupied by the node.
         kind: NodeKind,
     },
@@ -431,10 +430,9 @@ fn resolve_initializer(
             coordinate: None,
             path: Some(path.to_owned()),
         });
-        return InitializerResolution::NonType { node, kind };
+        return InitializerResolution::NonType { kind };
     }
     InitializerResolution::Resolved {
-        node,
         category: category(tree, node, roots),
     }
 }
@@ -603,10 +601,6 @@ mod tests {
         assert_eq!(
             template.initializers[0].resolution,
             InitializerResolution::Resolved {
-                node: match template.initializers[0].resolution {
-                    InitializerResolution::Resolved { node, .. } => node,
-                    _ => panic!("movable should resolve"),
-                },
                 category: AtomCategory::Movable,
             }
         );

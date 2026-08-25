@@ -34,15 +34,18 @@ Current measured progress:
   artifact; a warm artifact load is currently about 9–10 seconds on the test
   machine.
 - Compiler and server are separate processes. The compiler's incremental state
-  remains in `dream64-cache`; the one deployable `.d64` contains executable
+  remains in `dream64-cache`; each generation's deployable `.d64` contains executable
   bytecode and the bootstrap metadata needed by the server. A runtime launch
   never recompiles stale or missing input—it fails closed and asks the compiler
   process to rebuild.
 - Production prewarming uses an explicit deployment identity and random seed,
-  so station-map, ruin, room, engine, storyteller, and round selection happen
-  normally in the background. The fully initialized process can then wait in a
-  low-priority hot-standby state and take ownership of the live IPC port during
-  handoff without rerunning atom or subsystem initialization.
+  so station-map, ruin, room, and engine selection happen through the normal
+  DM lifecycle and remain reproducible for that generation. The expensive map,
+  atom, and subsystem stages are captured at a quiescent generation boundary.
+  During handoff the client can reconnect to a read-only startup lobby while
+  Dream64 resumes the final controller tail; interaction opens only after
+  Monke's ticker enters pregame, preserving population-sensitive storyteller
+  voting and the configured round countdown.
 - The server and native client have a real loopback transport for attach,
   ordered UI batches and acknowledgements, resource transfer, map/screen
   appearances, input, and movement commands.
@@ -164,6 +167,43 @@ cargo run -p dm-lifecycle --bin dream64-server -- boot path\to\world.d64 path\to
 one sibling `.d64`; `dream64-server` can load that artifact without compiler
 sources or private caches. The compiler reuses the whole artifact when the DME
 graph is unchanged and reuses unchanged per-file syntax units after edits.
+
+For an immutable deployment artifact, choose an explicit output path:
+
+```powershell
+dream64-compiler compile path\to\world.dme `
+    --output target\dream64-generations\build-123\world.d64 `
+    --reuse-artifact target\dream64-generations\build-122\world.d64
+```
+
+`--reuse-artifact` is validated against the current source fingerprint. When
+the source graph is unchanged, Dream64 hard-links (or copies) the already
+validated artifact instead of lowering the whole executable again.
+
+### Background compile and hot-generation safety
+
+Run the development deployment watchdog with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\watch-and-prewarm.ps1 `
+    -BuildImmediately
+```
+
+The watchdog debounces relevant Monke source/resource changes, invokes the
+separate compiler, starts the resulting generation at below-normal priority,
+and waits for its isolated prewarm readiness signal. Only then does it atomically
+publish `target\dream64-generations\current.json`. A failed compile or prewarm
+leaves the current pointer unchanged.
+
+Generation artifacts are immutable. Dream64 never deletes or overwrites the
+`.d64` used by a running round. Activation writes a generation lease before the
+handoff; the watchdog preserves that generation while its server PID is alive,
+then removes its artifact and preparation logs after exit. Superseded standbys
+that were never activated are cancelled. The steady state therefore retains
+only the active generation and its selected replacement. This model
+also provides a stable adapter boundary for TGS: TGS can stage a unique game
+directory, invoke the compiler, prewarm it, and switch generations without
+mutating the active game directory.
 
 This currently runs the supported `New()`, `Initialize()`, and
 `LateInitialize()` bodies against the allocated `/world`, areas, turfs, and

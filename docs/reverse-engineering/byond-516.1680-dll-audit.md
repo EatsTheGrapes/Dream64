@@ -367,6 +367,71 @@ imports, strings, and selected direct-call candidates do not reveal the private
 server packet format, exact private value layout, or every thread-affinity rule.
 Those behaviors require independent black-box oracles and differential tests.
 
+## DM instruction dispatcher
+
+A follow-up pass correlated the installed DLL with the public `auxtools` and
+`dmasm` implementations. The result identifies the 516.1680 interpreter
+dispatcher directly rather than inferring it from public procedure gateways:
+
+- The current auxtools Windows signature for build 1616 and later matches the
+  DLL exactly once, at RVA `0x0013E244`.
+- The execution context holds a pointer to 32-bit bytecode words at offset
+  `+0x10` and a 16-bit word offset/program counter at `+0x14`.
+- The dispatcher loads the current word, rejects values above `0x18C`, and
+  jumps through the absolute-address table at RVA `0x00153AC8`.
+- That table contains 397 legal slots (`0x000` through `0x18C`) and 396 distinct
+  native handler addresses. Opcodes `0x11B` (`Bounds`) and `0x11C` (`OBounds`)
+  are the only two slots sharing an entry address in this build.
+- Simple handlers confirm word-oriented operands. For example, handler
+  `0x084` at RVA `0x0013E269` advances the program counter, reads the next
+  32-bit word, stores it in the execution context cache field at `+0x08`, and
+  advances again. Handler `0x085` does the same for the cache-key field at
+  `+0x0C`.
+
+The opcode names and operand schemas are already substantially described by
+`dmasm`; native analysis should therefore concentrate on its unknown operands,
+unassigned slots, and semantic TODOs instead of rediscovering the whole table.
+The read-only helper `scripts/audit-byond-vm.py` reproduces bounded x86
+disassembly by export name or RVA and records the input DLL hash.
+
+The generated evidence is stored separately from the proprietary binary:
+
+- `generated/byondcore-516.1680-manifest.json` contains the five hashed PE
+  sections, 2,826 named exports, and 407 imports.
+- `generated/byondcore-516.1680-opcodes.json` contains all 397 table entries,
+  396 distinct handler RVAs, evidence-graded classifications for every entry,
+  and bounded
+  native disassembly for every handler.
+
+Auxtools `debug_server` 2.3.7 also builds successfully for
+`i686-pc-windows-msvc` in the local environment. Its source explicitly selects
+the post-1668 execution-context representation used by build 516.1680. The
+remaining unnamed dmasm slots are therefore candidates for controlled live
+instruction capture rather than speculative naming from machine code alone.
+
+### Live bytecode oracle
+
+The `fixtures/oracle/auxtools_vm` world loads the locally built probe DLL and
+receives `SUCCESS` from `auxtools_init` under DreamDaemon 516.1680. The
+`tools/auxtools-vm-dump` hook can then return raw bytecode words and dmasm output
+for a requested procedure without requiring an editor/debug-adapter session.
+
+One controlled procedure establishes opcode `0x17B`:
+
+```dm
+var/loaded = load_ext(library, function_name)
+return call_ext(loaded)(arglist(arguments))
+```
+
+Its raw tail is `GETVAR local(loaded)`, `GETVAR arg(arguments)`, `0x17B`,
+`RET`, `END`. This identifies `0x17B` as `CallExtLoadedArgList`; the generated
+opcode map records the name with provenance `dream64-live-oracle`. Static
+inspection of its handler at RVA `0x00148F27` is consistent with consuming a
+list-backed argument vector and dispatching a previously loaded external-call
+handle. The complete formerly-unnamed batch is documented in
+`byond-516.1680-unknown-opcodes.md`; all slots now have behavioral compatibility
+names, operand shapes, and handler classifications.
+
 ## Compiled database, map, and cache deep dive
 
 This follow-up examined the installed binaries without loading them into

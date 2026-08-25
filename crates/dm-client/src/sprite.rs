@@ -19,6 +19,8 @@ pub(crate) struct Appearance {
     pub frame: u32,
     pub plane: f32,
     pub layer: f32,
+    pub appearance_flags: i32,
+    pub mouse_opacity: i32,
     pub pixel_x: i32,
     pub pixel_y: i32,
     pub color: [u8; 3],

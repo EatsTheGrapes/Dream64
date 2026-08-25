@@ -1,16 +1,14 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use dm_core::SourceSpan;
-use dm_globals::UnsupportedCategory;
-use dm_runtime::{ConstantFieldApplication, RuntimeImage, RuntimeImageError};
+use dm_globals::{ConstantEvaluation, UnsupportedCategory};
+use dm_runtime::{RuntimeImage, RuntimeImageError};
 use dm_value::{DatumId, FieldName, TypePath, Value, ValueError};
 use dm_vm::ExecutionState;
 
-use crate::{
-    AtomCategory, CellTemplate, InitializerResolution, PlannedInitializer, WorldCoordinate,
-    WorldPlan,
-};
+use crate::{AtomCategory, InitializerResolution, PlannedInitializer, WorldCoordinate, WorldPlan};
 
 /// Inert runtime datum identities associated with one planned coordinate.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -271,6 +269,62 @@ struct AreaInstanceKey {
     variables: Vec<(String, String)>,
 }
 
+#[derive(Clone, Debug)]
+struct PreparedOverride {
+    assignment: dm_map::MapVariableAssignment,
+    field: Option<FieldName>,
+    evaluation: Option<ConstantEvaluation>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedInitializer {
+    source: PlannedInitializer,
+    type_path: Option<TypePath>,
+    overrides: Vec<PreparedOverride>,
+    area_key: Option<AreaInstanceKey>,
+}
+
+impl PreparedInitializer {
+    fn new(source: &PlannedInitializer) -> Self {
+        let type_path = matches!(source.resolution, InitializerResolution::Resolved { .. })
+            .then(|| TypePath::parse(&source.path).ok())
+            .flatten();
+        let overrides = source
+            .variables
+            .iter()
+            .map(|assignment| {
+                let field = FieldName::parse(&assignment.name).ok();
+                let evaluation = field.as_ref().map(|_| {
+                    RuntimeImage::prepare_constant_field_expression(&assignment.value.raw)
+                });
+                PreparedOverride {
+                    assignment: assignment.clone(),
+                    field,
+                    evaluation,
+                }
+            })
+            .collect();
+        Self {
+            source: source.clone(),
+            type_path,
+            overrides,
+            area_key: matches!(
+                source.resolution,
+                InitializerResolution::Resolved {
+                    category: AtomCategory::Area,
+                    ..
+                }
+            )
+            .then(|| AreaInstanceKey::new(source)),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PreparedCellTemplate {
+    initializers: Vec<PreparedInitializer>,
+}
+
 impl AreaInstanceKey {
     fn new(initializer: &PlannedInitializer) -> Self {
         Self {
@@ -293,11 +347,28 @@ struct Allocator<'plan, 'image> {
     work_items: Vec<WorldAllocationWorkItem>,
     stats: WorldAllocationStats,
     state: ExecutionState,
+    prepared_templates: BTreeMap<String, Arc<PreparedCellTemplate>>,
 }
 
 impl<'plan, 'image> Allocator<'plan, 'image> {
     fn new(plan: &'plan WorldPlan, image: &'image mut RuntimeImage) -> Self {
         let state = image.take_execution_state();
+        let prepared_templates = plan
+            .templates()
+            .iter()
+            .map(|(key, template)| {
+                (
+                    key.clone(),
+                    Arc::new(PreparedCellTemplate {
+                        initializers: template
+                            .initializers
+                            .iter()
+                            .map(PreparedInitializer::new)
+                            .collect(),
+                    }),
+                )
+            })
+            .collect();
         Self {
             plan,
             image,
@@ -307,6 +378,7 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
             work_items: Vec::new(),
             stats: WorldAllocationStats::default(),
             state,
+            prepared_templates,
         }
     }
 
@@ -326,7 +398,7 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
                 movables: Vec::new(),
                 source_order: Vec::new(),
             };
-            let Some(template) = self.plan.template(&cell.key) else {
+            let Some(template) = self.prepared_templates.get(&cell.key).cloned() else {
                 self.work_items.push(WorldAllocationWorkItem {
                     kind: WorldAllocationWorkKind::MissingTemplate,
                     coordinate: cell.coordinate,
@@ -340,7 +412,7 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
                 self.snapshots.push(snapshot);
                 continue;
             };
-            self.allocate_template(template, &mut snapshot)?;
+            self.allocate_template(template.as_ref(), &mut snapshot)?;
             self.link_cell_locations(&snapshot)?;
             self.snapshots.push(snapshot);
         }
@@ -381,18 +453,18 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
 
     fn allocate_template(
         &mut self,
-        template: &CellTemplate,
+        template: &PreparedCellTemplate,
         snapshot: &mut CoordinateDatumSnapshot,
     ) -> Result<(), WorldAllocationError> {
         for initializer in &template.initializers {
-            match initializer.resolution {
+            match initializer.source.resolution {
                 InitializerResolution::Resolved {
                     category: AtomCategory::Area,
                     ..
                 } if snapshot.area.is_some() => {
                     self.skip_initializer(
                         snapshot.coordinate,
-                        initializer,
+                        &initializer.source,
                         WorldAllocationWorkKind::ExtraArea,
                     );
                 }
@@ -402,7 +474,7 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
                 } if snapshot.turf.is_some() => {
                     self.skip_initializer(
                         snapshot.coordinate,
-                        initializer,
+                        &initializer.source,
                         WorldAllocationWorkKind::ExtraTurf,
                     );
                 }
@@ -411,12 +483,12 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
                 }
                 InitializerResolution::Unknown => self.skip_initializer(
                     snapshot.coordinate,
-                    initializer,
+                    &initializer.source,
                     WorldAllocationWorkKind::UnknownInitializer,
                 ),
                 InitializerResolution::NonType { .. } => self.skip_initializer(
                     snapshot.coordinate,
-                    initializer,
+                    &initializer.source,
                     WorldAllocationWorkKind::NonTypeInitializer,
                 ),
             }
@@ -426,26 +498,29 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
 
     fn allocate_resolved(
         &mut self,
-        initializer: &PlannedInitializer,
+        initializer: &PreparedInitializer,
         category: AtomCategory,
         snapshot: &mut CoordinateDatumSnapshot,
     ) -> Result<(), WorldAllocationError> {
         if category == AtomCategory::OtherType {
             self.skip_initializer(
                 snapshot.coordinate,
-                initializer,
+                &initializer.source,
                 WorldAllocationWorkKind::OtherType,
             );
             return Ok(());
         }
         let datum = if category == AtomCategory::Area {
-            let key = AreaInstanceKey::new(initializer);
+            let key = initializer
+                .area_key
+                .as_ref()
+                .expect("prepared area initializer has an area key");
             if let Some(datum) = self.areas.get(&key).copied() {
                 datum
             } else {
                 let datum =
                     self.allocate_initializer(snapshot.coordinate, initializer, category)?;
-                self.areas.insert(key, datum);
+                self.areas.insert(key.clone(), datum);
                 self.stats.unique_areas += 1;
                 datum
             }
@@ -471,10 +546,13 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
     fn allocate_initializer(
         &mut self,
         coordinate: WorldCoordinate,
-        initializer: &PlannedInitializer,
+        initializer: &PreparedInitializer,
         category: AtomCategory,
     ) -> Result<DatumId, WorldAllocationError> {
-        let type_path = TypePath::parse(&initializer.path)?;
+        let type_path = initializer
+            .type_path
+            .as_ref()
+            .ok_or_else(|| ValueError::InvalidTypePath(initializer.source.path.clone()))?;
         let datum = if matches!(category, AtomCategory::Area | AtomCategory::Turf) {
             self.image
                 .allocate_compact_map_datum_in_state(&type_path, &mut self.state)?
@@ -502,14 +580,15 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
             )?;
         }
         self.allocation_order.push(datum);
-        for assignment in &initializer.variables {
-            let Ok(field) = FieldName::parse(&assignment.name) else {
+        for prepared in &initializer.overrides {
+            let assignment = &prepared.assignment;
+            let Some(field) = prepared.field.clone() else {
                 self.stats.unsupported_overrides += 1;
                 self.work_items.push(WorldAllocationWorkItem {
                     kind: WorldAllocationWorkKind::InvalidFieldName,
                     coordinate,
-                    span: initializer.span,
-                    initializer_path: Some(initializer.path.clone()),
+                    span: initializer.source.span,
+                    initializer_path: Some(initializer.source.path.clone()),
                     field: Some(assignment.name.clone()),
                     assignment_span: Some(assignment.span),
                     blocker_span: Some(assignment.name_span),
@@ -517,20 +596,27 @@ impl<'plan, 'image> Allocator<'plan, 'image> {
                 });
                 continue;
             };
-            match self.image.apply_constant_field_expression_in_state(
-                &mut self.state,
-                datum,
-                field,
-                &assignment.value.raw,
-            )? {
-                ConstantFieldApplication::Applied => self.stats.constant_overrides += 1,
-                ConstantFieldApplication::Unsupported(unsupported) => {
+            match prepared
+                .evaluation
+                .as_ref()
+                .expect("valid prepared field has an evaluation")
+            {
+                ConstantEvaluation::Value(constant) => {
+                    self.image.apply_prepared_constant_field_in_state(
+                        &mut self.state,
+                        datum,
+                        field,
+                        constant,
+                    )?;
+                    self.stats.constant_overrides += 1;
+                }
+                ConstantEvaluation::Unsupported(unsupported) => {
                     self.stats.unsupported_overrides += 1;
                     self.work_items.push(WorldAllocationWorkItem {
                         kind: WorldAllocationWorkKind::DynamicOverride(unsupported.category),
                         coordinate,
-                        span: initializer.span,
-                        initializer_path: Some(initializer.path.clone()),
+                        span: initializer.source.span,
+                        initializer_path: Some(initializer.source.path.clone()),
                         field: Some(assignment.name.clone()),
                         assignment_span: Some(assignment.span),
                         blocker_span: Some(absolute_span(

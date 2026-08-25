@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 crc32fast = "1.5"
+bincode = "1.3"
 dm-compiler = { path = "../dm-compiler" }
 dm-core = { path = "../dm-core" }
 dm-globals = { path = "../dm-globals" }
@@ -16,6 +17,7 @@ dm-object-tree = { path = "../dm-object-tree" }
 dm-semantics = { path = "../dm-semantics" }
 dm-value = { path = "../dm-value" }
 dm-vm = { path = "../dm-vm" }
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 dm-syntax = { path = "../dm-syntax" }

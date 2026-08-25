@@ -3,6 +3,8 @@ param(
     [string] $CompilerExecutable,
     [string] $Dme = "C:\Users\Administrator\Desktop\RBMK Project\Monkestation2.0\tgstation.dme",
     [string] $Map = "C:\Users\Administrator\Desktop\RBMK Project\Monkestation2.0\_maps\map_files\generic\CentCom.dmm",
+    [string] $Artifact,
+    [string] $ReuseArtifact,
     [string] $DeploymentId = (Get-Date -Format "yyyyMMdd-HHmmss"),
     [UInt64] $RandomSeed = 0,
     [string] $StandbyAddress = "127.0.0.1:51665",
@@ -35,11 +37,22 @@ $prewarmLog = Join-Path $logDirectory "prewarm-$DeploymentId-runtime.log"
 $manifest = Join-Path $logDirectory "prewarm-$DeploymentId.json"
 $quotedDme = '"' + $Dme + '"'
 $quotedMap = '"' + $Map + '"'
+$compilerArguments = @($quotedDme)
+if (-not [string]::IsNullOrWhiteSpace($Artifact)) {
+    $Artifact = [IO.Path]::GetFullPath($Artifact)
+    $artifactParent = Split-Path -Parent $Artifact
+    [IO.Directory]::CreateDirectory($artifactParent) | Out-Null
+    $compilerArguments += @("--output", ('"' + $Artifact + '"'))
+}
+if (-not [string]::IsNullOrWhiteSpace($ReuseArtifact)) {
+    $ReuseArtifact = (Resolve-Path -LiteralPath $ReuseArtifact).Path
+    $compilerArguments += @("--reuse-artifact", ('"' + $ReuseArtifact + '"'))
+}
 
 Write-Host "  Dream64 background preparation $DeploymentId" -ForegroundColor Cyan
 Write-Host "  Compiler and runtime are separate processes; both run below the live server priority." -ForegroundColor DarkGray
 $compiler = Start-Process -FilePath $CompilerExecutable `
-    -ArgumentList @($quotedDme) `
+    -ArgumentList $compilerArguments `
     -WorkingDirectory $workspace `
     -RedirectStandardError $compilerLog `
     -WindowStyle Hidden `
@@ -49,7 +62,11 @@ $compiler.WaitForExit()
 if ($compiler.ExitCode -ne 0) {
     throw "Compiler failed with code $($compiler.ExitCode). See $compilerLog"
 }
-$Artifact = [IO.Path]::ChangeExtension($Dme, ".d64")
+$Artifact = if ([string]::IsNullOrWhiteSpace($Artifact)) {
+    [IO.Path]::ChangeExtension($Dme, ".d64")
+} else {
+    $Artifact
+}
 $Artifact = (Resolve-Path -LiteralPath $Artifact).Path
 $quotedArtifact = '"' + $Artifact + '"'
 
@@ -77,6 +94,7 @@ $standby.PriorityClass = [Diagnostics.ProcessPriorityClass]::BelowNormal
     standby_pid = $standby.Id
     standby_address = $StandbyAddress
     runtime_address = $RuntimeAddress
+    artifact = $Artifact
     compiler_log = $compilerLog
     runtime_log = $prewarmLog
 } | ConvertTo-Json | Set-Content -LiteralPath $manifest -Encoding UTF8

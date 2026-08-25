@@ -11,12 +11,16 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender, SyncSender},
     },
     thread,
 };
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+// Resource bytes are hex encoded on this text protocol. Keep a chunk well
+// below half the frame ceiling so headers and future metadata remain bounded.
+const MAX_RESOURCE_CHUNK_BYTES: u32 = 256 * 1024;
+static NEXT_STARTUP_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, PartialEq)]
 enum Command {
@@ -35,6 +39,12 @@ enum Command {
     Resource {
         session: String,
         path: String,
+    },
+    ResourceChunk {
+        session: String,
+        path: String,
+        offset: u64,
+        length: u32,
     },
     UiEvents {
         session: String,
@@ -99,12 +109,119 @@ pub struct LoopbackIpc {
     retained_ui: BTreeMap<String, Vec<(u64, LocalClientUiEvent)>>,
     readiness: BTreeMap<String, SessionReadiness>,
     startup_gate: Option<Arc<StartupGate>>,
+    startup_generation: u64,
 }
 
 struct StartupGate {
-    accepting: AtomicBool,
-    interactive: AtomicBool,
+    state: AtomicU64,
     phase: RwLock<String>,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+/// Owner-thread boot milestones committed under one startup-generation token.
+pub enum BootPhase {
+    /// Inputs and compiled artifact identity are being validated.
+    ArtifactValidation = 0,
+    /// Immutable program, resource, and structural tables are being linked.
+    StructuralLoad = 1,
+    /// Map prototypes and initializer work are being planned.
+    WorldPlan = 2,
+    /// The live world and map heap are being allocated on the owner thread.
+    WorldAllocation = 3,
+    /// Ordered DM lifecycle and subsystem startup code is executing.
+    Lifecycle = 4,
+    /// Runtime startup finished and clients may observe a read-only lobby.
+    RuntimeStartedReadOnly = 5,
+    /// The current generation may accept interactive client work.
+    Interactive = 6,
+}
+
+impl StartupGate {
+    const PHASE_BITS: u32 = 3;
+
+    const fn state(generation: u64, readiness: BootPhase) -> u64 {
+        (generation << Self::PHASE_BITS) | readiness as u64
+    }
+
+    const fn generation(state: u64) -> u64 {
+        state >> Self::PHASE_BITS
+    }
+
+    const fn readiness(state: u64) -> u8 {
+        (state & ((1 << Self::PHASE_BITS) - 1)) as u8
+    }
+
+    fn advance(&self, generation: u64, target: BootPhase) -> Result<(), &'static str> {
+        let target = target as u8;
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if generation != Self::generation(state) {
+                return Err("stale-startup-generation");
+            }
+            let current = Self::readiness(state);
+            if target < current {
+                return Err("startup-readiness-regression");
+            }
+            if target == current {
+                return Ok(());
+            }
+            if self
+                .state
+                .compare_exchange(
+                    state,
+                    Self::state(generation, target.try_into().expect("valid readiness")),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    fn at_least(&self, readiness: BootPhase) -> bool {
+        Self::readiness(self.state.load(Ordering::Acquire)) >= readiness as u8
+    }
+
+    fn rearm(&self, generation: u64, next_generation: u64) -> Result<(), &'static str> {
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if generation != Self::generation(state) {
+                return Err("stale-startup-generation");
+            }
+            if self
+                .state
+                .compare_exchange(
+                    state,
+                    Self::state(next_generation, BootPhase::ArtifactValidation),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+}
+
+impl TryFrom<u8> for BootPhase {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::ArtifactValidation),
+            1 => Ok(Self::StructuralLoad),
+            2 => Ok(Self::WorldPlan),
+            3 => Ok(Self::WorldAllocation),
+            4 => Ok(Self::Lifecycle),
+            5 => Ok(Self::RuntimeStartedReadOnly),
+            6 => Ok(Self::Interactive),
+            _ => Err(()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -174,11 +291,14 @@ impl LoopbackIpc {
     /// Early attach attempts receive the current phase instead of blocking the
     /// native client event loop on a scheduler boundary that does not yet exist.
     pub fn bind_starting(address: SocketAddr, phase: &str) -> Result<Self, String> {
+        let generation = NEXT_STARTUP_GENERATION.fetch_add(1, Ordering::Relaxed);
         Self::bind_with_startup_gate(
             address,
             Some(Arc::new(StartupGate {
-                accepting: AtomicBool::new(false),
-                interactive: AtomicBool::new(false),
+                state: AtomicU64::new(StartupGate::state(
+                    generation,
+                    BootPhase::ArtifactValidation,
+                )),
                 phase: RwLock::new(phase.to_owned()),
             })),
         )
@@ -204,12 +324,15 @@ impl LoopbackIpc {
             ui_sequences: BTreeMap::new(),
             retained_ui: BTreeMap::new(),
             readiness: BTreeMap::new(),
+            startup_generation: startup_gate.as_ref().map_or(0, |gate| {
+                StartupGate::generation(gate.state.load(Ordering::Relaxed))
+            }),
             startup_gate,
         })
     }
 
     /// Updates the human-readable phase returned to clients during preflight.
-    pub fn set_startup_phase(&self, phase: &str) {
+    fn set_startup_description(&self, phase: &str) {
         let Some(gate) = &self.startup_gate else {
             return;
         };
@@ -219,18 +342,54 @@ impl LoopbackIpc {
     }
 
     /// Allows subsequent attach requests to enter the scheduler-owned VM.
-    pub fn accept_startup_clients(&self) {
+    pub fn accept_startup_clients(&self, generation: u64) -> Result<(), &'static str> {
         if let Some(gate) = &self.startup_gate {
-            gate.interactive.store(true, Ordering::Release);
-            gate.accepting.store(true, Ordering::Release);
+            gate.advance(generation, BootPhase::Interactive)?;
         }
+        Ok(())
     }
 
     /// Exposes a read-only live lobby once Master begins subsystem work.
-    pub fn show_startup_lobby(&self) {
+    pub fn show_startup_lobby(&self, generation: u64) -> Result<(), &'static str> {
         if let Some(gate) = &self.startup_gate {
-            gate.accepting.store(true, Ordering::Release);
+            gate.advance(generation, BootPhase::RuntimeStartedReadOnly)?;
         }
+        Ok(())
+    }
+
+    /// Token required to commit readiness for this listener's boot generation.
+    #[must_use]
+    pub const fn startup_generation(&self) -> u64 {
+        self.startup_generation
+    }
+
+    /// Commits a typed boot phase and publishes its client-facing description.
+    pub fn commit_boot_phase(
+        &self,
+        generation: u64,
+        phase: BootPhase,
+        description: &str,
+    ) -> Result<(), &'static str> {
+        if let Some(gate) = &self.startup_gate {
+            gate.advance(generation, phase)?;
+            if let Ok(mut current) = gate.phase.write() {
+                *current = description.to_owned();
+            }
+        }
+        Ok(())
+    }
+
+    /// Invalidates every outstanding readiness token and returns the token for
+    /// a fresh startup cycle on the already-bound transport.
+    pub fn rearm_startup(&mut self, phase: &str) -> Result<u64, &'static str> {
+        let Some(gate) = &self.startup_gate else {
+            return Ok(0);
+        };
+        let next = NEXT_STARTUP_GENERATION.fetch_add(1, Ordering::Relaxed);
+        gate.rearm(self.startup_generation, next)?;
+        self.startup_generation = next;
+        self.set_startup_description(phase);
+        Ok(next)
     }
 
     /// Enables input for clients that attached to the read-only startup lobby.
@@ -249,7 +408,7 @@ impl LoopbackIpc {
     fn startup_interactive(&self) -> bool {
         self.startup_gate
             .as_ref()
-            .is_none_or(|gate| gate.interactive.load(Ordering::Acquire))
+            .is_none_or(|gate| gate.at_least(BootPhase::Interactive))
     }
     /// Returns the actual bound loopback address.
     #[must_use]
@@ -615,6 +774,27 @@ impl LoopbackIpc {
                     Err(error) => format!("error {error}"),
                 }
             }
+            Command::ResourceChunk {
+                session,
+                path,
+                offset,
+                length,
+            } => {
+                if !self.sessions.contains_key(&session) {
+                    return "error unknown-session".into();
+                }
+                match read_project_resource_chunk(state, &path, offset, length) {
+                    Ok(chunk) => format!(
+                        "ok resource_chunk protocol=3 pathhex={} offset={} total={} eof={} datahex={}",
+                        hex(path.as_bytes()),
+                        offset,
+                        chunk.total,
+                        u8::from(chunk.eof),
+                        hex(&chunk.bytes)
+                    ),
+                    Err(error) => format!("error {error}"),
+                }
+            }
             Command::UiEvents { session } => {
                 let Some(client) = self.sessions.get(&session).copied() else {
                     return "error unknown-session".into();
@@ -693,7 +873,8 @@ fn serve(listener: TcpListener, sender: &Sender<Request>, startup_gate: Option<&
             let response = match parse_command(&frame) {
                 Ok(Command::Ping) => "ok ping protocol=1".to_owned(),
                 Ok(Command::Attach)
-                    if startup_gate.is_some_and(|gate| !gate.accepting.load(Ordering::Acquire)) =>
+                    if startup_gate
+                        .is_some_and(|gate| !gate.at_least(BootPhase::RuntimeStartedReadOnly)) =>
                 {
                     let phase = startup_gate
                         .and_then(|gate| gate.phase.read().ok().map(|phase| phase.clone()))
@@ -770,6 +951,37 @@ fn parse_command(frame: &[u8]) -> Result<Command, String> {
             let path = String::from_utf8(unhex(path)?)
                 .map_err(|_| "resource path is not UTF-8".to_owned())?;
             Ok(Command::Resource { session, path })
+        }
+        Some("resource_chunk") => {
+            let session = p
+                .next()
+                .ok_or("resource_chunk session is missing")?
+                .to_owned();
+            let path = p.next().ok_or("resource_chunk path is missing")?;
+            let offset = p
+                .next()
+                .ok_or("resource_chunk offset is missing")?
+                .parse::<u64>()
+                .map_err(|_| "resource_chunk offset is invalid".to_owned())?;
+            let length = p
+                .next()
+                .ok_or("resource_chunk length is missing")?
+                .parse::<u32>()
+                .map_err(|_| "resource_chunk length is invalid".to_owned())?;
+            if p.next().is_some() {
+                return Err("resource_chunk has trailing arguments".into());
+            }
+            if length == 0 || length > MAX_RESOURCE_CHUNK_BYTES {
+                return Err("resource_chunk length is out of range".into());
+            }
+            let path = String::from_utf8(unhex(path)?)
+                .map_err(|_| "resource_chunk path is not UTF-8".to_owned())?;
+            Ok(Command::ResourceChunk {
+                session,
+                path,
+                offset,
+                length,
+            })
         }
         Some("ui_events") => {
             let session = p.next().ok_or("ui_events session is missing")?.to_owned();
@@ -979,7 +1191,7 @@ fn encode_snapshot(
     snapshot: LocalClientMapSnapshot,
 ) -> String {
     let mut out = format!(
-        "ok map_snapshot protocol=3 session={session} tick={tick} width={} height={} x={} y={} z={} tiles={} screen={}\n",
+        "ok map_snapshot protocol=4 session={session} tick={tick} width={} height={} x={} y={} z={} tiles={} screen={}\n",
         snapshot.width,
         snapshot.height,
         center.0,
@@ -1031,7 +1243,7 @@ fn encode_appearance(out: &mut String, appearance: &dm_vm::LocalClientAppearance
     use std::fmt::Write as _;
     let _ = writeln!(
         out,
-        "A {:x}:{:x} {} {} {} {} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {} {:08x} {} {} {} {:08x} {:08x} {:08x} {:08x}",
+        "A {:x}:{:x} {} {} {} {} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {} {:08x} {} {} {} {:08x} {:08x} {:08x} {:08x} {} {}",
         appearance.datum.index(),
         appearance.datum.generation(),
         hex(appearance.type_path.as_bytes()),
@@ -1053,6 +1265,8 @@ fn encode_appearance(out: &mut String, appearance: &dm_vm::LocalClientAppearance
         appearance.maptext_height.to_bits(),
         appearance.maptext_x.to_bits(),
         appearance.maptext_y.to_bits(),
+        appearance.appearance_flags,
+        appearance.mouse_opacity,
     );
     for child in &appearance.underlays {
         encode_appearance(out, child);
@@ -1124,6 +1338,67 @@ fn read_project_resource(state: &ExecutionState, path: &str) -> Result<Vec<u8>, 
     std::fs::read(target).map_err(|error| error.to_string())
 }
 
+#[derive(Debug, PartialEq)]
+struct ResourceChunk {
+    bytes: Vec<u8>,
+    total: u64,
+    eof: bool,
+}
+
+fn read_project_resource_chunk(
+    state: &ExecutionState,
+    path: &str,
+    offset: u64,
+    length: u32,
+) -> Result<ResourceChunk, String> {
+    use std::{
+        io::{Read as _, Seek as _, SeekFrom},
+        path::{Component, Path},
+    };
+    if length == 0 || length > MAX_RESOURCE_CHUNK_BYTES {
+        return Err("resource chunk length is out of range".to_owned());
+    }
+    let root = state
+        .project_root()
+        .ok_or_else(|| "project root is unavailable".to_owned())?;
+    let relative = Path::new(path);
+    if relative.is_absolute()
+        || relative.components().any(|part| {
+            matches!(
+                part,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err("resource path escapes project root".to_owned());
+    }
+    let root = root.canonicalize().map_err(|error| error.to_string())?;
+    let target = root
+        .join(relative)
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if !target.starts_with(&root) {
+        return Err("resource path escapes project root".to_owned());
+    }
+    let mut file = std::fs::File::open(target).map_err(|error| error.to_string())?;
+    let total = file.metadata().map_err(|error| error.to_string())?.len();
+    if offset > total {
+        return Err("resource chunk offset exceeds file length".to_owned());
+    }
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| error.to_string())?;
+    let remaining = total - offset;
+    let take = remaining.min(u64::from(length)) as usize;
+    let mut bytes = vec![0; take];
+    file.read_exact(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    Ok(ResourceChunk {
+        bytes,
+        total,
+        eof: offset + take as u64 == total,
+    })
+}
+
 fn encode_retained_ui_events(session: &str, events: &[(u64, LocalClientUiEvent)]) -> String {
     use std::fmt::Write as _;
     let mut output = format!(
@@ -1132,6 +1407,9 @@ fn encode_retained_ui_events(session: &str, events: &[(u64, LocalClientUiEvent)]
     );
     for (sequence, event) in events {
         match event.clone() {
+            LocalClientUiEvent::Link { url } => {
+                let _ = writeln!(output, "U {sequence} link {}", required_hex(url.as_bytes()));
+            }
             LocalClientUiEvent::Winset {
                 control,
                 parameters,
@@ -1278,6 +1556,16 @@ mod tests {
                 path: "icons/test.dmi".into(),
             })
         );
+        assert_eq!(
+            parse_command(b"resource_chunk s1 69636f6e732f746573742e646d69 4294967296 262144"),
+            Ok(Command::ResourceChunk {
+                session: "s1".into(),
+                path: "icons/test.dmi".into(),
+                offset: 4_294_967_296,
+                length: 262_144,
+            })
+        );
+        assert!(parse_command(b"resource_chunk s1 61 0 262145").is_err());
         assert_eq!(
             parse_command(b"ui_events s1"),
             Ok(Command::UiEvents {
@@ -1438,7 +1726,12 @@ mod tests {
                 hex(b"Preflighting subsystem plans")
             )
         );
-        ipc.set_startup_phase("Allocating map world");
+        ipc.commit_boot_phase(
+            ipc.startup_generation(),
+            BootPhase::WorldAllocation,
+            "Allocating map world",
+        )
+        .unwrap();
         write_frame(&mut stream, b"attach").unwrap();
         assert_eq!(
             String::from_utf8(read_frame(&mut stream).unwrap()).unwrap(),
@@ -1450,7 +1743,80 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_v3_hex_encodes_map_and_screen_appearance_trees() {
+    fn startup_gate_rejects_stale_generation_commits() {
+        let gate = StartupGate {
+            state: AtomicU64::new(StartupGate::state(41, BootPhase::ArtifactValidation)),
+            phase: RwLock::new("Loading world".into()),
+        };
+
+        assert_eq!(
+            gate.advance(40, BootPhase::RuntimeStartedReadOnly),
+            Err("stale-startup-generation")
+        );
+        assert!(!gate.at_least(BootPhase::RuntimeStartedReadOnly));
+        assert_eq!(gate.advance(41, BootPhase::RuntimeStartedReadOnly), Ok(()));
+        assert!(gate.at_least(BootPhase::RuntimeStartedReadOnly));
+        assert!(!gate.at_least(BootPhase::Interactive));
+    }
+
+    #[test]
+    fn startup_gate_is_monotonic_and_idempotent() {
+        let gate = StartupGate {
+            state: AtomicU64::new(StartupGate::state(7, BootPhase::ArtifactValidation)),
+            phase: RwLock::new("Starting".into()),
+        };
+
+        assert_eq!(gate.advance(7, BootPhase::Interactive), Ok(()));
+        assert_eq!(gate.advance(7, BootPhase::Interactive), Ok(()));
+        assert_eq!(
+            gate.advance(7, BootPhase::RuntimeStartedReadOnly),
+            Err("startup-readiness-regression")
+        );
+        assert!(gate.at_least(BootPhase::Interactive));
+    }
+
+    #[test]
+    fn boot_coordinator_accepts_the_complete_ordered_phase_sequence() {
+        let gate = StartupGate {
+            state: AtomicU64::new(StartupGate::state(19, BootPhase::ArtifactValidation)),
+            phase: RwLock::new("Validating artifact".into()),
+        };
+
+        for phase in [
+            BootPhase::StructuralLoad,
+            BootPhase::WorldPlan,
+            BootPhase::WorldAllocation,
+            BootPhase::Lifecycle,
+            BootPhase::RuntimeStartedReadOnly,
+            BootPhase::Interactive,
+        ] {
+            assert_eq!(gate.advance(19, phase), Ok(()));
+            assert!(gate.at_least(phase));
+        }
+        assert_eq!(
+            gate.advance(19, BootPhase::Lifecycle),
+            Err("startup-readiness-regression")
+        );
+    }
+
+    #[test]
+    fn rearming_startup_atomically_invalidates_the_previous_token() {
+        let gate = StartupGate {
+            state: AtomicU64::new(StartupGate::state(11, BootPhase::Interactive)),
+            phase: RwLock::new("Ready".into()),
+        };
+
+        assert_eq!(gate.rearm(11, 12), Ok(()));
+        assert!(!gate.at_least(BootPhase::RuntimeStartedReadOnly));
+        assert_eq!(
+            gate.advance(11, BootPhase::Interactive),
+            Err("stale-startup-generation")
+        );
+        assert_eq!(gate.advance(12, BootPhase::RuntimeStartedReadOnly), Ok(()));
+    }
+
+    #[test]
+    fn snapshot_v4_encodes_map_screen_trees_and_mouse_policy() {
         let mut state = ExecutionState::new();
         let datum = state
             .heap_mut()
@@ -1463,6 +1829,8 @@ mod tests {
             dir: 4,
             layer: -1.5,
             plane: 7.0,
+            appearance_flags: 4096,
+            mouse_opacity: 2,
             pixel_x: 1.0,
             pixel_y: 2.0,
             pixel_w: 3.0,
@@ -1487,6 +1855,8 @@ mod tests {
                 dir: 2,
                 layer: 1.0,
                 plane: 0.0,
+                appearance_flags: 0,
+                mouse_opacity: 1,
                 pixel_x: 0.0,
                 pixel_y: 0.0,
                 pixel_w: 0.0,
@@ -1526,6 +1896,8 @@ mod tests {
                     dir: 2,
                     layer: 20.0,
                     plane: 20.0,
+                    appearance_flags: 64,
+                    mouse_opacity: 0,
                     pixel_x: 0.0,
                     pixel_y: 0.0,
                     pixel_w: 0.0,
@@ -1543,7 +1915,7 @@ mod tests {
             }],
         };
         let encoded = encode_snapshot("s1", 9, (4, 5, 1), snapshot);
-        assert!(encoded.starts_with("ok map_snapshot protocol=3"));
+        assert!(encoded.starts_with("ok map_snapshot protocol=4"));
         assert!(encoded.lines().any(|line| line.starts_with("S ")));
         assert_eq!(
             encoded
@@ -1553,6 +1925,8 @@ mod tests {
             3
         );
         assert!(!encoded.contains("unsafe"));
+        assert!(encoded.lines().any(|line| line.ends_with("4096 2")));
+        assert!(encoded.lines().any(|line| line.ends_with("64 0")));
         assert_eq!(String::from_utf8(unhex("e99baa").unwrap()).unwrap(), "雪");
     }
 
@@ -1576,6 +1950,24 @@ mod tests {
             bytes
         );
         assert!(read_project_resource(&state, "../secret").is_err());
+        assert_eq!(
+            read_project_resource_chunk(&state, "icons/test.dmi", 2, 2).unwrap(),
+            ResourceChunk {
+                bytes: vec![b'\n', b'\t'],
+                total: 5,
+                eof: false,
+            }
+        );
+        assert_eq!(
+            read_project_resource_chunk(&state, "icons/test.dmi", 4, 2).unwrap(),
+            ResourceChunk {
+                bytes: vec![17],
+                total: 5,
+                eof: true,
+            }
+        );
+        assert!(read_project_resource_chunk(&state, "icons/test.dmi", 6, 1).is_err());
+        assert!(read_project_resource_chunk(&state, "../secret", 0, 1).is_err());
         assert_eq!(unhex(&hex(&bytes)).unwrap(), bytes);
         std::fs::remove_dir_all(root).unwrap();
     }

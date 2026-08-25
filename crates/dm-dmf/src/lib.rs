@@ -774,7 +774,13 @@ impl UiState {
         let Ok((window_id, control_id)) = self.resolve_control(control) else {
             return String::new();
         };
-        self.tree
+        if let Ok(runtime_type) = self.winget(control, "type")
+            && !runtime_type.trim().is_empty()
+        {
+            return runtime_type.to_ascii_uppercase();
+        }
+        let declared = self
+            .tree
             .addressable_control(
                 self.source_window_id(&window_id),
                 self.source_control_id(&window_id, &control_id),
@@ -790,13 +796,56 @@ impl UiState {
                 ControlType::Unknown => "UNKNOWN",
             })
             .unwrap_or_default()
-            .to_owned()
+            .to_owned();
+        if declared.is_empty() {
+            self.winget(control, "type")
+                .unwrap_or_default()
+                .to_ascii_uppercase()
+        } else {
+            declared
+        }
     }
 
     /// Returns addressable control identifiers in a window/menu/macro section,
     /// including controls created at runtime with `winset(parent=...)`.
     /// Source order and runtime insertion order are preserved.
     pub fn section_control_ids(&self, namespace: &str) -> Result<Vec<String>, UiStateError> {
+        if let Some(clone) = self
+            .cloned_windows
+            .iter()
+            .find(|clone| clone.destination == namespace)
+        {
+            let section = self
+                .tree
+                .windows
+                .iter()
+                .chain(self.tree.auxiliary.iter())
+                .find(|section| section.id == clone.source)
+                .ok_or_else(|| UiStateError::UnknownControl(namespace.to_owned()))?;
+            let mut ids = section
+                .controls
+                .iter()
+                .filter_map(|control| {
+                    control.id.as_ref().map(|id| {
+                        if id == &clone.source {
+                            namespace.to_owned()
+                        } else {
+                            id.clone()
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for override_ in self
+                .overrides
+                .iter()
+                .filter(|override_| override_.window_id == namespace)
+            {
+                if !ids.contains(&override_.control_id) {
+                    ids.push(override_.control_id.clone());
+                }
+            }
+            return Ok(ids);
+        }
         let section = self
             .tree
             .windows
@@ -823,6 +872,29 @@ impl UiState {
             }
         }
         Ok(ids)
+    }
+
+    /// Returns runtime-cloned top-level window identifiers in creation order.
+    #[must_use]
+    pub fn cloned_window_ids(&self) -> Vec<String> {
+        self.cloned_windows
+            .iter()
+            .map(|clone| clone.destination.clone())
+            .collect()
+    }
+
+    /// Creates the implicit browser window produced by BYOND `browse()` when
+    /// its `window=` selector does not name a control in the skin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the skin has no `popupwindow` template.
+    pub fn ensure_browser_window(&mut self, window: &str) -> Result<(), UiStateError> {
+        if self.winexists_type(window).eq_ignore_ascii_case("BROWSER") {
+            return Ok(());
+        }
+        self.winclone("popupwindow", window)?;
+        self.winset(window, "type=BROWSER;is-visible=true;pos=0,0")
     }
 
     /// Copies runtime overrides from one control to another.
@@ -1108,6 +1180,15 @@ impl ClientSession {
     /// Returns an error when the command cannot be applied to the loaded skin.
     pub fn apply_command(&mut self, command: UiCommand) -> Result<UiCommandReply, UiStateError> {
         self.ui.apply(command)
+    }
+
+    /// Ensures that an implicit `browse(window=...)` target exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the loaded skin has no popup template.
+    pub fn ensure_browser_window(&mut self, window: &str) -> Result<(), UiStateError> {
+        self.ui.ensure_browser_window(window)
     }
 
     /// Queues a local UI event for delivery to the server.
@@ -2192,6 +2273,25 @@ mod tests {
             state.winget("tgui-window-1.browser", "type"),
             Ok("BROWSER".to_owned())
         );
+    }
+
+    #[test]
+    fn browse_creates_an_implicit_top_level_browser_window() {
+        let document = parse(
+            "window \"popupwindow\"\n\telem \"popupwindow\"\n\t\ttype = MAIN\n\t\tsize = 120x120\n\t\tis-visible = false\n",
+        );
+        let mut state = super::UiState::new(ControlTree::from_document(&document));
+
+        state
+            .ensure_browser_window("tgui-window-1")
+            .expect("browse(window=...) creates its browser target");
+
+        assert_eq!(state.winexists_type("tgui-window-1"), "BROWSER");
+        assert_eq!(
+            state.winget("tgui-window-1", "is-visible"),
+            Ok("true".to_owned())
+        );
+        assert_eq!(state.cloned_window_ids(), vec!["tgui-window-1".to_owned()]);
     }
 
     #[test]

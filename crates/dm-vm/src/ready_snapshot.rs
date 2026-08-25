@@ -9,6 +9,25 @@ type ListHandle = (u32, u32);
 const READY_WORLD_MAGIC: &[u8; 8] = b"D64READY";
 const READY_WORLD_VERSION: u32 = 1;
 const READY_WORLD_METADATA_LIMIT: u64 = 1024 * 1024 * 1024;
+const RUNTIME_CATALOG_MAGIC: &[u8; 8] = b"D64RCAT\0";
+const RUNTIME_CATALOG_VERSION: u32 = 1;
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct RuntimeCatalogSnapshot {
+    type_paths: Vec<String>,
+    type_parents: Vec<(String, Option<String>)>,
+    initial_values: Vec<(String, Vec<(String, HeapSnapshotValue)>)>,
+    shared_fields: Vec<(String, Vec<(String, String)>)>,
+    instance_initializers: Vec<(String, Vec<RuntimeInitializerSnapshot>)>,
+    initializer_module: Option<Vec<u8>>,
+    project_root: Option<String>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+enum RuntimeInitializerSnapshot {
+    Constant(String, HeapSnapshotValue),
+    Program(String, u32),
+}
 
 /// Mutable, process-independent runtime state captured at the ready boundary.
 ///
@@ -64,6 +83,211 @@ impl ReadyWorldCoreSnapshot {
             for frame in &spawn.frames {
                 validate_frame(module, frame, 0)?;
             }
+        }
+        Ok(())
+    }
+}
+
+impl ExecutionState {
+    /// Writes immutable runtime catalogs without process pointers or OS handles.
+    pub fn write_runtime_catalog_to(&self, writer: &mut impl Write) -> io::Result<()> {
+        let snapshot = RuntimeCatalogSnapshot {
+            type_paths: self.type_paths.iter().map(ToString::to_string).collect(),
+            type_parents: self
+                .type_parents
+                .iter()
+                .map(|(path, parent)| (path.to_string(), parent.as_ref().map(ToString::to_string)))
+                .collect(),
+            initial_values: self
+                .initial_values
+                .iter()
+                .map(|(path, fields)| {
+                    (
+                        path.to_string(),
+                        fields
+                            .iter()
+                            .map(|(field, value)| {
+                                (field.as_str().to_owned(), HeapSnapshotValue::from(value))
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+            shared_fields: self
+                .shared_fields
+                .iter()
+                .map(|(path, fields)| {
+                    (
+                        path.to_string(),
+                        fields
+                            .iter()
+                            .map(|(field, shared)| {
+                                (field.as_str().to_owned(), shared.as_str().to_owned())
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+            instance_initializers: self
+                .instance_initializers
+                .iter()
+                .map(|(path, initializers)| {
+                    (
+                        path.to_string(),
+                        initializers
+                            .iter()
+                            .map(|initializer| match initializer {
+                                InstanceInitializer::Constant { field, value } => {
+                                    RuntimeInitializerSnapshot::Constant(
+                                        field.as_str().to_owned(),
+                                        HeapSnapshotValue::from(value),
+                                    )
+                                }
+                                InstanceInitializer::Program { field, entry } => {
+                                    RuntimeInitializerSnapshot::Program(
+                                        field.as_str().to_owned(),
+                                        entry.0,
+                                    )
+                                }
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+            initializer_module: self
+                .instance_initializer_module
+                .as_deref()
+                .map(Module::encode_portable)
+                .transpose()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            project_root: self
+                .project_root()
+                .map(|path| path.to_string_lossy().into_owned()),
+        };
+        writer.write_all(RUNTIME_CATALOG_MAGIC)?;
+        writer.write_all(&RUNTIME_CATALOG_VERSION.to_le_bytes())?;
+        ready_world_bincode()
+            .serialize_into(writer, &snapshot)
+            .map_err(bincode_io_error)
+    }
+
+    /// Restores immutable runtime catalogs written by [`Self::write_runtime_catalog_to`].
+    pub fn restore_runtime_catalog_from(&mut self, reader: &mut impl Read) -> io::Result<()> {
+        let mut magic = [0; 8];
+        reader.read_exact(&mut magic)?;
+        if &magic != RUNTIME_CATALOG_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "runtime catalog magic",
+            ));
+        }
+        let mut version = [0; 4];
+        reader.read_exact(&mut version)?;
+        if u32::from_le_bytes(version) != RUNTIME_CATALOG_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "runtime catalog version",
+            ));
+        }
+        let snapshot: RuntimeCatalogSnapshot = ready_world_bincode()
+            .deserialize_from(reader)
+            .map_err(bincode_io_error)?;
+        let parse_path = |path: String| {
+            TypePath::parse(&path)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        };
+        let parse_field = |field: String| {
+            FieldName::parse(&field)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        };
+        self.set_type_paths(
+            snapshot
+                .type_paths
+                .into_iter()
+                .map(parse_path)
+                .collect::<io::Result<Vec<_>>>()?,
+        );
+        self.set_type_parents(
+            snapshot
+                .type_parents
+                .into_iter()
+                .map(|(path, parent)| Ok((parse_path(path)?, parent.map(parse_path).transpose()?)))
+                .collect::<io::Result<_>>()?,
+        );
+        self.set_initial_values(
+            snapshot
+                .initial_values
+                .into_iter()
+                .map(|(path, fields)| {
+                    Ok((
+                        parse_path(path)?,
+                        fields
+                            .into_iter()
+                            .map(|(field, value)| {
+                                Ok((
+                                    parse_field(field)?,
+                                    value.into_value().map_err(|error| {
+                                        io::Error::new(io::ErrorKind::InvalidData, error)
+                                    })?,
+                                ))
+                            })
+                            .collect::<io::Result<_>>()?,
+                    ))
+                })
+                .collect::<io::Result<_>>()?,
+        );
+        self.set_shared_fields(Arc::new(
+            snapshot
+                .shared_fields
+                .into_iter()
+                .map(|(path, fields)| {
+                    Ok((
+                        parse_path(path)?,
+                        fields
+                            .into_iter()
+                            .map(|(field, shared)| Ok((parse_field(field)?, parse_field(shared)?)))
+                            .collect::<io::Result<_>>()?,
+                    ))
+                })
+                .collect::<io::Result<_>>()?,
+        ));
+        let initializers = snapshot
+            .instance_initializers
+            .into_iter()
+            .map(|(path, initializers)| {
+                Ok((
+                    parse_path(path)?,
+                    initializers
+                        .into_iter()
+                        .map(|initializer| match initializer {
+                            RuntimeInitializerSnapshot::Constant(field, value) => {
+                                Ok(InstanceInitializer::Constant {
+                                    field: parse_field(field)?,
+                                    value: value.into_value().map_err(|error| {
+                                        io::Error::new(io::ErrorKind::InvalidData, error)
+                                    })?,
+                                })
+                            }
+                            RuntimeInitializerSnapshot::Program(field, entry) => {
+                                Ok(InstanceInitializer::Program {
+                                    field: parse_field(field)?,
+                                    entry: ProcedureId(entry),
+                                })
+                            }
+                        })
+                        .collect::<io::Result<_>>()?,
+                ))
+            })
+            .collect::<io::Result<_>>()?;
+        let module = snapshot
+            .initializer_module
+            .map(|bytes| Module::decode_portable(&bytes))
+            .transpose()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            .map(Arc::new);
+        self.set_instance_initializers(Arc::new(initializers), module);
+        if let Some(root) = snapshot.project_root {
+            self.set_project_root(PathBuf::from(root));
         }
         Ok(())
     }
@@ -188,6 +412,7 @@ impl ExecutionState {
         reader: &mut impl Read,
         module: &Module,
     ) -> io::Result<()> {
+        self.assert_owner_thread();
         let mut magic = [0_u8; READY_WORLD_MAGIC.len()];
         reader.read_exact(&mut magic)?;
         if &magic != READY_WORLD_MAGIC {
@@ -365,6 +590,7 @@ impl ExecutionState {
         &mut self,
         mut snapshot: ReadyWorldCoreSnapshot,
     ) -> Result<(), String> {
+        self.assert_owner_thread();
         let heap_snapshot = std::mem::replace(&mut snapshot.heap, empty_heap_snapshot());
         let heap = ValueHeap::from_snapshot(heap_snapshot).map_err(|error| error.to_string())?;
         self.restore_ready_world_parts(snapshot, heap)
@@ -523,6 +749,8 @@ impl ExecutionState {
         self.pending_local_prompts.clear();
         self.dynamic_receiver_targets.clear();
         self.dynamic_callsite_targets.clear();
+        self.declared_field_slots.clear();
+        self.declared_field_quickening = DeclaredFieldQuickeningMetrics::default();
         self.clear_effective_initial_value_cache();
         self.scheduler_inflight.clear();
         self.scheduler_tick_started = None;
@@ -570,63 +798,117 @@ impl ScheduledSpawnSnapshot {
         Ok(ScheduledSpawn {
             due_tick: self.due_tick,
             sequence: self.sequence,
-            frames: self
-                .frames
-                .into_iter()
-                .map(CallFrameSnapshot::into_runtime)
-                .collect::<Result<_, _>>()?,
+            frames: OwnedContinuation::new(
+                VmContinuationId(self.sequence),
+                self.frames
+                    .into_iter()
+                    .map(CallFrameSnapshot::into_runtime)
+                    .collect::<Result<_, _>>()?,
+            ),
         })
     }
 }
 
 impl From<&CallFrame> for CallFrameSnapshot {
     fn from(frame: &CallFrame) -> Self {
+        let packed = frame
+            .cold()
+            .and_then(|cold| cold.packed_numeric_state.as_ref());
         Self {
             procedure: frame.procedure.0,
             instruction: frame.instruction,
-            locals: snapshot_values(&frame.locals),
-            stack: snapshot_values(&frame.stack),
-            result: HeapSnapshotValue::from(&frame.result),
+            locals: packed.map_or_else(
+                || snapshot_values(&frame.locals),
+                |packed| {
+                    snapshot_values(
+                        &packed
+                            .locals
+                            .iter()
+                            .copied()
+                            .map(PackedValue::into_value)
+                            .collect::<Vec<_>>(),
+                    )
+                },
+            ),
+            stack: packed.map_or_else(
+                || snapshot_values(&frame.stack),
+                |packed| {
+                    snapshot_values(
+                        &packed
+                            .stack
+                            .iter()
+                            .copied()
+                            .map(PackedValue::into_value)
+                            .collect::<Vec<_>>(),
+                    )
+                },
+            ),
+            result: packed.map_or_else(
+                || HeapSnapshotValue::from(&frame.result),
+                |packed| HeapSnapshotValue::from(&packed.result.into_value()),
+            ),
             src: HeapSnapshotValue::from(&frame.src),
             usr: HeapSnapshotValue::from(&frame.usr),
             arguments: snapshot_values(&frame.arguments),
             args_list: frame.args_list.map(list_handle),
             declared_argument_count: frame.declared_argument_count,
             supplied_parameters: frame.supplied_parameters.to_vec(),
-            pending_argument_names: frame.pending_argument_names.clone(),
-            pending_argument_roots: snapshot_values(&frame.pending_argument_roots),
-            retained_call_roots: snapshot_values(&frame.retained_call_roots),
+            pending_argument_names: frame.pending_argument_names().cloned(),
+            pending_argument_roots: snapshot_values(frame.pending_argument_roots()),
+            retained_call_roots: snapshot_values(frame.retained_call_roots()),
             exception_handlers: frame
-                .exception_handlers
+                .exception_handlers()
                 .iter()
                 .map(ExceptionHandlerSnapshot::from)
                 .collect(),
             detached_waitfor: frame.detached_waitfor,
-            caller_result_override: frame
-                .caller_result_override
-                .as_ref()
-                .map(HeapSnapshotValue::from),
+            caller_result_override: frame.caller_result_override().map(HeapSnapshotValue::from),
             engine_post_return: frame
-                .engine_post_return
-                .as_deref()
+                .engine_post_return()
                 .map(CallFrameSnapshot::from)
                 .map(Box::new),
             static_locals: frame.static_locals.to_vec(),
-            shuttle_trace_target: frame.shuttle_trace_target.map(datum_handle),
+            shuttle_trace_target: frame.shuttle_trace_target().map(datum_handle),
             shuttle_trace_post_return: frame
-                .shuttle_trace_post_return
-                .as_ref()
+                .shuttle_trace_post_return()
                 .map(ShuttleTracePostReturnSnapshot::from),
-            numeric_jit_state: frame
-                .numeric_jit_state
-                .as_ref()
-                .map(NumericStateSnapshot::from),
+            numeric_jit_state: frame.numeric_jit_state().map(NumericStateSnapshot::from),
         }
     }
 }
 
 impl CallFrameSnapshot {
     fn into_runtime(self) -> Result<CallFrame, ValueError> {
+        let caller_result_override = self
+            .caller_result_override
+            .map(HeapSnapshotValue::into_value)
+            .transpose()?;
+        let engine_post_return = self
+            .engine_post_return
+            .map(|frame| frame.into_runtime().map(Box::new))
+            .transpose()?;
+        let numeric_jit_state = self
+            .numeric_jit_state
+            .map(NumericStateSnapshot::into_runtime);
+        let cold = CallFrameCold {
+            pending_argument_names: self.pending_argument_names,
+            pending_argument_roots: restore_values(self.pending_argument_roots)?.into(),
+            retained_call_roots: restore_values(self.retained_call_roots)?.into(),
+            exception_handlers: self
+                .exception_handlers
+                .into_iter()
+                .map(ExceptionHandlerSnapshot::into_runtime)
+                .collect(),
+            shuttle_trace_target: self.shuttle_trace_target.map(datum_from_handle),
+            shuttle_trace_post_return: self
+                .shuttle_trace_post_return
+                .map(ShuttleTracePostReturnSnapshot::into_runtime),
+            caller_result_override,
+            engine_post_return,
+            numeric_jit_state,
+            ..CallFrameCold::default()
+        };
+        let cold = (!cold.is_empty()).then(|| Box::new(cold));
         Ok(CallFrame {
             procedure: ProcedureId(self.procedure),
             instruction: self.instruction,
@@ -639,36 +921,12 @@ impl CallFrameSnapshot {
             args_list: self.args_list.map(list_from_handle),
             declared_argument_count: self.declared_argument_count,
             supplied_parameters: self.supplied_parameters.into(),
-            pending_argument_names: self.pending_argument_names,
-            pending_argument_roots: restore_values(self.pending_argument_roots)?.into(),
-            retained_call_roots: restore_values(self.retained_call_roots)?.into(),
-            exception_handlers: self
-                .exception_handlers
-                .into_iter()
-                .map(ExceptionHandlerSnapshot::into_runtime)
-                .collect(),
+            cold,
             detached_waitfor: self.detached_waitfor,
-            caller_result_override: self
-                .caller_result_override
-                .map(HeapSnapshotValue::into_value)
-                .transpose()?,
-            engine_post_return: self
-                .engine_post_return
-                .map(|frame| frame.into_runtime().map(Box::new))
-                .transpose()?,
             static_locals: self.static_locals.into(),
-            boot_trace_started: None,
-            boot_trace_heap: None,
-            boot_trace_step: 0,
             atoms_profile_entry_counted: false,
             atoms_profile_root: false,
-            shuttle_trace_target: self.shuttle_trace_target.map(datum_from_handle),
-            shuttle_trace_post_return: self
-                .shuttle_trace_post_return
-                .map(ShuttleTracePostReturnSnapshot::into_runtime),
-            numeric_jit_state: self
-                .numeric_jit_state
-                .map(NumericStateSnapshot::into_runtime),
+            tgm_profile_root: false,
         })
     }
 }
@@ -993,7 +1251,7 @@ mod tests {
         source.scheduled_spawns.push(ScheduledSpawn {
             due_tick: 500,
             sequence: 42,
-            frames: vec![frame],
+            frames: OwnedContinuation::new(VmContinuationId(42), vec![frame]),
         });
         source.rebuild_world_geometry();
 
@@ -1024,6 +1282,8 @@ mod tests {
             deferred: Arc::new(HashMap::new()),
             procedure_types: Vec::new(),
             initializer_call_names: None,
+            compact_wordcode: Default::default(),
+            semantic_digests: Default::default(),
         };
         snapshot.validate_module(&module).unwrap();
         let mut restored = ExecutionState::new();
@@ -1037,6 +1297,7 @@ mod tests {
         assert_eq!(restored.scheduler_tick(), 456);
         assert_eq!(restored.world_turfs.get(&(2, 3, 1)), Some(&turf));
         assert_eq!(restored.scheduled_spawns.len(), 1);
+        assert_eq!(restored.scheduled_spawns[0].frames.id.get(), 42);
         let restored_frame = &restored.scheduled_spawns[0].frames[0];
         assert_eq!(restored_frame.procedure, ProcedureId(7));
         assert_eq!(restored_frame.instruction, 1);
@@ -1054,6 +1315,27 @@ mod tests {
             Some(&Value::List(list))
         );
         assert_eq!(streamed.scheduled_spawns.len(), 1);
+        assert_eq!(streamed.scheduled_spawns[0].frames.id.get(), 42);
         assert_eq!(streamed.scheduled_spawns[0].frames[0].instruction, 1);
+
+        let restored_on_worker = std::thread::spawn(move || {
+            let mut restored = ExecutionState::new();
+            restored
+                .restore_ready_world_snapshot_from(&mut encoded.as_slice(), &module)
+                .unwrap();
+            restored.set_global(
+                FieldName::parse("worker_owned").unwrap(),
+                Value::number(1.0),
+            );
+            restored
+                .global(&FieldName::parse("worker_owned").unwrap())
+                .cloned()
+        });
+        assert_eq!(
+            restored_on_worker
+                .join()
+                .expect("worker-owned snapshot restore should succeed"),
+            Some(Value::number(1.0))
+        );
     }
 }

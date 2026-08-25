@@ -72,17 +72,17 @@ fn run() -> Result<(), String> {
         insert_target(world_type, LifecycleKind::Genesis, &mut roots);
         insert_target(world_type, LifecycleKind::New, &mut roots);
     }
-    let map_nodes = world
+    let map_paths = world
         .templates()
         .values()
         .flat_map(|template| &template.initializers)
         .filter_map(|initializer| match initializer.resolution {
-            InitializerResolution::Resolved { node, .. } => Some(node),
+            InitializerResolution::Resolved { .. } => Some(initializer.path.as_str()),
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    for node in map_nodes {
-        if let Some(lifecycle) = index.find_node(node) {
+    for path in map_paths {
+        if let Some(lifecycle) = index.find_path(path) {
             for kind in [
                 LifecycleKind::New,
                 LifecycleKind::Initialize,

@@ -15,6 +15,16 @@ param(
 $ErrorActionPreference = "Stop"
 $workspace = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $desktop = Split-Path -Parent $workspace
+function Find-NewestBuildBinary([string] $Name) {
+    $candidates = @(
+        (Join-Path $workspace ("target\release\" + $Name)),
+        (Join-Path $workspace ("target-client-menu-showcase\release\" + $Name))
+    ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }
+    if ($candidates.Count -eq 0) {
+        return Join-Path $workspace ("target\release\" + $Name)
+    }
+    return ($candidates | Get-Item | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).FullName
+}
 if ([string]::IsNullOrWhiteSpace($MonkestationDirectory)) {
     $MonkestationDirectory = Join-Path $desktop "Monkestation2.0"
 }
@@ -31,13 +41,13 @@ if ($BootNumber -le 0) {
     $BootNumber = [int](Get-Date -Format "HHmmss")
 }
 if ([string]::IsNullOrWhiteSpace($ServerExecutable)) {
-    $ServerExecutable = Join-Path $workspace "target\release\dream64-server.exe"
+    $ServerExecutable = Find-NewestBuildBinary "dream64-server.exe"
 }
 if ([string]::IsNullOrWhiteSpace($CompilerExecutable)) {
-    $CompilerExecutable = Join-Path $workspace "target\release\dream64-compiler.exe"
+    $CompilerExecutable = Find-NewestBuildBinary "dream64-compiler.exe"
 }
 if ([string]::IsNullOrWhiteSpace($ClientExecutable)) {
-    $ClientExecutable = Join-Path $workspace "target\release\dm-client.exe"
+    $ClientExecutable = Find-NewestBuildBinary "dm-client.exe"
 }
 
 $ServerExecutable = (Resolve-Path -LiteralPath $ServerExecutable).Path

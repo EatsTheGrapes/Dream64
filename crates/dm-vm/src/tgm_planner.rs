@@ -57,7 +57,10 @@ pub struct Config {
     /// Current world maximum Z.
     pub world_max_z: i32,
     /// Model key representing default space.
-    pub space_key: Arc<str>,
+    /// Model key for the canonical default-space cell, when the map defines
+    /// one. Maps such as Lavaland can contain no such model; in that case no
+    /// cell may be elided by the `no_changeturf` fast path.
+    pub space_key: Option<Arc<str>>,
     /// Keys present in the owner-thread model cache.
     pub model_keys: Arc<BTreeSet<Arc<str>>>,
 }
@@ -120,6 +123,22 @@ pub struct MissingModel {
     pub z: i32,
 }
 
+/// One owner-thread action in exact `_tgm_load` source traversal order.
+///
+/// Planning never performs these actions. In particular, [`Self::Cell`] must
+/// still invoke the ordinary DM `build_coordinate` procedure so constructors
+/// and hooks remain observable. [`Self::SafepointOnly`] represents a skipped
+/// default-space cell, whose `MAPLOADING_CHECK_TICK` remains observable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommitEvent {
+    /// Commit one cell, then execute the corresponding scheduler safepoint.
+    Cell(Cell),
+    /// Execute a safepoint without constructing a cell.
+    SafepointOnly(Ordinal),
+    /// Raise the canonical undefined-model failure before its safepoint.
+    MissingModel(MissingModel),
+}
+
 /// Pure worker result, already merged in source order.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Plan {
@@ -129,6 +148,40 @@ pub struct Plan {
     pub bounds: Option<Bounds>,
     /// Missing keys in stable source order.
     pub missing_models: Vec<MissingModel>,
+    /// Ordered commit/yield/error stream for a resumable owner-thread commit.
+    pub events: Vec<CommitEvent>,
+}
+
+/// Resumable position in a [`Plan`]'s ordered owner-thread commit stream.
+///
+/// The cursor advances only after the caller acknowledges a completed event.
+/// A yield or error therefore retains the exact event for retry/restoration.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CommitCursor {
+    next: usize,
+}
+
+impl CommitCursor {
+    /// Returns the next event without consuming it.
+    #[must_use]
+    pub fn peek<'a>(&self, plan: &'a Plan) -> Option<&'a CommitEvent> {
+        plan.events.get(self.next)
+    }
+
+    /// Acknowledges that the currently-peeked event completed, and advances.
+    pub fn acknowledge(&mut self, plan: &Plan) -> bool {
+        if self.next >= plan.events.len() {
+            return false;
+        }
+        self.next += 1;
+        true
+    }
+
+    /// Returns whether every planned event has completed.
+    #[must_use]
+    pub fn is_complete(&self, plan: &Plan) -> bool {
+        self.next == plan.events.len()
+    }
 }
 
 /// Uses available CPU parallelism for large snapshots and sequential planning
@@ -252,7 +305,15 @@ fn plan_range(grids: &[GridSet], c: &Config, base: usize, geometry: Geometry) ->
         for line in start..end {
             let y = highest_y - (line - start) as i32;
             let key = Arc::clone(&grid.lines[line]);
-            if no_afterchange && key.as_ref() == c.space_key.as_ref() {
+            if no_afterchange
+                && c.space_key
+                    .as_ref()
+                    .is_some_and(|space| key.as_ref() == space.as_ref())
+            {
+                plan.events.push(CommitEvent::SafepointOnly(Ordinal {
+                    grid: base + local,
+                    line,
+                }));
                 continue;
             }
             let ordinal = Ordinal {
@@ -260,23 +321,27 @@ fn plan_range(grids: &[GridSet], c: &Config, base: usize, geometry: Geometry) ->
                 line,
             };
             if !c.model_keys.contains(&key) {
-                plan.missing_models.push(MissingModel {
+                let missing = MissingModel {
                     ordinal,
                     model_key: key,
                     x,
                     y,
                     z,
-                });
+                };
+                plan.missing_models.push(missing.clone());
+                plan.events.push(CommitEvent::MissingModel(missing));
                 continue;
             }
-            plan.cells.push(Cell {
+            let cell = Cell {
                 ordinal,
                 x,
                 y,
                 z,
                 model_key: key,
                 no_afterchange,
-            });
+            };
+            plan.cells.push(cell.clone());
+            plan.events.push(CommitEvent::Cell(cell));
             extend(&mut plan.bounds, x, y, z);
         }
     }
@@ -311,6 +376,7 @@ fn merge(plans: impl IntoIterator<Item = Plan>) -> Plan {
     for mut plan in plans {
         out.cells.append(&mut plan.cells);
         out.missing_models.append(&mut plan.missing_models);
+        out.events.append(&mut plan.events);
         if let Some(b) = plan.bounds {
             extend(&mut out.bounds, b.min_x, b.min_y, b.min_z);
             extend(&mut out.bounds, b.max_x, b.max_y, b.max_z);
@@ -364,7 +430,7 @@ mod tests {
             world_max_x: 22,
             world_max_y: 28,
             world_max_z: 2,
-            space_key: s("space"),
+            space_key: Some(s("space")),
             model_keys: Arc::new(keys),
         };
         (grids, config)
@@ -400,6 +466,73 @@ mod tests {
     }
 
     #[test]
+    fn commit_events_preserve_cells_space_safepoints_and_errors_in_source_order() {
+        let grids = vec![GridSet {
+            x: 1,
+            y: 4,
+            z: 1,
+            lines: vec![s("a"), s("space"), s("missing"), s("b")].into(),
+        }];
+        let config = Config {
+            x_offset: 1,
+            y_offset: 1,
+            z_offset: 1,
+            crop_map: false,
+            no_changeturf: true,
+            x_lower: 1,
+            x_upper: 1,
+            y_lower: 1,
+            y_upper: 4,
+            z_lower: None,
+            z_upper: None,
+            world_max_x: 1,
+            world_max_y: 4,
+            world_max_z: 1,
+            space_key: Some(s("space")),
+            model_keys: Arc::new([s("a"), s("b"), s("space")].into_iter().collect()),
+        };
+        let plan = prepare(&grids, &config);
+        assert!(matches!(plan.events[0], CommitEvent::Cell(_)));
+        assert!(matches!(
+            plan.events[1],
+            CommitEvent::SafepointOnly(Ordinal { grid: 0, line: 1 })
+        ));
+        assert!(matches!(
+            plan.events[2],
+            CommitEvent::MissingModel(MissingModel {
+                ordinal: Ordinal { grid: 0, line: 2 },
+                ..
+            })
+        ));
+        assert!(matches!(plan.events[3], CommitEvent::Cell(_)));
+    }
+
+    #[test]
+    fn commit_cursor_does_not_consume_a_yielded_or_failed_event() {
+        let (grids, mut config) = fixture(9);
+        config.no_changeturf = true;
+        let plan = prepare(&grids, &config);
+        let mut cursor = CommitCursor::default();
+        let first = cursor.peek(&plan).cloned().expect("plan has work");
+        assert_eq!(cursor.peek(&plan), Some(&first));
+        assert!(cursor.acknowledge(&plan));
+        assert_ne!(cursor.peek(&plan), Some(&first));
+
+        while cursor
+            .peek(&plan)
+            .is_some_and(|event| !matches!(event, CommitEvent::MissingModel(_)))
+        {
+            assert!(cursor.acknowledge(&plan));
+        }
+        let failed = cursor
+            .peek(&plan)
+            .cloned()
+            .expect("fixture has missing model");
+        assert!(matches!(failed, CommitEvent::MissingModel(_)));
+        assert_eq!(cursor.peek(&plan), Some(&failed));
+    }
+
+    #[test]
     #[ignore = "release-only production-sized planner benchmark"]
     fn benchmark_255x255_sequential_vs_available_parallel() {
         const SIDE: usize = 255;
@@ -432,7 +565,7 @@ mod tests {
             world_max_x: SIDE as i32,
             world_max_y: SIDE as i32,
             world_max_z: 1,
-            space_key: s("space"),
+            space_key: Some(s("space")),
             model_keys: Arc::new([Arc::clone(&model)].into_iter().collect()),
         };
         let workers = std::thread::available_parallelism().map_or(1, usize::from);

@@ -24,6 +24,20 @@ use dm_syntax::{
     Definition, DefinitionKind, DefinitionPath, Indentation, ParameterSyntax, SourceLine,
     SyntaxError, SyntaxFile,
 };
+use persistent_database::{
+    Digest, InputDependency, MAX_SECTION_PAYLOAD_BYTES, PersistentCompilerDatabase,
+    SectionDependency, StableIdEntry,
+};
+
+const LINKED_FRONTEND_SECTION: u64 = 1;
+/// Persistent section containing the fully linked executable module.
+pub const PERSISTENT_EXECUTABLE_SECTION: u64 = 2;
+/// Reserved page-ID range for the persistent executable section.
+pub const PERSISTENT_EXECUTABLE_PAGE_BASE: u64 = 20_000_000;
+const INPUT_SECTION_BASE: u64 = 1_000;
+const LINKED_PAYLOAD_PAGE_BASE: u64 = 10_000_000;
+
+pub mod persistent_database;
 
 /// Reusable entry point for deterministic project compilations.
 ///
@@ -96,7 +110,50 @@ impl CompilerDatabase {
         root_file: impl AsRef<Path>,
         cache_file: impl AsRef<Path>,
     ) -> Result<(Compilation, CompilationCacheStats), CompilerError> {
+        self.compile_with_mode(root_file, cache_file, BuildMode::Incremental)
+    }
+
+    /// Compiles using an explicit persistent-build policy.
+    ///
+    /// Incremental builds may reuse both cache tiers. Clean builds discard the
+    /// project and parsed-syntax payloads at the caller-provided cache path
+    /// before rebuilding and repopulating them. Fresh builds neither read nor
+    /// write those persistent caches.
+    ///
+    /// # Errors
+    ///
+    /// Returns project discovery or source-loading errors. Cache removal and
+    /// cache writes remain best-effort and cannot make valid source fail.
+    pub fn compile_with_mode(
+        &self,
+        root_file: impl AsRef<Path>,
+        cache_file: impl AsRef<Path>,
+        mode: BuildMode,
+    ) -> Result<(Compilation, CompilationCacheStats), CompilerError> {
         let cache_file = cache_file.as_ref();
+        if mode == BuildMode::Fresh {
+            let compilation = self.compile(root_file)?;
+            let source_file_count = compilation
+                .project
+                .files
+                .iter()
+                .filter(|file| matches!(file.kind, FileKind::Environment | FileKind::Source))
+                .count();
+            return Ok((
+                compilation,
+                CompilationCacheStats {
+                    build_mode: mode,
+                    project_snapshot_hit: false,
+                    parsed_syntax_hit: false,
+                    syntax_files_reused: 0,
+                    syntax_files_reparsed: source_file_count,
+                },
+            ));
+        }
+        if mode == BuildMode::Clean {
+            let _ = fs::remove_file(cache_file);
+            let _ = fs::remove_file(parsed_syntax_cache_path(cache_file));
+        }
         let (project, project_snapshot_hit) =
             Project::load_cached(root_file, cache_file).map_err(CompilerError::Project)?;
         let syntax_cache_file = parsed_syntax_cache_path(cache_file);
@@ -125,6 +182,7 @@ impl CompilerDatabase {
         Ok((
             compile_project_from_syntax(project, syntax_files, syntax_diagnostics),
             CompilationCacheStats {
+                build_mode: mode,
                 project_snapshot_hit,
                 parsed_syntax_hit,
                 syntax_files_reused,
@@ -132,11 +190,172 @@ impl CompilerDatabase {
             },
         ))
     }
+
+    /// Compiles through the versioned persistent compiler database.
+    ///
+    /// An exact build/input match restores the linked frontend section without
+    /// parsing or rebuilding the object tree. A miss reuses unchanged syntax
+    /// files, rebuilds the linked section, and atomically replaces the vNext
+    /// database with updated dependency and stable-ID metadata.
+    pub fn compile_persistent(
+        &self,
+        root_file: impl AsRef<Path>,
+        database_file: impl AsRef<Path>,
+        mode: BuildMode,
+        semantic_digest: Digest,
+        build_configuration_digest: Digest,
+    ) -> Result<(Compilation, PersistentCompilationStats), CompilerError> {
+        let database_file = database_file.as_ref();
+        let frontend_cache = persistent_frontend_cache_path(database_file);
+        if mode == BuildMode::Clean {
+            let _ = fs::remove_file(database_file);
+            let _ = fs::remove_file(&frontend_cache);
+            let _ = fs::remove_file(parsed_syntax_cache_path(&frontend_cache));
+        }
+        let (project, project_snapshot_hit) = if mode == BuildMode::Fresh {
+            (
+                Project::load(root_file).map_err(CompilerError::Project)?,
+                false,
+            )
+        } else {
+            Project::load_cached_exact(root_file, &frontend_cache)
+                .map_err(CompilerError::Project)?
+        };
+        self.compile_persistent_prevalidated(
+            project,
+            project_snapshot_hit,
+            database_file,
+            mode,
+            semantic_digest,
+            build_configuration_digest,
+        )
+    }
+
+    /// Compiles a project snapshot already validated by the caller.
+    ///
+    /// This avoids a duplicate filesystem byte scan when a lifecycle owner has
+    /// already selected metadata validation or strict exact hashing.
+    pub fn compile_persistent_prevalidated(
+        &self,
+        project: Project,
+        project_snapshot_hit: bool,
+        database_file: impl AsRef<Path>,
+        mode: BuildMode,
+        semantic_digest: Digest,
+        build_configuration_digest: Digest,
+    ) -> Result<(Compilation, PersistentCompilationStats), CompilerError> {
+        let database_file = database_file.as_ref();
+        let frontend_cache = persistent_frontend_cache_path(database_file);
+        let inputs = persistent_inputs(&project);
+        let prior = (mode == BuildMode::Incremental)
+            .then(|| PersistentCompilerDatabase::read(database_file).ok())
+            .flatten();
+        let changed_inputs = prior.as_ref().map_or_else(
+            || (0..inputs.len() as u64).collect(),
+            |database| {
+                if database.matches_build(&semantic_digest, &build_configuration_digest) {
+                    database.changed_inputs(&inputs)
+                } else {
+                    (0..inputs.len() as u64).collect()
+                }
+            },
+        );
+        let invalidated_sections = prior.as_ref().map_or_else(Vec::new, |database| {
+            database.invalidated_sections(&changed_inputs)
+        });
+        if let Some(database) = &prior
+            && database.matches_build(&semantic_digest, &build_configuration_digest)
+            && changed_inputs.is_empty()
+            && let Some(payload) = linked_frontend_payload(database)
+            && let Ok(compilation) = Compilation::decode_compiled_artifact(&payload)
+        {
+            return Ok((
+                compilation,
+                PersistentCompilationStats {
+                    build_mode: mode,
+                    project_snapshot_hit,
+                    parsed_syntax_hit: true,
+                    syntax_files_reused: inputs.len(),
+                    syntax_files_reparsed: 0,
+                    linked_sections_reused: 1,
+                    linked_sections_rebuilt: 0,
+                    changed_inputs: 0,
+                    invalidated_sections: 0,
+                },
+            ));
+        }
+
+        let syntax_cache_file = parsed_syntax_cache_path(&frontend_cache);
+        let cached_syntax = (mode != BuildMode::Fresh)
+            .then(|| fs::read(&syntax_cache_file).ok())
+            .flatten()
+            .and_then(|bytes| decode_parsed_syntax_cache(&bytes, &project));
+        let source_file_count = project
+            .files
+            .iter()
+            .filter(|file| matches!(file.kind, FileKind::Environment | FileKind::Source))
+            .count();
+        let (syntax_files, syntax_diagnostics, parsed_syntax_hit, syntax_files_reused) =
+            cached_syntax.unwrap_or_else(|| {
+                let (syntax, diagnostics) = parse_project_syntax(&project);
+                (syntax, diagnostics, false, 0)
+            });
+        if mode != BuildMode::Fresh && !parsed_syntax_hit {
+            if let Some(parent) = syntax_cache_file.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(
+                &syntax_cache_file,
+                encode_parsed_syntax_cache(&project, &syntax_files),
+            );
+        }
+        let compilation = compile_project_from_syntax(project, syntax_files, syntax_diagnostics);
+        if mode != BuildMode::Fresh {
+            let database = persistent_database_for_compilation(
+                &compilation,
+                inputs,
+                semantic_digest,
+                build_configuration_digest,
+                prior.as_ref(),
+            );
+            database
+                .write_atomic(database_file)
+                .map_err(|error| CompilerError::Persistent(error.to_string()))?;
+        }
+        Ok((
+            compilation,
+            PersistentCompilationStats {
+                build_mode: mode,
+                project_snapshot_hit,
+                parsed_syntax_hit,
+                syntax_files_reused,
+                syntax_files_reparsed: source_file_count.saturating_sub(syntax_files_reused),
+                linked_sections_reused: 0,
+                linked_sections_rebuilt: 1,
+                changed_inputs: changed_inputs.len(),
+                invalidated_sections: invalidated_sections.len(),
+            },
+        ))
+    }
+}
+
+/// Persistent-cache policy for one compiler invocation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BuildMode {
+    /// Compile without reading or updating persistent caches.
+    Fresh,
+    /// Reuse valid persistent products and replace stale products.
+    #[default]
+    Incremental,
+    /// Rebuild and repopulate persistent products at the selected cache path.
+    Clean,
 }
 
 /// Cache hits observed while compiling one project.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CompilationCacheStats {
+    /// Persistent-cache policy selected for this compilation.
+    pub build_mode: BuildMode,
     /// The immutable preprocessed project snapshot passed filesystem validation.
     pub project_snapshot_hit: bool,
     /// Parsed declaration syntax was restored without lexing or parsing sources.
@@ -145,6 +364,29 @@ pub struct CompilationCacheStats {
     pub syntax_files_reused: usize,
     /// Source files lexed and parsed for this compilation.
     pub syntax_files_reparsed: usize,
+}
+
+/// Stage-level reuse and invalidation observed by the vNext compiler database.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PersistentCompilationStats {
+    /// Requested persistent build policy.
+    pub build_mode: BuildMode,
+    /// Preprocessed project snapshot reused.
+    pub project_snapshot_hit: bool,
+    /// Every parsed syntax file reused.
+    pub parsed_syntax_hit: bool,
+    /// Syntax files restored from cache.
+    pub syntax_files_reused: usize,
+    /// Syntax files reparsed.
+    pub syntax_files_reparsed: usize,
+    /// Linked frontend sections restored directly.
+    pub linked_sections_reused: usize,
+    /// Linked frontend sections rebuilt.
+    pub linked_sections_rebuilt: usize,
+    /// Project inputs whose identity or content changed.
+    pub changed_inputs: usize,
+    /// Existing dependency-graph sections invalidated by those changes.
+    pub invalidated_sections: usize,
 }
 
 /// A complete frontend snapshot for one project.
@@ -531,12 +773,15 @@ pub struct Diagnostic {
 pub enum CompilerError {
     /// Project discovery, preprocessing, or source loading failed.
     Project(ProjectError),
+    /// Persistent compiler database serialization or installation failed.
+    Persistent(String),
 }
 
 impl fmt::Display for CompilerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Project(error) => write!(formatter, "project loading failed: {error}"),
+            Self::Persistent(error) => write!(formatter, "persistent compilation failed: {error}"),
         }
     }
 }
@@ -545,6 +790,7 @@ impl std::error::Error for CompilerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Project(error) => Some(error),
+            Self::Persistent(_) => None,
         }
     }
 }
@@ -574,6 +820,205 @@ fn parsed_syntax_cache_path(project_cache: &Path) -> PathBuf {
     let mut name = project_cache.file_name().unwrap_or_default().to_os_string();
     name.push(".syntax");
     project_cache.with_file_name(name)
+}
+
+fn persistent_frontend_cache_path(database: &Path) -> PathBuf {
+    let mut name = database.file_name().unwrap_or_default().to_os_string();
+    name.push(".frontend");
+    database.with_file_name(name)
+}
+
+fn digest32(bytes: &[u8]) -> Digest {
+    let first = md5::compute(bytes).0;
+    let mut salted = Vec::with_capacity(bytes.len() + 1);
+    salted.push(1);
+    salted.extend_from_slice(bytes);
+    let second = md5::compute(salted).0;
+    let mut digest = [0; 32];
+    digest[..16].copy_from_slice(&first);
+    digest[16..].copy_from_slice(&second);
+    digest
+}
+
+fn persistent_inputs(project: &Project) -> Vec<InputDependency> {
+    project
+        .files
+        .iter()
+        .map(|file| {
+            InputDependency::new(
+                &file.relative_path,
+                digest32(&file.contents),
+                file.contents.len() as u64,
+            )
+        })
+        .collect()
+}
+
+fn persistent_database_for_compilation(
+    compilation: &Compilation,
+    inputs: Vec<InputDependency>,
+    semantic_digest: Digest,
+    build_configuration_digest: Digest,
+    prior: Option<&PersistentCompilerDatabase>,
+) -> PersistentCompilerDatabase {
+    let prior_ids = prior
+        .into_iter()
+        .flat_map(|database| &database.stable_ids)
+        .map(|entry| ((entry.namespace.clone(), entry.name.clone()), entry.id))
+        .collect::<HashMap<_, _>>();
+    let mut next_ids = HashMap::<String, u64>::new();
+    for entry in prior.into_iter().flat_map(|database| &database.stable_ids) {
+        next_ids
+            .entry(entry.namespace.clone())
+            .and_modify(|next| *next = (*next).max(entry.id.saturating_add(1)))
+            .or_insert(entry.id.saturating_add(1));
+    }
+    let stable_ids = compilation
+        .code_tree
+        .nodes()
+        .iter()
+        .map(|node| {
+            let namespace = match node.kind {
+                dm_object_tree::NodeKind::Type => "type",
+                dm_object_tree::NodeKind::Procedure | dm_object_tree::NodeKind::Verb => "procedure",
+                dm_object_tree::NodeKind::Variable => "field",
+            };
+            let name = node.path.to_string();
+            let id = prior_ids
+                .get(&(namespace.to_owned(), name.clone()))
+                .copied()
+                .unwrap_or_else(|| {
+                    let next = next_ids.entry(namespace.to_owned()).or_default();
+                    let id = *next;
+                    *next = next.saturating_add(1);
+                    id
+                });
+            StableIdEntry {
+                namespace: namespace.to_owned(),
+                name,
+                id,
+            }
+        })
+        .collect();
+    let linked_segments = compilation.encode_compiled_artifact_segments();
+    let input_sections = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| SectionDependency {
+            section_id: INPUT_SECTION_BASE + index as u64,
+            section_dependencies: vec![],
+            input_dependencies: vec![index as u64],
+            content_digest: input.content_digest,
+            payload: vec![],
+        });
+    let input_section_ids = (0..inputs.len())
+        .map(|index| INPUT_SECTION_BASE + index as u64)
+        .collect::<Vec<_>>();
+    let mut sections = input_sections.collect::<Vec<_>>();
+    let mut linked_hasher = md5::Context::new();
+    let mut page_ids = Vec::new();
+    let mut next_page_id = LINKED_PAYLOAD_PAGE_BASE;
+    for segment in linked_segments {
+        for page in segment.chunks(MAX_SECTION_PAYLOAD_BYTES) {
+            linked_hasher.consume(page);
+            page_ids.push(next_page_id);
+            sections.push(SectionDependency {
+                section_id: next_page_id,
+                section_dependencies: input_section_ids.clone(),
+                input_dependencies: vec![],
+                content_digest: digest32(page),
+                payload: page.to_vec(),
+            });
+            next_page_id += 1;
+        }
+    }
+    let linked_digest = digest32_from_md5(linked_hasher.compute().0);
+    sections.push(SectionDependency {
+        section_id: LINKED_FRONTEND_SECTION,
+        section_dependencies: page_ids,
+        input_dependencies: vec![],
+        content_digest: linked_digest,
+        payload: vec![],
+    });
+    let preserved_runtime = prior.and_then(|database| {
+        let manifest = database
+            .sections
+            .iter()
+            .find(|section| section.section_id == PERSISTENT_EXECUTABLE_SECTION)?
+            .clone();
+        if manifest.content_digest == [0; 32]
+            || manifest.section_dependencies.iter().any(|id| {
+                !(PERSISTENT_EXECUTABLE_PAGE_BASE..PERSISTENT_EXECUTABLE_PAGE_BASE + 1_000_000)
+                    .contains(id)
+            })
+        {
+            return None;
+        }
+        let page_ids = manifest.section_dependencies.clone();
+        let pages = database
+            .sections
+            .iter()
+            .filter(|section| page_ids.contains(&section.section_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        (pages.len() == page_ids.len()).then_some((manifest, pages))
+    });
+    if let Some((manifest, mut pages)) = preserved_runtime {
+        for page in &mut pages {
+            page.section_dependencies = vec![LINKED_FRONTEND_SECTION];
+        }
+        sections.extend(pages);
+        sections.push(manifest);
+    } else {
+        sections.push(SectionDependency {
+            section_id: PERSISTENT_EXECUTABLE_SECTION,
+            section_dependencies: vec![LINKED_FRONTEND_SECTION],
+            input_dependencies: vec![],
+            content_digest: [0; 32],
+            payload: vec![],
+        });
+    }
+    PersistentCompilerDatabase {
+        semantic_digest,
+        build_configuration_digest,
+        inputs,
+        stable_ids,
+        sections,
+    }
+}
+
+fn linked_frontend_payload(database: &PersistentCompilerDatabase) -> Option<Vec<u8>> {
+    let manifest = database
+        .sections
+        .iter()
+        .find(|section| section.section_id == LINKED_FRONTEND_SECTION)?;
+    if !manifest.payload.is_empty() {
+        return Some(manifest.payload.clone());
+    }
+    let by_id = database
+        .sections
+        .iter()
+        .map(|section| (section.section_id, section))
+        .collect::<HashMap<_, _>>();
+    let total = manifest
+        .section_dependencies
+        .iter()
+        .try_fold(0_usize, |total, id| {
+            total.checked_add(by_id.get(id)?.payload.len())
+        })?;
+    let mut payload = Vec::with_capacity(total);
+    for id in &manifest.section_dependencies {
+        payload.extend_from_slice(&by_id.get(id)?.payload);
+    }
+    Some(payload)
+}
+
+fn digest32_from_md5(first: [u8; 16]) -> Digest {
+    let second = md5::compute(first).0;
+    let mut digest = [0; 32];
+    digest[..16].copy_from_slice(&first);
+    digest[16..].copy_from_slice(&second);
+    digest
 }
 
 fn syntax_source_fingerprint(file: &dm_project::ProjectFile) -> u64 {
@@ -3114,7 +3559,9 @@ mod tests {
     use dm_core::SourceSpan;
     use dm_object_tree::NodeKind;
 
-    use super::{Compilation, CompilerDatabase, DiagnosticKind, parsed_syntax_cache_path};
+    use super::{
+        BuildMode, Compilation, CompilerDatabase, DiagnosticKind, parsed_syntax_cache_path,
+    };
 
     static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
 
@@ -4270,6 +4717,123 @@ mod tests {
         assert_eq!(changed_cache.syntax_files_reused, 1);
         assert_eq!(changed_cache.syntax_files_reparsed, 1);
         assert_eq!(changed.stats().definitions, 3);
+    }
+
+    #[test]
+    fn explicit_build_modes_control_persistent_cache_reuse() {
+        let fixture = TestProject::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write("types.dm", "/datum/example\n\tvar/value = 3\n");
+        let cache = fixture.path("cache/project.bin");
+        let database = CompilerDatabase::new();
+
+        let (_, cold) = database
+            .compile_with_mode(fixture.path("world.dme"), &cache, BuildMode::Incremental)
+            .expect("cold incremental compilation should populate caches");
+        assert_eq!(cold.build_mode, BuildMode::Incremental);
+        assert!(!cold.project_snapshot_hit);
+
+        let (_, warm) = database
+            .compile_with_mode(fixture.path("world.dme"), &cache, BuildMode::Incremental)
+            .expect("warm incremental compilation should reuse caches");
+        assert!(warm.project_snapshot_hit);
+        assert!(warm.parsed_syntax_hit);
+
+        let (_, fresh) = database
+            .compile_with_mode(fixture.path("world.dme"), &cache, BuildMode::Fresh)
+            .expect("fresh compilation should bypass caches");
+        assert_eq!(fresh.build_mode, BuildMode::Fresh);
+        assert!(!fresh.project_snapshot_hit);
+        assert!(!fresh.parsed_syntax_hit);
+
+        let (_, still_warm) = database
+            .compile_with_mode(fixture.path("world.dme"), &cache, BuildMode::Incremental)
+            .expect("fresh compilation must not disturb persistent caches");
+        assert!(still_warm.project_snapshot_hit);
+        assert!(still_warm.parsed_syntax_hit);
+
+        let (_, clean) = database
+            .compile_with_mode(fixture.path("world.dme"), &cache, BuildMode::Clean)
+            .expect("clean compilation should rebuild and repopulate caches");
+        assert_eq!(clean.build_mode, BuildMode::Clean);
+        assert!(!clean.project_snapshot_hit);
+        assert!(!clean.parsed_syntax_hit);
+
+        let (_, after_clean) = database
+            .compile_with_mode(fixture.path("world.dme"), &cache, BuildMode::Incremental)
+            .expect("clean compilation should leave reusable caches");
+        assert!(after_clean.project_snapshot_hit);
+        assert!(after_clean.parsed_syntax_hit);
+    }
+
+    #[test]
+    fn persistent_database_reuses_linked_stage_and_invalidates_dependents() {
+        let fixture = TestProject::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write("types.dm", "/datum/example\n\tvar/value = 3\n");
+        let database_file = fixture.path("cache/project.d64cdb");
+        let database = CompilerDatabase::new();
+
+        let (cold, cold_stats) = database
+            .compile_persistent(
+                fixture.path("world.dme"),
+                &database_file,
+                BuildMode::Incremental,
+                [1; 32],
+                [2; 32],
+            )
+            .expect("cold persistent compilation should succeed");
+        assert_eq!(cold_stats.linked_sections_rebuilt, 1);
+        assert_eq!(cold_stats.linked_sections_reused, 0);
+        let first_database =
+            crate::persistent_database::PersistentCompilerDatabase::read(&database_file).unwrap();
+        let original_type_id = first_database
+            .stable_ids
+            .iter()
+            .find(|entry| entry.namespace == "type" && entry.name == "/datum/example")
+            .unwrap()
+            .id;
+
+        let (warm, warm_stats) = database
+            .compile_persistent(
+                fixture.path("world.dme"),
+                &database_file,
+                BuildMode::Incremental,
+                [1; 32],
+                [2; 32],
+            )
+            .expect("warm persistent compilation should restore linked output");
+        assert_eq!(warm_stats.linked_sections_reused, 1);
+        assert_eq!(warm_stats.linked_sections_rebuilt, 0);
+        assert_eq!(warm.stats(), cold.stats());
+
+        fixture.write("types.dm", "/aaa\n/datum/example\n\tvar/value = 4\n");
+        let (changed, changed_stats) = database
+            .compile_persistent(
+                fixture.path("world.dme"),
+                &database_file,
+                BuildMode::Incremental,
+                [1; 32],
+                [2; 32],
+            )
+            .expect("changed persistent compilation should rebuild dependents");
+        assert_eq!(changed_stats.changed_inputs, 1);
+        assert_eq!(changed_stats.syntax_files_reused, 1);
+        assert_eq!(changed_stats.syntax_files_reparsed, 1);
+        assert_eq!(changed_stats.linked_sections_rebuilt, 1);
+        assert!(changed_stats.invalidated_sections >= 3);
+        assert_eq!(changed.stats().definitions, cold.stats().definitions + 1);
+        let changed_database =
+            crate::persistent_database::PersistentCompilerDatabase::read(&database_file).unwrap();
+        assert_eq!(
+            changed_database
+                .stable_ids
+                .iter()
+                .find(|entry| entry.namespace == "type" && entry.name == "/datum/example")
+                .unwrap()
+                .id,
+            original_type_id,
+        );
     }
 
     #[test]

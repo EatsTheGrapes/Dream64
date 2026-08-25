@@ -335,6 +335,10 @@ fn preprocess_fixture(path: &Path) -> Result<Vec<dm_syntax::Definition>, AuditFa
         .compile(path)
         .map_err(|error| match error {
             dm_compiler::CompilerError::Project(error) => project_audit_failure(error),
+            dm_compiler::CompilerError::Persistent(error) => AuditFailure {
+                category: "compile: persistent database".to_owned(),
+                message: error,
+            },
         })?;
     if let Some(diagnostic) = compilation
         .diagnostics()

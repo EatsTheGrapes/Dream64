@@ -15,6 +15,7 @@ dm-object-tree = { path = "../dm-object-tree" }
 dm-syntax = { path = "../dm-syntax" }
 dm-vm = { path = "../dm-vm" }
 dm-value = { path = "../dm-value" }
+md5 = "0.7"
 
 [lints]
 workspace = true

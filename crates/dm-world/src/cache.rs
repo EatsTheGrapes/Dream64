@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use dm_compiler::Compilation;
 use dm_core::SourceSpan;
 use dm_map::{MapValue, MapValueKind, MapVariableAssignment};
-use dm_object_tree::{NodeId, NodeKind};
+use dm_object_tree::NodeKind;
 
 use super::{
     AtomCategory, CellTemplate, InitializerResolution, PlannedCell, PlannedInitializer,
@@ -16,12 +16,72 @@ use super::{
 };
 
 const MAGIC: &[u8; 16] = b"DREAM64-MAPPLAN!";
-const SCHEMA: u16 = 1;
+const SCHEMA: u16 = 2;
 const HEADER: usize = 80;
 const MAX_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ITEMS: usize = 4_000_000;
 const MAX_STRING: usize = 16 * 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Encodes a portable map plan for inclusion in a runtime artifact.
+pub fn encode_portable_plan(plan: &WorldPlan) -> Result<Vec<u8>, MapPlanCacheError> {
+    encode(plan, [0; 16], [0; 16], [0; 16])
+}
+
+/// Decodes a portable map plan without a compiler object tree.
+pub fn decode_portable_plan(bytes: &[u8]) -> Result<WorldPlan, String> {
+    decode_portable(bytes, [0; 16], [0; 16], [0; 16])
+}
+
+/// Encodes a named portable map plan for standalone runtime discovery.
+pub fn encode_named_portable_plan(
+    name: &str,
+    plan: &WorldPlan,
+) -> Result<Vec<u8>, MapPlanCacheError> {
+    if name.len() > MAX_STRING {
+        return Err(MapPlanCacheError("map name exceeds size limit".into()));
+    }
+    let plan = encode_portable_plan(plan)?;
+    let mut bytes = Vec::with_capacity(16 + name.len() + plan.len());
+    bytes.extend_from_slice(&(name.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.extend_from_slice(&(plan.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&plan);
+    Ok(bytes)
+}
+
+/// Decodes a named portable map plan without project sources.
+pub fn decode_named_portable_plan(bytes: &[u8]) -> Result<(String, WorldPlan), String> {
+    if bytes.len() < 16 {
+        return Err("named map plan header is truncated".into());
+    }
+    let name_len = usize::try_from(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
+        .map_err(|_| "map name length exceeds usize")?;
+    if name_len > MAX_STRING
+        || bytes.len()
+            < 16usize
+                .checked_add(name_len)
+                .ok_or("map name length overflow")?
+    {
+        return Err("invalid map name length".into());
+    }
+    let name = std::str::from_utf8(&bytes[8..8 + name_len])
+        .map_err(|error| error.to_string())?
+        .to_owned();
+    let plan_start = 8 + name_len + 8;
+    let plan_len = usize::try_from(u64::from_le_bytes(
+        bytes[8 + name_len..plan_start].try_into().unwrap(),
+    ))
+    .map_err(|_| "map plan length exceeds usize")?;
+    if bytes.len()
+        != plan_start
+            .checked_add(plan_len)
+            .ok_or("map plan length overflow")?
+    {
+        return Err("invalid map plan length".into());
+    }
+    Ok((name, decode_portable_plan(&bytes[plan_start..])?))
+}
 
 /// Timing and disposition of one persistent map-plan lookup.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -190,7 +250,16 @@ fn decode(
     map: [u8; 16],
     project: [u8; 16],
     abi: [u8; 16],
-    compilation: &Compilation,
+    _compilation: &Compilation,
+) -> Result<WorldPlan, String> {
+    decode_portable(bytes, map, project, abi)
+}
+
+fn decode_portable(
+    bytes: &[u8],
+    map: [u8; 16],
+    project: [u8; 16],
+    abi: [u8; 16],
 ) -> Result<WorldPlan, String> {
     if bytes.len() < HEADER || &bytes[..16] != MAGIC {
         return Err("bad header".into());
@@ -214,7 +283,7 @@ fn decode(
     let count = get_len(&mut input)?;
     let mut templates = BTreeMap::new();
     for _ in 0..count {
-        let template = get_template(&mut input, compilation)?;
+        let template = get_template(&mut input)?;
         templates.insert(template.key.clone(), template);
     }
     let count = get_len(&mut input)?;
@@ -250,16 +319,13 @@ fn put_template(out: &mut Vec<u8>, value: &CellTemplate) -> Result<(), MapPlanCa
     out.push(value.has_turf as u8);
     Ok(())
 }
-fn get_template(
-    input: &mut Cursor<&[u8]>,
-    compilation: &Compilation,
-) -> Result<CellTemplate, String> {
+fn get_template(input: &mut Cursor<&[u8]>) -> Result<CellTemplate, String> {
     let key = get_str(input)?;
     let span = get_span(input)?;
     let n = get_len(input)?;
     let mut initializers = Vec::with_capacity(n);
     for _ in 0..n {
-        initializers.push(get_initializer(input, compilation)?);
+        initializers.push(get_initializer(input)?);
     }
     Ok(CellTemplate {
         key,
@@ -277,24 +343,19 @@ fn put_initializer(out: &mut Vec<u8>, v: &PlannedInitializer) -> Result<(), MapP
         put_assignment(out, x)?;
     }
     match v.resolution {
-        InitializerResolution::Resolved { node, category } => {
+        InitializerResolution::Resolved { category } => {
             out.push(0);
-            put_len(out, node.index())?;
             out.push(category_tag(category));
         }
         InitializerResolution::Unknown => out.push(1),
-        InitializerResolution::NonType { node, kind } => {
+        InitializerResolution::NonType { kind } => {
             out.push(2);
-            put_len(out, node.index())?;
             out.push(kind_tag(kind));
         }
     }
     Ok(())
 }
-fn get_initializer(
-    input: &mut Cursor<&[u8]>,
-    compilation: &Compilation,
-) -> Result<PlannedInitializer, String> {
+fn get_initializer(input: &mut Cursor<&[u8]>) -> Result<PlannedInitializer, String> {
     let path = get_str(input)?;
     let span = get_span(input)?;
     let n = get_len(input)?;
@@ -304,17 +365,13 @@ fn get_initializer(
     }
     let resolution = match get_u8(input)? {
         0 => {
-            let node = NodeId::from_index(get_len(input)?);
             let category = get_category(input)?;
-            validate_node(compilation, node, &path, NodeKind::Type)?;
-            InitializerResolution::Resolved { node, category }
+            InitializerResolution::Resolved { category }
         }
         1 => InitializerResolution::Unknown,
         2 => {
-            let node = NodeId::from_index(get_len(input)?);
             let kind = get_kind(input)?;
-            validate_node(compilation, node, &path, kind)?;
-            InitializerResolution::NonType { node, kind }
+            InitializerResolution::NonType { kind }
         }
         _ => return Err("bad resolution".into()),
     };
@@ -324,13 +381,6 @@ fn get_initializer(
         variables,
         resolution,
     })
-}
-fn validate_node(c: &Compilation, n: NodeId, path: &str, kind: NodeKind) -> Result<(), String> {
-    let x = c.code_tree().node(n).ok_or("node out of range")?;
-    if x.path.to_string() != path || x.kind != kind {
-        return Err("node identity mismatch".into());
-    }
-    Ok(())
 }
 fn put_assignment(out: &mut Vec<u8>, v: &MapVariableAssignment) -> Result<(), MapPlanCacheError> {
     put_str(out, &v.name)?;

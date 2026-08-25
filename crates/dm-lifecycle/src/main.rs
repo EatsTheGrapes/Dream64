@@ -8,18 +8,28 @@ use std::io::{BufRead as _, BufReader, BufWriter, Read as _, Write as _};
 use std::net::{IpAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use dm_compiler::{Compilation, CompilerDatabase};
-use dm_lifecycle::ipc::{LoopbackIpc, parse_loopback_address};
+use dm_compiler::persistent_database::{
+    PersistentCompilerDatabase, decode_stable_id_table, encode_stable_id_table,
+};
+use dm_compiler::{
+    BuildMode, Compilation, CompilerDatabase, PERSISTENT_EXECUTABLE_PAGE_BASE,
+    PERSISTENT_EXECUTABLE_SECTION,
+};
+use dm_lifecycle::ipc::{BootPhase, LoopbackIpc, parse_loopback_address};
 use dm_lifecycle::{
     HeadlessReadinessProbe, HostSliceBudget, LifecycleIndex, LifecycleKind, LifecycleResolution,
     SchedulerDrainLimits, SchedulerDrainTermination, advance_persistent_scheduler_responsive,
     artifact::{ArtifactSection, CompiledArtifact, engine_semantics_fingerprint},
-    audit_initialization_plan_with_precompiled, build_initialization_plan,
-    execute_boot_initialization_plan_with_precompiled,
+    audit_initialization_plan_with_precompiled, build_initialization_plan, build_parsed_dmm_cache,
+    decode_and_attach_procedure_semantics, decode_dmm_measurements, decode_parsed_dmm_cache,
+    dmm_measurements_from_parsed, encode_dmm_measurements, encode_parsed_dmm_cache,
+    encode_procedure_semantics, execute_boot_initialization_plan_with_precompiled,
     execute_boot_initialization_plan_with_precompiled_and_startup_service,
     precompile_lifecycle_for_world, precompile_lifecycle_for_world_with_executable,
+    precompile_portable_lifecycle_for_world, readiness_probe_matches,
     sweep_lifecycle_compatibility, sweep_lifecycle_compatibility_with_closures,
 };
 use dm_project::Project;
@@ -312,9 +322,24 @@ fn run_main() -> ExitCode {
     } else {
         executable_artifact_file(&environment)
     };
+    if standalone_artifact && command == Command::Boot {
+        if requested_map.is_some() {
+            eprintln!("standalone runtime artifacts use their linked map directory");
+            return ExitCode::from(2);
+        }
+        return run_standalone_linked_boot(
+            &artifact_file,
+            audit_runtime,
+            boot_startup_ipc.take(),
+            process_started,
+        );
+    }
     let mut cached_executable = None;
     let mut cached_procedures = None;
     let mut cached_structural_seed = None;
+    let mut cached_linked_runtime = None;
+    let mut cached_lifecycle_index = None;
+    let mut cached_default_map = None;
     let compilation_result: Result<_, String> = if cached_compilation {
         if standalone_artifact {
             prepare_standalone_artifact(&artifact_file)
@@ -345,6 +370,9 @@ fn run_main() -> ExitCode {
             cached_executable = Some(prepared.executable);
             cached_procedures = Some(prepared.procedures);
             cached_structural_seed = Some(prepared.structural_seed);
+            cached_linked_runtime = prepared.linked_runtime;
+            cached_lifecycle_index = prepared.lifecycle_index;
+            cached_default_map = prepared.default_map;
             (prepared.compilation, Some(cache))
         })
     } else {
@@ -427,69 +455,128 @@ fn run_main() -> ExitCode {
     let mut prepared_boot = None;
     if command == Command::Boot {
         if let Some(ipc) = &boot_startup_ipc {
-            ipc.set_startup_phase("Loading and parsing the map");
+            ipc.commit_boot_phase(
+                ipc.startup_generation(),
+                BootPhase::StructuralLoad,
+                "Loading and parsing the map",
+            )
+            .expect("boot phase advances monotonically");
         }
         eprintln!("boot-progress: loading map");
-        let (map_path, map_source) = match load_map(&compilation, requested_map.as_deref()) {
-            Ok(map) => map,
-            Err(error) => {
-                eprintln!("{error}");
-                return ExitCode::FAILURE;
+        let linked_map = requested_map
+            .is_none()
+            .then(|| cached_default_map.take())
+            .flatten();
+        let (map_path, map_source) = match linked_map {
+            Some((map_path, world)) => {
+                let ready_cache = cache_file.with_extension("linked-map.ready");
+                let compile_index = cached_lifecycle_index.clone().unwrap_or_else(|| {
+                    LifecycleIndex::build_compile_only(&compilation, &procedures)
+                });
+                let precompiled = match cached_executable.take() {
+                    Some(executable) => precompile_lifecycle_for_world_with_executable(
+                        &compilation,
+                        &procedures,
+                        &compile_index,
+                        &world,
+                        executable,
+                    ),
+                    None => match precompile_lifecycle_for_world(
+                        &compilation,
+                        &procedures,
+                        &compile_index,
+                        &world,
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            eprintln!("lifecycle precompile: {error}");
+                            return ExitCode::FAILURE;
+                        }
+                    },
+                };
+                prepared_boot = Some((map_path, world, precompiled, ready_cache));
+                (String::new(), String::new())
             }
+            None => match load_map(&compilation, requested_map.as_deref()) {
+                Ok(map) => map,
+                Err(error) => {
+                    eprintln!("{error}");
+                    return ExitCode::FAILURE;
+                }
+            },
         };
-        eprintln!("boot-progress: preparing map plan {map_path}");
-        let ready_cache = ready_world_cache_file(
-            &cache_file,
-            &map_source,
-            &compilation,
-            ready_world_mode.production_identity(),
-        );
-        let world = match cached_world_plan(&cache_file, &map_source, &compilation) {
-            Ok(world) => world,
-            Err(error) => {
-                eprintln!("{map_path}: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
-        drop(map_source);
-        let compile_index = LifecycleIndex::build_compile_only(&compilation, &procedures);
-        if let Some(ipc) = &boot_startup_ipc {
-            ipc.set_startup_phase("Precompiling lifecycle procedures");
-        }
-        eprintln!("boot-progress: precompiling lifecycle before runtime materialization");
-        let started = Instant::now();
-        let precompiled = match cached_executable.take() {
-            Some(executable) => Ok(precompile_lifecycle_for_world_with_executable(
+        if prepared_boot.is_some() {
+            // The linked map already supplied the complete world/precompile tuple.
+        } else {
+            eprintln!("boot-progress: preparing map plan {map_path}");
+            let ready_cache = ready_world_cache_file(
+                &cache_file,
+                &map_source,
                 &compilation,
-                &procedures,
-                &compile_index,
-                &world,
-                executable,
-            )),
-            None => {
-                precompile_lifecycle_for_world(&compilation, &procedures, &compile_index, &world)
+                ready_world_mode.production_identity(),
+            );
+            let world = match cached_world_plan(&cache_file, &map_source, &compilation) {
+                Ok(world) => world,
+                Err(error) => {
+                    eprintln!("{map_path}: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            drop(map_source);
+            let compile_index = cached_lifecycle_index
+                .clone()
+                .unwrap_or_else(|| LifecycleIndex::build_compile_only(&compilation, &procedures));
+            if let Some(ipc) = &boot_startup_ipc {
+                ipc.commit_boot_phase(
+                    ipc.startup_generation(),
+                    BootPhase::StructuralLoad,
+                    "Precompiling lifecycle procedures",
+                )
+                .expect("boot phase advances monotonically");
             }
-        };
-        let precompiled = match precompiled {
-            Ok(precompiled) => precompiled,
-            Err(error) => {
-                eprintln!("lifecycle precompile: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
-        eprintln!(
-            "boot-progress: lifecycle-precompile-complete elapsed_ms={} targets={} bodies={} procedures={} deferred={}",
-            started.elapsed().as_millis(),
-            precompiled.targets(),
-            precompiled.reachable_bodies(),
-            precompiled.module_procedures(),
-            precompiled.deferred_procedures(),
-        );
-        prepared_boot = Some((map_path, world, precompiled, ready_cache));
+            eprintln!("boot-progress: precompiling lifecycle before runtime materialization");
+            let started = Instant::now();
+            let precompiled = match cached_executable.take() {
+                Some(executable) => Ok(precompile_lifecycle_for_world_with_executable(
+                    &compilation,
+                    &procedures,
+                    &compile_index,
+                    &world,
+                    executable,
+                )),
+                None => precompile_lifecycle_for_world(
+                    &compilation,
+                    &procedures,
+                    &compile_index,
+                    &world,
+                ),
+            };
+            let precompiled = match precompiled {
+                Ok(precompiled) => precompiled,
+                Err(error) => {
+                    eprintln!("lifecycle precompile: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            eprintln!(
+                "boot-progress: lifecycle-precompile-complete elapsed_ms={} targets={} bodies={} procedures={} deferred={}",
+                started.elapsed().as_millis(),
+                precompiled.targets(),
+                precompiled.reachable_bodies(),
+                precompiled.module_procedures(),
+                precompiled.deferred_procedures(),
+            );
+            prepared_boot = Some((map_path, world, precompiled, ready_cache));
+        }
     }
     if command == Command::Boot {
         if let Some(ipc) = &boot_startup_ipc {
-            ipc.set_startup_phase("Materializing globals and type defaults");
+            ipc.commit_boot_phase(
+                ipc.startup_generation(),
+                BootPhase::StructuralLoad,
+                "Materializing globals and type defaults",
+            )
+            .expect("boot phase advances monotonically");
         }
         eprintln!("boot-progress: materializing globals and type defaults");
     }
@@ -513,7 +600,9 @@ fn run_main() -> ExitCode {
             );
         }
     };
-    let runtime_result = if let Some((_, _, precompiled, _)) = prepared_boot.as_mut() {
+    let runtime_result = if let Some(runtime) = cached_linked_runtime.take() {
+        Ok(runtime)
+    } else if let Some((_, _, precompiled, _)) = prepared_boot.as_mut() {
         match cached_structural_seed.take() {
             Some(seed) => RuntimeImage::from_compilation_with_prelinked_module_and_seed(
                 &compilation,
@@ -589,7 +678,9 @@ fn run_main() -> ExitCode {
             );
             return ExitCode::from(2);
         };
-        let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
+        let index = cached_lifecycle_index
+            .clone()
+            .unwrap_or_else(|| LifecycleIndex::build(&compilation, &procedures, &runtime));
         return run_lobby_preflight(
             &environment,
             world_params,
@@ -601,11 +692,18 @@ fn run_main() -> ExitCode {
     }
     if command == Command::Boot {
         if let Some(ipc) = &boot_startup_ipc {
-            ipc.set_startup_phase("Indexing lifecycle dispatch");
+            ipc.commit_boot_phase(
+                ipc.startup_generation(),
+                BootPhase::StructuralLoad,
+                "Indexing lifecycle dispatch",
+            )
+            .expect("boot phase advances monotonically");
         }
         eprintln!("boot-progress: indexing procedures and lifecycle dispatch");
     }
-    let index = LifecycleIndex::build(&compilation, &procedures, &runtime);
+    let index = cached_lifecycle_index
+        .take()
+        .unwrap_or_else(|| LifecycleIndex::build(&compilation, &procedures, &runtime));
     let mut boot_precompiled = None;
     let mut ready_world_cache = None;
     let (map_path, world) =
@@ -651,6 +749,7 @@ fn run_main() -> ExitCode {
     }
     if command == Command::Boot {
         let readiness = master_controller_readiness(&compilation, &runtime);
+        let lobby_readiness = lobby_pregame_readiness(&compilation, &runtime);
         if let Some(probe) = &readiness {
             eprintln!(
                 "boot-progress: readiness probe global={} fields={} expected={:?}",
@@ -676,7 +775,12 @@ fn run_main() -> ExitCode {
         );
         if restore_snapshot && ready_cache.is_file() {
             if let Some(ipc) = &startup_ipc {
-                ipc.set_startup_phase("Restoring ready world");
+                ipc.commit_boot_phase(
+                    ipc.startup_generation(),
+                    BootPhase::WorldPlan,
+                    "Restoring ready world",
+                )
+                .expect("boot phase advances monotonically");
             }
             let restore_started = Instant::now();
             let mut state = runtime.take_execution_state();
@@ -700,7 +804,12 @@ fn run_main() -> ExitCode {
                         "boot-progress: headless ready from snapshot; entering persistent scheduler loop ready_elapsed_ms={}",
                         process_started.elapsed().as_millis()
                     );
-                    return run_persistent_server_loop(&mut runtime, precompiled, startup_ipc);
+                    return run_persistent_server_loop(
+                        &mut runtime,
+                        precompiled,
+                        startup_ipc,
+                        lobby_readiness.as_ref(),
+                    );
                 }
                 Err(error) => {
                     runtime.restore_execution_state(state);
@@ -741,7 +850,12 @@ fn run_main() -> ExitCode {
             );
         }
         if let Some(ipc) = &startup_ipc {
-            ipc.set_startup_phase("Preflighting map initializer plans");
+            ipc.commit_boot_phase(
+                ipc.startup_generation(),
+                BootPhase::WorldPlan,
+                "Preflighting map initializer plans",
+            )
+            .expect("boot phase advances monotonically");
         }
         eprintln!("boot-progress: preflighting map initializer plans");
         let map_types = world
@@ -774,7 +888,12 @@ fn run_main() -> ExitCode {
             }
         }
         if let Some(ipc) = &startup_ipc {
-            ipc.set_startup_phase("Allocating the map world");
+            ipc.commit_boot_phase(
+                ipc.startup_generation(),
+                BootPhase::WorldAllocation,
+                "Allocating the map world",
+            )
+            .expect("boot phase advances monotonically");
         }
         eprintln!("boot-progress: allocating map world");
         let allocation = match allocate_world(&world, &mut runtime) {
@@ -799,7 +918,12 @@ fn run_main() -> ExitCode {
         drop(world);
         let precompiled = boot_precompiled.as_mut().expect("boot preparation exists");
         if let Some(ipc) = &startup_ipc {
-            ipc.set_startup_phase("Starting world and subsystem controller");
+            ipc.commit_boot_phase(
+                ipc.startup_generation(),
+                BootPhase::Lifecycle,
+                "Starting world and subsystem controller",
+            )
+            .expect("boot phase advances monotonically");
         }
         let startup_limits = startup_scheduler_limits();
         let execution = match if audit_runtime {
@@ -819,7 +943,12 @@ fn run_main() -> ExitCode {
                     // become the content-addressed ready image. The native
                     // client retries its attach once per second and replaces
                     // its startup replay as soon as the gate opens below.
-                    ipc.set_startup_phase("Initializing subsystems");
+                    ipc.commit_boot_phase(
+                        ipc.startup_generation(),
+                        BootPhase::Lifecycle,
+                        "Initializing subsystems",
+                    )
+                    .expect("boot phase advances monotonically");
                 };
             execute_boot_initialization_plan_with_precompiled_and_startup_service(
                 &index,
@@ -916,11 +1045,22 @@ fn run_main() -> ExitCode {
                     eprintln!("DREAM64_PREWARM_STANDBY_ADDR is not valid Unicode");
                     return ExitCode::FAILURE;
                 };
-                return run_prewarmed_standby(&mut runtime, precompiled, identity, control_address);
+                return run_prewarmed_standby(
+                    &mut runtime,
+                    precompiled,
+                    identity,
+                    control_address,
+                    lobby_readiness.as_ref(),
+                );
             }
             return ExitCode::SUCCESS;
         }
-        return run_persistent_server_loop(&mut runtime, precompiled, startup_ipc);
+        return run_persistent_server_loop(
+            &mut runtime,
+            precompiled,
+            startup_ipc,
+            lobby_readiness.as_ref(),
+        );
     }
     ExitCode::SUCCESS
 }
@@ -1004,6 +1144,7 @@ fn run_prewarmed_standby(
     precompiled: &mut dm_lifecycle::PrecompiledLifecycle,
     identity: &ProductionReadyWorldIdentity,
     control_address: &str,
+    lobby_readiness: Option<&HeadlessReadinessProbe>,
 ) -> ExitCode {
     let control_address = match parse_loopback_address(control_address) {
         Ok(address) => address,
@@ -1093,7 +1234,7 @@ fn run_prewarmed_standby(
         ipc.local_addr(),
         identity.deployment_id,
     );
-    run_persistent_server_loop(runtime, precompiled, Some(ipc))
+    run_persistent_server_loop(runtime, precompiled, Some(ipc), lobby_readiness)
 }
 
 fn launch_random_seed() -> (u64, &'static str) {
@@ -1134,19 +1275,34 @@ fn run_persistent_server_loop(
     runtime: &mut RuntimeImage,
     precompiled: &mut dm_lifecycle::PrecompiledLifecycle,
     startup_ipc: Option<LoopbackIpc>,
+    lobby_readiness: Option<&HeadlessReadinessProbe>,
 ) -> ExitCode {
-    if let Some(ipc) = &startup_ipc {
-        ipc.set_startup_phase("Server ready");
-        ipc.accept_startup_clients();
-        if let Some(state) = precompiled.persistent_state_mut() {
-            ipc.enable_session_interaction(state);
-        }
-        eprintln!(
-            "server-progress: loopback-ipc={} startup=accepting",
-            ipc.local_addr()
-        );
-    }
     let mut ipc_address = startup_ipc.expect("production boot bound loopback IPC");
+    if let Err(error) =
+        activate_lobby_generation(runtime, precompiled, &mut ipc_address, lobby_readiness)
+    {
+        eprintln!("generation activation: {error}");
+        return ExitCode::FAILURE;
+    }
+    ipc_address
+        .commit_boot_phase(
+            ipc_address.startup_generation(),
+            BootPhase::RuntimeStartedReadOnly,
+            "Lobby ready — round countdown active",
+        )
+        .expect("activated lobby belongs to current boot generation");
+    let startup_generation = ipc_address.startup_generation();
+    if let Err(error) = ipc_address.accept_startup_clients(startup_generation) {
+        eprintln!("generation activation commit: {error}");
+        return ExitCode::FAILURE;
+    }
+    if let Some(state) = precompiled.persistent_state_mut() {
+        ipc_address.enable_session_interaction(state);
+    }
+    eprintln!(
+        "server-progress: loopback-ipc={} startup=accepting lobby=pregame",
+        ipc_address.local_addr()
+    );
     let max_slices = env::var_os("DREAM64_BOOT_MAX_SLICES")
         .and_then(|limit| {
             limit
@@ -1191,7 +1347,7 @@ fn run_persistent_server_loop(
         host_budget.observe(vm_elapsed);
         ipc_address.apply_lifecycle_tick_boundary(precompiled);
         slices = slices.saturating_add(1);
-        if slices == 1 || slices % 100 == 0 {
+        if slices == 1 || slices % 100 == 0 || vm_elapsed >= Duration::from_millis(50) {
             eprintln!(
                 "server-progress: scheduler slice={} tick={} rounds={} completed={} failed={} pending={} termination={:?} vm_us={} vm_max_us={} next_step_budget={} over_10ms={} host_loop_us={}",
                 slices,
@@ -1221,6 +1377,165 @@ fn run_persistent_server_loop(
             std::thread::sleep(remaining);
         }
     }
+}
+
+fn activate_lobby_generation(
+    runtime: &mut RuntimeImage,
+    precompiled: &mut dm_lifecycle::PrecompiledLifecycle,
+    ipc: &mut LoopbackIpc,
+    lobby_readiness: Option<&HeadlessReadinessProbe>,
+) -> Result<(), String> {
+    let Some(lobby_readiness) = lobby_readiness else {
+        return Ok(());
+    };
+    let is_ready = |precompiled: &mut dm_lifecycle::PrecompiledLifecycle| {
+        precompiled
+            .persistent_state_mut()
+            .is_some_and(|state| readiness_probe_matches(state, lobby_readiness))
+    };
+    if is_ready(precompiled) {
+        return Ok(());
+    }
+
+    ipc.commit_boot_phase(
+        ipc.startup_generation(),
+        BootPhase::Lifecycle,
+        "Finishing subsystem initialization",
+    )?;
+    ipc.show_startup_lobby(ipc.startup_generation())?;
+    eprintln!(
+        "boot-progress: generation activation gate opened read_only=true target=SSticker.current_state"
+    );
+
+    // A reconnecting native client retries once per second. Give it a short,
+    // bounded window to enter the restored lobby before Monk's final
+    // Master.Initialize tail performs population-sensitive storyteller setup.
+    let attach_grace = env::var("DREAM64_ACTIVATION_ATTACH_GRACE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(3_000);
+    let grace_deadline = Instant::now() + Duration::from_millis(attach_grace);
+    while Instant::now() < grace_deadline {
+        ipc.apply_lifecycle_tick_boundary(precompiled);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let max_slices = env::var("DREAM64_ACTIVATION_MAX_SLICES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1_000);
+    let target_millis = env::var("DREAM64_SCHEDULER_WALL_BUDGET_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(50)
+        .max(1);
+    // Native quickening must translate into more startup progress, not merely
+    // finish the same fixed 100k legacy instructions earlier. The VM's wall
+    // deadline remains authoritative for responsiveness; this controller
+    // raises the logical ceiling while slices are comfortably under it.
+    let mut activation_budget = HostSliceBudget::new(
+        100_000,
+        10_000,
+        10_000_000,
+        Duration::from_millis(target_millis),
+    );
+    for slice in 1..=max_slices {
+        ipc.apply_lifecycle_tick_boundary(precompiled);
+        if is_ready(precompiled) {
+            eprintln!(
+                "boot-progress: generation activation complete slices={} lobby=pregame",
+                slice - 1,
+            );
+            return Ok(());
+        }
+        let vm_started = Instant::now();
+        let scheduled_steps = activation_budget.steps();
+        let scheduler = advance_persistent_scheduler_responsive(
+            precompiled,
+            runtime,
+            SchedulerDrainLimits {
+                max_ticks: 1,
+                max_rounds: 1,
+            },
+            scheduled_steps,
+        )
+        .map_err(|error| error.to_string())?;
+        let vm_elapsed = vm_started.elapsed();
+        activation_budget.observe(vm_elapsed);
+        if slice == 1 || slice % 100 == 0 {
+            eprintln!(
+                "boot-progress: generation activation slice={slice} tick={} rounds={} completed={} failed={} pending={} termination={:?} vm_us={} step_budget={} next_step_budget={}",
+                scheduler.final_tick,
+                scheduler.rounds,
+                scheduler.completed_tasks,
+                scheduler.failed_tasks,
+                scheduler.pending_tasks,
+                scheduler.termination,
+                vm_elapsed.as_micros(),
+                scheduled_steps,
+                activation_budget.steps(),
+            );
+        }
+        ipc.apply_lifecycle_tick_boundary(precompiled);
+        if is_ready(precompiled) {
+            eprintln!(
+                "boot-progress: generation activation complete slices={slice} tick={} completed={} pending={} lobby=pregame",
+                scheduler.final_tick, scheduler.completed_tasks, scheduler.pending_tasks,
+            );
+            return Ok(());
+        }
+    }
+    for line in precompiled.bounded_scheduler_progress() {
+        eprintln!("boot-progress: activation-timeout-dm-frame {line}");
+    }
+    let (ruin_batches, ruin_steps) = dm_vm::native_ruin_batch_metrics();
+    let (ruin_scan_activations, ruin_scan_cells, ruin_scan_rejections, ruin_scan_successes) =
+        dm_vm::native_ruin_scan_metrics();
+    let (ruin_flag_rejections, ruin_area_rejections) = dm_vm::native_ruin_rejection_causes();
+    let (tgm_cells, tgm_safepoints, tgm_commits) = dm_vm::native_tgm_load_metrics();
+    let (tgm_target_resolutions, tgm_target_cache_hits) = dm_vm::native_tgm_target_cache_metrics();
+    let (tgm_build_cache_members, tgm_build_cache_logical_steps) =
+        dm_vm::native_tgm_build_cache_metrics();
+    let (build_coordinate_prefixes, build_coordinate_fallbacks) =
+        dm_vm::native_build_coordinate_prefix_metrics();
+    eprintln!(
+        "boot-progress: native-quickening tgm_load_activations={} tgm_cells={} tgm_safepoints={} tgm_commits={} tgm_target_resolutions={} tgm_target_cache_hits={} tgm_build_cache_members={} tgm_build_cache_logical_steps={} build_coordinate_prefixes={} build_coordinate_fallbacks={} discover_offset_activations={} ruin_batches={} ruin_logical_steps={} ruin_scan_activations={} ruin_scan_cells={} ruin_scan_rejections={} ruin_scan_successes={} ruin_flag_rejections={} ruin_area_rejections={} ruin_rejection_cache_hits={}",
+        dm_vm::native_tgm_load_activations(),
+        tgm_cells,
+        tgm_safepoints,
+        tgm_commits,
+        tgm_target_resolutions,
+        tgm_target_cache_hits,
+        tgm_build_cache_members,
+        tgm_build_cache_logical_steps,
+        build_coordinate_prefixes,
+        build_coordinate_fallbacks,
+        dm_vm::native_discover_offset_activations(),
+        ruin_batches,
+        ruin_steps,
+        ruin_scan_activations,
+        ruin_scan_cells,
+        ruin_scan_rejections,
+        ruin_scan_successes,
+        ruin_flag_rejections,
+        ruin_area_rejections,
+        dm_vm::native_ruin_rejection_cache_hits(),
+    );
+    for sample in dm_vm::native_tgm_commit_samples() {
+        eprintln!("boot-progress: tgm-commit {sample}");
+    }
+    for sample in dm_vm::native_tgm_continuation_rejections() {
+        eprintln!("boot-progress: tgm-continuation-rejection {sample}");
+    }
+    for sample in dm_vm::native_tgm_route_samples() {
+        eprintln!("boot-progress: tgm-route {sample}");
+    }
+    for sample in dm_vm::native_ruin_area_rejection_samples() {
+        eprintln!("boot-progress: ruin-area-rejection {sample}");
+    }
+    Err(format!(
+        "Monke lobby did not enter pregame within {max_slices} activation slices"
+    ))
 }
 
 fn restore_ready_world_cache(
@@ -1609,6 +1924,251 @@ fn run_lobby_preflight(
 const COMPILATION_ARTIFACT_SECTION: u32 = 1;
 const EXECUTABLE_ARTIFACT_SECTION: u32 = 2;
 const RUNTIME_STRUCTURAL_ARTIFACT_SECTION: u32 = 3;
+const COMPACT_WORDCODE_ARTIFACT_SECTION: u32 = 4;
+const STABLE_ID_ARTIFACT_SECTION: u32 = 5;
+const RUNTIME_LINKED_ARTIFACT_SECTION: u32 = 6;
+const LIFECYCLE_DIRECTORY_ARTIFACT_SECTION: u32 = 7;
+const DEFAULT_MAP_ARTIFACT_SECTION: u32 = 8;
+const BOOT_MANIFEST_ARTIFACT_SECTION: u32 = 9;
+const DMM_MEASUREMENT_ARTIFACT_SECTION: u32 = 10;
+const PARSED_DMM_ARTIFACT_SECTION: u32 = 11;
+const PROCEDURE_SEMANTICS_ARTIFACT_SECTION: u32 = 12;
+
+struct PreparedStandaloneRuntime {
+    executable: ExecutableProcedures,
+    runtime: RuntimeImage,
+    lifecycle: LifecycleIndex,
+    map_path: String,
+    world: dm_world::WorldPlan,
+    readiness: Option<HeadlessReadinessProbe>,
+    dmm_measurements: BTreeMap<String, dm_lifecycle::PortableDmmMeasurement>,
+    _parsed_dmm_cache: BTreeMap<String, dm_lifecycle::PortableParsedDmm>,
+}
+
+fn prepare_standalone_runtime(path: &Path) -> Result<PreparedStandaloneRuntime, String> {
+    let fingerprint =
+        CompiledArtifact::peek_project_fingerprint(path).map_err(|error| error.to_string())?;
+    let artifact =
+        CompiledArtifact::read_from(path, fingerprint).map_err(|error| error.to_string())?;
+    let executable_payload = artifact
+        .section(EXECUTABLE_ARTIFACT_SECTION)
+        .ok_or("standalone artifact is missing executable section")?
+        .payload();
+    let mut executable = ExecutableProcedures::decode_compiled_artifact(executable_payload)?;
+    decode_and_attach_procedure_semantics(
+        artifact
+            .section(PROCEDURE_SEMANTICS_ARTIFACT_SECTION)
+            .ok_or("standalone artifact is missing procedure semantic directory")?
+            .payload(),
+        executable.module_mut(),
+    )?;
+    if let Some(selector) = env::var_os("DREAM64_SEMANTIC_DIGEST_PATH") {
+        let selector = selector.to_string_lossy();
+        if selector.len() > 4096 || !selector.starts_with('/') {
+            return Err("DREAM64_SEMANTIC_DIGEST_PATH is invalid".to_owned());
+        }
+        let procedure = executable
+            .module()
+            .effective_procedure_id(&selector)
+            .or_else(|| executable.module().procedure_id(&selector))
+            .ok_or_else(|| format!("semantic digest procedure {selector:?} is absent"))?;
+        let digest = executable
+            .module()
+            .procedure_semantic_digest(procedure)
+            .ok_or("semantic digest was not attached")?;
+        let hex = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        eprintln!(
+            "boot-progress: procedure-semantic path={} id={} sha256={hex}",
+            selector,
+            procedure.index(),
+        );
+    }
+    if let Some(section) = artifact.section(COMPACT_WORDCODE_ARTIFACT_SECTION) {
+        let compact = dm_vm::CompactWordcodeImage::decode(section.payload())
+            .map_err(|error| error.to_string())?;
+        executable
+            .module_mut()
+            .attach_compact_wordcode(compact)
+            .map_err(|error| error.to_string())?;
+    }
+    let runtime = RuntimeImage::decode_linked_artifact(
+        artifact
+            .section(RUNTIME_LINKED_ARTIFACT_SECTION)
+            .ok_or("standalone artifact is missing linked runtime section")?
+            .payload(),
+        executable.module(),
+    )?;
+    let lifecycle = LifecycleIndex::decode_portable(
+        artifact
+            .section(LIFECYCLE_DIRECTORY_ARTIFACT_SECTION)
+            .ok_or("standalone artifact is missing lifecycle directory")?
+            .payload(),
+    )?;
+    let (map_path, world) = dm_world::decode_named_portable_plan(
+        artifact
+            .section(DEFAULT_MAP_ARTIFACT_SECTION)
+            .ok_or("standalone artifact is missing default map directory")?
+            .payload(),
+    )?;
+    let readiness = artifact
+        .section(BOOT_MANIFEST_ARTIFACT_SECTION)
+        .map(|section| HeadlessReadinessProbe::decode_portable_manifest(section.payload()))
+        .transpose()
+        .map_err(|error| format!("boot manifest: {error}"))?;
+    let dmm_measurements = decode_dmm_measurements(
+        artifact
+            .section(DMM_MEASUREMENT_ARTIFACT_SECTION)
+            .ok_or("standalone artifact is missing DMM measurement catalog")?
+            .payload(),
+    )?;
+    let parsed_dmm_cache = decode_parsed_dmm_cache(
+        artifact
+            .section(PARSED_DMM_ARTIFACT_SECTION)
+            .ok_or("standalone artifact is missing parsed DMM catalog")?
+            .payload(),
+    )?;
+    let has_ticker = runtime
+        .types()
+        .any(|(path, _)| path.as_str() == "/datum/controller/subsystem/ticker");
+    if has_ticker && readiness.is_none() {
+        return Err("standalone ticker runtime is missing its boot readiness manifest".to_owned());
+    }
+    Ok(PreparedStandaloneRuntime {
+        executable,
+        runtime,
+        lifecycle,
+        map_path,
+        world,
+        readiness,
+        dmm_measurements,
+        _parsed_dmm_cache: parsed_dmm_cache,
+    })
+}
+
+fn run_standalone_linked_boot(
+    path: &Path,
+    audit: bool,
+    startup_ipc: Option<LoopbackIpc>,
+    process_started: Instant,
+) -> ExitCode {
+    let PreparedStandaloneRuntime {
+        executable,
+        mut runtime,
+        lifecycle,
+        map_path,
+        world,
+        readiness,
+        dmm_measurements,
+        _parsed_dmm_cache: parsed_dmm_cache,
+    } = match prepare_standalone_runtime(path) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.set_dmm_measurements(Arc::new(
+        dmm_measurements
+            .into_iter()
+            .map(|(path, entry)| (path, entry.measurement))
+            .collect(),
+    ));
+    runtime.set_parsed_dmm_cache(Arc::new(
+        parsed_dmm_cache
+            .into_iter()
+            .map(|(path, entry)| {
+                (
+                    path,
+                    dm_vm::ParsedDmm {
+                        digest: entry.digest,
+                        tgm: entry.tgm,
+                        key_len: entry.key_len,
+                        line_len: entry.line_len,
+                        bounds: entry.bounds,
+                        models: entry.models,
+                        grids: entry
+                            .grids
+                            .into_iter()
+                            .map(|grid| dm_vm::ParsedDmmGrid {
+                                x: grid.x,
+                                y: grid.y,
+                                z: grid.z,
+                                lines: grid.lines,
+                            })
+                            .collect(),
+                    },
+                )
+            })
+            .collect(),
+    ));
+    let plan = build_initialization_plan(&runtime, &lifecycle, &world, map_path.clone());
+    if let Err(errors) = runtime.preflight_instance_initializers(
+        world
+            .templates()
+            .values()
+            .flat_map(|template| template.initializers.iter())
+            .filter_map(|initializer| TypePath::parse(&initializer.path).ok()),
+    ) {
+        eprintln!("initializer preflight failed: {} error(s)", errors.len());
+        return ExitCode::FAILURE;
+    }
+    let allocation = match allocate_world(&world, &mut runtime) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("world allocation: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut precompiled = precompile_portable_lifecycle_for_world(&lifecycle, &world, executable);
+    let execution = if audit {
+        audit_initialization_plan_with_precompiled(
+            &lifecycle,
+            &plan,
+            &allocation,
+            &mut runtime,
+            startup_scheduler_limits(),
+            &mut precompiled,
+        )
+    } else {
+        execute_boot_initialization_plan_with_precompiled(
+            &lifecycle,
+            &plan,
+            &allocation,
+            &mut runtime,
+            startup_scheduler_limits(),
+            readiness.as_ref(),
+            &mut precompiled,
+        )
+    };
+    let execution = match execution {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("initialization: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    print_boot_summary(&allocation, &execution);
+    if audit {
+        eprintln!(
+            "boot-progress: standalone linked audit complete elapsed_ms={}",
+            process_started.elapsed().as_millis()
+        );
+        return ExitCode::SUCCESS;
+    }
+    eprintln!(
+        "boot-progress: standalone linked runtime ready elapsed_ms={}",
+        process_started.elapsed().as_millis()
+    );
+    run_persistent_server_loop(
+        &mut runtime,
+        &mut precompiled,
+        startup_ipc,
+        readiness.as_ref(),
+    )
+}
 
 #[derive(Clone, Copy)]
 struct PreparedCacheStats {
@@ -1622,6 +2182,9 @@ struct PreparedCompiledExecutable {
     procedures: ProcedureRegistry,
     executable: ExecutableProcedures,
     structural_seed: RuntimeStructuralSeed,
+    linked_runtime: Option<RuntimeImage>,
+    lifecycle_index: Option<LifecycleIndex>,
+    default_map: Option<(String, dm_world::WorldPlan)>,
     project_snapshot_hit: bool,
     parsed_syntax_hit: Option<bool>,
     artifact_hit: bool,
@@ -1632,7 +2195,7 @@ struct PreparedCompiledExecutable {
 fn prepare_standalone_artifact(artifact_file: &Path) -> Result<PreparedCompiledExecutable, String> {
     let project_fingerprint = CompiledArtifact::peek_project_fingerprint(artifact_file)
         .map_err(|error| error.to_string())?;
-    let (compilation, executable, structural_seed) =
+    let (compilation, executable, structural_seed, linked_runtime, lifecycle_index, default_map) =
         decode_compiled_executable(artifact_file, project_fingerprint)?;
     let procedures = ProcedureRegistry::build_lazy(&compilation);
     Ok(PreparedCompiledExecutable {
@@ -1640,6 +2203,9 @@ fn prepare_standalone_artifact(artifact_file: &Path) -> Result<PreparedCompiledE
         procedures,
         executable,
         structural_seed,
+        linked_runtime,
+        lifecycle_index,
+        default_map,
         project_snapshot_hit: false,
         parsed_syntax_hit: None,
         artifact_hit: true,
@@ -1663,6 +2229,15 @@ fn prepare_compiled_executable(
     let phase = Instant::now();
     let strict_source_hash = env::var_os("DREAM64_STRICT_SOURCE_HASH")
         .is_some_and(|value| !matches!(value.to_string_lossy().trim(), "" | "0" | "false" | "no"));
+    eprintln!(
+        "compile-cache-phase: project-source-validation-start mode={} project={}",
+        if strict_source_hash {
+            "strict-bytes"
+        } else {
+            "metadata"
+        },
+        environment.display(),
+    );
     let (project, project_snapshot_hit, project_fingerprint) = if strict_source_hash {
         Project::load_cached_exact_with_fingerprint(environment, cache_file)
             .map_err(|error| format!("project snapshot: {error}"))?
@@ -1684,7 +2259,14 @@ fn prepare_compiled_executable(
     let project_fingerprint = *project_fingerprint.as_bytes();
     let miss_reason = if project_snapshot_hit {
         match decode_compiled_executable(artifact_file, project_fingerprint) {
-            Ok((compilation, executable, structural_seed)) => {
+            Ok((
+                compilation,
+                executable,
+                structural_seed,
+                linked_runtime,
+                lifecycle_index,
+                default_map,
+            )) => {
                 let phase = Instant::now();
                 let procedures = ProcedureRegistry::build_lazy(&compilation);
                 eprintln!(
@@ -1696,6 +2278,9 @@ fn prepare_compiled_executable(
                     procedures,
                     executable,
                     structural_seed,
+                    linked_runtime,
+                    lifecycle_index,
+                    default_map,
                     project_snapshot_hit,
                     parsed_syntax_hit: None,
                     artifact_hit: true,
@@ -1708,8 +2293,6 @@ fn prepare_compiled_executable(
     } else {
         "project snapshot changed or was not cached".to_owned()
     };
-    drop(project);
-
     if !allow_compile {
         return Err(format!(
             "runtime artifacts are unavailable or stale: {miss_reason}; run `dream64-compiler {}` before booting",
@@ -1720,42 +2303,80 @@ fn prepare_compiled_executable(
     // One miss performs exactly one ordinary frontend compilation followed by
     // one complete symbolic link and deterministic eager materialization.
     let phase = Instant::now();
+    let compiler_database_file = compiler_database_file(cache_file);
     let (compilation, cache_stats) = CompilerDatabase::new()
-        .compile_cached_with_stats(environment, cache_file)
+        .compile_persistent_prevalidated(
+            project,
+            project_snapshot_hit,
+            &compiler_database_file,
+            BuildMode::Incremental,
+            persistent_semantic_digest(),
+            persistent_build_configuration_digest(),
+        )
         .map_err(|error| error.to_string())?;
     eprintln!(
-        "compile-cache-phase: frontend-compile elapsed_ms={} parsed_syntax_hit={} syntax_reused={} syntax_reparsed={}",
+        "compile-cache-phase: persistent-frontend elapsed_ms={} linked_cache={} project_snapshot_hit={} parsed_syntax_hit={} syntax_reused={} syntax_reparsed={} changed_inputs={} invalidated_sections={} database={}",
         phase.elapsed().as_millis(),
+        if cache_stats.linked_sections_reused != 0 {
+            "hit"
+        } else {
+            "miss"
+        },
+        cache_stats.project_snapshot_hit,
         cache_stats.parsed_syntax_hit,
         cache_stats.syntax_files_reused,
         cache_stats.syntax_files_reparsed,
+        cache_stats.changed_inputs,
+        cache_stats.invalidated_sections,
+        compiler_database_file.display(),
     );
+    let mut persistent_database = PersistentCompilerDatabase::read(&compiler_database_file)
+        .map_err(|error| format!("read persistent compiler database: {error}"))?;
+    let procedure_ids = stable_ids_for_namespace(&persistent_database, "procedure");
+    let type_ids = stable_ids_for_namespace(&persistent_database, "type");
+    validate_procedure_id_inventory(&compilation, &procedure_ids)?;
     let phase = Instant::now();
-    let procedures = ProcedureRegistry::build(&compilation);
+    let procedures = ProcedureRegistry::build_with_stable_ids(&compilation, &procedure_ids)
+        .map_err(|error| format!("stable procedure linking: {error}"))?;
+    let procedure_digest = procedures.persistent_semantic_digest(&compilation);
     eprintln!(
         "compile-cache-phase: procedure-registry elapsed_ms={}",
         phase.elapsed().as_millis()
     );
     let phase = Instant::now();
-    let executable = procedures
-        .compile_vm_all_symbolic_deferred(&compilation)
-        .map_err(|error| format!("complete executable lowering: {error}"))?;
+    let cached_payload = persistent_database
+        .sections
+        .iter()
+        .find(|section| section.section_id == PERSISTENT_EXECUTABLE_SECTION)
+        .filter(|section| section.content_digest == procedure_digest)
+        .and_then(|_| persistent_database.section_payload(PERSISTENT_EXECUTABLE_SECTION));
+    let (mut executable, executable_cache_hit) = cached_payload
+        .as_deref()
+        .and_then(|payload| ExecutableProcedures::decode_compiled_artifact(payload).ok())
+        .map_or_else(
+            || {
+                procedures
+                    .compile_vm_all_symbolic_deferred(&compilation)
+                    .map_err(|error| format!("complete executable lowering: {error}"))?
+                    .into_fully_eager_bounded(MAX_EAGER_ARTIFACT_DIAGNOSTICS)
+                    .map(|executable| (executable, false))
+                    .map_err(|error| format!("complete executable lowering: {error}"))
+            },
+            |executable| Ok((executable, true)),
+        )?;
     eprintln!(
-        "compile-cache-phase: symbolic-lowering elapsed_ms={}",
-        phase.elapsed().as_millis()
-    );
-    let phase = Instant::now();
-    let executable = executable
-        .into_fully_eager_bounded(MAX_EAGER_ARTIFACT_DIAGNOSTICS)
-        .map_err(|error| format!("complete executable lowering: {error}"))?;
-    eprintln!(
-        "compile-cache-phase: eager-materialization elapsed_ms={}",
+        "compile-cache-phase: executable-link cache={} elapsed_ms={}",
+        if executable_cache_hit { "hit" } else { "miss" },
         phase.elapsed().as_millis()
     );
     if executable.module().deferred_procedure_count() != 0 {
         return Err("complete executable lowering retained deferred procedures".to_owned());
     }
-    let new_lowerings = executable.module().procedure_count();
+    let new_lowerings = if executable_cache_hit {
+        0
+    } else {
+        executable.module().procedure_count()
+    };
     let phase = Instant::now();
     let compilation_payload = compilation.encode_compiled_artifact();
     eprintln!(
@@ -1764,12 +2385,31 @@ fn prepare_compiled_executable(
     );
     let phase = Instant::now();
     let executable_payload = executable.encode_compiled_artifact()?;
+    let procedure_semantics_payload = encode_procedure_semantics(executable.module())?;
     eprintln!(
         "compile-cache-phase: executable-encode elapsed_ms={}",
         phase.elapsed().as_millis()
     );
+    if !executable_cache_hit {
+        let pages = persistent_database
+            .replace_paged_section(
+                PERSISTENT_EXECUTABLE_SECTION,
+                PERSISTENT_EXECUTABLE_PAGE_BASE,
+                procedure_digest,
+                &executable_payload,
+                vec![1],
+            )
+            .map_err(|error| format!("cache executable link: {error}"))?;
+        persistent_database
+            .write_atomic(&compiler_database_file)
+            .map_err(|error| format!("write executable compiler database: {error}"))?;
+        eprintln!(
+            "compile-cache-phase: executable-cache-write bytes={} pages={pages}",
+            executable_payload.len()
+        );
+    }
     let phase = Instant::now();
-    let structural_seed = RuntimeStructuralSeed::build(&compilation)
+    let structural_seed = RuntimeStructuralSeed::build_with_stable_ids(&compilation, &type_ids)
         .map_err(|error| format!("runtime structural seed: {error}"))?;
     let structural_payload = structural_seed.encode_compiled_artifact();
     eprintln!(
@@ -1777,22 +2417,122 @@ fn prepare_compiled_executable(
         phase.elapsed().as_millis(),
         structural_payload.len(),
     );
+    let stable_id_payload = encode_stable_id_table(&persistent_database.stable_ids)
+        .map_err(|error| format!("stable-ID runtime section: {error}"))?;
+    let mut linked_runtime = RuntimeImage::from_compilation(&compilation)
+        .map_err(|error| format!("linked runtime image: {error}"))?;
+    let boot_manifest_payload = lobby_pregame_readiness(&compilation, &linked_runtime)
+        .map(|probe| probe.encode_portable_manifest())
+        .transpose()
+        .map_err(|error| format!("boot manifest: {error}"))?;
+    let parsed_dmm_cache = build_parsed_dmm_cache(&compilation)?;
+    let dmm_measurements = dmm_measurements_from_parsed(&parsed_dmm_cache);
+    let dmm_measurement_payload = encode_dmm_measurements(&dmm_measurements)?;
+    let parsed_dmm_payload = encode_parsed_dmm_cache(&parsed_dmm_cache)?;
+    eprintln!(
+        "compile-progress: dmm-measurements entries={} bytes={}",
+        dmm_measurements.len(),
+        dmm_measurement_payload.len(),
+    );
+    linked_runtime
+        .materialize_linked_artifact_initializers(MAX_EAGER_ARTIFACT_DIAGNOSTICS)
+        .map_err(|error| format!("linked runtime initializer module: {error}"))?;
+    let linked_runtime_payload = linked_runtime
+        .encode_linked_artifact(executable.module())
+        .map_err(|error| format!("linked runtime image: {error}"))?;
+    let lifecycle_index = LifecycleIndex::build_compile_only(&compilation, &procedures);
+    let lifecycle_directory_payload = lifecycle_index
+        .encode_portable()
+        .map_err(|error| format!("lifecycle directory: {error}"))?;
+    let default_map_payload = load_map(&compilation, None)
+        .ok()
+        .map(|(path, source)| {
+            let map =
+                dm_map::parse(&source).map_err(|error| format!("default map {path}: {error}"))?;
+            let plan = dm_world::build_plan(&map, &compilation);
+            dm_world::encode_named_portable_plan(&path, &plan)
+                .map_err(|error| format!("default map directory: {error}"))
+        })
+        .transpose()?;
+    let prepared_default_map = default_map_payload
+        .as_deref()
+        .map(dm_world::decode_named_portable_plan)
+        .transpose()?;
     eprintln!(
         "compile-progress: executable-artifact-payloads frontend_bytes={} executable_bytes={}",
         compilation_payload.len(),
         executable_payload.len(),
     );
     let fingerprint = *compilation.project().content_fingerprint().as_bytes();
+    let compact_payload = if env::var_os("DREAM64_DISABLE_COMPACT_WORDCODE").is_none() {
+        let compact = dm_vm::CompactWordcodeImage::build(executable.module())
+            .map_err(|error| format!("compact wordcode: {error}"))?;
+        let payload = compact
+            .encode()
+            .map_err(|error| format!("compact wordcode: {error}"))?;
+        eprintln!(
+            "compile-cache-phase: compact-wordcode-encode bytes={} strings={} procedures={} words={} specialized={}",
+            payload.len(),
+            compact.string_count(),
+            compact.procedure_count(),
+            compact.word_count(),
+            compact.specialized_word_count(),
+        );
+        executable
+            .module_mut()
+            .attach_compact_wordcode(compact)
+            .map_err(|error| format!("compact wordcode: {error}"))?;
+        Some(payload)
+    } else {
+        None
+    };
     let phase = Instant::now();
-    let runtime_artifact = CompiledArtifact::new(
-        fingerprint,
-        vec![
-            ArtifactSection::new(COMPILATION_ARTIFACT_SECTION, compilation_payload),
-            ArtifactSection::new(EXECUTABLE_ARTIFACT_SECTION, executable_payload),
-            ArtifactSection::new(RUNTIME_STRUCTURAL_ARTIFACT_SECTION, structural_payload),
-        ],
-    )
-    .map_err(|error| format!("build executable artifact: {error}"))?;
+    let mut sections = vec![
+        ArtifactSection::new(COMPILATION_ARTIFACT_SECTION, compilation_payload),
+        ArtifactSection::new(EXECUTABLE_ARTIFACT_SECTION, executable_payload),
+        ArtifactSection::new(RUNTIME_STRUCTURAL_ARTIFACT_SECTION, structural_payload),
+    ];
+    if let Some(payload) = compact_payload {
+        sections.push(ArtifactSection::new(
+            COMPACT_WORDCODE_ARTIFACT_SECTION,
+            payload,
+        ));
+    }
+    sections.push(ArtifactSection::new(
+        STABLE_ID_ARTIFACT_SECTION,
+        stable_id_payload,
+    ));
+    sections.push(ArtifactSection::new(
+        RUNTIME_LINKED_ARTIFACT_SECTION,
+        linked_runtime_payload,
+    ));
+    sections.push(ArtifactSection::new(
+        LIFECYCLE_DIRECTORY_ARTIFACT_SECTION,
+        lifecycle_directory_payload,
+    ));
+    if let Some(payload) = default_map_payload {
+        sections.push(ArtifactSection::new(DEFAULT_MAP_ARTIFACT_SECTION, payload));
+    }
+    if let Some(payload) = boot_manifest_payload {
+        sections.push(ArtifactSection::new(
+            BOOT_MANIFEST_ARTIFACT_SECTION,
+            payload,
+        ));
+    }
+    sections.push(ArtifactSection::new(
+        DMM_MEASUREMENT_ARTIFACT_SECTION,
+        dmm_measurement_payload,
+    ));
+    sections.push(ArtifactSection::new(
+        PARSED_DMM_ARTIFACT_SECTION,
+        parsed_dmm_payload,
+    ));
+    sections.push(ArtifactSection::new(
+        PROCEDURE_SEMANTICS_ARTIFACT_SECTION,
+        procedure_semantics_payload,
+    ));
+    let runtime_artifact = CompiledArtifact::new(fingerprint, sections)
+        .map_err(|error| format!("build executable artifact: {error}"))?;
     eprintln!(
         "compile-cache-phase: envelope-build elapsed_ms={}",
         phase.elapsed().as_millis()
@@ -1818,6 +2558,9 @@ fn prepare_compiled_executable(
         procedures,
         executable,
         structural_seed,
+        linked_runtime: Some(linked_runtime),
+        lifecycle_index: Some(lifecycle_index),
+        default_map: prepared_default_map,
         project_snapshot_hit,
         parsed_syntax_hit: Some(cache_stats.parsed_syntax_hit),
         artifact_hit: false,
@@ -1829,7 +2572,17 @@ fn prepare_compiled_executable(
 fn decode_compiled_executable(
     artifact_file: &Path,
     project_fingerprint: [u8; 16],
-) -> Result<(Compilation, ExecutableProcedures, RuntimeStructuralSeed), String> {
+) -> Result<
+    (
+        Compilation,
+        ExecutableProcedures,
+        RuntimeStructuralSeed,
+        Option<RuntimeImage>,
+        Option<LifecycleIndex>,
+        Option<(String, dm_world::WorldPlan)>,
+    ),
+    String,
+> {
     let phase = Instant::now();
     let runtime_artifact = match CompiledArtifact::read_from(artifact_file, project_fingerprint) {
         Ok(artifact) => artifact,
@@ -1852,11 +2605,30 @@ fn decode_compiled_executable(
         runtime_storage.backing_bytes,
         runtime_storage.backing_allocations,
     );
-    if runtime_artifact.sections().len() != 3 {
+    if !(3..=12).contains(&runtime_artifact.sections().len()) {
         return Err(format!(
-            "runtime artifact contains {} sections instead of 3",
+            "runtime artifact contains {} sections instead of 3 through 5",
             runtime_artifact.sections().len()
         ));
+    }
+    if runtime_artifact.sections().iter().any(|section| {
+        !matches!(
+            section.id(),
+            COMPILATION_ARTIFACT_SECTION
+                | EXECUTABLE_ARTIFACT_SECTION
+                | RUNTIME_STRUCTURAL_ARTIFACT_SECTION
+                | COMPACT_WORDCODE_ARTIFACT_SECTION
+                | STABLE_ID_ARTIFACT_SECTION
+                | RUNTIME_LINKED_ARTIFACT_SECTION
+                | LIFECYCLE_DIRECTORY_ARTIFACT_SECTION
+                | DEFAULT_MAP_ARTIFACT_SECTION
+                | BOOT_MANIFEST_ARTIFACT_SECTION
+                | DMM_MEASUREMENT_ARTIFACT_SECTION
+                | PARSED_DMM_ARTIFACT_SECTION
+                | PROCEDURE_SEMANTICS_ARTIFACT_SECTION
+        )
+    }) {
+        return Err("runtime artifact contains an unknown section".to_owned());
     }
     let frontend_payload = runtime_artifact
         .section(COMPILATION_ARTIFACT_SECTION)
@@ -1870,8 +2642,22 @@ fn decode_compiled_executable(
         .section(RUNTIME_STRUCTURAL_ARTIFACT_SECTION)
         .ok_or_else(|| "runtime artifact is missing the structural section".to_owned())?
         .payload();
+    let compact_payload = runtime_artifact
+        .section(COMPACT_WORDCODE_ARTIFACT_SECTION)
+        .map(ArtifactSection::payload);
+    let stable_ids = if let Some(payload) = runtime_artifact
+        .section(STABLE_ID_ARTIFACT_SECTION)
+        .map(ArtifactSection::payload)
+    {
+        let stable_ids = decode_stable_id_table(payload)
+            .map_err(|error| format!("runtime artifact stable-ID section: {error}"))?;
+        eprintln!("boot-progress: stable-ids validated={}", stable_ids.len());
+        Some(stable_ids)
+    } else {
+        None
+    };
     let parallel_phase = Instant::now();
-    let (compilation, executable, structural_seed) = std::thread::scope(|scope| {
+    let (compilation, mut executable, structural_seed, compact) = std::thread::scope(|scope| {
         let frontend = scope.spawn(|| {
             let started = Instant::now();
             (
@@ -1893,6 +2679,15 @@ fn decode_compiled_executable(
                 started.elapsed(),
             )
         });
+        let compact = compact_payload.map(|payload| {
+            scope.spawn(|| {
+                let started = Instant::now();
+                (
+                    dm_vm::CompactWordcodeImage::decode(payload),
+                    started.elapsed(),
+                )
+            })
+        });
         let (compilation, frontend_elapsed) = frontend
             .join()
             .map_err(|_| "frontend artifact decoder panicked".to_owned())?;
@@ -1902,6 +2697,13 @@ fn decode_compiled_executable(
         let (structural_seed, structural_elapsed) = structural
             .join()
             .map_err(|_| "runtime structural artifact decoder panicked".to_owned())?;
+        let compact = compact
+            .map(|thread| {
+                thread
+                    .join()
+                    .map_err(|_| "compact wordcode artifact decoder panicked".to_owned())
+            })
+            .transpose()?;
         eprintln!(
             "compile-cache-phase: frontend-decode elapsed_ms={}",
             frontend_elapsed.as_millis()
@@ -1914,7 +2716,20 @@ fn decode_compiled_executable(
             "compile-cache-phase: runtime-structural-decode elapsed_ms={}",
             structural_elapsed.as_millis()
         );
-        Ok::<_, String>((compilation?, executable?, structural_seed?))
+        if let Some((_, elapsed)) = &compact {
+            eprintln!(
+                "compile-cache-phase: compact-wordcode-decode elapsed_ms={}",
+                elapsed.as_millis()
+            );
+        }
+        Ok::<_, String>((
+            compilation?,
+            executable?,
+            structural_seed?,
+            compact
+                .map(|(image, _)| image.map_err(|error| error.to_string()))
+                .transpose()?,
+        ))
     })?;
     eprintln!(
         "compile-cache-phase: parallel-section-decode elapsed_ms={}",
@@ -1925,10 +2740,116 @@ fn decode_compiled_executable(
             "compiled executable frontend fingerprint disagrees with its envelope".to_owned(),
         );
     }
+    decode_and_attach_procedure_semantics(
+        runtime_artifact
+            .section(PROCEDURE_SEMANTICS_ARTIFACT_SECTION)
+            .ok_or("runtime artifact is missing procedure semantic directory")?
+            .payload(),
+        executable.module_mut(),
+    )?;
     if executable.module().deferred_procedure_count() != 0 {
         return Err("compiled executable contains deferred procedures".to_owned());
     }
-    Ok((compilation, executable, structural_seed))
+    if let Some(stable_ids) = &stable_ids {
+        validate_stable_linkage(&compilation, &executable, &structural_seed, stable_ids)?;
+    }
+    if let Some(compact) = compact {
+        executable
+            .module_mut()
+            .attach_compact_wordcode(compact)
+            .map_err(|error| format!("compact wordcode mismatch: {error}"))?;
+    }
+    let linked_runtime = runtime_artifact
+        .section(RUNTIME_LINKED_ARTIFACT_SECTION)
+        .map(|section| RuntimeImage::decode_linked_artifact(section.payload(), executable.module()))
+        .transpose()
+        .map_err(|error| format!("linked runtime artifact: {error}"))?;
+    let lifecycle_index = runtime_artifact
+        .section(LIFECYCLE_DIRECTORY_ARTIFACT_SECTION)
+        .map(|section| LifecycleIndex::decode_portable(section.payload()))
+        .transpose()
+        .map_err(|error| format!("lifecycle directory artifact: {error}"))?;
+    let default_map = runtime_artifact
+        .section(DEFAULT_MAP_ARTIFACT_SECTION)
+        .map(|section| dm_world::decode_named_portable_plan(section.payload()))
+        .transpose()
+        .map_err(|error| format!("default map artifact: {error}"))?;
+    Ok((
+        compilation,
+        executable,
+        structural_seed,
+        linked_runtime,
+        lifecycle_index,
+        default_map,
+    ))
+}
+
+fn validate_stable_linkage(
+    compilation: &Compilation,
+    executable: &ExecutableProcedures,
+    structural_seed: &RuntimeStructuralSeed,
+    stable_ids: &[dm_compiler::persistent_database::StableIdEntry],
+) -> Result<(), String> {
+    let expected_types = compilation
+        .code_tree()
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == dm_object_tree::NodeKind::Type)
+        .count();
+    let mut types = stable_ids
+        .iter()
+        .filter(|entry| entry.namespace == "type")
+        .collect::<Vec<_>>();
+    if types.len() != expected_types {
+        return Err("stable-ID type inventory disagrees with the frontend".to_owned());
+    }
+    types.sort_by_key(|entry| entry.id);
+    for (runtime_id, entry) in types.into_iter().enumerate() {
+        let path = TypePath::parse(&entry.name).map_err(|error| error.to_string())?;
+        if structural_seed.type_id(&path) != u32::try_from(runtime_id).ok() {
+            return Err(format!(
+                "stable-ID type ordering disagrees for {}",
+                entry.name
+            ));
+        }
+    }
+
+    let expected_procedures = compilation
+        .code_tree()
+        .nodes()
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.kind,
+                dm_object_tree::NodeKind::Procedure | dm_object_tree::NodeKind::Verb
+            )
+        })
+        .count();
+    let mut procedures = stable_ids
+        .iter()
+        .filter(|entry| entry.namespace == "procedure")
+        .collect::<Vec<_>>();
+    if procedures.len() != expected_procedures {
+        return Err("stable-ID procedure inventory disagrees with the frontend".to_owned());
+    }
+    procedures.sort_by_key(|entry| entry.id);
+    let mut previous = None;
+    for entry in procedures {
+        let id = executable
+            .module()
+            .effective_procedure_id(&entry.name)
+            .ok_or_else(|| {
+                format!(
+                    "stable-ID procedure {} is absent from the module",
+                    entry.name
+                )
+            })?;
+        if previous.is_some_and(|previous| previous >= id) {
+            return Err("stable-ID procedure ordering disagrees with the module".to_owned());
+        }
+        previous = Some(id);
+    }
+    Ok(())
 }
 
 fn executable_artifact_file(environment: &Path) -> PathBuf {
@@ -1953,6 +2874,81 @@ fn project_cache_file(environment: &Path) -> PathBuf {
         PathBuf::from,
     );
     cache_root.join(format!("project-{hash:016x}.bin"))
+}
+
+fn compiler_database_file(project_cache: &Path) -> PathBuf {
+    let name = project_cache
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or("project");
+    project_cache.with_file_name(format!("compiler-{name}.d64cdb"))
+}
+
+fn stable_ids_for_namespace(
+    database: &PersistentCompilerDatabase,
+    namespace: &str,
+) -> BTreeMap<String, u64> {
+    database
+        .stable_ids
+        .iter()
+        .filter(|entry| entry.namespace == namespace)
+        .map(|entry| (entry.name.clone(), entry.id))
+        .collect()
+}
+
+fn validate_procedure_id_inventory(
+    compilation: &Compilation,
+    procedure_ids: &BTreeMap<String, u64>,
+) -> Result<(), String> {
+    let expected = compilation
+        .code_tree()
+        .nodes()
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.kind,
+                dm_object_tree::NodeKind::Procedure | dm_object_tree::NodeKind::Verb
+            )
+        })
+        .count();
+    if procedure_ids.len() != expected {
+        return Err(format!(
+            "persistent procedure ID inventory contains {} entries but the frontend contains {expected}",
+            procedure_ids.len()
+        ));
+    }
+    Ok(())
+}
+
+fn persistent_semantic_digest() -> [u8; 32] {
+    digest32(
+        b"dream64-compiler-semantics-v2",
+        &engine_semantics_fingerprint(),
+    )
+}
+
+fn persistent_build_configuration_digest() -> [u8; 32] {
+    let compact = if env::var_os("DREAM64_DISABLE_COMPACT_WORDCODE").is_some() {
+        b"compact=disabled".as_slice()
+    } else {
+        b"compact=enabled".as_slice()
+    };
+    digest32(b"dream64-compiler-build-v1", compact)
+}
+
+fn digest32(domain: &[u8], value: &[u8]) -> [u8; 32] {
+    let mut left = md5::Context::new();
+    left.consume(domain);
+    left.consume([0]);
+    left.consume(value);
+    let mut right = md5::Context::new();
+    right.consume(domain);
+    right.consume([1]);
+    right.consume(value);
+    let mut digest = [0; 32];
+    digest[..16].copy_from_slice(&left.compute().0);
+    digest[16..].copy_from_slice(&right.compute().0);
+    digest
 }
 
 fn ready_world_cache_file(
@@ -2050,6 +3046,27 @@ fn master_controller_readiness(
         } else {
             vec![FieldName::parse("init_stage_completed").expect("DM field identifier is valid")]
         },
+        expected: Value::number(expected),
+    })
+}
+
+fn lobby_pregame_readiness(
+    compilation: &Compilation,
+    runtime: &RuntimeImage,
+) -> Option<HeadlessReadinessProbe> {
+    let has_ticker_type = runtime
+        .types()
+        .any(|(path, _)| path.as_str() == "/datum/controller/subsystem/ticker");
+    let expected = compilation
+        .project()
+        .object_macro("GAME_STATE_PREGAME")?
+        .trim()
+        .parse::<f32>()
+        .ok()?;
+    has_ticker_type.then(|| HeadlessReadinessProbe {
+        qualified_storage: None,
+        global: FieldName::parse("SSticker").expect("DM global identifier is valid"),
+        fields: vec![FieldName::parse("current_state").expect("DM field identifier is valid")],
         expected: Value::number(expected),
     })
 }
@@ -2217,14 +3234,21 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use dm_value::{FieldName, Value};
+    use dm_compiler::persistent_database::PersistentCompilerDatabase;
+    use dm_compiler::{BuildMode, CompilerDatabase};
+    use dm_lifecycle::readiness_probe_matches;
+    use dm_runtime::{RuntimeImage, RuntimeStructuralSeed};
+    use dm_semantics::ProcedureRegistry;
+    use dm_value::{FieldName, TypePath, Value};
     use dm_vm::{ExecutionState, execute_module_in_state};
 
     use super::{
+        ArtifactSection, COMPACT_WORDCODE_ARTIFACT_SECTION, CompiledArtifact,
         ProductionReadyWorldIdentity, ReadyWorldMode, decode_compiled_executable,
         executable_artifact_file, fresh_launch_random_seed, launch_random_seed_from,
-        parse_ready_world_mode, prepare_compiled_executable, prepare_standalone_artifact,
-        ready_world_cache_file, restore_ready_world_cache, write_ready_world_cache,
+        lobby_pregame_readiness, parse_ready_world_mode, prepare_compiled_executable,
+        ready_world_cache_file, restore_ready_world_cache, stable_ids_for_namespace,
+        write_ready_world_cache,
     };
 
     static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
@@ -2249,9 +3273,17 @@ mod tests {
             let source = root.join("code.dm");
             let cache = root.join("project.bin");
             let artifact = root.join("project.d64");
-            fs::write(&environment, "#include \"code.dm\"\n")
-                .expect("environment should be written");
+            fs::write(
+                &environment,
+                "#include \"code.dm\"\n#include \"CentCom.dmm\"\n",
+            )
+            .expect("environment should be written");
             Self::write_source(&source, 1);
+            fs::write(
+                root.join("CentCom.dmm"),
+                "\"a\" = (/turf, /area)\n(1,1,1) = {\"\na\n\"}\n",
+            )
+            .expect("map should be written");
             Self {
                 root,
                 environment,
@@ -2286,6 +3318,95 @@ mod tests {
         let environment = Path::new("Monkestation2.0").join("tgstation.DmE");
         let runtime = executable_artifact_file(&environment);
         assert_eq!(runtime, Path::new("Monkestation2.0").join("tgstation.d64"));
+    }
+
+    #[test]
+    fn lexically_earlier_additions_preserve_authoritative_runtime_ids() {
+        let fixture = Fixture::new();
+        let database_file = fixture.root.join("stable.d64cdb");
+        let compiler = CompilerDatabase::new();
+        let (first, _) = compiler
+            .compile_persistent(
+                &fixture.environment,
+                &database_file,
+                BuildMode::Incremental,
+                [1; 32],
+                [2; 32],
+            )
+            .unwrap();
+        let first_database = PersistentCompilerDatabase::read(&database_file).unwrap();
+        let first_procedure_ids = stable_ids_for_namespace(&first_database, "procedure");
+        let first_type_ids = stable_ids_for_namespace(&first_database, "type");
+        let first_registry =
+            ProcedureRegistry::build_with_stable_ids(&first, &first_procedure_ids).unwrap();
+        let first_seed = RuntimeStructuralSeed::build_with_stable_ids(&first, &first_type_ids)
+            .expect("first structural link");
+        let first_make = first_registry
+            .procedures()
+            .iter()
+            .find(|procedure| procedure.path.to_string() == "/proc/make")
+            .unwrap()
+            .id
+            .index();
+
+        fs::write(
+            &fixture.source,
+            "/aaa\n/aaa/proc/first()\n\treturn 0\n/proc/make()\n\treturn list(1)\n",
+        )
+        .unwrap();
+        let (second, _) = compiler
+            .compile_persistent(
+                &fixture.environment,
+                &database_file,
+                BuildMode::Incremental,
+                [1; 32],
+                [2; 32],
+            )
+            .unwrap();
+        let second_database = PersistentCompilerDatabase::read(&database_file).unwrap();
+        let second_procedure_ids = stable_ids_for_namespace(&second_database, "procedure");
+        let second_type_ids = stable_ids_for_namespace(&second_database, "type");
+        let second_registry =
+            ProcedureRegistry::build_with_stable_ids(&second, &second_procedure_ids).unwrap();
+        let second_seed = RuntimeStructuralSeed::build_with_stable_ids(&second, &second_type_ids)
+            .expect("second structural link");
+        assert_eq!(
+            second_registry
+                .procedures()
+                .iter()
+                .find(|procedure| procedure.path.to_string() == "/proc/make")
+                .unwrap()
+                .id
+                .index(),
+            first_make
+        );
+        for path in first_type_ids.keys() {
+            let path = TypePath::parse(path).unwrap();
+            assert_eq!(first_seed.type_id(&path), second_seed.type_id(&path));
+        }
+    }
+
+    #[test]
+    fn nonsemantic_file_diff_reuses_persisted_executable_link() {
+        let fixture = Fixture::new();
+        let cold = fixture.prepare();
+        assert!(cold.new_lowerings > 0);
+        drop(cold);
+        fs::remove_file(&fixture.artifact).unwrap();
+        fs::write(
+            &fixture.source,
+            "/proc/make()\n\tvar/list/items = list(1)\n\treturn items\n// cache-neutral edit\n",
+        )
+        .unwrap();
+        let warm = fixture.prepare();
+        assert_eq!(warm.new_lowerings, 0);
+        assert!(!warm.artifact_hit);
+        assert_eq!(warm.executable.module().deferred_procedure_count(), 0);
+        drop(warm);
+        fs::remove_file(&fixture.artifact).unwrap();
+        Fixture::write_source(&fixture.source, 2);
+        let changed_body = fixture.prepare();
+        assert!(changed_body.new_lowerings > 0);
     }
 
     #[test]
@@ -2336,6 +3457,50 @@ mod tests {
             parse_ready_world_mode(false, false, true, false, None, None).unwrap(),
             ReadyWorldMode::Development
         );
+    }
+
+    #[test]
+    fn monk_lobby_probe_requires_ticker_pregame_state() {
+        let fixture = Fixture::new();
+        fs::write(
+            &fixture.source,
+            concat!(
+                "#define GAME_STATE_PREGAME 1\n",
+                "var/global/datum/controller/subsystem/ticker/SSticker\n",
+                "/datum/controller/subsystem/ticker\n",
+                "\tvar/current_state = 0\n",
+            ),
+        )
+        .unwrap();
+        let prepared = fixture.prepare();
+        let runtime = RuntimeImage::from_compilation(&prepared.compilation).unwrap();
+        let probe = lobby_pregame_readiness(&prepared.compilation, &runtime)
+            .expect("Monke-like ticker should expose a pregame probe");
+
+        let mut state = ExecutionState::new();
+        let ticker = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/controller/subsystem/ticker").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(
+                ticker,
+                FieldName::parse("current_state").unwrap(),
+                Value::number(0.0),
+            )
+            .unwrap();
+        state.set_global(FieldName::parse("SSticker").unwrap(), Value::Datum(ticker));
+        assert!(!readiness_probe_matches(&state, &probe));
+
+        state
+            .heap_mut()
+            .set_datum_field(
+                ticker,
+                FieldName::parse("current_state").unwrap(),
+                Value::number(1.0),
+            )
+            .unwrap();
+        assert!(readiness_probe_matches(&state, &probe));
     }
 
     #[test]
@@ -2473,17 +3638,121 @@ mod tests {
         let compiled = fixture.prepare();
         let expected = compiled.compilation.project().content_fingerprint();
         drop(compiled);
+        let artifact =
+            CompiledArtifact::read_from(&fixture.artifact, *expected.as_bytes()).unwrap();
+        let sections = artifact
+            .sections()
+            .iter()
+            .filter(|section| section.id() != super::COMPILATION_ARTIFACT_SECTION)
+            .cloned()
+            .collect();
+        CompiledArtifact::new(*expected.as_bytes(), sections)
+            .unwrap()
+            .write_atomic(&fixture.artifact)
+            .unwrap();
         fs::remove_file(&fixture.environment).expect("source environment should be removable");
         fs::remove_file(&fixture.source).expect("source file should be removable");
+        fs::remove_file(fixture.root.join("CentCom.dmm")).expect("map source should be removable");
 
-        let runtime = prepare_standalone_artifact(&fixture.artifact)
+        let runtime = super::prepare_standalone_runtime(&fixture.artifact)
             .expect("self-contained runtime should not require compiler sources");
-        assert!(runtime.artifact_hit);
-        assert_eq!(
-            runtime.compilation.project().content_fingerprint(),
-            expected
+        let artifact = CompiledArtifact::read_from(&fixture.artifact, *expected.as_bytes())
+            .expect("runtime artifact should decode");
+        assert!(
+            artifact
+                .section(super::COMPILATION_ARTIFACT_SECTION)
+                .is_none()
         );
-        assert_eq!(runtime.new_lowerings, 0);
+        assert!(
+            artifact
+                .section(super::RUNTIME_LINKED_ARTIFACT_SECTION)
+                .is_some()
+        );
+        assert!(!runtime.map_path.is_empty());
+        assert!(!runtime.world.cells().is_empty());
+        assert!(runtime.lifecycle.find_path("/world").is_some());
+        assert_eq!(
+            runtime
+                .dmm_measurements
+                .get("centcom.dmm")
+                .expect("source-deleted artifact retains DMM measurement")
+                .measurement
+                .bounds,
+            [1, 1, 1, 1, 1, 1]
+        );
+        drop(runtime);
+        assert_eq!(
+            super::run_standalone_linked_boot(
+                &fixture.artifact,
+                true,
+                None,
+                std::time::Instant::now(),
+            ),
+            std::process::ExitCode::SUCCESS,
+        );
+    }
+
+    #[test]
+    fn source_deleted_standalone_ticker_uses_portable_readiness_manifest() {
+        let fixture = Fixture::new();
+        fs::write(
+            &fixture.source,
+            concat!(
+                "#define GAME_STATE_PREGAME 2\n",
+                "/datum/controller/subsystem/ticker\n",
+                "\tvar/current_state = GAME_STATE_PREGAME\n",
+                "/var/global/datum/controller/subsystem/ticker/SSticker = new\n",
+            ),
+        )
+        .unwrap();
+        let compiled = fixture.prepare();
+        let fingerprint = *compiled
+            .compilation
+            .project()
+            .content_fingerprint()
+            .as_bytes();
+        drop(compiled);
+        let artifact = CompiledArtifact::read_from(&fixture.artifact, fingerprint).unwrap();
+        let sections = artifact
+            .sections()
+            .iter()
+            .filter(|section| section.id() != super::COMPILATION_ARTIFACT_SECTION)
+            .cloned()
+            .collect();
+        CompiledArtifact::new(fingerprint, sections)
+            .unwrap()
+            .write_atomic(&fixture.artifact)
+            .unwrap();
+        fs::remove_file(&fixture.environment).unwrap();
+        fs::remove_file(&fixture.source).unwrap();
+
+        let prepared = super::prepare_standalone_runtime(&fixture.artifact).unwrap();
+        let probe = prepared
+            .readiness
+            .as_ref()
+            .expect("ticker artifact requires readiness");
+        assert_eq!(probe.expected, Value::number(2.0));
+        assert_eq!(probe.global.as_str(), "SSticker");
+        assert_eq!(probe.fields[0].as_str(), "current_state");
+
+        let artifact = CompiledArtifact::read_from(&fixture.artifact, fingerprint).unwrap();
+        let sections = artifact
+            .sections()
+            .iter()
+            .filter(|section| section.id() != super::BOOT_MANIFEST_ARTIFACT_SECTION)
+            .cloned()
+            .collect();
+        let missing = fixture.root.join("missing-manifest.d64");
+        CompiledArtifact::new(fingerprint, sections)
+            .unwrap()
+            .write_atomic(&missing)
+            .unwrap();
+        assert!(
+            super::prepare_standalone_runtime(&missing)
+                .err()
+                .unwrap()
+                .contains("missing its boot readiness manifest")
+        );
     }
 
     #[test]
@@ -2536,9 +3805,9 @@ mod tests {
             .and_then(|procedure| procedure.effective_target)
             .expect("fixture semantic entry should exist");
         drop(prepared);
-        let (_, left, _) = decode_compiled_executable(&fixture.artifact, fingerprint)
+        let (_, left, _, _, _, _) = decode_compiled_executable(&fixture.artifact, fingerprint)
             .expect("first executable should load");
-        let (_, right, _) = decode_compiled_executable(&fixture.artifact, fingerprint)
+        let (_, right, _, _, _, _) = decode_compiled_executable(&fixture.artifact, fingerprint)
             .expect("second executable should load");
         let left_entry = left
             .implementation(semantic_entry)
@@ -2569,6 +3838,55 @@ mod tests {
         assert_eq!(right_state.heap().list(right_list).unwrap().len(), 1);
         assert_eq!(left_state.heap().live_list_count(), 1);
         assert_eq!(right_state.heap().live_list_count(), 1);
+    }
+
+    #[test]
+    fn optional_compact_wordcode_section_loads_and_attaches() {
+        let fixture = Fixture::new();
+        let prepared = fixture.prepare();
+        let fingerprint = *prepared
+            .compilation
+            .project()
+            .content_fingerprint()
+            .as_bytes();
+        let compact = dm_vm::CompactWordcodeImage::build(prepared.executable.module())
+            .expect("compact image should build")
+            .encode()
+            .expect("compact image should encode");
+        drop(prepared);
+
+        let artifact = CompiledArtifact::read_from(&fixture.artifact, fingerprint)
+            .expect("base artifact should load");
+        let mut sections: Vec<_> = artifact
+            .sections()
+            .iter()
+            .filter(|section| section.id() != COMPACT_WORDCODE_ARTIFACT_SECTION)
+            .cloned()
+            .collect();
+        let stable_ids = sections.pop().expect("stable-ID section should exist");
+        sections.push(ArtifactSection::new(
+            COMPACT_WORDCODE_ARTIFACT_SECTION,
+            compact,
+        ));
+        sections.push(stable_ids);
+        CompiledArtifact::new(fingerprint, sections)
+            .expect("artifact with compact wordcode should build")
+            .write_atomic(&fixture.artifact)
+            .expect("artifact with compact wordcode should be written");
+
+        let (_, executable, _, _, _, _) =
+            decode_compiled_executable(&fixture.artifact, fingerprint)
+                .expect("executable with compact wordcode should load");
+        let compact = executable
+            .module()
+            .compact_wordcode()
+            .expect("compact image should attach");
+        assert_eq!(
+            compact.procedure_count(),
+            executable.module().procedure_count()
+        );
+        assert!(compact.word_count() > 0);
+        assert!(compact.specialized_word_count() > 0);
     }
 
     fn refresh_envelope_checksums(bytes: &mut [u8]) {

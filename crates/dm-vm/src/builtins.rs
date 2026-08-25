@@ -390,10 +390,7 @@ pub(super) fn execute_standard_builtin_with_usr(
         "trimtext" if matches!(arguments[0], Value::Null) => Ok(Value::Null),
         "trimtext" => text_map(arguments, state, |value| value.trim().to_owned()),
         "fcopy_rsc" => fcopy_rsc(arguments, state),
-        // `link()` wraps a URL for BYOND's output operator. Headless output
-        // retains the URL value itself, which is sufficient to preserve the
-        // observable redirect payload without a client browser.
-        "link" => Ok(arguments.first().cloned().unwrap_or(Value::Null)),
+        "link" => headless_link(arguments, state, usr),
         "run" => Ok(Value::Null),
         "issaved" => Ok(Value::number(1.0)),
         "REGEX_QUOTE" => regex_quote(arguments, state, false),
@@ -3863,6 +3860,25 @@ fn local_client_for_value(state: &ExecutionState, value: &Value) -> Option<Datum
     state.client_session(*client).is_some().then_some(*client)
 }
 
+fn headless_link(
+    arguments: &[Value],
+    state: &mut ExecutionState,
+    usr: &Value,
+) -> Result<Value, String> {
+    let value = arguments.first().cloned().unwrap_or(Value::Null);
+    if let Some(url) = value_text(&value)
+        && let Some(client) = local_client_for_value(state, usr)
+    {
+        state.emit_local_client_ui_event(
+            client,
+            LocalClientUiEvent::Link {
+                url: url.to_owned(),
+            },
+        );
+    }
+    Ok(value)
+}
+
 fn headless_winset(
     arguments: &[Value],
     state: &mut ExecutionState,
@@ -6597,7 +6613,7 @@ pub(super) fn move_movable_to_atom(
     Ok(())
 }
 
-fn move_turf_to_area(
+pub(super) fn move_turf_to_area(
     state: &mut ExecutionState,
     turf: DatumId,
     new_area: DatumId,
@@ -7429,9 +7445,20 @@ pub(super) fn execute_output(
                             None => path,
                         }
                     };
-                    let bytes = fs::read(&path).map_err(|error| {
-                        format!("browse_rsc failed to read {}: {error}", path.display())
-                    })?;
+                    let bytes = fs::read(&path).unwrap_or_else(|error| {
+                        eprintln!(
+                            "browse_rsc warning: optional resource {} is unavailable: {error}",
+                            path.display()
+                        );
+                        if path
+                            .extension()
+                            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+                        {
+                            b"{}".to_vec()
+                        } else {
+                            Vec::new()
+                        }
+                    });
                     state.emit_local_client_ui_event(
                         target,
                         LocalClientUiEvent::BrowseResource { name, bytes },
@@ -7448,8 +7475,16 @@ pub(super) fn execute_output(
                 let window = options
                     .split(';')
                     .find_map(|item| item.trim().strip_prefix("window="))
+                    .and_then(|value| value.split('&').next())
                     .unwrap_or_default()
                     .to_owned();
+                if !window.is_empty()
+                    && let Some(session) = state.client_session_mut(target)
+                {
+                    session
+                        .ensure_browser_window(&window)
+                        .map_err(|error| format!("browse window creation failed: {error:?}"))?;
+                }
                 state.emit_local_client_ui_event(
                     target,
                     LocalClientUiEvent::Browse { window, html },
