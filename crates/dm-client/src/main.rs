@@ -7125,7 +7125,7 @@ fn screen_hit_at(
         if screen_is_render_pipeline_helper(screen) {
             continue;
         }
-        let Ok((width, height, pixels)) = composite_native(sprites, &screen.appearances) else {
+        let Ok((width, height, _pixels)) = composite_native(sprites, &screen.appearances) else {
             continue;
         };
         let Some((origin_x, origin_y)) =
