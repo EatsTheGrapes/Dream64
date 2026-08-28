@@ -634,6 +634,8 @@ mod tests {
             RUNTIME_LINKED_SECTION,
             LIFECYCLE_DIRECTORY_SECTION,
             DMM_MEASUREMENT_SECTION,
+            PARSED_DMM_SECTION,
+            PROCEDURE_SEMANTICS_SECTION,
         ]);
         assert!(artifact_has_current_sections(&current));
     }
