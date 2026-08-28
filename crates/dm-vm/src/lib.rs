@@ -34275,7 +34275,11 @@ mod tests {
         execute_module_in_state(&module, start, &[], &mut scheduled).unwrap();
         let mut rounds = 0;
         let mut completed = Vec::new();
-        while scheduled.scheduled_task_count() != 0 && rounds < 100 {
+        // tick_usage is derived from real wall-clock elapsed time (see
+        // account_scheduler_tick_usage), so how many rounds this worker needs
+        // to finish depends on host speed, not a fixed instruction count.
+        // Keep this bound generous so slower/loaded machines don't flake.
+        while scheduled.scheduled_task_count() != 0 && rounds < 100_000 {
             let advance = u64::from(rounds != 0);
             completed.extend(
                 advance_scheduler(&module, advance, ExecutionLimits::default(), &mut scheduled)
