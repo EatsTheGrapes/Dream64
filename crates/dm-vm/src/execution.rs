@@ -27,15 +27,15 @@ use crate::bytecode::{
 use crate::compile::{EXPANDED_ARGUMENT_COUNT, to_local_index};
 use crate::tgm_planner;
 use crate::value_ops::{
-    allocate_dm_array, allocate_matrix, allocate_or_replace_engine_datum, allocate_vector,
-    apply_icon_blend, apply_icon_map_colors, apply_icon_set_intensity, area_coordinate_field,
-    assign_datum_or_shared_field, atom_contents_iteration_snapshot, block_builtin, builtin_length,
-    canonicalize_owned_value, canonicalize_value, compare_values, construct_matrix,
-    construct_sized_list, construct_vector, constructor_target_if_present, copy_text_builtin,
-    datum_field_or_shared, datum_field_requires_special_read, deterministic_unit,
-    direction_towards_builtin, dm_list_length_number, dm_list_resize_length, dynamic_call_target,
-    dynamic_call_target_named_at_callsite, engine_root_initial_field_maps, engine_root_paths,
-    execute_animate, execute_del, execute_icon_method, execute_matrix_binary,
+    ExecutionContext, allocate_dm_array, allocate_matrix, allocate_or_replace_engine_datum,
+    allocate_vector, apply_icon_blend, apply_icon_map_colors, apply_icon_set_intensity,
+    area_coordinate_field, assign_datum_or_shared_field, atom_contents_iteration_snapshot,
+    block_builtin, builtin_length, canonicalize_owned_value, canonicalize_value, compare_values,
+    construct_matrix, construct_sized_list, construct_vector, constructor_target_if_present,
+    copy_text_builtin, datum_field_or_shared, datum_field_requires_special_read,
+    deterministic_unit, direction_towards_builtin, dm_list_length_number, dm_list_resize_length,
+    dynamic_call_target, dynamic_call_target_named_at_callsite, engine_root_initial_field_maps,
+    engine_root_paths, execute_animate, execute_del, execute_icon_method, execute_matrix_binary,
     execute_matrix_compound, execute_matrix_method, execute_scalar_add,
     execute_scalar_compound_assignment, execute_vector_binary, execute_vector_compound,
     execute_vector_method, fractional_remainder, get_step_builtin, hascall_builtin,
@@ -3390,41 +3390,6 @@ fn extend_heap_root_value(
             }
         }
         Value::Null | Value::Number(_) | Value::Text(_) | Value::File(_) | Value::TypePath(_) => {}
-    }
-}
-/// Entry-frame object context retained across a procedure call chain.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ExecutionContext {
-    pub(crate) src: Value,
-    pub(crate) usr: Value,
-}
-
-impl ExecutionContext {
-    /// Creates a context with explicit `src` and `usr` values.
-    #[must_use]
-    pub const fn new(src: Value, usr: Value) -> Self {
-        Self { src, usr }
-    }
-
-    /// Returns the current source object.
-    #[must_use]
-    pub const fn src(&self) -> &Value {
-        &self.src
-    }
-
-    /// Returns the current user object.
-    #[must_use]
-    pub const fn usr(&self) -> &Value {
-        &self.usr
-    }
-}
-
-impl Default for ExecutionContext {
-    fn default() -> Self {
-        Self {
-            src: Value::Null,
-            usr: Value::Null,
-        }
     }
 }
 

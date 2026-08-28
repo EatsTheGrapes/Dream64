@@ -7,7 +7,6 @@ use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
-use crate::ExecutionContext;
 use crate::ExecutionState;
 use crate::MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES;
 use crate::MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE;
@@ -24,6 +23,42 @@ use crate::compile::EXPANDED_ARGUMENT_COUNT;
 use crate::execute_module_in_context;
 use crate::execution::{bitwise_binary, bitwise_shift};
 use dm_value::{DatumId, FieldName, ListId, TypePath, Value, ValueError, ValueHeap};
+
+/// Entry-frame object context retained across a procedure call chain.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecutionContext {
+    pub(crate) src: Value,
+    pub(crate) usr: Value,
+}
+
+impl ExecutionContext {
+    /// Creates a context with explicit `src` and `usr` values.
+    #[must_use]
+    pub const fn new(src: Value, usr: Value) -> Self {
+        Self { src, usr }
+    }
+
+    /// Returns the current source object.
+    #[must_use]
+    pub const fn src(&self) -> &Value {
+        &self.src
+    }
+
+    /// Returns the current user object.
+    #[must_use]
+    pub const fn usr(&self) -> &Value {
+        &self.usr
+    }
+}
+
+impl Default for ExecutionContext {
+    fn default() -> Self {
+        Self {
+            src: Value::Null,
+            usr: Value::Null,
+        }
+    }
+}
 
 #[inline]
 pub(crate) fn dm_list_length_number(length: usize) -> f32 {

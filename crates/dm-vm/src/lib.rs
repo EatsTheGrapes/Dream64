@@ -28,10 +28,11 @@ pub use compile::{
 };
 pub use module_codec::ModuleCodecError;
 pub use ready_snapshot::ReadyWorldCoreSnapshot;
+pub use value_ops::ExecutionContext;
 
 pub use execution::{
-    ContinuationMetrics, DeclaredFieldQuickeningMetrics, ExecutionContext, ExecutionState,
-    VmContinuationId, advance_scheduler,
+    ContinuationMetrics, DeclaredFieldQuickeningMetrics, ExecutionState, VmContinuationId,
+    advance_scheduler,
 };
 
 // Interpreter-internal execution items still consulted by the crate root and
