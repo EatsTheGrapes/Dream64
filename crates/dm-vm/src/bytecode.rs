@@ -1241,3 +1241,4 @@ impl Module {
     pub fn procedure_type_paths(&self) -> impl Iterator<Item = &TypePath> {
         self.procedure_types.iter()
     }
+}
