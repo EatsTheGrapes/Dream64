@@ -19,10 +19,10 @@ use dm_value::{FieldName, TypePath};
 
 use crate::builtins::standard_builtin_arity;
 use crate::bytecode::{
-    CompoundAssignmentOperator, CompoundListIndexOperator, DeferredProcedure,
-    InitializerBinding, InitializerCallNameIndex, InitializerCompileContext,
-    InitializerProgram, Instruction, ListEntryKind, Module, ProcedureId, Program,
-    TypePredicateKind, VerbParameterType, next_module_identity,
+    CompoundAssignmentOperator, CompoundListIndexOperator, DeferredProcedure, InitializerBinding,
+    InitializerCallNameIndex, InitializerCompileContext, InitializerProgram, Instruction,
+    ListEntryKind, Module, ProcedureId, Program, TypePredicateKind, VerbParameterType,
+    next_module_identity,
 };
 use crate::{
     CompileError, ProcedureSpec, TEXT_MACRO_A, TEXT_MACRO_A_UPPER, TEXT_MACRO_IMPROPER,
@@ -511,7 +511,9 @@ struct SpecCallIndex {
     latest_by_base_path: HashMap<String, ProcedureId>,
 }
 
-pub(crate) fn dynamic_name_index(paths: &[String]) -> Result<HashMap<String, ProcedureId>, CompileError> {
+pub(crate) fn dynamic_name_index(
+    paths: &[String],
+) -> Result<HashMap<String, ProcedureId>, CompileError> {
     let mut index = HashMap::new();
     for (position, path) in paths.iter().enumerate() {
         let (base_path, suffix) = path

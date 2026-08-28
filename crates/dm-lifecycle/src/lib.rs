@@ -2965,9 +2965,7 @@ fn drain_startup_scheduler(
                 drop(completed);
             }
             Err(error) => {
-                if !startup_fail_fast_on_error()
-                    && scheduler_budget_exhausted(&error)
-                {
+                if !startup_fail_fast_on_error() && scheduler_budget_exhausted(&error) {
                     drain.rounds += 1;
                     state.release_host_value_roots();
                     drain.final_tick = state.scheduler_tick();
@@ -3820,15 +3818,17 @@ fn project_manages_atom_initialization(index: &LifecycleIndex) -> bool {
         .types
         .iter()
         .enumerate()
-        .filter(|&(type_index, _)| {
-            inherits_from_subsystem_atoms(index, type_index)
-        })
+        .filter(|&(type_index, _)| inherits_from_subsystem_atoms(index, type_index))
         .any(|(type_index, _)| {
             matches!(
-                index.types[type_index].targets.get(LifecycleKind::Initialize),
+                index.types[type_index]
+                    .targets
+                    .get(LifecycleKind::Initialize),
                 LifecycleResolution::Resolved(_)
             ) || matches!(
-                index.types[type_index].targets.get(LifecycleKind::LateInitialize),
+                index.types[type_index]
+                    .targets
+                    .get(LifecycleKind::LateInitialize),
                 LifecycleResolution::Resolved(_)
             )
         })
@@ -4494,7 +4494,10 @@ mod tests {
                 )
         );
         assert!(lifecycle[world_new + 1..].is_empty());
-        assert!(!lifecycle.iter().any(|(_, kind)| matches!(kind, LifecycleKind::Initialize | LifecycleKind::LateInitialize)));
+        assert!(!lifecycle.iter().any(|(_, kind)| matches!(
+            kind,
+            LifecycleKind::Initialize | LifecycleKind::LateInitialize
+        )));
     }
 
     #[test]
@@ -4564,7 +4567,8 @@ mod tests {
         ))
         .expect("one-cell subsystem-managed grand-descendant map should parse");
         let world = build_plan(&map, &compilation);
-        let plan = build_initialization_plan(&runtime, &index, &world, "managed-granddescendant.dmm");
+        let plan =
+            build_initialization_plan(&runtime, &index, &world, "managed-granddescendant.dmm");
         let lifecycle: Vec<_> = plan
             .events
             .iter()
