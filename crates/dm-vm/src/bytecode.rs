@@ -15,7 +15,7 @@ use dm_core::{DmNumberBits, SourceSpan};
 use dm_syntax::Definition;
 use dm_value::{FieldName, TypePath, Value};
 
-use crate::compact_wordcode::CompactWordcodeImage;
+use crate::compact_wordcode::{CompactWordcodeError, CompactWordcodeImage};
 use crate::{
     CompileError, FullyEagerCompileErrors, boot_trace_enabled, compile_error,
     compile_procedure_with_resolver_and_fields,
@@ -676,10 +676,10 @@ pub enum InitializerBinding {
 
 /// Stable procedure identity within one compiled module.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ProcedureId(u32);
+pub struct ProcedureId(pub(crate) u32);
 
 impl ProcedureId {
-    fn from_index(index: usize) -> Result<Self, CompileError> {
+    pub(crate) fn from_index(index: usize) -> Result<Self, CompileError> {
         u32::try_from(index)
             .map(Self)
             .map_err(|_| compile_error("module has more than u32::MAX procedures"))
@@ -742,15 +742,15 @@ pub enum VerbParameterType {
 /// A deterministic table of compiled procedures and their canonical paths.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Module {
-    identity: ModuleIdentity,
-    procedures: Vec<Arc<Program>>,
-    paths: Vec<String>,
+    pub(crate) identity: ModuleIdentity,
+    pub(crate) procedures: Vec<Arc<Program>>,
+    pub(crate) paths: Vec<String>,
     names: HashMap<String, ProcedureId>,
     /// Latest implementation for each canonical path with reopening suffixes removed.
-    dynamic_names: HashMap<String, ProcedureId>,
-    deferred: Arc<HashMap<ProcedureId, DeferredProcedure>>,
-    procedure_types: Vec<TypePath>,
-    initializer_call_names: Option<InitializerCallNameIndex>,
+    pub(crate) dynamic_names: HashMap<String, ProcedureId>,
+    pub(crate) deferred: Arc<HashMap<ProcedureId, DeferredProcedure>>,
+    pub(crate) procedure_types: Vec<TypePath>,
+    pub(crate) initializer_call_names: Option<InitializerCallNameIndex>,
     compact_wordcode: CompactWordcodeAttachment,
     semantic_digests: ProcedureSemanticDigestAttachment,
 }
@@ -758,7 +758,7 @@ pub struct Module {
 static NEXT_MODULE_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug)]
-struct ModuleIdentity(u64);
+pub(crate) struct ModuleIdentity(pub(crate) u64);
 
 // Module identity is an execution-cache namespace, not part of portable
 // bytecode semantics. Independently compiled equivalent modules must retain
@@ -808,7 +808,7 @@ pub(crate) struct InitializerCallNameIndex {
 /// Immutable call-resolution snapshot shared by parallel initializer lowering.
 #[derive(Clone, Debug)]
 pub struct InitializerCompileContext {
-    names: Arc<HashMap<String, ProcedureId>>,
+    pub(crate) names: Arc<HashMap<String, ProcedureId>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -947,11 +947,11 @@ impl Module {
         Ok(())
     }
 
-    fn clear_compact_wordcode(&mut self) {
+    pub(crate) fn clear_compact_wordcode(&mut self) {
         self.compact_wordcode.0 = None;
     }
 
-    fn resolve_procedure(&self, procedure: ProcedureId) -> Result<&Program, String> {
+    pub(crate) fn resolve_procedure(&self, procedure: ProcedureId) -> Result<&Program, String> {
         if let Some(deferred) = self.deferred.get(&procedure) {
             let pending = deferred.compiled.get().is_none();
             let started = pending.then(Instant::now);

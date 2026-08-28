@@ -20,8 +20,7 @@ pub use module_codec::ModuleCodecError;
 pub use ready_snapshot::ReadyWorldCoreSnapshot;
 
 use bytecode::{
-    DeferredProcedure, InitializerCallNameIndex, ProcedureSemanticDigestAttachment,
-    next_module_identity,
+    DeferredProcedure, InitializerCallNameIndex, next_module_identity,
 };
 
 use std::cell::{Cell, RefCell};
