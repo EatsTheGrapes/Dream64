@@ -21,7 +21,6 @@ use crate::bytecode::{
 };
 use crate::compile::EXPANDED_ARGUMENT_COUNT;
 use crate::execute_module_in_context;
-use crate::execution::{bitwise_binary, bitwise_shift};
 use dm_value::{DatumId, FieldName, ListId, TypePath, Value, ValueError, ValueHeap};
 
 /// Entry-frame object context retained across a procedure call chain.
@@ -58,6 +57,40 @@ impl Default for ExecutionContext {
             usr: Value::Null,
         }
     }
+}
+
+const DM_BIT_MASK: u32 = (1 << 24) - 1;
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn dm_u24(value: f32) -> u32 {
+    (value.trunc() as i64 as u32) & DM_BIT_MASK
+}
+
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn bitwise_binary(
+    left: f32,
+    right: f32,
+    operation: impl FnOnce(u32, u32) -> u32,
+) -> f32 {
+    (operation(dm_u24(left), dm_u24(right)) & DM_BIT_MASK) as f32
+}
+
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn bitwise_not(value: f32) -> f32 {
+    ((!dm_u24(value)) & DM_BIT_MASK) as f32
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+pub(crate) fn bitwise_shift(left: f32, right: f32, operation: impl FnOnce(u32, u32) -> u32) -> f32 {
+    let count = right.trunc().max(0.0) as u32;
+    if count >= 24 {
+        return 0.0;
+    }
+    (operation(dm_u24(left), count) & DM_BIT_MASK) as f32
 }
 
 #[inline]
