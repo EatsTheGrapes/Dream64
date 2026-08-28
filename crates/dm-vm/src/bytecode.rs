@@ -745,14 +745,14 @@ pub struct Module {
     pub(crate) identity: ModuleIdentity,
     pub(crate) procedures: Vec<Arc<Program>>,
     pub(crate) paths: Vec<String>,
-    names: HashMap<String, ProcedureId>,
+    pub(crate) names: HashMap<String, ProcedureId>,
     /// Latest implementation for each canonical path with reopening suffixes removed.
     pub(crate) dynamic_names: HashMap<String, ProcedureId>,
     pub(crate) deferred: Arc<HashMap<ProcedureId, DeferredProcedure>>,
     pub(crate) procedure_types: Vec<TypePath>,
     pub(crate) initializer_call_names: Option<InitializerCallNameIndex>,
-    compact_wordcode: CompactWordcodeAttachment,
-    semantic_digests: ProcedureSemanticDigestAttachment,
+    pub(crate) compact_wordcode: CompactWordcodeAttachment,
+    pub(crate) semantic_digests: ProcedureSemanticDigestAttachment,
 }
 
 static NEXT_MODULE_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -801,8 +801,8 @@ pub(crate) fn next_module_identity() -> ModuleIdentity {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InitializerCallNameIndex {
-    names: Arc<HashMap<String, ProcedureId>>,
-    module_names_scanned: usize,
+    pub(crate) names: Arc<HashMap<String, ProcedureId>>,
+    pub(crate) module_names_scanned: usize,
 }
 
 /// Immutable call-resolution snapshot shared by parallel initializer lowering.
@@ -813,13 +813,13 @@ pub struct InitializerCompileContext {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DeferredProcedure {
-    definition: Arc<Definition>,
-    targets: Arc<HashMap<String, ProcedureId>>,
-    src_fields: Arc<BTreeMap<String, FieldName>>,
-    global_fields: Arc<BTreeMap<String, FieldName>>,
-    global_types: Arc<BTreeMap<String, TypePath>>,
-    preflight_error: Option<CompileError>,
-    compiled: Arc<OnceLock<Result<Program, CompileError>>>,
+    pub(crate) definition: Arc<Definition>,
+    pub(crate) targets: Arc<HashMap<String, ProcedureId>>,
+    pub(crate) src_fields: Arc<BTreeMap<String, FieldName>>,
+    pub(crate) global_fields: Arc<BTreeMap<String, FieldName>>,
+    pub(crate) global_types: Arc<BTreeMap<String, TypePath>>,
+    pub(crate) preflight_error: Option<CompileError>,
+    pub(crate) compiled: Arc<OnceLock<Result<Program, CompileError>>>,
 }
 
 impl DeferredProcedure {
