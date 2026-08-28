@@ -1257,7 +1257,7 @@ mod tests {
 
         let snapshot = source.capture_ready_world_core();
         let module = Module {
-            identity: ModuleIdentity(1),
+            identity: crate::bytecode::ModuleIdentity(1),
             procedures: (0..8)
                 .map(|index| {
                     Arc::new(if index == 7 {

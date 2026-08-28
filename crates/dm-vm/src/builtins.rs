@@ -242,7 +242,7 @@ fn atmos_compare_snapshot(
     })
 }
 
-pub(super) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
+pub(crate) fn standard_builtin_arity(name: &str) -> Option<(usize, usize)> {
     Some(match name {
         "_dream64_atmos_setup_differences" => (5, 5),
         "abs" | "ceil" | "floor" | "fract" | "trunc" | "sign" | "sqrt" | "sin" | "cos" | "tan"
