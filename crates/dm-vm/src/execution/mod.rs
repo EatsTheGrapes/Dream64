@@ -9,6 +9,7 @@
 
 mod frame;
 mod run;
+mod run_support;
 mod scheduler;
 mod state;
 mod support;
@@ -25,7 +26,8 @@ pub(crate) use frame::{
     RuinCandidateScan, StepBudgetBehavior, TgmLoadContinuation, TgmLoadPhase,
     declared_argument_count, frame_context, make_frame,
 };
-pub(crate) use run::{run_frames, trace};
+pub(crate) use run::run_frames;
+pub(crate) use run_support::trace;
 pub(crate) use scheduler::schedule_frames;
 #[cfg(test)]
 pub(crate) use state::adaptive_heap_collection_growth;

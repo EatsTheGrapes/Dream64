@@ -1,7 +1,7 @@
 //! The interpreter execution loop and its instruction helpers.
 //!
 //! Module layout: this crate splits `execution` into `state`, `frame`, `scheduler`, `run`,
-//! and `support` so the deterministic engine stays navigable by concern.
+//! `run_support`, and `support` so the deterministic engine stays navigable by concern.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
@@ -14,8 +14,8 @@ use crate::builtins::{
     execute_standard_builtin_with_usr, is_regex_datum, is_subtype,
 };
 use crate::bytecode::{
-    CompoundAssignmentOperator, CompoundListIndexOperator, Instruction, ListEntryKind, Module,
-    ProcedureId, Program, TypePredicateKind,
+    CompoundListIndexOperator, Instruction, ListEntryKind, Module, ProcedureId, Program,
+    TypePredicateKind,
 };
 use crate::compile::{EXPANDED_ARGUMENT_COUNT, to_local_index};
 use crate::value_ops::{
@@ -30,21 +30,20 @@ use crate::value_ops::{
     execute_animate, execute_del, execute_icon_method, execute_matrix_binary,
     execute_matrix_compound, execute_matrix_method, execute_scalar_add,
     execute_scalar_compound_assignment, execute_vector_binary, execute_vector_compound,
-    execute_vector_method, fractional_remainder, get_step_builtin, hascall_builtin,
-    indexed_text_character, initial_value_or_engine_root, integer_remainder, is_area_type_path,
-    is_icon_datum, is_matrix_datum, is_vector_datum, locate_in_container, locate_single,
-    logical_or_empty_list_field, logical_or_empty_list_index, matrix_components,
-    mutate_scalar_value, order_image_arguments, pick_value, pop, pop_builtin_arguments, pop_number,
-    random_integer, range_builtin, read_list_value, ref_builtin, replace_text_builtin,
-    replace_text_regex, roll_dice, round_builtin, runtime_argument_count,
-    runtime_initial_field_value, runtime_truthy, savefile_current_directory,
-    savefile_directory_entries, savefile_export_value, savefile_resolve_path, scalar_number_string,
-    type_predicate_builtin, typesof_builtin, validate_jump, value_to_list_index, values_equal,
-    values_equivalent, vector_zip, world_contents_iteration_snapshot, write_datum_vars,
-    write_list_value,
+    execute_vector_method, get_step_builtin, hascall_builtin, indexed_text_character,
+    initial_value_or_engine_root, is_area_type_path, is_icon_datum, is_matrix_datum,
+    is_vector_datum, locate_in_container, locate_single, logical_or_empty_list_field,
+    logical_or_empty_list_index, matrix_components, mutate_scalar_value, order_image_arguments,
+    pick_value, pop, pop_builtin_arguments, pop_number, random_integer, range_builtin,
+    read_list_value, ref_builtin, replace_text_builtin, replace_text_regex, roll_dice,
+    round_builtin, runtime_argument_count, runtime_initial_field_value, runtime_truthy,
+    savefile_current_directory, savefile_directory_entries, savefile_export_value,
+    savefile_resolve_path, scalar_number_string, type_predicate_builtin, typesof_builtin,
+    validate_jump, value_to_list_index, values_equal, values_equivalent, vector_zip,
+    world_contents_iteration_snapshot, write_datum_vars, write_list_value,
 };
 use crate::{
-    AtomsProfile, AtomsProfileInstruction, AtomsProfileProcedure, CallTrace, CompactWordcodeImage,
+    AtomsProfile, AtomsProfileInstruction, AtomsProfileProcedure, CompactWordcodeImage,
     ExceptionHandler, ExecutionLimits, PendingLocalPrompt, PendingPromptContinuation, RuntimeError,
     STARTUP_INSTRUCTION_CATEGORY_COUNT, ShuttleTracePostReturn, SimpleIterationValue, TgmDrive,
     TgmProfile, allocate_initialized_datum, assign_datum_field, atoms_profile_enabled,
@@ -83,11 +82,15 @@ use crate::execution::frame::make_frame_named;
 use crate::execution::frame::make_frame_owned;
 use crate::execution::frame::preserve_reentrant_frame_roots;
 use crate::execution::frame::synchronize_frame_argument_write;
+use crate::execution::run_support::{
+    compound_assignment_from_list_index, execute_compound_list_index_operation,
+    execute_numeric_binary, execution_error,
+};
 use crate::execution::scheduler::account_scheduler_tick_usage;
 use crate::execution::scheduler::materialize_callee_chain;
 use crate::execution::scheduler::schedule_frames;
 use crate::execution::state::ExecutionState;
-use crate::value_ops::{bitwise_binary, bitwise_not, bitwise_shift};
+use crate::value_ops::bitwise_not;
 
 pub(crate) fn run_frames(
     module: &Module,
@@ -5304,111 +5307,5 @@ pub(crate) fn run_frames(
             }
         }
         frames[frame_index].instruction += 1;
-    }
-}
-fn execution_error(
-    module: &Module,
-    frames: &[CallFrame],
-    message: impl Into<String>,
-) -> RuntimeError {
-    let instruction = frames.last().map_or(0, |frame| frame.instruction);
-    let source_span = frames.last().and_then(|frame| {
-        module
-            .procedure(frame.procedure)
-            .and_then(|program| program.source_spans.get(frame.instruction))
-            .copied()
-    });
-    RuntimeError {
-        message: message.into(),
-        instruction,
-        source_span,
-        call_stack: frames
-            .iter()
-            .map(|frame| trace(module, frame.procedure, frame.instruction))
-            .collect(),
-    }
-}
-
-pub(crate) fn trace(module: &Module, procedure: ProcedureId, instruction: usize) -> CallTrace {
-    CallTrace {
-        procedure: module
-            .procedure_path(procedure)
-            .unwrap_or("<invalid procedure>")
-            .to_owned(),
-        instruction,
-        source_span: module
-            .procedure(procedure)
-            .and_then(|program| program.source_spans.get(instruction))
-            .copied(),
-    }
-}
-
-fn execute_numeric_binary(instruction: &Instruction, left: f32, right: f32) -> f32 {
-    match instruction {
-        Instruction::Add => left + right,
-        Instruction::Subtract => left - right,
-        Instruction::Multiply => left * right,
-        Instruction::Power => left.powf(right),
-        Instruction::Divide => left / right,
-        Instruction::Remainder => integer_remainder(left, right),
-        Instruction::FractionalRemainder => fractional_remainder(left, right),
-        Instruction::BitAnd => bitwise_binary(left, right, |left, right| left & right),
-        Instruction::BitOr => bitwise_binary(left, right, |left, right| left | right),
-        Instruction::BitXor => bitwise_binary(left, right, |left, right| left ^ right),
-        Instruction::ShiftLeft => bitwise_shift(left, right, |left, right| left << right),
-        Instruction::ShiftRight => bitwise_shift(left, right, |left, right| left >> right),
-        Instruction::Less => f32::from(left < right),
-        Instruction::LessEqual => f32::from(left <= right),
-        Instruction::Greater => f32::from(left > right),
-        Instruction::GreaterEqual => f32::from(left >= right),
-        _ => unreachable!("instruction came from the numeric operation group"),
-    }
-}
-
-fn execute_compound_list_index_operation(
-    operator: CompoundListIndexOperator,
-    left: f32,
-    right: f32,
-) -> f32 {
-    match operator {
-        CompoundListIndexOperator::Add => left + right,
-        CompoundListIndexOperator::Subtract => left - right,
-        CompoundListIndexOperator::Multiply => left * right,
-        CompoundListIndexOperator::Divide => left / right,
-        CompoundListIndexOperator::Remainder => integer_remainder(left, right),
-        CompoundListIndexOperator::FractionalRemainder => fractional_remainder(left, right),
-        CompoundListIndexOperator::BitAnd => {
-            bitwise_binary(left, right, |left, right| left & right)
-        }
-        CompoundListIndexOperator::BitOr => bitwise_binary(left, right, |left, right| left | right),
-        CompoundListIndexOperator::BitXor => {
-            bitwise_binary(left, right, |left, right| left ^ right)
-        }
-        CompoundListIndexOperator::ShiftLeft => {
-            bitwise_shift(left, right, |left, right| left << right)
-        }
-        CompoundListIndexOperator::ShiftRight => {
-            bitwise_shift(left, right, |left, right| left >> right)
-        }
-    }
-}
-
-fn compound_assignment_from_list_index(
-    operator: CompoundListIndexOperator,
-) -> CompoundAssignmentOperator {
-    match operator {
-        CompoundListIndexOperator::Add => CompoundAssignmentOperator::Add,
-        CompoundListIndexOperator::Subtract => CompoundAssignmentOperator::Subtract,
-        CompoundListIndexOperator::Multiply => CompoundAssignmentOperator::Multiply,
-        CompoundListIndexOperator::Divide => CompoundAssignmentOperator::Divide,
-        CompoundListIndexOperator::Remainder => CompoundAssignmentOperator::Remainder,
-        CompoundListIndexOperator::FractionalRemainder => {
-            CompoundAssignmentOperator::FractionalRemainder
-        }
-        CompoundListIndexOperator::BitAnd => CompoundAssignmentOperator::BitAnd,
-        CompoundListIndexOperator::BitOr => CompoundAssignmentOperator::BitOr,
-        CompoundListIndexOperator::BitXor => CompoundAssignmentOperator::BitXor,
-        CompoundListIndexOperator::ShiftLeft => CompoundAssignmentOperator::ShiftLeft,
-        CompoundListIndexOperator::ShiftRight => CompoundAssignmentOperator::ShiftRight,
     }
 }
