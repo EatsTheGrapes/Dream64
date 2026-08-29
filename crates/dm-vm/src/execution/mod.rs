@@ -8,6 +8,7 @@
 //! frames stay small.
 
 mod frame;
+mod interpreter;
 mod run;
 mod run_support;
 mod scheduler;
