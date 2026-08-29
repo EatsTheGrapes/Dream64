@@ -6,6 +6,8 @@ mod builtins;
 mod bytecode;
 mod compact_wordcode;
 mod compile;
+mod compile_expr;
+mod compile_stmt;
 mod execution;
 mod local_client;
 mod module_codec;
