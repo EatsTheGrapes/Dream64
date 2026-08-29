@@ -21,7 +21,7 @@ pub(super) fn values_cut(
             .associated
             .as_ref()
             .and_then(Value::as_number)
-            .map_or(true, |value| {
+            .is_none_or(|value| {
                 if over {
                     value > threshold || (inclusive && value == threshold)
                 } else {

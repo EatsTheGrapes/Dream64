@@ -236,9 +236,11 @@ pub(crate) fn dispatch_instruction(
             let expanded_argument_names = (*argument_count == EXPANDED_ARGUMENT_COUNT)
                 .then(|| frames[frame_index].take_pending_argument_names())
                 .flatten();
-            let expanded_argument_roots = (*argument_count == EXPANDED_ARGUMENT_COUNT)
-                .then(|| frames[frame_index].take_pending_argument_roots())
-                .unwrap_or_default();
+            let expanded_argument_roots = if *argument_count == EXPANDED_ARGUMENT_COUNT {
+                frames[frame_index].take_pending_argument_roots()
+            } else {
+                Default::default()
+            };
             let count_result =
                 runtime_argument_count(&mut frames[frame_index].stack, *argument_count);
             let count = count_result.map_err(|message| execution_error(module, frames, message))?;
@@ -403,9 +405,11 @@ pub(crate) fn dispatch_instruction(
             let expanded_argument_names = (*argument_count == EXPANDED_ARGUMENT_COUNT)
                 .then(|| frames[frame_index].take_pending_argument_names())
                 .flatten();
-            let expanded_argument_roots = (*argument_count == EXPANDED_ARGUMENT_COUNT)
-                .then(|| frames[frame_index].take_pending_argument_roots())
-                .unwrap_or_default();
+            let expanded_argument_roots = if *argument_count == EXPANDED_ARGUMENT_COUNT {
+                frames[frame_index].take_pending_argument_roots()
+            } else {
+                Default::default()
+            };
             let count = runtime_argument_count(&mut frames[frame_index].stack, *argument_count)
                 .map_err(|message| execution_error(module, frames, message))?;
             if frames[frame_index].stack.len() < count {
@@ -668,14 +672,14 @@ pub(crate) fn dispatch_instruction(
             let arguments = pop_builtin_arguments(&mut frames[frame_index].stack, count);
             let ordered_arguments;
             let arguments: &[Value] = if name == "image" {
-                ordered_arguments = order_image_arguments(&arguments, &argument_names)
+                ordered_arguments = order_image_arguments(&arguments, argument_names)
                     .map_err(|message| execution_error(module, frames, message))?;
                 &ordered_arguments
             } else {
                 &arguments
             };
             let usr = frames[frame_index].usr.clone();
-            if let Some(prompt) = local_prompt_spec(&name, arguments, &usr, state)
+            if let Some(prompt) = local_prompt_spec(name, arguments, &usr, state)
                 .map_err(|message| execution_error(module, frames, message))?
             {
                 frames[frame_index].instruction += 1;
@@ -696,12 +700,12 @@ pub(crate) fn dispatch_instruction(
             let value = if name == "del" {
                 let caller_context = frame_context(&frames[frame_index]);
                 let root_len = preserve_reentrant_frame_roots(state, frames);
-                let result = execute_del(module, &arguments, state, &caller_context);
+                let result = execute_del(module, arguments, state, &caller_context);
                 state.host_value_roots.truncate(root_len);
                 result?
             } else {
                 let builtin_name = name.split_once('@').map_or(name.as_str(), |(name, _)| name);
-                execute_standard_builtin_with_usr(builtin_name, &arguments, state, &usr)
+                execute_standard_builtin_with_usr(builtin_name, arguments, state, &usr)
                     .map_err(|message| execution_error(module, frames, message))?
             };
             frames[frame_index].stack.push(value);
@@ -1157,7 +1161,7 @@ pub(crate) fn dispatch_instruction(
             let matches = state
                 .heap
                 .datums()
-                .filter(|(_, datum)| is_subtype(state, datum.type_path(), &target))
+                .filter(|(_, datum)| is_subtype(state, datum.type_path(), target))
                 .map(|(id, _)| id)
                 .collect::<Vec<_>>();
             let list = state.heap.allocate_list();
@@ -1215,7 +1219,7 @@ pub(crate) fn dispatch_instruction(
             let values = frames[frame_index]
                 .stack
                 .split_off(stack_length - value_count);
-            let value = pick_value(&values, &weighted, &state.heap, &mut state.random_state)
+            let value = pick_value(&values, weighted, &state.heap, &mut state.random_state)
                 .map_err(|message| execution_error(module, frames, message))?;
             frames[frame_index].stack.push(value);
         }
@@ -1345,7 +1349,7 @@ pub(crate) fn dispatch_instruction(
             // while variadic values beyond the declared parameters remain
             // intact. OpenDream exposes the same state through
             // DMProcState.GetArguments().
-            let arguments = forwarded_frame_arguments(&frames[frame_index], &program);
+            let arguments = forwarded_frame_arguments(&frames[frame_index], program);
             for value in arguments {
                 state
                     .heap
@@ -1637,7 +1641,7 @@ pub(crate) fn dispatch_instruction(
                                         .list_mut(lookup)
                                         .expect("live DCS lookup was just read");
                                     lookup.remove_key(&key);
-                                    lookup.len() == 0
+                                    lookup.is_empty()
                                 };
                                 if empty {
                                     state
@@ -1888,7 +1892,7 @@ pub(crate) fn dispatch_instruction(
                 return Err(execution_error(module, frames, error.to_string()));
             }
             if let Some((key, value)) = args_write {
-                synchronize_frame_argument_write(&mut frames[frame_index], &program, &key, value)
+                synchronize_frame_argument_write(&mut frames[frame_index], program, &key, value)
                     .map_err(|message| execution_error(module, frames, message))?;
             }
         }
@@ -2221,7 +2225,7 @@ pub(crate) fn dispatch_instruction(
                 Value::Datum(datum) => state
                     .heap()
                     .datum(datum)
-                    .is_ok_and(|datum| is_subtype(state, datum.type_path(), &target)),
+                    .is_ok_and(|datum| is_subtype(state, datum.type_path(), target)),
                 Value::List(_) => target.as_str() == "/list" || target.as_str() == "/alist",
                 _ => false,
             };
@@ -2268,7 +2272,7 @@ pub(crate) fn dispatch_instruction(
                         .cloned()
                         .map_or(Value::Null, Value::TypePath),
                     _ => state
-                        .initial_value(&path, &name)
+                        .initial_value(&path, name)
                         .cloned()
                         .unwrap_or(Value::Null),
                 },
@@ -2284,7 +2288,7 @@ pub(crate) fn dispatch_instruction(
                         .rev()
                         .find(|(field, _)| field == name)
                         .map(|(_, value)| value.clone())
-                        .or_else(|| state.initial_value(path.base(), &name).cloned())
+                        .or_else(|| state.initial_value(path.base(), name).cloned())
                         .unwrap_or(Value::Null),
                 },
                 Value::List(list) if name.as_str() == "len" => {
@@ -2318,20 +2322,18 @@ pub(crate) fn dispatch_instruction(
                         if datum_field_requires_special_read(record.type_path(), name) {
                             return None;
                         }
-                        match record.field_at_validated_slot(usize::from(slot), name) {
-                            Some(value) => {
-                                state.declared_field_quickening.hits =
-                                    state.declared_field_quickening.hits.saturating_add(1);
-                                Some(value.clone())
-                            }
-                            None => {
-                                state.declared_field_quickening.invalidations = state
-                                    .declared_field_quickening
-                                    .invalidations
-                                    .saturating_add(1);
-                                state.declared_field_slots.remove(&key);
-                                None
-                            }
+                        if let Some(value) = record.field_at_validated_slot(usize::from(slot), name)
+                        {
+                            state.declared_field_quickening.hits =
+                                state.declared_field_quickening.hits.saturating_add(1);
+                            Some(value.clone())
+                        } else {
+                            state.declared_field_quickening.invalidations = state
+                                .declared_field_quickening
+                                .invalidations
+                                .saturating_add(1);
+                            state.declared_field_slots.remove(&key);
+                            None
                         }
                     });
                     let ordinary_value = if quickened_value.is_some() {
@@ -2404,7 +2406,7 @@ pub(crate) fn dispatch_instruction(
                         } else if name.as_str() == "appearance"
                             && builtins::is_appearance_source(&runtime_type)
                             && matches!(
-                                datum_field_or_initial(state, datum, &name),
+                                datum_field_or_initial(state, datum, name),
                                 Ok(Value::Null) | Err(ValueError::MissingField(_))
                             )
                         {
@@ -2413,7 +2415,7 @@ pub(crate) fn dispatch_instruction(
                         } else if name.as_str() == "transform"
                             && builtins::is_appearance_source(&runtime_type)
                             && matches!(
-                                datum_field_or_initial(state, datum, &name),
+                                datum_field_or_initial(state, datum, name),
                                 Ok(Value::Null) | Err(ValueError::MissingField(_))
                             )
                         {
@@ -2423,10 +2425,10 @@ pub(crate) fn dispatch_instruction(
                             )
                         } else if is_area_type_path(&runtime_type)
                             && matches!(name.as_str(), "x" | "y" | "z")
-                            && let Some(coordinate) = area_coordinate_field(state, datum, &name)
+                            && let Some(coordinate) = area_coordinate_field(state, datum, name)
                         {
                             coordinate
-                        } else if let Some(value) = lazy_atom_list_field(state, datum, &name)
+                        } else if let Some(value) = lazy_atom_list_field(state, datum, name)
                             .map_err(|message| execution_error(module, frames, message))?
                         {
                             value
@@ -2462,7 +2464,7 @@ pub(crate) fn dispatch_instruction(
                                     }
                                     Value::List(list)
                                 }
-                                _ => match state.heap.datum_field(datum, &name) {
+                                _ => match state.heap.datum_field(datum, name) {
                                     Ok(value) => value.clone(),
                                     Err(error) => {
                                         return Err(execution_error(
@@ -2474,7 +2476,7 @@ pub(crate) fn dispatch_instruction(
                                 },
                             }
                         } else {
-                            match datum_field_or_shared(state, datum, &name) {
+                            match datum_field_or_shared(state, datum, name) {
                                 Ok(value) => value,
                                 Err(ValueError::MissingField(_)) if statically_declared => {
                                     Value::Null
@@ -2486,7 +2488,7 @@ pub(crate) fn dispatch_instruction(
                                             runtime_type,
                                             name,
                                             engine_root_paths(&runtime_type),
-                                            engine_builtin_initial_value(&runtime_type, &name),
+                                            engine_builtin_initial_value(&runtime_type, name),
                                         );
                                     }
                                     return Err(execution_error(module, frames, error.to_string()));
@@ -2535,10 +2537,10 @@ pub(crate) fn dispatch_instruction(
                 }
             };
             let value = if type_scope {
-                runtime_initial_field_value(state, &runtime_type, &name)
+                runtime_initial_field_value(state, &runtime_type, name)
                     .map_err(|message| execution_error(module, frames, message))?
             } else {
-                initial_value_or_engine_root(state, &runtime_type, &name).unwrap_or(Value::Null)
+                initial_value_or_engine_root(state, &runtime_type, name).unwrap_or(Value::Null)
             };
             frames[frame_index].stack.push(value);
         }
@@ -2692,7 +2694,7 @@ pub(crate) fn dispatch_instruction(
                 frames[frame_index].instruction = target;
                 return Ok(DispatchFlow::Continue);
             }
-            let Some(value) = state.global(&name).cloned() else {
+            let Some(value) = state.global(name).cloned() else {
                 return Err(execution_error(
                     module,
                     frames,
@@ -2875,7 +2877,7 @@ pub(crate) fn dispatch_instruction(
         Instruction::LoadInitialGlobal(name) => {
             let value = state
                 .initial_globals
-                .get(&name)
+                .get(name)
                 .cloned()
                 .unwrap_or(Value::Null);
             frames[frame_index].stack.push(value);
@@ -2920,7 +2922,7 @@ pub(crate) fn dispatch_instruction(
             prefix,
         } => {
             let (delta, prefix) = (*delta, *prefix);
-            let current = state.global(&name).cloned().unwrap_or(Value::Null);
+            let current = state.global(name).cloned().unwrap_or(Value::Null);
             let (result, updated) = mutate_scalar_value(current, delta, prefix)
                 .map_err(|message| execution_error(module, frames, message))?;
             state.set_global(name.clone(), updated);
@@ -2944,7 +2946,7 @@ pub(crate) fn dispatch_instruction(
                 .map_err(|message| execution_error(module, frames, message))?;
             let receiver = canonicalize_owned_value(&state.heap, receiver);
             let current = match &receiver {
-                Value::Datum(datum) => datum_field_or_initial(state, *datum, &name)
+                Value::Datum(datum) => datum_field_or_initial(state, *datum, name)
                     .map_err(|error| execution_error(module, frames, error.to_string()))?
                     .clone(),
                 Value::List(list) if name.as_str() == "len" => {
@@ -3363,7 +3365,7 @@ pub(crate) fn dispatch_instruction(
                             && value.fract() == 0.0
                             && value >= i32::MIN as f32
                             && value <= i32::MAX as f32)
-                            .then(|| {
+                            .then_some({
                                 #[allow(clippy::cast_possible_truncation)]
                                 {
                                     value as i32
@@ -3548,7 +3550,7 @@ pub(crate) fn dispatch_instruction(
                     .map_err(|message| execution_error(module, frames, message))?;
                 let right = scalar_number_string(right)
                     .map_err(|message| execution_error(module, frames, message))?;
-                Value::number(execute_numeric_binary(&instruction, left, right))
+                Value::number(execute_numeric_binary(instruction, left, right))
             };
             frames[frame_index].stack.push(value);
         }
@@ -3585,7 +3587,7 @@ pub(crate) fn dispatch_instruction(
                     .map_err(|message| execution_error(module, frames, message))?;
                 let right = scalar_number_string(right)
                     .map_err(|message| execution_error(module, frames, message))?;
-                Value::number(execute_numeric_binary(&instruction, left, right))
+                Value::number(execute_numeric_binary(instruction, left, right))
             };
             frames[frame_index].stack.push(value);
         }
@@ -3785,9 +3787,11 @@ pub(crate) fn dispatch_instruction(
             let expanded_argument_names = (argument_count == EXPANDED_ARGUMENT_COUNT)
                 .then(|| frames[frame_index].take_pending_argument_names())
                 .flatten();
-            let expanded_argument_roots = (argument_count == EXPANDED_ARGUMENT_COUNT)
-                .then(|| frames[frame_index].take_pending_argument_roots())
-                .unwrap_or_default();
+            let expanded_argument_roots = if argument_count == EXPANDED_ARGUMENT_COUNT {
+                frames[frame_index].take_pending_argument_roots()
+            } else {
+                Default::default()
+            };
             let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
                 .map_err(|message| execution_error(module, frames, message))?;
             let stack_length = frames[frame_index].stack.len();
@@ -3817,9 +3821,7 @@ pub(crate) fn dispatch_instruction(
             let target_program = module
                 .resolve_procedure(target)
                 .map_err(|message| execution_error(module, frames, message))?;
-            let names = expanded_argument_names
-                .as_deref()
-                .unwrap_or(&argument_names);
+            let names = expanded_argument_names.as_deref().unwrap_or(argument_names);
             if names.iter().all(Option::is_none)
                 && let Some(name) = canonical_static_native_builtin(module, target, target_program)
             {
@@ -3852,7 +3854,7 @@ pub(crate) fn dispatch_instruction(
             {
                 frames[frame_index]
                     .stack
-                    .push(canonical_type2parent(&path).map_or(Value::Null, Value::TypePath));
+                    .push(canonical_type2parent(path).map_or(Value::Null, Value::TypePath));
                 frames[frame_index].instruction += 1;
                 return Ok(DispatchFlow::Continue);
             }
@@ -4094,9 +4096,11 @@ pub(crate) fn dispatch_instruction(
             let expanded_argument_names = (argument_count == EXPANDED_ARGUMENT_COUNT)
                 .then(|| frames[frame_index].take_pending_argument_names())
                 .flatten();
-            let expanded_argument_roots = (argument_count == EXPANDED_ARGUMENT_COUNT)
-                .then(|| frames[frame_index].take_pending_argument_roots())
-                .unwrap_or_default();
+            let expanded_argument_roots = if argument_count == EXPANDED_ARGUMENT_COUNT {
+                frames[frame_index].take_pending_argument_roots()
+            } else {
+                Default::default()
+            };
             let count = runtime_argument_count(&mut frames[frame_index].stack, argument_count)
                 .map_err(|message| execution_error(module, frames, message))?;
             let stack_length = frames[frame_index].stack.len();

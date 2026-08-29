@@ -367,7 +367,7 @@ pub(crate) fn icon_swap_color_builtin(
 /// Constructs BYOND's mutable `/icon` value.
 ///
 /// An existing `/icon` is a copy-constructor input, not the backing resource
-/// stored in the new icon's `icon` field. OpenDream's `DreamObjectIcon`
+/// stored in the new icon's `icon` field. `OpenDream`'s `DreamObjectIcon`
 /// mirrors BYOND by copying its complete `DreamIcon` here. This is observable
 /// in tg-derived `getFlatIcon()`, which starts every render with
 /// `flat_template = icon(file); flat = icon(flat_template)` and then mutates
@@ -434,7 +434,7 @@ pub(crate) fn fcopy_rsc(arguments: &[Value], state: &ExecutionState) -> Result<V
     }
 }
 
-/// OpenDream, matching BYOND, keeps `/icon` objects distinct from resources:
+/// `OpenDream`, matching BYOND, keeps `/icon` objects distinct from resources:
 /// `isfile(icon)` is false, while `fcopy_rsc(icon)` materializes an icon
 /// resource. Dream64's headless renderer retains the constructor's backing
 /// resource instead of rasterizing pixels, so unwrap that backing resource
@@ -458,7 +458,7 @@ pub(crate) fn icon_backing_resource(
     }
     let field = FieldName::parse("icon").expect("built-in icon field is valid");
     match datum.field(&field) {
-        Ok(Value::File(path)) | Ok(Value::Text(path)) => Ok(Value::file(path.clone())),
+        Ok(Value::File(path) | Value::Text(path)) => Ok(Value::file(path.clone())),
         Ok(Value::Datum(backing)) => {
             icon_backing_resource(&Value::Datum(*backing), state, depth + 1)
         }

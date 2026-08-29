@@ -1,6 +1,13 @@
 //! Portable stack bytecode and the deterministic reference interpreter.
 
 #![cfg_attr(not(test), deny(missing_docs))]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "DM stores all numbers as f32; index conversions and u8/i8 spreading across the value layer are intentional"
+)]
 
 mod builtins;
 mod bytecode;
@@ -515,7 +522,7 @@ pub struct ParsedDmm {
     pub key_len: u32,
     /// Encoded grid-line byte width.
     pub line_len: u32,
-    /// Bounds in MAP_MINX..MAP_MAXZ order.
+    /// Bounds in `MAP_MINX..MAP_MAXZ` order.
     pub bounds: [i32; 6],
     /// Source-ordered model key/body pairs.
     pub models: Vec<(String, String)>,

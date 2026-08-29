@@ -263,14 +263,13 @@ pub(crate) fn record_icon_operation(
     }
     let field = FieldName::parse("_dream64_icon_operations")
         .expect("internal icon operation field is valid");
-    let operations = match heap.datum_field(icon, &field) {
-        Ok(Value::List(operations)) => *operations,
-        _ => {
-            let operations = heap.allocate_list();
-            heap.set_datum_field(icon, field, Value::List(operations))
-                .map_err(|error| error.to_string())?;
-            operations
-        }
+    let operations = if let Ok(Value::List(operations)) = heap.datum_field(icon, &field) {
+        *operations
+    } else {
+        let operations = heap.allocate_list();
+        heap.set_datum_field(icon, field, Value::List(operations))
+            .map_err(|error| error.to_string())?;
+        operations
     };
     heap.list_mut(operations)
         .map_err(|error| error.to_string())?
@@ -379,14 +378,13 @@ pub(crate) fn apply_icon_blend(
     }
     let history_field =
         FieldName::parse("_dream64_blends").expect("headless icon blend field is valid");
-    let history = match heap.datum_field(icon, &history_field) {
-        Ok(Value::List(history)) => *history,
-        _ => {
-            let history = heap.allocate_list();
-            heap.set_datum_field(icon, history_field, Value::List(history))
-                .map_err(|error| error.to_string())?;
-            history
-        }
+    let history = if let Ok(Value::List(history)) = heap.datum_field(icon, &history_field) {
+        *history
+    } else {
+        let history = heap.allocate_list();
+        heap.set_datum_field(icon, history_field, Value::List(history))
+            .map_err(|error| error.to_string())?;
+        history
     };
     let operation = heap.allocate_list();
     for value in [
@@ -1787,7 +1785,6 @@ pub(crate) fn replace_text_regex(
             caller_context,
             true,
         )
-        .map(|(procedure, context)| (procedure, context))
     });
     let replacement_text = if replacement_proc.is_none() {
         Some(builtin_text(
@@ -2268,13 +2265,13 @@ pub(crate) fn get_step_builtin(
             continue;
         }
         if candidate
-            .field(&x)
+            .field(x)
             .is_ok_and(|value| value.as_number() == Some(target_x as f32))
             && candidate
-                .field(&y)
+                .field(y)
                 .is_ok_and(|value| value.as_number() == Some(target_y as f32))
             && candidate
-                .field(&z)
+                .field(z)
                 .is_ok_and(|value| value.as_number() == Some(target_z as f32))
         {
             return Ok(Value::Datum(datum));
@@ -2290,7 +2287,7 @@ pub(crate) fn dm_world_coordinate(value: f32) -> Option<i32> {
         && value >= i32::MIN as f32
         // `i32::MAX as f32` rounds upward to 2^31, which parse::<i32> rejects.
         && value < 2_147_483_648.0)
-        .then(|| value as i32)
+        .then_some(value as i32)
 }
 
 #[inline]
@@ -2298,7 +2295,7 @@ pub(crate) fn dm_direction_bits(direction: f32) -> Option<i16> {
     // Direction masks are a tiny closed integer domain. Avoid formatting the
     // number as decimal and parsing it back on every topology/step query.
     (direction.is_finite() && direction.fract() == 0.0 && (0.0..=63.0).contains(&direction))
-        .then(|| direction as i16)
+        .then_some(direction as i16)
 }
 
 pub(crate) fn direction_towards_builtin(
@@ -2558,7 +2555,7 @@ pub(crate) fn range_builtin(
                 && value.fract() == 0.0
                 && value >= i32::MIN as f32
                 && value <= i32::MAX as f32)
-                .then(|| {
+                .then_some({
                     #[allow(clippy::cast_possible_truncation)]
                     {
                         value as i32
@@ -3079,13 +3076,12 @@ pub(crate) fn logical_or_empty_list_index(
             let current = text
                 .chars()
                 .nth(index - 1)
-                .map(|character| Value::text(character.to_string()))
-                .unwrap_or(Value::Null);
+                .map_or(Value::Null, |character| Value::text(character.to_string()));
             if runtime_truthy(&state.heap, &current)? {
                 return Ok(current);
             }
             let _allocated_rhs = Value::List(state.heap.allocate_list());
-            return Err(format!("list assignment received {}", receiver));
+            return Err(format!("list assignment received {receiver}"));
         }
         Value::Datum(savefile)
             if state.heap.datum(*savefile).is_ok_and(|datum| {
@@ -3225,18 +3221,20 @@ pub(crate) fn locate_in_container(
 pub(crate) fn locate_single(search: &Value, state: &ExecutionState) -> Value {
     match search {
         Value::Null => Value::Null,
-        Value::Datum(datum) => state
-            .heap()
-            .datum(*datum)
-            .is_ok()
-            .then_some(Value::Datum(*datum))
-            .unwrap_or(Value::Null),
-        Value::List(list) => state
-            .heap()
-            .list(*list)
-            .is_ok()
-            .then_some(Value::List(*list))
-            .unwrap_or(Value::Null),
+        Value::Datum(datum) => {
+            if state.heap().datum(*datum).is_ok() {
+                Value::Datum(*datum)
+            } else {
+                Value::Null
+            }
+        }
+        Value::List(list) => {
+            if state.heap().list(*list).is_ok() {
+                Value::List(*list)
+            } else {
+                Value::Null
+            }
+        }
         Value::TypePath(target) => state
             .heap()
             .datums()
@@ -3760,10 +3758,7 @@ pub(crate) fn constructor_target_if_present(
             Ok(target) => target,
             Err(error) => {
                 if let Some(path) = traced_type {
-                    eprintln!(
-                        "boot-vm: subsystem-constructor-missing type={} reason={}",
-                        path, error
-                    );
+                    eprintln!("boot-vm: subsystem-constructor-missing type={path} reason={error}");
                 }
                 return None;
             }
@@ -3820,8 +3815,8 @@ pub(crate) fn construct_sized_list(
     Ok(list)
 }
 
-pub(crate) fn read_list_value<'heap>(
-    heap: &'heap ValueHeap,
+pub(crate) fn read_list_value(
+    heap: &ValueHeap,
     list: ListId,
     key: &Value,
     associative: bool,
@@ -3941,7 +3936,7 @@ pub(crate) fn datum_field_or_initial_record(
 
 /// Returns the effective initial field catalog for an engine atom root.
 ///
-/// OpenDream exposes `/atom` variables through `DreamObjectAtom` and its
+/// `OpenDream` exposes `/atom` variables through `DreamObjectAtom` and its
 /// engine-owned appearance state even when an object's concrete definition is
 /// synthesized at runtime. Dream64 normally flattens those values into every
 /// registered type. Legacy/native construction can produce a concrete path
@@ -4782,9 +4777,7 @@ pub(crate) fn execute_scalar_compound_assignment(
     if matches!(operator, CompoundAssignmentOperator::Add)
         && matches!(
             (&left, &right),
-            (Value::Text(_), Value::Text(_))
-                | (Value::Null, Value::Text(_))
-                | (Value::Text(_), Value::Null)
+            (Value::Text(_) | Value::Null, Value::Text(_)) | (Value::Text(_), Value::Null)
         )
     {
         return execute_scalar_add(left, right);
@@ -4853,7 +4846,7 @@ pub(crate) fn runtime_argument_count(
 ///
 /// BYOND has one constructor-specific positional rule: when the second
 /// argument is text it is `icon_state`, not `loc`, and every following
-/// positional argument shifts over one slot. OpenDream performs the same
+/// positional argument shifts over one slot. `OpenDream` performs the same
 /// reordering for keyed calls before `DreamObjectImage.Initialize` observes
 /// them. Keeping it at the VM call boundary means the native image constructor
 /// can apply copied appearance state first and explicit overrides second.

@@ -90,7 +90,7 @@ pub(super) fn rgb2num_builtin(
                     maximum * 100.0,
                 ]
             } else {
-                let lightness = (maximum + minimum) / 2.0;
+                let lightness = f32::midpoint(maximum, minimum);
                 vec![
                     hue,
                     if delta == 0.0 {

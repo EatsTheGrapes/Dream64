@@ -3302,11 +3302,14 @@ fn emit_switch_case_condition(
     if alternatives.is_empty() {
         return Err(compile_error("switch case requires at least one value"));
     }
-    let alternative_count = alternatives
+    let alternative_count = if alternatives
         .last()
         .is_some_and(|alternative| alternative.is_empty())
-        .then(|| alternatives.len().saturating_sub(1))
-        .unwrap_or(alternatives.len());
+    {
+        alternatives.len().saturating_sub(1)
+    } else {
+        alternatives.len()
+    };
     if alternative_count == 0 {
         return Err(compile_error("switch case requires at least one value"));
     }
@@ -3663,7 +3666,7 @@ fn compile_local(
                     match tokens[index].kind {
                         TokenKind::Punctuation('[') => bracket_depth += 1,
                         TokenKind::Punctuation(']') => {
-                            bracket_depth = bracket_depth.saturating_sub(1)
+                            bracket_depth = bracket_depth.saturating_sub(1);
                         }
                         _ => {}
                     }

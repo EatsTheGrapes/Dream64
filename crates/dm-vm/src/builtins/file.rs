@@ -480,16 +480,15 @@ pub(crate) fn execute_output(
         }
         let field = FieldName::parse("_dream64_output_events")
             .expect("headless output event field is valid");
-        let events = match state.heap.datum_field(*target, &field) {
-            Ok(Value::List(events)) => *events,
-            _ => {
-                let events = state.heap.allocate_list();
-                state
-                    .heap
-                    .set_datum_field(*target, field, Value::List(events))
-                    .map_err(|error| error.to_string())?;
-                events
-            }
+        let events = if let Ok(Value::List(events)) = state.heap.datum_field(*target, &field) {
+            *events
+        } else {
+            let events = state.heap.allocate_list();
+            state
+                .heap
+                .set_datum_field(*target, field, Value::List(events))
+                .map_err(|error| error.to_string())?;
+            events
         };
         state
             .heap

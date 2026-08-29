@@ -2123,7 +2123,7 @@ pub(crate) fn emit_expression(
         Expression::Null => instructions.push(Instruction::PushNull),
         Expression::Number(number) => instructions.push(Instruction::PushNumber(*number)),
         Expression::Text(text) => {
-            instructions.push(Instruction::PushText(Arc::from(text.as_str())))
+            instructions.push(Instruction::PushText(Arc::from(text.as_str())));
         }
         Expression::File(path) => instructions.push(Instruction::PushFile(path.clone())),
         Expression::TypePath(path) => instructions.push(Instruction::PushTypePath(path.clone())),
@@ -2795,17 +2795,15 @@ pub(crate) fn emit_expression(
                 emit_expression(receiver, locals, instructions, procedures)?;
                 emit_expression(index, locals, instructions, procedures)?;
                 instructions.push(Instruction::LoadDynamicField);
+            } else if let Expression::Local(name) = list.as_ref()
+                && let Some(slot) = locals.get(name)
+            {
+                emit_expression(index, locals, instructions, procedures)?;
+                instructions.push(Instruction::IndexLocalList(slot));
             } else {
-                if let Expression::Local(name) = list.as_ref()
-                    && let Some(slot) = locals.get(name)
-                {
-                    emit_expression(index, locals, instructions, procedures)?;
-                    instructions.push(Instruction::IndexLocalList(slot));
-                } else {
-                    emit_expression(list, locals, instructions, procedures)?;
-                    emit_expression(index, locals, instructions, procedures)?;
-                    instructions.push(Instruction::IndexList);
-                }
+                emit_expression(list, locals, instructions, procedures)?;
+                emit_expression(index, locals, instructions, procedures)?;
+                instructions.push(Instruction::IndexList);
             }
         }
         Expression::SafeIndex { list, index } => {

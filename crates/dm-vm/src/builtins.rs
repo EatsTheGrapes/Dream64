@@ -251,7 +251,7 @@ pub(super) fn execute_standard_builtin_with_usr(
         "ckey" => ckey(arguments, state),
         "ckeyEx" => ckey_ex(arguments, state),
         "refcount" => Ok(Value::number(match arguments.first() {
-            Some(Value::Datum(_)) | Some(Value::List(_)) => 1.0,
+            Some(Value::Datum(_) | Value::List(_)) => 1.0,
             _ => 0.0,
         })),
         "fexists" => fexists(arguments, state),
@@ -739,8 +739,7 @@ pub(super) fn execute_external_call(
 
 fn headless_memory_stats_report() -> String {
     let resident = current_process_resident_bytes()
-        .map(format_memory_size)
-        .unwrap_or_else(|| "unavailable".to_owned());
+        .map_or_else(|| "unavailable".to_owned(), format_memory_size);
     format!(
         "Server mem usage:\n\
 prototypes:\n\

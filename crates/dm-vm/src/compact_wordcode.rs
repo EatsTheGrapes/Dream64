@@ -818,7 +818,7 @@ impl<'a> Reader<'a> {
     fn count(&mut self, maximum: usize, label: &str) -> Result<usize, CompactWordcodeError> {
         let count = self.u32(label)? as usize;
         if count > maximum {
-            return Err(CompactWordcodeError::new(format!("{label} exceeds limit",)));
+            return Err(CompactWordcodeError::new(format!("{label} exceeds limit")));
         }
         Ok(count)
     }

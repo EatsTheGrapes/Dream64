@@ -1507,7 +1507,7 @@ impl ExecutionState {
                 .ok()
                 .and_then(|values| values.get_key(&Value::text("src")).ok())
                 .and_then(|value| match value {
-                    Value::Text(reference) => match parse_heap_reference(&reference) {
+                    Value::Text(reference) => match parse_heap_reference(reference) {
                         Some(HeapReference::Datum(index)) => {
                             self.heap.datum_id_at_index(index).map(Value::Datum)
                         }
@@ -1695,15 +1695,14 @@ impl ExecutionState {
             }
         }
         let verbs_field = FieldName::parse("verbs").expect("engine verbs field is valid");
-        let list = match self.heap.datum_field(datum, &verbs_field) {
-            Ok(Value::List(list)) => *list,
-            _ => {
-                let list = self.heap.allocate_list();
-                self.heap
-                    .set_datum_field(datum, verbs_field, Value::List(list))
-                    .map_err(|error| error.to_string())?;
-                list
-            }
+        let list = if let Ok(Value::List(list)) = self.heap.datum_field(datum, &verbs_field) {
+            *list
+        } else {
+            let list = self.heap.allocate_list();
+            self.heap
+                .set_datum_field(datum, verbs_field, Value::List(list))
+                .map_err(|error| error.to_string())?;
+            list
         };
         let existing = self
             .heap
@@ -3016,7 +3015,7 @@ impl ExecutionState {
                 extend_heap_root_ids(
                     &mut datum_roots,
                     &mut list_roots,
-                    current.caller_result_override().into_iter(),
+                    current.caller_result_override(),
                 );
                 frame = current.engine_post_return();
             }
@@ -3218,14 +3217,16 @@ fn map_loader_progress(frame: &CallFrame, path: &str, heap: &ValueHeap) -> Strin
             Some(format!("{name}={}", bounded_progress_value(value, heap)))
         })
         .collect::<Vec<_>>();
-    (!fields.is_empty())
-        .then(|| format!(" map=[{}]", fields.join(",")))
-        .unwrap_or_default()
+    if !fields.is_empty() {
+        format!(" map=[{}]", fields.join(","))
+    } else {
+        Default::default()
+    }
 }
 
 fn normalize_client_command_name(name: &str) -> String {
     name.chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .flat_map(char::to_lowercase)
         .collect()
 }

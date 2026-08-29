@@ -718,7 +718,7 @@ pub struct Program {
     pub source_spans: Vec<SourceSpan>,
 }
 
-/// Client-side conversion supported by OpenDream's explicit verb command line.
+/// Client-side conversion supported by `OpenDream`'s explicit verb command line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VerbParameterType {
     /// `as text`, `as message`, or `as command_text`.

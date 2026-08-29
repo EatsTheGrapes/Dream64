@@ -44,9 +44,8 @@ pub(crate) fn materialize_callee_chain(
             .split('@')
             .next()
             .unwrap_or("/proc");
-        let procedure_value = TypePath::parse(procedure)
-            .map(Value::TypePath)
-            .unwrap_or_else(|_| Value::text(procedure));
+        let procedure_value =
+            TypePath::parse(procedure).map_or_else(|_| Value::text(procedure), Value::TypePath);
         for (name, value) in [
             ("caller", previous.clone()),
             ("src", frame.src.clone()),

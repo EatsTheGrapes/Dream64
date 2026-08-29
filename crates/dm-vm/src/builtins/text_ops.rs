@@ -615,8 +615,7 @@ pub(super) fn splittext(
                     + text[finish..region_end]
                         .chars()
                         .next()
-                        .map(char::len_utf8)
-                        .unwrap_or(1)
+                        .map_or(1, char::len_utf8)
             };
         }
         output.push(text[segment_start..region_end].to_owned());

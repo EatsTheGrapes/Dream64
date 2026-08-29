@@ -248,7 +248,7 @@ fn shuttle_trace_expected_slot_direction(
 
 fn shuttle_trace_list_len(state: &ExecutionState, list: Option<ListId>) -> usize {
     list.and_then(|list| state.heap.list(list).ok())
-        .map_or(0, |list| list.len())
+        .map_or(0, dm_value::DmList::len)
 }
 
 fn shuttle_trace_list_slot(
@@ -310,11 +310,10 @@ fn shuttle_trace_list_field(state: &ExecutionState, datum: DatumId, name: &str) 
 }
 
 fn shuttle_trace_datum_type(state: &ExecutionState, target: DatumId) -> String {
-    state
-        .heap
-        .datum(target)
-        .map(|datum| datum.type_path().to_owned().to_string())
-        .unwrap_or_else(|_| "<missing>".to_owned())
+    state.heap.datum(target).map_or_else(
+        |_| "<missing>".to_owned(),
+        |datum| datum.type_path().to_owned().to_string(),
+    )
 }
 
 fn shuttle_trace_value_ref(value: Option<&Value>) -> String {
@@ -415,34 +414,45 @@ target_loc={target_location} target_xyz={target_x},{target_y},{target_z}"
         };
         let node_type = node
             .and_then(|datum| state.heap.datum(datum).ok())
-            .map(|datum| datum.type_path().to_string())
-            .unwrap_or_else(|| "<null>".to_owned());
+            .map_or_else(
+                || "<null>".to_owned(),
+                |datum| datum.type_path().to_string(),
+            );
         let parent_type = parent
             .and_then(|datum| state.heap.datum(datum).ok())
-            .map(|datum| datum.type_path().to_string())
-            .unwrap_or_else(|| "<null>".to_owned());
-        let node_x = node
-            .map(|datum| shuttle_trace_field_text(state, datum, "x"))
-            .unwrap_or_else(|| "null".to_owned());
-        let node_y = node
-            .map(|datum| shuttle_trace_field_text(state, datum, "y"))
-            .unwrap_or_else(|| "null".to_owned());
-        let node_z = node
-            .map(|datum| shuttle_trace_field_text(state, datum, "z"))
-            .unwrap_or_else(|| "null".to_owned());
-        let node_dir = node
-            .map(|datum| shuttle_trace_field_text(state, datum, "dir"))
-            .unwrap_or_else(|| "null".to_owned());
-        let node_pipe = node
-            .map(|datum| shuttle_trace_field_text(state, datum, "piping_layer"))
-            .unwrap_or_else(|| "null".to_owned());
+            .map_or_else(
+                || "<null>".to_owned(),
+                |datum| datum.type_path().to_string(),
+            );
+        let node_x = node.map_or_else(
+            || "null".to_owned(),
+            |datum| shuttle_trace_field_text(state, datum, "x"),
+        );
+        let node_y = node.map_or_else(
+            || "null".to_owned(),
+            |datum| shuttle_trace_field_text(state, datum, "y"),
+        );
+        let node_z = node.map_or_else(
+            || "null".to_owned(),
+            |datum| shuttle_trace_field_text(state, datum, "z"),
+        );
+        let node_dir = node.map_or_else(
+            || "null".to_owned(),
+            |datum| shuttle_trace_field_text(state, datum, "dir"),
+        );
+        let node_pipe = node.map_or_else(
+            || "null".to_owned(),
+            |datum| shuttle_trace_field_text(state, datum, "piping_layer"),
+        );
         let node_loc = node
             .and_then(|datum| {
                 let field = FieldName::parse("loc").expect("built-in atom variable");
                 state.heap.datum_field(datum, &field).ok().cloned()
             })
-            .map(|value| shuttle_trace_value_ref(Some(&value)))
-            .unwrap_or_else(|| "null".to_owned());
+            .map_or_else(
+                || "null".to_owned(),
+                |value| shuttle_trace_value_ref(Some(&value)),
+            );
         eprintln!(
             "shuttle-trace event={event} component={component:?} slot={slot} \
 expected_dir={expected_direction} node={node_ref} node_type={node_type} node_x={node_x} node_y={node_y} node_z={node_z} \
@@ -793,7 +803,7 @@ fn boot_trace_describe_value(value: &Value, state: &ExecutionState) -> String {
         .field(&FieldName::parse("contents").expect("built-in contents field is valid"))
         .ok()
         .and_then(|value| match value {
-            Value::List(list) => state.heap.list(*list).ok().map(|list| list.len()),
+            Value::List(list) => state.heap.list(*list).ok().map(dm_value::DmList::len),
             _ => None,
         })
         .map_or_else(|| "<unset>".to_owned(), |length| length.to_string());

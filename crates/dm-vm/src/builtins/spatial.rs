@@ -126,7 +126,7 @@ pub(super) fn indexed_spatial_candidates(
             && value.fract() == 0.0
             && value >= i32::MIN as f32
             && value <= i32::MAX as f32)
-            .then(|| value as i32)
+            .then_some(value as i32)
     };
     let (Some(center_x), Some(center_y), Some(center_z)) = (
         integral_coordinate(center_x),
@@ -309,7 +309,7 @@ pub(super) fn orange_builtin(
             && value.fract() == 0.0
             && value >= i32::MIN as f32
             && value <= i32::MAX as f32)
-            .then(|| value as i32)
+            .then_some(value as i32)
     };
     let (Some(center_x), Some(center_y), Some(center_z)) = (
         integral_coordinate(center_x),
@@ -922,10 +922,15 @@ pub(super) fn bounds_dist_builtin(
             .unwrap_or(32.0)
     };
     let horizontal = (right.0 - left.0).abs() * 32.0
-        - (dimension(&arguments[0], "bound_width") + dimension(&arguments[1], "bound_width")) / 2.0;
+        - f32::midpoint(
+            dimension(&arguments[0], "bound_width"),
+            dimension(&arguments[1], "bound_width"),
+        );
     let vertical = (right.1 - left.1).abs() * 32.0
-        - (dimension(&arguments[0], "bound_height") + dimension(&arguments[1], "bound_height"))
-            / 2.0;
+        - f32::midpoint(
+            dimension(&arguments[0], "bound_height"),
+            dimension(&arguments[1], "bound_height"),
+        );
     Ok(Value::number(horizontal.max(vertical)))
 }
 

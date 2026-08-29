@@ -530,11 +530,10 @@ fn local_verb_choice_label(state: &ExecutionState, value: &Value) -> String {
     let Value::Datum(datum) = value else {
         return prompt_value_text(Some(value));
     };
-    state
-        .heap
-        .datum(*datum)
-        .map(|value| format!("{} [0x{:x}]", value.type_path().as_str(), datum.index() + 1))
-        .unwrap_or_else(|_| value.to_string())
+    state.heap.datum(*datum).map_or_else(
+        |_| value.to_string(),
+        |value| format!("{} [0x{:x}]", value.type_path().as_str(), datum.index() + 1),
+    )
 }
 
 pub(crate) fn queue_next_verb_prompt(

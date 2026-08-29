@@ -46,6 +46,7 @@ pub enum AtmosCompareResult {
 }
 
 /// Computes one gas comparison without access to the VM or live heap.
+#[must_use]
 pub fn compare_atmos_snapshot(snapshot: &AtmosCompareSnapshot) -> AtmosCompareResult {
     let mut moles_sum = 0.0_f32;
     for gas in &snapshot.gases {

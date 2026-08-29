@@ -1452,7 +1452,7 @@ pub(crate) fn trace_tgm_route(
     }
     frame.cold_mut().tgm_route_trace_mask |= milestone;
     let list_len = |value: Option<&Value>| match value {
-        Some(Value::List(list)) => state.heap.list(*list).ok().map(|list| list.len()),
+        Some(Value::List(list)) => state.heap.list(*list).ok().map(dm_value::DmList::len),
         _ => None,
     };
     let src_field = |name: &str| match frame.src {
@@ -1519,7 +1519,7 @@ fn record_tgm_continuation_rejection(frame: &CallFrame, state: &ExecutionState) 
                     Value::List(list) => state.heap.list(*list).ok(),
                     _ => None,
                 })
-                .map_or(0, |list| list.len());
+                .map_or(0, dm_value::DmList::len);
             let (model_positions, model_associations) = frame
                 .locals
                 .get(14)
@@ -2030,21 +2030,17 @@ pub(crate) fn drive_ruin_candidate_scan(
             NATIVE_RUIN_SCAN_SUCCESSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return TgmDrive::Continue;
         };
-        let allowed = match frame.locals.get(1).cloned() {
-            Some(Value::List(list)) => list,
-            _ => {
-                frame.cold_mut().ruin_scan = None;
-                frame.instruction = 63;
-                return TgmDrive::None;
-            }
+        let allowed = if let Some(Value::List(list)) = frame.locals.get(1).cloned() {
+            list
+        } else {
+            frame.cold_mut().ruin_scan = None;
+            frame.instruction = 63;
+            return TgmDrive::None;
         };
         let area_type = match area {
-            Value::Datum(area) => state
-                .heap
-                .datum(area)
-                .ok()
-                .map(|datum| Value::TypePath(datum.type_path().clone()))
-                .unwrap_or(Value::Null),
+            Value::Datum(area) => state.heap.datum(area).ok().map_or(Value::Null, |datum| {
+                Value::TypePath(datum.type_path().clone())
+            }),
             _ => Value::Null,
         };
         let allowed_value = read_list_value(
@@ -2065,18 +2061,16 @@ pub(crate) fn drive_ruin_candidate_scan(
                     .cold()
                     .and_then(|cold| cold.ruin_scan.as_ref())
                     .map_or(0, |scan| scan.low.2);
-                let allowed_entries = state
-                    .heap
-                    .list(allowed)
-                    .ok()
-                    .map(|list| {
+                let allowed_entries = state.heap.list(allowed).ok().map_or_else(
+                    || "<stale>".to_owned(),
+                    |list| {
                         list.associations()
                             .take(8)
                             .map(|(key, value)| format!("{key:?}={value:?}"))
                             .collect::<Vec<_>>()
                             .join(",")
-                    })
-                    .unwrap_or_else(|| "<stale>".to_owned());
+                    },
+                );
                 samples.push(format!(
                     "z={z} actual={area_type:?} lookup={allowed_value:?} allowed=[{allowed_entries}]"
                 ));
@@ -3215,8 +3209,8 @@ pub(crate) fn try_run_register_signal_fast_path(
         } else {
             None
         };
-        if matches!(procs, None) && runtime_truthy(&state.heap, &procs_value).ok()?
-            || matches!(lookup, None) && runtime_truthy(&state.heap, &lookup_value).ok()?
+        if procs.is_none() && runtime_truthy(&state.heap, &procs_value).ok()?
+            || lookup.is_none() && runtime_truthy(&state.heap, &lookup_value).ok()?
         {
             return None;
         }

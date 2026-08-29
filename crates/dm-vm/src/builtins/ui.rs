@@ -163,16 +163,15 @@ pub(super) fn headless_winset(
         return Ok(Value::Null);
     }
     let field = FieldName::parse("_dream64_winset").expect("headless UI field is valid");
-    let settings = match state.heap.datum_field(client, &field) {
-        Ok(Value::List(settings)) => *settings,
-        _ => {
-            let settings = state.heap.allocate_list();
-            state
-                .heap
-                .set_datum_field(client, field, Value::List(settings))
-                .map_err(|error| error.to_string())?;
-            settings
-        }
+    let settings = if let Ok(Value::List(settings)) = state.heap.datum_field(client, &field) {
+        *settings
+    } else {
+        let settings = state.heap.allocate_list();
+        state
+            .heap
+            .set_datum_field(client, field, Value::List(settings))
+            .map_err(|error| error.to_string())?;
+        settings
     };
     let control = arguments.get(1).cloned().unwrap_or(Value::Null);
     let params = arguments.get(2).cloned().unwrap_or(Value::Null);
@@ -204,17 +203,16 @@ pub(super) fn headless_winshow(
         return Ok(Value::Null);
     }
     let field = FieldName::parse("_dream64_winshow").expect("headless UI field");
-    let settings = match state.heap.datum_field(*client, &field) {
-        Ok(Value::List(list)) => *list,
-        _ => {
-            let list = state.heap.allocate_list();
-            state.mark_associative_list(list);
-            state
-                .heap
-                .set_datum_field(*client, field, Value::List(list))
-                .map_err(|e| e.to_string())?;
-            list
-        }
+    let settings = if let Ok(Value::List(list)) = state.heap.datum_field(*client, &field) {
+        *list
+    } else {
+        let list = state.heap.allocate_list();
+        state.mark_associative_list(list);
+        state
+            .heap
+            .set_datum_field(*client, field, Value::List(list))
+            .map_err(|e| e.to_string())?;
+        list
     };
     state
         .heap

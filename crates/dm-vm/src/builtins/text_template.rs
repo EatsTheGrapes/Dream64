@@ -75,7 +75,7 @@ pub(super) fn text_template(arguments: &[Value], state: &ExecutionState) -> Resu
             output.push('[');
             continue;
         }
-        for _ in 0..whitespace.chars().count() + 1 {
+        for _ in 0..=whitespace.chars().count() {
             characters.next();
         }
         let value = values
