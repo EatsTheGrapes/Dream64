@@ -10,7 +10,8 @@ use std::time::SystemTime;
 
 use dm_value::{FieldName, Value};
 
-use super::{ExecutionState, relaxed_resolved_file_path, resource_datum_builtin};
+use super::generator::resource_datum_builtin;
+use super::{ExecutionState, relaxed_resolved_file_path};
 
 #[derive(Clone, Debug)]
 pub(crate) struct DmiMetadata {
