@@ -1,25 +1,32 @@
 //! Trace-compiled fast-path JITs: camera chunks, RegisterSignal, rooted-list
 //! loops, lumcount loops, and dmm-discovery/digest verification.
 
-
-use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
-use crate::builtins::is_subtype;
-use crate::bytecode::{CompoundAssignmentOperator, Instruction, Module, ProcedureId, Program, TypePredicateKind};
+use crate::builtins::execute_standard_builtin;
+use crate::bytecode::{
+    CompoundAssignmentOperator, Instruction, Module, ProcedureId, Program, TypePredicateKind,
+};
 use crate::compact_wordcode;
-use crate::value_ops::{compare_values, datum_field_or_initial, dm_list_length_number, dynamic_call_target_named, logical_or_empty_list_index, pop, read_list_value, runtime_truthy, values_equal, write_list_value};
-use crate::{CallFrame, ExecutionState, PackedNumericState, declared_argument_count, frame_context, make_frame};
-use dm_jit::{CompiledNumericTrace, CompiledRootedBlock, NumericInstruction, NumericRunOutcome, RootedBlockOutcome, compile_numeric_field_trace, compile_numeric_trace, compile_safe_rooted_block};
-use dm_value::{DatumId, FieldName, ListId, PackedValue, TypePath, Value, ValueError};
+use crate::value_ops::{
+    assign_datum_or_shared_field, canonicalize_value, datum_field_or_initial,
+    datum_field_or_shared, logical_or_empty_list_field, logical_or_empty_list_index, pop,
+    read_list_value, runtime_truthy, stringify_dm_value, write_list_value,
+};
+use crate::{CallFrame, ExecutionState, declared_argument_count};
+use dm_jit::{
+    CompiledNumericTrace, CompiledRootedBlock, NumericInstruction, NumericRunOutcome,
+    RootedBlockOutcome, compile_numeric_field_trace, compile_numeric_trace,
+    compile_safe_rooted_block,
+};
+use dm_value::{DatumId, FieldName, ListId, TypePath, Value, ValueError};
+use smallvec::SmallVec;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 
 // The trace fast paths canonicalize type2parent-style shapes and read the dmm
 // digest metrics from the tgm/ruin cluster.
-use super::tgm_ruin::{
-    canonical_static_native_builtin, native_discover_offset_activations,
-    NATIVE_DISCOVER_OFFSET_ACTIVATIONS,
-};
+use super::tgm_ruin::{NATIVE_DISCOVER_OFFSET_ACTIVATIONS, canonical_static_native_builtin};
 
 #[inline(always)]
 pub(crate) fn execute_compact_fast_instruction(

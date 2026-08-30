@@ -1,15 +1,14 @@
 //! Numeric-core acceleration: world-datum access, the clock, and the numeric
 //! dispatch/loop fast paths.
 
-
+use crate::bytecode::{Instruction, Program};
+use crate::value_ops::{
+    canonicalize_owned_value, compare_values, datum_field_or_shared, dm_list_length_number,
+};
+use crate::{CallFrame, ExecutionState, PackedNumericState};
+use dm_value::{DatumId, FieldName, PackedValue, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use crate::builtins::{execute_standard_builtin, is_subtype};
-use crate::bytecode::{CompoundAssignmentOperator, Instruction, Module, ProcedureId, Program, TypePredicateKind};
-use crate::value_ops::{canonicalize_owned_value, canonicalize_value, dm_list_length_number, dynamic_call_target_named, get_step_builtin, is_area_type_path, is_turf_type_path, logical_or_empty_list_field, logical_or_empty_list_index, pop, read_list_value, runtime_truthy, stringify_dm_value, values_equal};
-use crate::{CallFrame, ExecutionState, PackedNumericState, declared_argument_count, frame_context, make_frame};
-use dm_jit::{CompiledNumericTrace, NumericExecutionState, NumericInstruction, NumericRunOutcome, compile_numeric_field_trace, compile_numeric_trace, compile_safe_rooted_block};
-use dm_value::{DatumId, FieldName, PackedValue, TypePath, Value, ValueError};
 
 fn world_datum(state: &ExecutionState) -> Option<DatumId> {
     static WORLD: std::sync::OnceLock<FieldName> = std::sync::OnceLock::new();

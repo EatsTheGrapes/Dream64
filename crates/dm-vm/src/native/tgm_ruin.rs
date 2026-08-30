@@ -1,20 +1,24 @@
 //! Monke .dmm TGM/ruin loading drives and canonical type2parent/istext
 //! compaction, plus their instrumentation counters.
 
-
+use crate::builtins;
+use crate::builtins::is_subtype;
+use crate::bytecode::{Instruction, Module, ProcedureId, Program};
+use crate::compile::compile_procedure;
+use crate::tgm_planner;
+use crate::value_ops::{
+    ExecutionContext, datum_field_or_initial, dynamic_call_target_named, get_step_builtin,
+    is_area_type_path, is_turf_type_path, read_list_value, runtime_truthy, values_equal,
+    write_list_value,
+};
+use crate::{
+    CallFrame, ExecutionState, RuinCandidateScan, TgmLoadContinuation, TgmLoadPhase, frame_context,
+    make_frame,
+};
+use dm_value::{FieldName, TypePath, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use crate::builtins;
-use crate::builtins::{execute_standard_builtin, is_subtype};
-use crate::bytecode::{CompoundAssignmentOperator, Instruction, Module, ProcedureId, Program};
-use crate::compact_wordcode;
-use crate::tgm_planner;
-use crate::value_ops::{canonicalize_owned_value, compare_values, datum_field_or_initial, datum_field_or_shared, logical_or_empty_list_index, pop, write_list_value};
-use crate::{CallFrame, ExecutionState, RuinCandidateScan, TgmLoadContinuation, TgmLoadPhase, frame_context, make_frame};
-use dm_jit::{NumericExecutionState, RootedBlockOutcome};
-use dm_value::{DatumId, FieldName, ListId, PackedValue, TypePath, Value, ValueError};
-use smallvec::SmallVec;
 
 // The tgm/ruin drives read the world clock through the numeric-core sibling.
 use super::numeric_core::world_numeric_field;
@@ -76,7 +80,7 @@ static NATIVE_BUILD_COORDINATE_PREFIX_ACTIVATIONS: AtomicU64 = AtomicU64::new(0)
 static NATIVE_BUILD_COORDINATE_PREFIX_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static NATIVE_RUIN_BATCH_ACTIVATIONS: AtomicU64 = AtomicU64::new(0);
 static NATIVE_RUIN_BATCH_LOGICAL_STEPS: AtomicU64 = AtomicU64::new(0);
-static NATIVE_DISCOVER_OFFSET_ACTIVATIONS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static NATIVE_DISCOVER_OFFSET_ACTIVATIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Returns the process-wide number of canonical `_tgm_load` frames that
 /// actually installed the native commit sidecar.

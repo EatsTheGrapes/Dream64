@@ -34,8 +34,9 @@ pub use self::tgm_ruin::{
 
 pub(crate) use self::fastpath_jit::{
     execute_compact_fast_instruction, try_run_camera_chunk_fast_path,
-    try_run_discover_offset_fast_path, try_run_dmm_preload_measurement_fast_path, try_run_guarded_jit,
-    try_run_parsed_dmm_new_fast_path, try_run_register_signal_fast_path, try_run_rooted_list_jit,
+    try_run_discover_offset_fast_path, try_run_dmm_preload_measurement_fast_path,
+    try_run_guarded_jit, try_run_parsed_dmm_new_fast_path, try_run_register_signal_fast_path,
+    try_run_rooted_list_jit,
 };
 
 pub(crate) use self::numeric_core::{
@@ -57,8 +58,8 @@ pub(crate) use self::tgm_ruin::{
 pub(crate) use self::{
     fastpath_jit::{
         REGISTER_SIGNAL_FAST_CACHE, compile_lumcount_trace, compile_register_signal_trace,
-        compile_rooted_list_trace, discover_offset_native, jit_disabled, numeric_jit_prefix_candidate,
-        numeric_trace_instructions,
+        compile_rooted_list_trace, discover_offset_native, jit_disabled,
+        numeric_jit_prefix_candidate, numeric_trace_instructions,
     },
     numeric_core::{try_run_packed_numeric_dispatch_block, try_run_rich_numeric_dispatch_block},
     tgm_ruin::{
