@@ -529,3 +529,92 @@ pub(crate) fn inherited_declared_field_type(
         owner = compilation.code_tree().node(owner)?.parent_type?;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use dm_compiler::{Compilation, CompilerDatabase};
+
+    use super::declared_global_types;
+    use crate::ProcedureRegistry;
+
+    static NEXT_PROJECT: AtomicU64 = AtomicU64::new(0);
+
+    struct TestProject {
+        root: std::path::PathBuf,
+    }
+
+    impl TestProject {
+        fn compile(source: &str) -> Compilation {
+            let ordinal = NEXT_PROJECT.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "dream64-dm-semantics-type-resolve-{}-{}",
+                ordinal,
+                std::process::id()
+            ));
+            std::fs::create_dir(&root).expect("test project directory should be created");
+            let project = Self { root };
+            std::fs::write(project.root.join("world.dme"), "#include \"types.dm\"\n")
+                .expect("environment should be written");
+            std::fs::write(project.root.join("types.dm"), source)
+                .expect("source should be written");
+            CompilerDatabase::new()
+                .compile(project.root.join("world.dme"))
+                .expect("test project should compile")
+        }
+    }
+
+    impl Drop for TestProject {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn typed_global_receiver_static_access_does_not_dereference_null() {
+        let compilation = TestProject::compile(
+            "var/global/datum/globals/GLOB\n/datum/globals\n\tvar/global/config_error_log\n/world/Genesis()\n\tGLOB.config_error_log = \"early.log\"\n\treturn GLOB.config_error_log\n",
+        );
+        assert_eq!(
+            declared_global_types(&compilation)
+                .get("GLOB")
+                .map(dm_value::TypePath::as_str),
+            Some("/datum/globals")
+        );
+        let registry = ProcedureRegistry::build(&compilation);
+        let executable = registry
+            .compile_vm(&compilation)
+            .expect("typed global static");
+        let genesis = registry
+            .procedures()
+            .iter()
+            .find(|procedure| procedure.path.to_string() == "/world/proc/Genesis")
+            .expect("Genesis procedure");
+        let procedure = genesis
+            .effective_target
+            .and_then(|id| executable.implementation(id))
+            .expect("Genesis implementation");
+        let instructions = &executable
+            .module()
+            .procedure(procedure)
+            .unwrap()
+            .instructions;
+        let qualified = dm_value::FieldName::static_storage("/datum/globals/var/config_error_log");
+        assert!(
+            instructions.iter().any(|instruction| matches!(
+                instruction,
+                dm_vm::Instruction::StoreGlobal(field) if field == &qualified
+            )),
+            "{instructions:?}"
+        );
+        assert!(instructions.iter().any(|instruction| matches!(
+            instruction,
+            dm_vm::Instruction::LoadGlobal(field) if field == &qualified
+        )));
+        assert!(!instructions.iter().any(|instruction| matches!(
+            instruction,
+            dm_vm::Instruction::LoadField(_) | dm_vm::Instruction::StoreField(_)
+        )));
+    }
+}
