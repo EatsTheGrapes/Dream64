@@ -36,7 +36,7 @@ use deps::{
 };
 use fields::{
     direct_instance_field_types, direct_instance_fields, direct_static_fields,
-    referenced_inherited_field_types, referenced_inherited_fields,
+    referenced_inherited_field_types, referenced_inherited_fields, scope_operator_static_fields,
 };
 use ids::{implementation_id, procedure_id};
 use ir::effective_target;

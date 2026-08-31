@@ -153,6 +153,159 @@ fn bare_type_static_in_owner_method_uses_qualified_shared_slot() {
 }
 
 #[test]
+fn scope_operator_static_write_and_read_use_qualified_shared_slot() {
+    // DM's `Type::name` scope operator reads and writes the type's shared
+    // `static` slot directly. Both sides must resolve to the qualified
+    // `__dm_static_` global, never an instance field or an `initial()` snapshot.
+    let compilation = TestProject::compile(
+        "/datum/gas_mixture\n\tvar/static/list/gas_meta\n/proc/meta_gas_list()\n\t/datum/gas_mixture::gas_meta = list(1, 2)\n\treturn /datum/gas_mixture::gas_meta\n",
+    );
+    let registry = ProcedureRegistry::build(&compilation);
+    let executable = registry
+        .compile_vm(&compilation)
+        .expect("scope-operator static access should lower");
+    let procedure = procedure_by_path(&registry, "/proc/meta_gas_list")
+        .effective_target
+        .and_then(|id| executable.implementation(id))
+        .expect("meta_gas_list implementation");
+    let instructions = &executable
+        .module()
+        .procedure(procedure)
+        .unwrap()
+        .instructions;
+    let qualified = FieldName::static_storage("/datum/gas_mixture/var/gas_meta");
+    assert!(
+        instructions.iter().any(
+            |instruction| matches!(instruction, Instruction::StoreGlobal(field) if field == &qualified)
+        ),
+        "{instructions:?}"
+    );
+    assert!(
+        instructions.iter().any(
+            |instruction| matches!(instruction, Instruction::LoadGlobal(field) if field == &qualified)
+        ),
+        "{instructions:?}"
+    );
+    assert!(!instructions.iter().any(|instruction| matches!(
+        instruction,
+        Instruction::StoreField(field) | Instruction::LoadField(field) if field.as_str() == "gas_meta"
+    )));
+    assert!(!instructions.iter().any(|instruction| matches!(
+        instruction,
+        Instruction::LoadInitialGlobal(_) | Instruction::InitialField(_)
+    )));
+}
+
+#[test]
+fn inherited_scope_operator_static_resolves_to_ancestor_slot() {
+    // `/datum/child::shared` must bind to the ancestor's declaration when the
+    // static is only declared on `/datum/base`.
+    let compilation = TestProject::compile(
+        "/datum/base\n\tvar/static/shared = 1\n/datum/child\n\tparent_type = /datum/base\n/proc/poke()\n\t/datum/child::shared = 5\n\treturn /datum/child::shared\n",
+    );
+    let registry = ProcedureRegistry::build(&compilation);
+    let executable = registry
+        .compile_vm(&compilation)
+        .expect("inherited scope-operator static should lower");
+    let procedure = procedure_by_path(&registry, "/proc/poke")
+        .effective_target
+        .and_then(|id| executable.implementation(id))
+        .expect("poke implementation");
+    let instructions = &executable
+        .module()
+        .procedure(procedure)
+        .unwrap()
+        .instructions;
+    let qualified = FieldName::static_storage("/datum/base/var/shared");
+    assert!(
+        instructions.iter().any(
+            |instruction| matches!(instruction, Instruction::StoreGlobal(field) if field == &qualified)
+        ),
+        "{instructions:?}"
+    );
+    assert!(
+        instructions.iter().any(
+            |instruction| matches!(instruction, Instruction::LoadGlobal(field) if field == &qualified)
+        ),
+        "{instructions:?}"
+    );
+}
+
+#[test]
+fn scope_operator_compound_assignment_uses_qualified_shared_slot() {
+    let compilation = TestProject::compile(
+        "/datum/base\n\tvar/static/tally = 0\n/proc/bump()\n\t/datum/base::tally += 3\n\treturn /datum/base::tally\n",
+    );
+    let registry = ProcedureRegistry::build(&compilation);
+    let executable = registry
+        .compile_vm(&compilation)
+        .expect("compound scope op");
+    let procedure = procedure_by_path(&registry, "/proc/bump")
+        .effective_target
+        .and_then(|id| executable.implementation(id))
+        .expect("bump implementation");
+    let instructions = &executable
+        .module()
+        .procedure(procedure)
+        .unwrap()
+        .instructions;
+    let qualified = FieldName::static_storage("/datum/base/var/tally");
+    assert!(
+        instructions.iter().any(
+            |instruction| matches!(instruction, Instruction::StoreGlobal(field) if field == &qualified)
+        ),
+        "{instructions:?}"
+    );
+    assert!(
+        instructions
+            .iter()
+            .filter(
+                |instruction| matches!(instruction, Instruction::LoadGlobal(field) if field == &qualified)
+            )
+            .count()
+            >= 2,
+        "compound assignment loads the slot to fold, then the return reads it: {instructions:?}"
+    );
+    assert!(!instructions.iter().any(|instruction| matches!(
+        instruction,
+        Instruction::MutateField { name, .. } if name.as_str() == "tally"
+    )));
+}
+
+#[test]
+fn scope_operator_on_plain_instance_var_keeps_initial_semantics() {
+    // A non-shared instance var accessed as `Type::name` is not writable
+    // through a shared slot and reads as an `initial()` snapshot, exactly as
+    // before this feature existed.
+    let compilation = TestProject::compile(
+        "/datum/thing\n\tvar/plain = 7\n/proc/peek()\n\treturn /datum/thing::plain\n",
+    );
+    let registry = ProcedureRegistry::build(&compilation);
+    let executable = registry
+        .compile_vm(&compilation)
+        .expect("scope-operator instance read should still lower");
+    let procedure = procedure_by_path(&registry, "/proc/peek")
+        .effective_target
+        .and_then(|id| executable.implementation(id))
+        .expect("peek implementation");
+    let instructions = &executable
+        .module()
+        .procedure(procedure)
+        .unwrap()
+        .instructions;
+    assert!(
+        instructions
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::InitialField(field) if field.as_str() == "plain")),
+        "{instructions:?}"
+    );
+    assert!(!instructions.iter().any(|instruction| matches!(
+        instruction,
+        Instruction::LoadGlobal(_) | Instruction::StoreGlobal(_)
+    )));
+}
+
+#[test]
 fn true_instance_field_wins_over_inherited_same_name_static() {
     let compilation = TestProject::compile(
         "/datum/base\n\tvar/static/value\n/datum/base/child\n\tvar/value\n/datum/base/child/proc/Run()\n\tvalue = 4\n\treturn value\n",

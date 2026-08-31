@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dm_compiler::Compilation;
 use dm_globals::{StorageClass, VariableRegistry};
+use dm_lexer::{SpannedToken, TokenKind};
 use dm_object_tree::{CodePath, NodeId};
 use dm_value::{FieldName, TypePath};
 
@@ -107,6 +108,125 @@ pub(crate) fn referenced_inherited_fields(
         current = parent;
     }
     fields
+}
+
+/// Resolves the DM scope-operator form `Type::name` appearing anywhere in a
+/// procedure body to the qualified static-storage slot of `name`.
+///
+/// `Type::name` reads or writes the *shared* `static` / `global` var `name`
+/// declared on the literal type path `Type` (or any of its ancestors) through
+/// its type-owned slot — the same `__dm_static_<hex>` global that
+/// `direct_static_fields` assigns. This is distinct from typed *instance*
+/// access (`obj.name`): the receiver here is a compile-time type literal, not a
+/// value.
+///
+/// Every resolved pair is returned keyed `"<canonical type path>::<name>"`. The
+/// `::` separator cannot collide with the `"<receiver>.<name>"` keys the
+/// instance-static binding pass emits, so both sets of entries can share one
+/// procedure's `global_fields` map. A `Type::name` where `name` is a plain
+/// (non-shared) instance var resolves to nothing and keeps its `initial()`
+/// lowering.
+pub(crate) fn scope_operator_static_fields(
+    compilation: &Compilation,
+    definition: &dm_syntax::Definition,
+    direct_static_fields: &BTreeMap<NodeId, BTreeMap<String, FieldName>>,
+) -> BTreeMap<String, FieldName> {
+    let mut resolved = BTreeMap::new();
+    collect_scope_operator_statics(
+        compilation,
+        &definition.header,
+        direct_static_fields,
+        &mut resolved,
+    );
+    for line in &definition.body {
+        collect_scope_operator_statics(
+            compilation,
+            &line.tokens,
+            direct_static_fields,
+            &mut resolved,
+        );
+    }
+    resolved
+}
+
+fn collect_scope_operator_statics(
+    compilation: &Compilation,
+    tokens: &[SpannedToken],
+    direct_static_fields: &BTreeMap<NodeId, BTreeMap<String, FieldName>>,
+    resolved: &mut BTreeMap<String, FieldName>,
+) {
+    let mut index = 0;
+    while index < tokens.len() {
+        if !matches!(&tokens[index].kind, TokenKind::Operator(operator) if operator == "/") {
+            index += 1;
+            continue;
+        }
+        // A leading `/` only starts a type-path literal when the preceding
+        // token cannot itself yield a value; otherwise this is division.
+        if index > 0 && token_yields_value(&tokens[index - 1]) {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index;
+        let mut segments = Vec::new();
+        while matches!(tokens.get(cursor).map(|token| &token.kind), Some(TokenKind::Operator(operator)) if operator == "/")
+        {
+            let Some(TokenKind::Identifier(segment)) =
+                tokens.get(cursor + 1).map(|token| &token.kind)
+            else {
+                break;
+            };
+            segments.push(segment.clone());
+            cursor += 2;
+        }
+        if segments.is_empty() {
+            index += 1;
+            continue;
+        }
+        if let (Some(TokenKind::Operator(operator)), Some(TokenKind::Identifier(name))) = (
+            tokens.get(cursor).map(|token| &token.kind),
+            tokens.get(cursor + 1).map(|token| &token.kind),
+        ) && operator == "::"
+            && let Some(field) =
+                inherited_static_slot(compilation, &segments, name, direct_static_fields)
+        {
+            resolved.insert(format!("/{}::{name}", segments.join("/")), field);
+        }
+        index = cursor.max(index + 1);
+    }
+}
+
+fn token_yields_value(token: &SpannedToken) -> bool {
+    matches!(
+        &token.kind,
+        TokenKind::Identifier(_)
+            | TokenKind::Number(_)
+            | TokenKind::String(_)
+            | TokenKind::RawString(_)
+            | TokenKind::TextBlock(_)
+            | TokenKind::Resource(_)
+            | TokenKind::Punctuation(')' | ']')
+    )
+}
+
+fn inherited_static_slot(
+    compilation: &Compilation,
+    segments: &[String],
+    name: &str,
+    direct_static_fields: &BTreeMap<NodeId, BTreeMap<String, FieldName>>,
+) -> Option<FieldName> {
+    let tree = compilation.code_tree();
+    let mut current = Some(tree.find(&dm_syntax::DefinitionPath::new(segments.to_vec()))?);
+    while let Some(node) = current {
+        if let Some(field) = direct_static_fields
+            .get(&node)
+            .and_then(|fields| fields.get(name))
+        {
+            return Some(field.clone());
+        }
+        current = tree.node(node).and_then(|type_node| type_node.parent_type);
+    }
+    None
 }
 
 pub(crate) fn direct_instance_fields(
