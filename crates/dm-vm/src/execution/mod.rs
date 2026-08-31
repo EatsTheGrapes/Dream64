@@ -14,6 +14,7 @@ mod run_support;
 mod scheduler;
 mod state;
 mod support;
+mod world_geometry;
 
 pub use frame::VmContinuationId;
 pub use scheduler::advance_scheduler;
