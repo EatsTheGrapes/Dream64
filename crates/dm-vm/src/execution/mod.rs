@@ -8,6 +8,7 @@
 //! frames stay small.
 
 mod frame;
+mod host_services;
 mod interpreter;
 mod run;
 mod run_support;
