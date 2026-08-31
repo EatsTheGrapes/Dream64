@@ -25,9 +25,9 @@ use super::{
     direct_instance_fields, direct_static_fields, dynamic_call_literal_selectors, effective_target,
     expand_proc_pseudo_macro, implementation_id, member_call_dependencies, native_member_index,
     native_parent_index, normalize_upward_paths, procedure_id, referenced_identifiers,
-    referenced_inherited_field_types, referenced_inherited_fields, static_call_selectors,
-    static_proc_reference_paths, static_procedure_type_families, type_is_descendant_or_same,
-    validate_const_assignments,
+    referenced_inherited_field_types, referenced_inherited_fields, scope_operator_static_fields,
+    static_call_selectors, static_proc_reference_paths, static_procedure_type_families,
+    type_is_descendant_or_same, validate_const_assignments,
 };
 
 /// Project-wide registry of canonical procedures and override chains.
@@ -1319,6 +1319,16 @@ impl ProcedureRegistry {
                         referenced_globals.insert(format!("src.{name}"), field);
                     }
                 }
+                // DM's `Type::name` scope operator reads and writes a literal
+                // type's shared `static` / `global` var through its type-owned
+                // slot. Bind each such reference so VM lowering redirects it to
+                // the same `__dm_static_` global instead of failing on a
+                // non-writable target.
+                referenced_globals.extend(scope_operator_static_fields(
+                    compilation,
+                    definition,
+                    direct_static_fields,
+                ));
                 for (receiver, path) in declared_receiver_types(definition) {
                     if let Some(type_id) = compilation.code_tree().find(&path) {
                         inherited_field_name_lookups.set(

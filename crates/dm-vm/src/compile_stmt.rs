@@ -118,14 +118,18 @@ impl<'fields> LocalTable<'fields> {
         receiver: &Expression,
         name: &FieldName,
     ) -> Option<&FieldName> {
-        let receiver = match receiver {
-            Expression::Src => "src",
-            Expression::Local(receiver) => receiver.as_str(),
-            Expression::GlobalField(receiver) => receiver.as_str(),
+        let key = match receiver {
+            Expression::Src => format!("src.{}", name.as_str()),
+            Expression::Local(receiver) => format!("{}.{}", receiver.as_str(), name.as_str()),
+            Expression::GlobalField(receiver) => {
+                format!("{}.{}", receiver.as_str(), name.as_str())
+            }
+            // DM's `Type::name` scope operator: the receiver is a literal type
+            // path, resolved by dm-semantics to a `"<path>::<name>"` key.
+            Expression::TypePath(path) => format!("{}::{}", path.as_str(), name.as_str()),
             _ => return None,
         };
-        self.global_fields
-            .get(&format!("{receiver}.{}", name.as_str()))
+        self.global_fields.get(&key)
     }
 
     fn remove(&mut self, name: &str) {
@@ -1187,6 +1191,32 @@ fn compile_assignment_statement(
                 instructions.push(compound_instruction(operator)?);
             }
             instructions.push(Instruction::StoreResult);
+        }
+        // DM's `Type::name = value` scope-operator assignment. The parser wraps
+        // the target in `Initial` purely to reuse the `::` field syntax; a
+        // resolved shared-static slot makes it a plain global store.
+        Expression::Initial(reference)
+            if matches!(
+                reference.as_ref(),
+                Expression::Field { receiver, name }
+                    if locals.receiver_static(receiver.as_ref(), name).is_some()
+            ) =>
+        {
+            let Expression::Field { receiver, name } = reference.as_ref() else {
+                unreachable!("guard matched a field reference")
+            };
+            let storage = locals
+                .receiver_static(receiver.as_ref(), name)
+                .expect("guard resolved the static slot")
+                .clone();
+            if operator != "=" {
+                instructions.push(Instruction::LoadGlobal(storage.clone()));
+            }
+            compile_expression(&tokens[assignment + 1..], locals, instructions, procedures)?;
+            if operator != "=" {
+                instructions.push(compound_instruction(operator)?);
+            }
+            instructions.push(Instruction::StoreGlobal(storage));
         }
         Expression::Unary {
             operator: unary_operator,
