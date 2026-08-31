@@ -8,7 +8,7 @@ use std::time::Instant;
 use crate::builtins::advance_native_walks;
 use crate::bytecode::Module;
 use crate::{
-    ExecutionLimits, RuntimeError, ScheduledSpawn, advance_headless_world_clock, register_prompt,
+    ExecutionLimits, RuntimeError, ScheduledSpawn, advance_headless_world_clock,
     set_world_numeric_field, world_numeric_field,
 };
 use dm_value::{FieldName, TypePath, Value};
@@ -143,7 +143,7 @@ pub fn advance_scheduler(
                 completed.push(value);
             }
             FrameRunOutcome::Yielded { frames, delay } => schedule_frames(state, frames, delay),
-            FrameRunOutcome::Prompted { id, prompt } => register_prompt(state, id, prompt),
+            FrameRunOutcome::Prompted { id, prompt } => state.client.register_prompt(id, prompt),
         }
     }
     state.scheduler_tick_started = None;

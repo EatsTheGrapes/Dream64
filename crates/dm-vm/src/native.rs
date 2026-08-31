@@ -68,7 +68,7 @@ pub(crate) use self::{
     tgm_ruin::{
         CANONICAL_MONKE_BUILD_COORDINATE_DIGEST, CANONICAL_TYPE2PARENT_SOURCE,
         build_tgm_load_continuation, canonical_type2parent_program, revalidated_ruin_rejection,
-        ruin_scan_attach_at_call, run_ruin_affected_turfs_batch,
-        run_tgm_build_cache_simple_member, tgm_attach_location,
+        ruin_scan_attach_at_call, run_ruin_affected_turfs_batch, run_tgm_build_cache_simple_member,
+        tgm_attach_location,
     },
 };

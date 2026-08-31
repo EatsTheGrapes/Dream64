@@ -4480,7 +4480,7 @@ pub(crate) fn assign_datum_field(
         state.resize_world_geometry(datum, dimensions)?;
     }
     let client_mob_assignment =
-        if field.as_str() == "mob" && state.client_sessions.contains_key(&datum) {
+        if field.as_str() == "mob" && state.client.has_session(datum) {
             match &value {
                 Value::Datum(mob) => {
                     let path = state
@@ -4511,13 +4511,13 @@ pub(crate) fn assign_datum_field(
     if let Some(client_mob_assignment) = client_mob_assignment {
         match client_mob_assignment {
             Some(mob) => {
-                state.local_client_mobs.insert(datum, mob);
+                state.client.attach_mob(datum, mob);
                 if let Some(module) = state.instance_initializer_module.clone() {
                     state.populate_local_verb_inventory(&module, mob)?;
                 }
             }
             None => {
-                state.local_client_mobs.remove(&datum);
+                state.client.detach_mob(datum);
             }
         }
     }

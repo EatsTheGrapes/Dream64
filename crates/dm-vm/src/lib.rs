@@ -43,7 +43,7 @@ pub use ready_snapshot::ReadyWorldCoreSnapshot;
 pub use value_ops::ExecutionContext;
 
 pub use local_client::{
-    LocalClientAppearance, LocalClientError, LocalClientMapSnapshot, LocalClientMapTile,
+    ClientState, LocalClientAppearance, LocalClientError, LocalClientMapSnapshot, LocalClientMapTile,
     LocalClientPromptKind, LocalClientPromptResponse, LocalClientScreenAppearance,
     LocalClientState, LocalClientUiEvent, LocalMovementDirection, LocalScreenPointerEvent,
 };
@@ -157,13 +157,12 @@ pub(crate) use native::{
     try_run_packed_numeric_dispatch_block, try_run_rich_numeric_dispatch_block,
 };
 
-#[cfg(test)]
-pub(crate) use builtins::is_subtype;
+pub(crate) use builtins::{execute_standard_builtin, is_subtype};
 
-#[cfg(test)]
 pub(crate) use value_ops::{
     assign_datum_or_shared_field, canonicalize_owned_value, canonicalize_value,
     datum_field_or_shared, dm_list_length_number, read_list_value, write_list_value,
+    logical_or_empty_list_field, logical_or_empty_list_index, stringify_dm_value, values_equal,
 };
 
 use bytecode::next_module_identity;
