@@ -6,6 +6,7 @@
 //! lobby preflighting, and the human-readable reporting helpers).
 
 pub(crate) mod cli;
+pub(crate) mod lobby_preflight;
 pub(crate) mod ready_world;
 pub(crate) mod reporting;
 pub(crate) mod server_loop;
