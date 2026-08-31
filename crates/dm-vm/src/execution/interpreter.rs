@@ -50,9 +50,9 @@ use crate::{
     dynamic_call_target_named, emit_atoms_profile, emit_tgm_profile, engine_builtin_initial_fields,
     engine_builtin_initial_value, false_tick_check_target, is_atom_type_path, lazy_atom_list_field,
     local_prompt_spec, mark_boot_trace_frame, prepare_iteration_consumes_fresh_block,
-    shuttle_trace_emit_snapshot, shuttle_trace_enabled,
-    shuttle_trace_prepare_call, shuttle_trace_slot_from_arguments,
-    simple_iteration_field_assignment, startup_instruction_category,
+    shuttle_trace_emit_snapshot, shuttle_trace_enabled, shuttle_trace_prepare_call,
+    shuttle_trace_slot_from_arguments, simple_iteration_field_assignment,
+    startup_instruction_category,
 };
 use dm_value::{FieldName, ModifiedTypePath, TypePath, Value, ValueError};
 use smallvec::SmallVec;
