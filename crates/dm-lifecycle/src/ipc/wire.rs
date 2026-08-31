@@ -8,7 +8,8 @@ use std::sync::mpsc::SyncSender;
 
 use dm_vm::{LocalClientPromptResponse, LocalMovementDirection};
 
-use super::{MAX_RESOURCE_CHUNK_BYTES, unhex};
+use super::MAX_RESOURCE_CHUNK_BYTES;
+use super::text_encoding::unhex;
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
