@@ -8,3 +8,4 @@
 pub(crate) mod cli;
 pub(crate) mod ready_world;
 pub(crate) mod reporting;
+pub(crate) mod server_loop;
