@@ -922,8 +922,8 @@ pub(super) use self::spatial::{advance_native_walks, is_subtype, synchronize_mov
 mod icons;
 #[cfg(test)]
 pub(super) use self::icons::DMI_METADATA_PHYSICAL_READS;
-pub(super) use self::icons::{DmiMetadata, read_dmi_metadata};
-use self::icons::{fcopy_rsc, icon_builtin, icon_states_builtin, icon_swap_color_builtin};
+pub(super) use self::icons::{DmiMetadata, icon_states_builtin, read_dmi_metadata};
+use self::icons::{fcopy_rsc, icon_builtin, icon_swap_color_builtin};
 // The dispatcher addresses the noise/forge/world/generator leaf procedures
 // unqualified; `resource_datum_builtin` is also shared with the icon builder.
 mod noise;

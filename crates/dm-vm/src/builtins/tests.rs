@@ -1095,6 +1095,97 @@ mod color_text_file_tests {
     }
 
     #[test]
+    fn icon_states_method_resolves_backing_dmi_and_honours_movement_mode() {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+
+        let root = std::env::temp_dir().join(format!(
+            "dream64-icon-states-method-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("icons")).unwrap();
+        let description = concat!(
+            "# BEGIN DMI\n",
+            "version = 4.0\n",
+            "width = 32\n",
+            "height = 32\n",
+            "state = \"idle\"\n",
+            "dirs = 1\n",
+            "frames = 1\n",
+            "state = \"walk\"\n",
+            "dirs = 4\n",
+            "frames = 1\n",
+            "movement = 1\n",
+            "# END DMI\n",
+        );
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(description.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut push_chunk = |kind: &[u8; 4], data: &[u8]| {
+            png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            png.extend_from_slice(kind);
+            png.extend_from_slice(data);
+            png.extend_from_slice(&[0; 4]);
+        };
+        let mut header = Vec::new();
+        header.extend_from_slice(&32u32.to_be_bytes());
+        header.extend_from_slice(&32u32.to_be_bytes());
+        header.extend_from_slice(&[8, 6, 0, 0, 0]);
+        push_chunk(b"IHDR", &header);
+        let mut text = b"Description\0\0".to_vec();
+        text.extend_from_slice(&compressed);
+        push_chunk(b"zTXt", &text);
+        push_chunk(b"IEND", &[]);
+        fs::write(root.join("icons/mob.dmi"), png).unwrap();
+
+        let mut state = ExecutionState::new();
+        state.set_project_root(root.clone());
+
+        // Build the same `/icon` datum the constructor produces, then drive the
+        // native `IconStates` method through its shared `icon_states` machinery.
+        let Value::Datum(icon) =
+            execute_standard_builtin("icon", &[Value::file("icons/mob.dmi")], &mut state).unwrap()
+        else {
+            panic!("icon() should return an /icon datum");
+        };
+
+        let collect = |value: Value, state: &ExecutionState| {
+            let Value::List(list) = value else {
+                panic!("IconStates should return a list");
+            };
+            state
+                .heap()
+                .list(list)
+                .unwrap()
+                .positions()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let all = icon_states_builtin(&[Value::Datum(icon)], &mut state).unwrap();
+        assert_eq!(
+            collect(all, &state),
+            vec![Value::text("idle"), Value::text("walk")],
+        );
+
+        let movement =
+            icon_states_builtin(&[Value::Datum(icon), Value::number(1.0)], &mut state).unwrap();
+        assert_eq!(collect(movement, &state), vec![Value::text("walk")]);
+
+        let mode_zero =
+            icon_states_builtin(&[Value::Datum(icon), Value::number(0.0)], &mut state).unwrap();
+        assert_eq!(
+            collect(mode_zero, &state),
+            vec![Value::text("idle"), Value::text("walk")],
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn text2num_passes_numbers_and_null_like_byond_516() {
         let state = ExecutionState::new();
         assert_eq!(
