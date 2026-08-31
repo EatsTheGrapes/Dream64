@@ -18516,6 +18516,61 @@ fn dynamic_field_access_resolves_inherited_shared_storage_after_instance_fields(
 }
 
 #[test]
+fn scope_operator_static_assignment_and_read_target_the_shared_slot() {
+    // DM `Type::name` scope operator: the semantic layer binds it to a
+    // `"<type path>::<name>"` key in `global_fields`; VM lowering must redirect
+    // the write, the compound update, and the read to that qualified static
+    // slot instead of failing on a non-writable target.
+    let source = concat!(
+        "/proc/meta_gas_list()\n",
+        "\t/datum/gas_mixture::gas_meta = 5\n",
+        "\t/datum/gas_mixture::gas_meta += 2\n",
+        "\treturn /datum/gas_mixture::gas_meta\n",
+    );
+    let syntax = parse(source).expect("scope-operator source should parse");
+    let procedures = syntax
+        .definitions
+        .iter()
+        .filter(|definition| matches!(definition.kind, DefinitionKind::Procedure))
+        .cloned()
+        .collect::<Vec<_>>();
+    let storage = FieldName::static_storage("/datum/gas_mixture/var/gas_meta");
+    let globals = BTreeMap::from([("/datum/gas_mixture::gas_meta".to_owned(), storage.clone())]);
+    let module = compile_module_with_global_fields(&procedures, &globals)
+        .expect("scope-operator statics should compile");
+    let entry = module.procedure_id("/proc/meta_gas_list").unwrap();
+    let program = module.procedure(entry).unwrap();
+    assert!(
+        program
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::StoreGlobal(field) if field == &storage)),
+        "{:?}",
+        program.instructions
+    );
+    assert!(
+        program.instructions.iter().any(
+            |instruction| matches!(instruction, Instruction::LoadGlobal(field) if field == &storage)
+        ),
+        "{:?}",
+        program.instructions
+    );
+    assert!(!program.instructions.iter().any(|instruction| matches!(
+        instruction,
+        Instruction::StoreField(_)
+            | Instruction::LoadInitialGlobal(_)
+            | Instruction::InitialField(_)
+    )));
+
+    let mut state = ExecutionState::new();
+    assert_eq!(
+        execute_module_in_state(&module, entry, &[], &mut state),
+        Ok(Value::number(7.0))
+    );
+    assert_eq!(state.global(&storage), Some(&Value::number(7.0)));
+}
+
+#[test]
 fn atom_appearance_read_returns_a_truthy_snapshot_for_overlay_normalization() {
     let source = concat!(
         "/proc/normalize(atom/target)\n",

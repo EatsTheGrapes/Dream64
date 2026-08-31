@@ -2591,9 +2591,18 @@ pub(crate) fn emit_expression(
         Expression::Initial(reference) => match reference.as_ref() {
             Expression::Field { receiver, name } => {
                 if let Some(storage) = locals.receiver_static(receiver, name) {
-                    // Static initialization is materialized before procedures
-                    // run and occupies its qualified persistent slot.
-                    instructions.push(Instruction::LoadInitialGlobal(storage.clone()));
+                    if matches!(receiver.as_ref(), Expression::TypePath(_)) {
+                        // `Type::name` is DM's scope operator, not `initial()`:
+                        // it reads the type's shared static slot live. The
+                        // parser routes it through `Initial` only for syntax
+                        // reuse.
+                        instructions.push(Instruction::LoadGlobal(storage.clone()));
+                    } else {
+                        // Static initialization is materialized before
+                        // procedures run and occupies its qualified persistent
+                        // slot.
+                        instructions.push(Instruction::LoadInitialGlobal(storage.clone()));
+                    }
                 } else {
                     emit_expression(receiver, locals, instructions, procedures)?;
                     instructions.push(Instruction::InitialField(name.clone()));
@@ -2997,6 +3006,23 @@ fn emit_logical_or_empty_list_assignment(
                 instructions.push(Instruction::LogicalOrEmptyListField(name.clone()));
             }
         }
+        Expression::Initial(reference)
+            if matches!(
+                reference.as_ref(),
+                Expression::Field { receiver, name }
+                    if name.as_str() != "vars"
+                        && locals.receiver_static(receiver, name).is_some()
+            ) =>
+        {
+            let Expression::Field { receiver, name } = reference.as_ref() else {
+                unreachable!("guard matched a field reference")
+            };
+            let storage = locals
+                .receiver_static(receiver, name)
+                .expect("guard resolved the static slot")
+                .clone();
+            instructions.push(Instruction::LogicalOrEmptyListGlobal(storage));
+        }
         Expression::Index { list, index } => {
             emit_expression(list, locals, instructions, procedures)?;
             emit_expression(index, locals, instructions, procedures)?;
@@ -3082,6 +3108,28 @@ fn emit_mutation_expression(
                 instructions[null_jump] = Instruction::JumpIfNull(end);
             }
         }
+        // `Type::name++` — the scope operator parses through `Initial`; mutate
+        // the resolved shared static slot in place.
+        Expression::Initial(reference)
+            if matches!(
+                reference.as_ref(),
+                Expression::Field { receiver, name }
+                    if locals.receiver_static(receiver, name).is_some()
+            ) =>
+        {
+            let Expression::Field { receiver, name } = reference.as_ref() else {
+                unreachable!("guard matched a field reference")
+            };
+            let storage = locals
+                .receiver_static(receiver, name)
+                .expect("guard resolved the static slot")
+                .clone();
+            instructions.push(Instruction::MutateGlobal {
+                name: storage,
+                delta,
+                prefix,
+            });
+        }
         Expression::Index { list, index } => {
             emit_expression(list, locals, instructions, procedures)?;
             emit_expression(index, locals, instructions, procedures)?;
@@ -3090,6 +3138,29 @@ fn emit_mutation_expression(
         Expression::Result => instructions.push(Instruction::MutateResult { delta, prefix }),
         _ => return Err(compile_error("increment/decrement target is not writable")),
     }
+    Ok(())
+}
+
+/// Emits an assignment to a qualified static slot in expression position,
+/// leaving the assigned value on the stack. Mirrors the `GlobalField` arm of
+/// [`emit_assignment_expression`], including compound-operator handling.
+fn emit_qualified_static_assignment(
+    storage: FieldName,
+    operator: &str,
+    value: &Expression,
+    locals: &LocalTable,
+    instructions: &mut Vec<Instruction>,
+    procedures: &HashMap<String, ProcedureId>,
+) -> Result<(), CompileError> {
+    if operator != "=" {
+        instructions.push(Instruction::LoadGlobal(storage.clone()));
+    }
+    emit_expression(value, locals, instructions, procedures)?;
+    if operator != "=" {
+        instructions.push(compound_instruction(operator)?);
+    }
+    instructions.push(Instruction::Duplicate);
+    instructions.push(Instruction::StoreGlobal(storage));
     Ok(())
 }
 
@@ -3178,16 +3249,53 @@ fn emit_assignment_expression(
             instructions.push(Instruction::StoreSrc);
         }
         Expression::Field { receiver, name } => {
-            emit_expression(receiver, locals, instructions, procedures)?;
-            if operator != "=" {
-                instructions.push(Instruction::Duplicate);
-                instructions.push(Instruction::LoadField(name.clone()));
+            if let Some(storage) = locals.receiver_static(receiver, name) {
+                emit_qualified_static_assignment(
+                    storage.clone(),
+                    operator,
+                    value,
+                    locals,
+                    instructions,
+                    procedures,
+                )?;
+            } else {
+                emit_expression(receiver, locals, instructions, procedures)?;
+                if operator != "=" {
+                    instructions.push(Instruction::Duplicate);
+                    instructions.push(Instruction::LoadField(name.clone()));
+                }
+                emit_expression(value, locals, instructions, procedures)?;
+                if operator != "=" {
+                    instructions.push(compound_instruction(operator)?);
+                }
+                instructions.push(Instruction::StoreFieldKeep(name.clone()));
             }
-            emit_expression(value, locals, instructions, procedures)?;
-            if operator != "=" {
-                instructions.push(compound_instruction(operator)?);
-            }
-            instructions.push(Instruction::StoreFieldKeep(name.clone()));
+        }
+        // DM's `Type::name` scope operator parses through `Initial`; a writable
+        // target here is a literal type's shared static, resolved by
+        // dm-semantics to a qualified `__dm_static_` slot.
+        Expression::Initial(reference)
+            if matches!(
+                reference.as_ref(),
+                Expression::Field { receiver, name }
+                    if locals.receiver_static(receiver, name).is_some()
+            ) =>
+        {
+            let Expression::Field { receiver, name } = reference.as_ref() else {
+                unreachable!("guard matched a field reference")
+            };
+            let storage = locals
+                .receiver_static(receiver, name)
+                .expect("guard resolved the static slot")
+                .clone();
+            emit_qualified_static_assignment(
+                storage,
+                operator,
+                value,
+                locals,
+                instructions,
+                procedures,
+            )?;
         }
         Expression::SafeField { receiver, name } => {
             emit_expression(receiver, locals, instructions, procedures)?;
