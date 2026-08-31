@@ -24,16 +24,16 @@ const MAX_TARGET_LENGTH: usize = 255;
 const DEFAULT_MMAP_THRESHOLD: u64 = 1024 * 1024;
 
 /// Current on-disk artifact schema.
-pub const ARTIFACT_SCHEMA: u16 = 1;
+pub(crate) const ARTIFACT_SCHEMA: u16 = 1;
 
 /// Maximum accepted encoded artifact length (16 GiB).
-pub const MAX_ARTIFACT_LENGTH: u64 = 16 * 1024 * 1024 * 1024;
+pub(crate) const MAX_ARTIFACT_LENGTH: u64 = 16 * 1024 * 1024 * 1024;
 
 /// Maximum accepted payload section length (8 GiB).
-pub const MAX_SECTION_LENGTH: u64 = 8 * 1024 * 1024 * 1024;
+pub(crate) const MAX_SECTION_LENGTH: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Maximum number of independently checksummed payload sections.
-pub const MAX_SECTIONS: usize = 1_024;
+pub(crate) const MAX_SECTIONS: usize = 1_024;
 
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 

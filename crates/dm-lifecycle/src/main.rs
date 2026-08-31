@@ -153,7 +153,6 @@ const fn progress_label(command: Command) -> &'static str {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn main() -> ExitCode {
     // Large production DM procedures (notably tg/Monk's macro-expanded
     // /atom/Initialize) legitimately create a deeply nested compiler walk.

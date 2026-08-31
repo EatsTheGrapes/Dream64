@@ -7,16 +7,10 @@
 /// selection. PrecompiledLifecycle still carries persistent_state:
 /// Option<ExecutionState> — a hidden execution coupling that ideally would be
 /// split into a separate PersistentLifecycle in a future execution extraction.
-/// For now the field and its ExecutionState-touching methods remain here to
-/// preserve exact behavior and API compatibility; precompile.rs therefore
-/// still imports dm_vm::ExecutionState (see remaining-concerns note).
 use std::collections::BTreeSet;
-use std::time::Duration;
 
 use dm_compiler::Compilation;
-use dm_semantics::{ExecutableProcedures, ProcedureImplementationId, ProcedureRegistry};
-use dm_value::{DatumId, FieldName, Value};
-use dm_vm::{CompileError, ExecutionState, LocalClientState, LocalScreenPointerEvent, Module};
+use dm_semantics::{ProcedureImplementationId, ProcedureRegistry};
 use dm_world::{InitializerResolution, WorldPlan};
 
 use crate::lifecycle_index::{LifecycleIndex, LifecycleKind, LifecycleResolution};
@@ -37,12 +31,6 @@ impl PrecompiledLifecycle {
     #[must_use]
     pub fn module(&self) -> &dm_vm::Module {
         self.executable.module()
-    }
-
-    /// Installs a validated ready-world state loaded from the startup cache.
-    #[doc(hidden)]
-    pub fn install_persistent_state(&mut self, state: dm_vm::ExecutionState) {
-        self.persistent_state = Some(state);
     }
 
     /// Returns the complete linked module so runtime initializer expressions
@@ -80,148 +68,6 @@ impl PrecompiledLifecycle {
     #[must_use]
     pub fn deferred_procedures(&self) -> usize {
         self.executable.module().deferred_procedure_count()
-    }
-
-    /// Host duration of one current BYOND world tick for persistent pacing.
-    #[must_use]
-    pub fn persistent_tick_duration(&self) -> std::time::Duration {
-        let tick_lag = self
-            .persistent_state
-            .as_ref()
-            .and_then(|state| {
-                let world = state.global(&FieldName::parse("world").ok()?)?;
-                let Value::Datum(world) = world else {
-                    return None;
-                };
-                state
-                    .heap()
-                    .datum_field(*world, &FieldName::parse("tick_lag").ok()?)
-                    .ok()?
-                    .as_number()
-            })
-            .filter(|tick_lag| tick_lag.is_finite() && *tick_lag > 0.0)
-            .unwrap_or(1.0);
-        std::time::Duration::from_secs_f64(f64::from(tick_lag) / 10.0)
-    }
-
-    /// Returns the live VM state retained by a completed headless boot.
-    ///
-    /// Hosts use this at the persistent-scheduler boundary to service local
-    /// client sessions without duplicating world state in a second runtime.
-    #[must_use]
-    pub fn persistent_state_mut(&mut self) -> Option<&mut dm_vm::ExecutionState> {
-        self.persistent_state.as_mut()
-    }
-
-    /// Returns bounded suspended-DM telemetry for controlled host shutdown.
-    #[must_use]
-    pub fn bounded_scheduler_progress(&self) -> Vec<String> {
-        self.persistent_state
-            .as_ref()
-            .map_or_else(Vec::new, |state| {
-                state.bounded_scheduler_progress(self.executable.module())
-            })
-    }
-
-    /// Installs a loopback guest in the persistent world and queues the
-    /// project's effective `/client/New()` hook on the world scheduler.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when persistent startup is incomplete or the guest
-    /// cannot be created and scheduled.
-    pub fn connect_local_guest(&mut self) -> Result<dm_vm::LocalClientState, String> {
-        let state = self
-            .persistent_state
-            .as_mut()
-            .ok_or_else(|| "persistent world is not ready for clients".to_owned())?;
-        state.connect_local_guest(self.executable.module())
-    }
-
-    /// Queues one command through the connected client's effective verb set.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when startup is incomplete or command resolution fails.
-    pub fn queue_local_client_command(
-        &mut self,
-        client: DatumId,
-        command: &str,
-    ) -> Result<(), String> {
-        let state = self
-            .persistent_state
-            .as_mut()
-            .ok_or_else(|| "persistent world is not ready for clients".to_owned())?;
-        state.queue_local_client_command(self.executable.module(), client, command)
-    }
-
-    /// Queues one browser topic against the connected client's `Topic()`.
-    pub fn queue_local_browser_topic(
-        &mut self,
-        client: DatumId,
-        topic: &str,
-    ) -> Result<(), String> {
-        let state = self
-            .persistent_state
-            .as_mut()
-            .ok_or_else(|| "persistent world is not ready for clients".to_owned())?;
-        state.queue_local_browser_topic(self.executable.module(), client, topic)
-    }
-
-    /// Queues one pointer event for a session-owned screen object.
-    #[allow(clippy::too_many_arguments)]
-    pub fn queue_local_screen_pointer(
-        &mut self,
-        client: DatumId,
-        index: u32,
-        generation: u32,
-        event: dm_vm::LocalScreenPointerEvent,
-        location: &str,
-        params: &str,
-    ) -> Result<(), String> {
-        let state = self
-            .persistent_state
-            .as_mut()
-            .ok_or_else(|| "persistent world is not ready for clients".to_owned())?;
-        state.queue_local_screen_pointer(
-            self.executable.module(),
-            client,
-            index,
-            generation,
-            event,
-            location,
-            params,
-        )
-    }
-
-    /// Queues one click for an atom rendered in a session-visible map cell.
-    #[allow(clippy::too_many_arguments)]
-    pub fn queue_local_map_pointer(
-        &mut self,
-        client: DatumId,
-        index: u32,
-        generation: u32,
-        x: i32,
-        y: i32,
-        z: i32,
-        control: &str,
-        params: &str,
-    ) -> Result<(), String> {
-        let state = self
-            .persistent_state
-            .as_mut()
-            .ok_or_else(|| "persistent world is not ready for clients".to_owned())?;
-        state.queue_local_map_pointer(
-            self.executable.module(),
-            client,
-            index,
-            generation,
-            x,
-            y,
-            z,
-            control,
-            params,
-        )
     }
 }
 

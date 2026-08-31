@@ -20,7 +20,7 @@ use dm_runtime::RuntimeImage;
 use dm_semantics::ExecutableProcedures;
 use dm_vm::{ExecutionLimits, Module, RuntimeError, advance_scheduler};
 
-use crate::InitializationExecutionError;
+use crate::execute::InitializationExecutionError;
 use crate::precompile::PrecompiledLifecycle;
 use crate::readiness::{HeadlessReadinessProbe, readiness_probe_matches};
 
@@ -138,9 +138,7 @@ pub(crate) fn drain_startup_scheduler(
     state: &mut dm_vm::ExecutionState,
     limits: SchedulerDrainLimits,
     readiness: Option<&HeadlessReadinessProbe>,
-    mut startup_service: Option<
-        &mut dyn FnMut(&ExecutableProcedures, &mut dm_vm::ExecutionState),
-    >,
+    mut startup_service: Option<&mut dyn FnMut(&ExecutableProcedures, &mut dm_vm::ExecutionState)>,
 ) -> Result<SchedulerDrain, InitializationExecutionError> {
     let start_tick = state.scheduler_tick();
     let tick_limit = start_tick.saturating_add(limits.max_ticks);
