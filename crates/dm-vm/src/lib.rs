@@ -43,14 +43,15 @@ pub use ready_snapshot::ReadyWorldCoreSnapshot;
 pub use value_ops::ExecutionContext;
 
 pub use local_client::{
-    ClientState, LocalClientAppearance, LocalClientError, LocalClientMapSnapshot, LocalClientMapTile,
-    LocalClientPromptKind, LocalClientPromptResponse, LocalClientScreenAppearance,
-    LocalClientState, LocalClientUiEvent, LocalMovementDirection, LocalScreenPointerEvent,
+    ClientState, LocalClientAppearance, LocalClientError, LocalClientMapSnapshot,
+    LocalClientMapTile, LocalClientPromptKind, LocalClientPromptResponse,
+    LocalClientScreenAppearance, LocalClientState, LocalClientUiEvent, LocalMovementDirection,
+    LocalScreenPointerEvent,
 };
 
 pub(crate) use local_client::{
-    ExceptionHandler, PendingLocalPrompt, PendingPromptContinuation, PendingVerbInvocation,
-    SavefileState, ScheduledSpawn, local_prompt_spec, queue_next_verb_prompt, register_prompt,
+    ExceptionHandler, PendingLocalPrompt, PendingPromptContinuation, SavefileState, ScheduledSpawn,
+    local_prompt_spec, register_prompt,
 };
 
 pub use execution::{
