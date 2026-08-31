@@ -14,11 +14,11 @@ use crate::builtins;
 use crate::bytecode::{InstanceInitializer, Module, ProcedureId};
 use crate::value_ops::ExecutionContext;
 use crate::{
-    AtomsProfile, DmmMeasurement, GlobalStore, HeapReference, LocalClientAppearance,
+    AtomsProfile, ClientState, DmmMeasurement, GlobalStore, HeapReference, LocalClientAppearance,
     LocalClientError, LocalClientMapSnapshot, LocalClientMapTile, LocalClientPromptKind,
     LocalClientPromptResponse, LocalClientScreenAppearance, LocalClientState, LocalClientUiEvent,
     LocalMovementDirection, LocalScreenPointerEvent, MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES,
-    MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE, NativeWalk, ParsedDmm, PendingLocalPrompt,
+    MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE, NativeWalk, ParsedDmm,
     PendingPromptContinuation, PendingVerbInvocation, QuiescentHeapCompaction, SavefileState,
     ScheduledSpawn, TgmProfile, VerbParameterType, allocate_initialized_datum, assign_datum_field,
     boot_dashboard_enabled, boot_trace_enabled, datum_field_or_initial, datum_shared_storage,
@@ -101,16 +101,7 @@ pub struct ExecutionState {
     pub(crate) reference_lists: HashSet<ListId>,
     pub(crate) savefiles: HashMap<DatumId, SavefileState>,
     pub(crate) savefile_entries: HashMap<DatumId, (DatumId, String)>,
-    pub(crate) client_sessions: BTreeMap<DatumId, ClientSession>,
-    pub(crate) interactive_local_clients: HashSet<DatumId>,
-    pub(crate) local_client_skin: Option<ControlTree>,
-    pub(crate) local_client_outbound_events: BTreeMap<DatumId, Vec<LocalClientUiEvent>>,
-    pub(crate) local_client_mobs: BTreeMap<DatumId, DatumId>,
-    pub(crate) local_client_commands: Vec<(u64, DatumId, LocalMovementDirection)>,
-    pub(crate) local_client_command_sequence: u64,
-    pub(crate) local_guest_sequence: u64,
-    pub(crate) local_prompt_sequence: u64,
-    pub(crate) pending_local_prompts: BTreeMap<u64, PendingLocalPrompt>,
+    pub(crate) client: ClientState,
     pub(crate) global_vars_proxy: Option<ListId>,
     pub(crate) datum_vars_proxies: HashMap<ListId, DatumId>,
     pub(crate) datum_vars_by_datum: HashMap<DatumId, ListId>,
@@ -261,16 +252,7 @@ impl ExecutionState {
             reference_lists: HashSet::new(),
             savefiles: HashMap::new(),
             savefile_entries: HashMap::new(),
-            client_sessions: BTreeMap::new(),
-            interactive_local_clients: HashSet::new(),
-            local_client_skin: None,
-            local_client_outbound_events: BTreeMap::new(),
-            local_client_mobs: BTreeMap::new(),
-            local_client_commands: Vec::new(),
-            local_client_command_sequence: 0,
-            local_guest_sequence: 0,
-            local_prompt_sequence: 0,
-            pending_local_prompts: BTreeMap::new(),
+            client: ClientState::new(),
             global_vars_proxy: None,
             datum_vars_proxies: HashMap::new(),
             datum_vars_by_datum: HashMap::new(),
@@ -1055,13 +1037,12 @@ impl ExecutionState {
 
     /// Installs a skin-backed UI session for a connected client datum.
     pub fn install_client_session(&mut self, client: DatumId, tree: ControlTree) {
-        self.client_sessions
-            .insert(client, ClientSession::new(tree));
+        self.client.install_session(client, tree);
     }
 
     /// Sets the parsed skin cloned into subsequently connected local clients.
     pub fn set_local_client_skin(&mut self, tree: ControlTree) {
-        self.local_client_skin = Some(tree);
+        self.client.set_skin(tree);
     }
 
     /// Drains authoritative UI operations in exact DM execution order.
@@ -1070,9 +1051,7 @@ impl ExecutionState {
         &mut self,
         client: DatumId,
     ) -> Vec<LocalClientUiEvent> {
-        self.local_client_outbound_events
-            .remove(&client)
-            .unwrap_or_default()
+        self.client.take_outbound_events().remove(&client).unwrap_or_default()
     }
 
     pub(crate) fn emit_local_client_ui_event(
@@ -1080,18 +1059,13 @@ impl ExecutionState {
         client: DatumId,
         event: LocalClientUiEvent,
     ) {
-        if self.client_sessions.contains_key(&client) {
-            self.local_client_outbound_events
-                .entry(client)
-                .or_default()
-                .push(event);
-        }
+        self.client.emit_ui_event(client, event);
     }
 
     /// Returns the number of DM continuations waiting for native prompt input.
     #[must_use]
     pub fn pending_local_prompt_count(&self) -> usize {
-        self.pending_local_prompts.len()
+        self.client.pending_prompt_count()
     }
 
     /// Supplies one typed native prompt answer and schedules its suspended DM
@@ -1108,11 +1082,11 @@ impl ExecutionState {
         response: LocalClientPromptResponse,
     ) -> Result<(), String> {
         let prompt = self
-            .pending_local_prompts
-            .remove(&id)
+            .client
+            .take_prompt(id)
             .ok_or_else(|| format!("unknown local prompt {id}"))?;
         if prompt.client != client {
-            self.pending_local_prompts.insert(id, prompt);
+            self.client.register_prompt(id, prompt);
             return Err(format!("local prompt {id} belongs to another client"));
         }
         if matches!(response, LocalClientPromptResponse::Null)
@@ -1124,7 +1098,7 @@ impl ExecutionState {
         let value = match response {
             LocalClientPromptResponse::Null if prompt.can_cancel => Value::Null,
             LocalClientPromptResponse::Null => {
-                self.pending_local_prompts.insert(id, prompt);
+                self.client.register_prompt(id, prompt);
                 return Err(format!("local prompt {id} cannot be cancelled"));
             }
             LocalClientPromptResponse::Text(value)
@@ -1146,7 +1120,7 @@ impl ExecutionState {
                 if prompt.kind == LocalClientPromptKind::Number =>
             {
                 Value::number(value.parse::<f32>().map_err(|_| {
-                    self.pending_local_prompts.insert(id, prompt.clone());
+                    self.client.register_prompt(id, prompt.clone());
                     format!("local prompt {id} requires a number")
                 })?)
             }
@@ -1162,12 +1136,12 @@ impl ExecutionState {
                 ) =>
             {
                 prompt.choices.get(index).cloned().ok_or_else(|| {
-                    self.pending_local_prompts.insert(id, prompt.clone());
+                    self.client.register_prompt(id, prompt.clone());
                     format!("local prompt {id} choice {index} is out of range")
                 })?
             }
             _ => {
-                self.pending_local_prompts.insert(id, prompt);
+                self.client.register_prompt(id, prompt);
                 return Err(format!(
                     "local prompt {id} received an incompatible response"
                 ));
@@ -1212,12 +1186,12 @@ impl ExecutionState {
     /// Returns the UI session associated with a connected client datum.
     #[must_use]
     pub fn client_session(&self, client: DatumId) -> Option<&ClientSession> {
-        self.client_sessions.get(&client)
+        self.client.client_sessions.get(&client)
     }
 
     /// Returns the mutable UI session associated with a connected client datum.
     pub fn client_session_mut(&mut self, client: DatumId) -> Option<&mut ClientSession> {
-        self.client_sessions.get_mut(&client)
+        self.client.client_sessions.get_mut(&client)
     }
 
     /// Enables or disables modal prompt suspension for a window-attached
@@ -1228,21 +1202,18 @@ impl ExecutionState {
         client: DatumId,
         interactive: bool,
     ) -> Result<(), String> {
-        if !self.client_sessions.contains_key(&client) {
+        if !self.client.has_session(client) {
             return Err("local client has no installed UI session".to_owned());
         }
-        if interactive {
-            self.interactive_local_clients.insert(client);
-        } else {
-            self.interactive_local_clients.remove(&client);
-        }
+        self.client.set_interactive(client, interactive);
         Ok(())
     }
 
     /// Drains local UI events emitted by one connected client.
     #[must_use]
     pub fn take_client_events(&mut self, client: DatumId) -> Vec<UiEvent> {
-        self.client_sessions
+        self.client
+            .client_sessions
             .get_mut(&client)
             .map_or_else(Vec::new, ClientSession::take_events)
     }
@@ -1300,7 +1271,7 @@ impl ExecutionState {
                 Value::Datum(turf),
             )?;
         }
-        self.local_client_mobs.insert(client, mob);
+        self.client.attach_mob(client, mob);
         self.local_client_state(client)
     }
 
@@ -1343,7 +1314,7 @@ impl ExecutionState {
             FieldName::parse("loc").unwrap(),
             Value::Datum(turf),
         )?;
-        self.local_client_mobs.insert(client, mob);
+        self.client.attach_mob(client, mob);
         self.local_client_state(client)
     }
 
@@ -1383,7 +1354,7 @@ impl ExecutionState {
     /// Returns an error when the world has no turf, the client cannot be bound,
     /// or the runtime client type has no effective `New` implementation.
     pub fn connect_local_guest(&mut self, module: &Module) -> Result<LocalClientState, String> {
-        if self.local_client_skin.is_none()
+        if self.client.local_client_skin.is_none()
             && let Some(root) = self.project_root.as_deref()
         {
             let skin_path = root.join("interface").join("skin.dmf");
@@ -1406,14 +1377,13 @@ impl ExecutionState {
                         diagnostic.message
                     ));
                 }
-                self.local_client_skin = Some(ControlTree::from_document(&document));
+                self.client.set_skin(ControlTree::from_document(&document));
             }
         }
         let attached = self.create_pending_local_client()?;
         self.populate_local_verb_inventory(module, attached.client)?;
         self.populate_local_verb_inventory(module, attached.mob)?;
-        let sequence = self.local_guest_sequence.saturating_add(1);
-        self.local_guest_sequence = sequence;
+        let sequence = self.client.next_guest_id();
         let key = format!("Guest-{sequence}");
         for (name, value) in [
             ("key", Value::text(key.as_str())),
@@ -1434,7 +1404,7 @@ impl ExecutionState {
         }
         self.install_client_session(
             attached.client,
-            self.local_client_skin.clone().unwrap_or_default(),
+            self.client.local_client_skin.clone().unwrap_or_default(),
         );
 
         let receiver = Value::Datum(attached.client);
@@ -1463,15 +1433,11 @@ impl ExecutionState {
         direction: LocalMovementDirection,
     ) -> Result<(), String> {
         let mob = self
-            .local_client_mobs
-            .get(&client)
-            .copied()
+            .client
+            .attached_mob(client)
             .ok_or_else(|| "local client is not attached to a mob".to_owned())?;
         self.heap.datum(mob).map_err(|error| error.to_string())?;
-        let sequence = self.local_client_command_sequence;
-        self.local_client_command_sequence = sequence.saturating_add(1);
-        self.local_client_commands
-            .push((sequence, client, direction));
+        self.client.queue_command(client, direction);
         Ok(())
     }
 
@@ -1488,9 +1454,9 @@ impl ExecutionState {
         client: DatumId,
         topic: &str,
     ) -> Result<(), String> {
-        let mob = *self
-            .local_client_mobs
-            .get(&client)
+        let mob = self
+            .client
+            .attached_mob(client)
             .ok_or_else(|| "local client is not attached".to_owned())?;
         self.heap.datum(client).map_err(|error| error.to_string())?;
         self.heap.datum(mob).map_err(|error| error.to_string())?;
@@ -1555,9 +1521,9 @@ impl ExecutionState {
         client: DatumId,
         command: &str,
     ) -> Result<(), String> {
-        let mob = *self
-            .local_client_mobs
-            .get(&client)
+        let mob = self
+            .client
+            .attached_mob(client)
             .ok_or_else(|| "local client is not attached to a mob".to_owned())?;
         self.heap.datum(client).map_err(|error| error.to_string())?;
         self.heap.datum(mob).map_err(|error| error.to_string())?;
@@ -1756,13 +1722,13 @@ impl ExecutionState {
     ///
     /// Returns an error if an attached datum or its authoritative turf is stale.
     pub fn apply_local_client_commands(&mut self) -> Result<Vec<LocalClientState>, String> {
-        let mut commands = std::mem::take(&mut self.local_client_commands);
+        let mut commands = self.client.take_commands();
         commands.sort_by_key(|(sequence, _, _)| *sequence);
         let mut committed = Vec::with_capacity(commands.len());
         for (_, client, direction) in commands {
-            let mob = *self
-                .local_client_mobs
-                .get(&client)
+            let mob = self
+                .client
+                .attached_mob(client)
                 .ok_or_else(|| "local client detached before movement commit".to_owned())?;
             let current = self.local_client_coordinates(mob)?;
             let (dx, dy) = match direction {
@@ -1790,9 +1756,9 @@ impl ExecutionState {
     ///
     /// Returns an error for an unknown client or a mob outside a turf.
     pub fn local_client_state(&self, client: DatumId) -> Result<LocalClientState, String> {
-        let mob = *self
-            .local_client_mobs
-            .get(&client)
+        let mob = self
+            .client
+            .attached_mob(client)
             .ok_or_else(|| "local client is not attached to a mob".to_owned())?;
         let (x, y, z) = self.local_client_coordinates(mob)?;
         Ok(LocalClientState {
@@ -1811,9 +1777,9 @@ impl ExecutionState {
         &self,
         client: DatumId,
     ) -> Result<(i32, i32, i32), String> {
-        let mob = *self
-            .local_client_mobs
-            .get(&client)
+        let mob = self
+            .client
+            .attached_mob(client)
             .ok_or_else(|| "local client is not attached to a mob".to_owned())?;
         let eye = datum_field_or_initial(
             self,
@@ -2022,9 +1988,9 @@ impl ExecutionState {
         location: &str,
         params: &str,
     ) -> Result<(), String> {
-        let mob = *self
-            .local_client_mobs
-            .get(&client)
+        let mob = self
+            .client
+            .attached_mob(client)
             .ok_or_else(|| "local client is not attached to a mob".to_owned())?;
         let screen = datum_field_or_initial(
             self,
@@ -2064,9 +2030,9 @@ impl ExecutionState {
         control: &str,
         params: &str,
     ) -> Result<(), String> {
-        let mob = *self
-            .local_client_mobs
-            .get(&client)
+        let mob = self
+            .client
+            .attached_mob(client)
             .ok_or_else(|| "local client is not attached to a mob".to_owned())?;
         let target = self
             .heap
@@ -2752,7 +2718,7 @@ impl ExecutionState {
     /// Returns the number of suspended or spawned tasks awaiting dispatch.
     #[must_use]
     pub fn scheduled_task_count(&self) -> usize {
-        self.scheduled_spawns.len() + self.pending_local_prompts.len()
+        self.scheduled_spawns.len() + self.client.pending_prompt_count()
     }
 
     /// Returns allocation-neutral suspended-frame metrics for runtime benchmarks.
@@ -2946,9 +2912,8 @@ impl ExecutionState {
                 .flat_map(|(entry, (savefile, _))| [*entry, *savefile]),
         );
         datum_roots.extend(self.deleting_datums.iter().copied());
-        datum_roots.extend(self.client_sessions.keys().copied());
-        datum_roots.extend(self.local_client_mobs.keys().copied());
-        datum_roots.extend(self.local_client_mobs.values().copied());
+        datum_roots.extend(self.client.session_datums());
+        datum_roots.extend(self.client.mob_datums());
         datum_roots.extend(self.compact_default_datums.iter().copied());
         datum_roots.extend(self.world_turfs.values().copied());
         datum_roots.extend(self.world_areas.values().copied());
@@ -2964,9 +2929,9 @@ impl ExecutionState {
             datum_roots.push(*datum);
             list_roots.push(*list);
         }
-        for prompt in self.pending_local_prompts.values() {
-            datum_roots.push(prompt.client);
-            extend_heap_root_ids(&mut datum_roots, &mut list_roots, &prompt.choices);
+        for prompt in self.client.pending_prompts() {
+            datum_roots.push(prompt.1.client);
+            extend_heap_root_ids(&mut datum_roots, &mut list_roots, &prompt.1.choices);
         }
 
         let mut add_frame_roots = |frame: &CallFrame| {
@@ -3033,7 +2998,7 @@ impl ExecutionState {
                 add_frame_roots(frame);
             }
         }
-        for prompt in self.pending_local_prompts.values() {
+        for (_, prompt) in self.client.pending_prompts() {
             match &prompt.continuation {
                 PendingPromptContinuation::Frames(frames) => {
                     for frame in frames {

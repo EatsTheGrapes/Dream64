@@ -61,10 +61,14 @@ pub(crate) use self::{
         compile_rooted_list_trace, discover_offset_native, jit_disabled,
         numeric_jit_prefix_candidate, numeric_trace_instructions,
     },
-    numeric_core::{try_run_packed_numeric_dispatch_block, try_run_rich_numeric_dispatch_block},
+    numeric_core::{
+        cached_world_numeric_field, try_run_packed_numeric_dispatch_block,
+        try_run_rich_numeric_dispatch_block,
+    },
     tgm_ruin::{
         CANONICAL_MONKE_BUILD_COORDINATE_DIGEST, CANONICAL_TYPE2PARENT_SOURCE,
         build_tgm_load_continuation, canonical_type2parent_program, revalidated_ruin_rejection,
-        ruin_scan_attach_at_call, run_ruin_affected_turfs_batch, tgm_attach_location,
+        ruin_scan_attach_at_call, run_ruin_affected_turfs_batch, run_tgm_build_cache_simple_member,
+        tgm_attach_location,
     },
 };

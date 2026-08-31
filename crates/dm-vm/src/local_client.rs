@@ -6,12 +6,12 @@
 //! receive map snapshots from, and answer prompts for. Prompt continuations
 //! suspend the calling DM frame and re-schedule it when the host answers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use crate::bytecode::VerbParameterType;
 use crate::{CallFrame, ExecutionState, OwnedContinuation, schedule_frames};
-use dm_dmf::Diagnostic;
+use dm_dmf::{ClientSession, ControlTree, Diagnostic};
 use dm_value::{DatumId, Value};
 
 /// A local client could not be created from the supplied DMF skin.
@@ -256,6 +256,164 @@ pub enum LocalScreenPointerEvent {
     Click,
 }
 
+/// Mutable per-world client session state.
+///
+/// Extracted from `ExecutionState` to establish a clear subsystem boundary
+/// for the in-process BYOND client model.
+#[derive(Debug, Default)]
+pub struct ClientState {
+    /// Connected client sessions keyed by client datum.
+    pub client_sessions: BTreeMap<DatumId, ClientSession>,
+    /// Clients with interactive input focus.
+    pub interactive_local_clients: HashSet<DatumId>,
+    /// Active DMF skin for the local client.
+    pub local_client_skin: Option<ControlTree>,
+    /// Outbound UI events queued for each client.
+    pub local_client_outbound_events: BTreeMap<DatumId, Vec<LocalClientUiEvent>>,
+    /// Client -> controlled mob mapping.
+    pub local_client_mobs: BTreeMap<DatumId, DatumId>,
+    /// Queued movement commands awaiting scheduler application.
+    pub local_client_commands: Vec<(u64, DatumId, LocalMovementDirection)>,
+    /// Monotonic sequence for client commands.
+    pub local_client_command_sequence: u64,
+    /// Monotonic sequence for guest clients.
+    pub local_guest_sequence: u64,
+    /// Monotonic sequence for modal prompts.
+    pub local_prompt_sequence: u64,
+    /// Suspended prompt continuations awaiting host response.
+    pub(crate) pending_local_prompts: BTreeMap<u64, PendingLocalPrompt>,
+}
+
+impl ClientState {
+    /// Creates a new empty client state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns whether a client has an active session.
+    pub fn has_session(&self, client: DatumId) -> bool {
+        self.client_sessions.contains_key(&client)
+    }
+
+    /// Installs a client session with its control tree.
+    pub fn install_session(&mut self, client: DatumId, tree: ControlTree) {
+        self.client_sessions
+            .entry(client)
+            .and_modify(|session| *session = ClientSession::new(tree.clone()))
+            .or_insert_with(|| ClientSession::new(tree));
+    }
+
+    /// Sets or replaces the local client skin.
+    pub fn set_skin(&mut self, tree: ControlTree) {
+        self.local_client_skin = Some(tree);
+    }
+
+    /// Takes all outbound UI events, leaving the queue empty.
+    pub fn take_outbound_events(&mut self) -> BTreeMap<DatumId, Vec<LocalClientUiEvent>> {
+        std::mem::take(&mut self.local_client_outbound_events)
+    }
+
+    /// Emits a UI event to a connected client.
+    pub fn emit_ui_event(&mut self, client: DatumId, event: LocalClientUiEvent) {
+        if self.client_sessions.contains_key(&client) {
+            self.local_client_outbound_events
+                .entry(client)
+                .or_default()
+                .push(event);
+        }
+    }
+
+    /// Returns the number of pending prompts.
+    pub fn pending_prompt_count(&self) -> usize {
+        self.pending_local_prompts.len()
+    }
+
+    /// Registers a pending prompt continuation.
+    pub(crate) fn register_prompt(&mut self, id: u64, prompt: PendingLocalPrompt) {
+        self.pending_local_prompts.insert(id, prompt);
+    }
+
+    /// Removes and returns a pending prompt by ID.
+    pub(crate) fn take_prompt(&mut self, id: u64) -> Option<PendingLocalPrompt> {
+        self.pending_local_prompts.remove(&id)
+    }
+
+    /// Returns an iterator over pending prompts.
+    pub(crate) fn pending_prompts(&self) -> impl Iterator<Item = (&u64, &PendingLocalPrompt)> {
+        self.pending_local_prompts.iter()
+    }
+
+    /// Sets interactive status for a client.
+    pub fn set_interactive(&mut self, client: DatumId, interactive: bool) {
+        if interactive {
+            self.interactive_local_clients.insert(client);
+        } else {
+            self.interactive_local_clients.remove(&client);
+        }
+    }
+
+    /// Returns whether a client is interactive.
+    pub fn is_interactive(&self, client: DatumId) -> bool {
+        self.interactive_local_clients.contains(&client)
+    }
+
+    /// Attaches a client to a mob.
+    pub fn attach_mob(&mut self, client: DatumId, mob: DatumId) {
+        self.local_client_mobs.insert(client, mob);
+    }
+
+    /// Returns the mob attached to a client.
+    pub fn attached_mob(&self, client: DatumId) -> Option<DatumId> {
+        self.local_client_mobs.get(&client).copied()
+    }
+
+    /// Removes a client's attached mob.
+    pub fn detach_mob(&mut self, client: DatumId) -> Option<DatumId> {
+        self.local_client_mobs.remove(&client)
+    }
+
+    /// Queues a movement command for a client.
+    pub fn queue_command(&mut self, client: DatumId, direction: LocalMovementDirection) -> u64 {
+        let sequence = self.local_client_command_sequence;
+        self.local_client_command_sequence = sequence.saturating_add(1);
+        self.local_client_commands
+            .push((sequence, client, direction));
+        sequence
+    }
+
+    /// Takes all queued commands, leaving the queue empty.
+    pub fn take_commands(&mut self) -> Vec<(u64, DatumId, LocalMovementDirection)> {
+        std::mem::take(&mut self.local_client_commands)
+    }
+
+    /// Generates the next prompt sequence ID.
+    pub fn next_prompt_id(&mut self) -> u64 {
+        self.local_prompt_sequence = self.local_prompt_sequence.saturating_add(1);
+        self.local_prompt_sequence
+    }
+
+    /// Generates the next guest sequence ID.
+    pub fn next_guest_id(&mut self) -> u64 {
+        self.local_guest_sequence = self.local_guest_sequence.saturating_add(1);
+        self.local_guest_sequence
+    }
+
+    /// Returns all client session datums for GC root tracking.
+    pub fn session_datums(&self) -> impl Iterator<Item = DatumId> + '_ {
+        self.client_sessions.keys().copied()
+    }
+
+    /// Returns all attached mob datums for GC root tracking.
+    pub fn mob_datums(&self) -> impl Iterator<Item = DatumId> + '_ {
+        self.local_client_mobs.keys().copied().chain(self.local_client_mobs.values().copied())
+    }
+
+    /// Returns all prompt client datums for GC root tracking.
+    pub fn prompt_client_datums(&self) -> impl Iterator<Item = DatumId> + '_ {
+        self.pending_local_prompts.values().map(|p| p.client)
+    }
+}
+
 impl fmt::Display for LocalClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -337,11 +495,11 @@ fn local_prompt_client(
             _ => None,
         })
         .find_map(|datum| {
-            if state.interactive_local_clients.contains(&datum) {
+            if state.client.is_interactive(datum) {
                 Some(datum)
             } else {
-                state.local_client_mobs.iter().find_map(|(client, mob)| {
-                    (*mob == datum && state.interactive_local_clients.contains(client))
+                state.client.local_client_mobs.iter().find_map(|(client, mob)| {
+                    (*mob == datum && state.client.is_interactive(*client))
                         .then_some(*client)
                 })
             }
@@ -437,8 +595,7 @@ pub(crate) fn local_prompt_spec(
             type_marker.split('+').any(|part| part == "null"),
         )
     };
-    state.local_prompt_sequence = state.local_prompt_sequence.saturating_add(1);
-    let id = state.local_prompt_sequence;
+    let id = state.client.next_prompt_id();
     let display_choices = choices
         .iter()
         .map(|value| prompt_value_text(Some(value)))
@@ -462,7 +619,7 @@ pub(crate) fn local_prompt_spec(
 }
 
 pub(crate) fn register_prompt(state: &mut ExecutionState, id: u64, prompt: PendingLocalPrompt) {
-    state.pending_local_prompts.insert(id, prompt);
+    state.client.register_prompt(id, prompt);
 }
 
 fn collect_prompt_appearance_datums(
@@ -501,7 +658,7 @@ fn local_verb_prompt_candidates(state: &ExecutionState, client: DatumId) -> Vec<
             collect_prompt_appearance_datums(&screen.appearance, &mut seen, &mut values);
         }
     }
-    for datum in [Some(client), state.local_client_mobs.get(&client).copied()]
+    for datum in [Some(client), state.client.attached_mob(client)]
         .into_iter()
         .flatten()
     {
@@ -590,8 +747,7 @@ pub(crate) fn queue_next_verb_prompt(
         .iter()
         .map(|value| local_verb_choice_label(state, value))
         .collect::<Vec<_>>();
-    state.local_prompt_sequence = state.local_prompt_sequence.saturating_add(1);
-    let id = state.local_prompt_sequence;
+    let id = state.client.next_prompt_id();
     let parameter_name = invocation
         .parameter_names
         .get(parameter)
@@ -610,7 +766,7 @@ pub(crate) fn queue_next_verb_prompt(
             can_cancel: true,
         },
     );
-    state.pending_local_prompts.insert(
+    state.client.register_prompt(
         id,
         PendingLocalPrompt {
             client,

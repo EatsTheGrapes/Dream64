@@ -7621,7 +7621,7 @@ fn connected_input_prompt_suspends_and_resumes_with_typed_response() {
     let mob = state
         .heap_mut()
         .allocate_datum(TypePath::parse("/mob").unwrap());
-    state.local_client_mobs.insert(client, mob);
+    state.client.attach_mob(client, mob);
     state.install_client_session(client, ControlTree::default());
     state.set_local_client_interactive(client, true).unwrap();
 
@@ -7671,7 +7671,7 @@ fn skin_only_preflight_client_uses_input_default_without_suspending() {
     let mob = state
         .heap_mut()
         .allocate_datum(TypePath::parse("/mob").unwrap());
-    state.local_client_mobs.insert(client, mob);
+    state.client.attach_mob(client, mob);
     state.install_client_session(client, ControlTree::default());
 
     assert_eq!(
@@ -7697,7 +7697,7 @@ fn connected_list_prompt_returns_original_choice_value() {
     let mob = state
         .heap_mut()
         .allocate_datum(TypePath::parse("/mob").unwrap());
-    state.local_client_mobs.insert(client, mob);
+    state.client.attach_mob(client, mob);
     state.install_client_session(client, ControlTree::default());
     state.set_local_client_interactive(client, true).unwrap();
 
@@ -7738,7 +7738,7 @@ fn connected_alert_prompt_returns_selected_button() {
     let mob = state
         .heap_mut()
         .allocate_datum(TypePath::parse("/mob").unwrap());
-    state.local_client_mobs.insert(client, mob);
+    state.client.attach_mob(client, mob);
     state.install_client_session(client, ControlTree::default());
     state.set_local_client_interactive(client, true).unwrap();
 
@@ -18088,7 +18088,7 @@ fn local_browser_topic_dispatches_href_list_and_resolved_hsrc() {
     let source = state
         .heap
         .allocate_datum(TypePath::parse("/datum/source").unwrap());
-    state.local_client_mobs.insert(client, mob);
+    state.client.attach_mob(client, mob);
     let topic = format!("byond://?src=[0xd{:06x}]&action=ready", source.index() + 1);
 
     state
@@ -18149,7 +18149,7 @@ fn local_client_command_resolves_normalized_verb_and_quoted_argument() {
     let target = state
         .heap
         .allocate_datum(TypePath::parse("/obj/item").unwrap());
-    state.local_client_mobs.insert(client, mob);
+    state.client.attach_mob(client, mob);
     state.install_client_session(client, ControlTree::default());
     state.set_local_client_interactive(client, true).unwrap();
     state
@@ -18231,7 +18231,7 @@ fn live_client_attachment_follows_client_mob_reassignment() {
     let player_mob = state
         .heap
         .allocate_datum(TypePath::parse("/mob/player").unwrap());
-    state.local_client_mobs.insert(client, lobby_mob);
+    state.client.attach_mob(client, lobby_mob);
     state.install_client_session(client, ControlTree::default());
 
     assign_datum_field(
@@ -18241,7 +18241,7 @@ fn live_client_attachment_follows_client_mob_reassignment() {
         Value::Datum(player_mob),
     )
     .unwrap();
-    assert_eq!(state.local_client_mobs.get(&client), Some(&player_mob));
+    assert_eq!(state.client.attached_mob(client), Some(player_mob));
 
     assign_datum_field(
         &mut state,
@@ -18250,7 +18250,7 @@ fn live_client_attachment_follows_client_mob_reassignment() {
         Value::Null,
     )
     .unwrap();
-    assert!(!state.local_client_mobs.contains_key(&client));
+    assert!(state.client.attached_mob(client).is_none());
 }
 
 #[test]
