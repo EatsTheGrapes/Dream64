@@ -15,6 +15,7 @@ mod run_support;
 mod scheduler;
 mod state;
 mod support;
+mod type_metadata;
 mod world_geometry;
 
 pub use frame::VmContinuationId;
