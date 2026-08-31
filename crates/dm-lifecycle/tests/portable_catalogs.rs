@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use dm_lifecycle::{
-    decode_dmm_measurements, decode_parsed_dmm_cache, encode_dmm_measurements,
-    encode_parsed_dmm_cache, PortableDmmGrid, PortableDmmMeasurement, PortableParsedDmm,
+    PortableDmmGrid, PortableDmmMeasurement, PortableParsedDmm, decode_dmm_measurements,
+    decode_parsed_dmm_cache, encode_dmm_measurements, encode_parsed_dmm_cache,
 };
 use dm_vm::DmmMeasurement;
 

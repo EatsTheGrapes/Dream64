@@ -87,7 +87,7 @@ pub struct Cell {
     pub z: i32,
     /// Validated model-cache key.
     pub model_key: Arc<str>,
-    /// Whether AfterChange must be suppressed for this cell.
+    /// Whether `AfterChange` must be suppressed for this cell.
     pub no_afterchange: bool,
 }
 
@@ -366,7 +366,7 @@ fn extend(slot: &mut Option<Bounds>, x: i32, y: i32, z: i32) {
                 max_x: x,
                 max_y: y,
                 max_z: z,
-            })
+            });
         }
     }
 }

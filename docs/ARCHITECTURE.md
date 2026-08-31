@@ -26,15 +26,22 @@ A higher-level crate may depend on lower-level crates, but lower-level crates sh
 
 - `dm-core`: shared identifiers, spans, and fundamental compiler types.
 - `dm-lexer` / `dm-syntax`: source lexing and syntax representation.
+- `dm-object-tree`: deterministic global object-tree construction from parsed declarations.
 - `dm-semantics`: semantic/type/procedure information.
+- `dm-globals`: deterministic inventory of global variable declarations and initialization work.
 - `dm-compiler` / `dm-lowering`: compilation and executable representation.
 - `dm-value`: runtime values and value serialization.
 - `dm-runtime`: runtime object/state representation.
 - `dm-vm`: execution engine and scheduler primitives.
+- `dm-jit`: Cranelift backend for statically safe numeric execution traces.
 - `dm-map`: DMM parsing and map representation.
+- `dm-dmf`: loss-aware Dream Maker interface (`.dmf`) skin parsing.
 - `dm-world`: world planning/materialization.
+- `dm-project`: deterministic project loading and include discovery.
 - `dm-lifecycle`: orchestration that connects compilation, runtime, VM, and world initialization.
+- `dm-mmap`: read-only memory-mapping boundary for immutable artifacts.
 - `dm-client`: presentation/client-side behavior.
+- `dm-native-menu`: audited platform boundary for the native application menu.
 - `dm-conformance`: compatibility/conformance tooling.
 
 ## Lifecycle crate rule

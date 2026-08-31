@@ -379,8 +379,8 @@ impl ExecutionState {
     /// failures are returned unchanged.
     pub fn write_ready_world_snapshot_to(&self, writer: &mut impl Write) -> io::Result<()> {
         if !self.scheduler_inflight.is_empty()
-            || !self.client_sessions.is_empty()
-            || !self.pending_local_prompts.is_empty()
+            || !self.client.client_sessions.is_empty()
+            || !self.client.pending_local_prompts.is_empty()
             || !self.deleting_datums.is_empty()
         {
             return Err(io::Error::new(
@@ -741,12 +741,12 @@ impl ExecutionState {
         // Everything below is either derived from the restored heap or tied to
         // one host process. Rebuild/clear it instead of persisting addresses,
         // clocks, sockets, browser state, external jobs, or speculative caches.
-        self.client_sessions.clear();
-        self.interactive_local_clients.clear();
-        self.local_client_outbound_events.clear();
-        self.local_client_mobs.clear();
-        self.local_client_commands.clear();
-        self.pending_local_prompts.clear();
+        self.client.client_sessions.clear();
+        self.client.interactive_local_clients.clear();
+        self.client.local_client_outbound_events.clear();
+        self.client.local_client_mobs.clear();
+        self.client.local_client_commands.clear();
+        self.client.pending_local_prompts.clear();
         self.dynamic_receiver_targets.clear();
         self.dynamic_callsite_targets.clear();
         self.declared_field_slots.clear();
@@ -1257,7 +1257,7 @@ mod tests {
 
         let snapshot = source.capture_ready_world_core();
         let module = Module {
-            identity: ModuleIdentity(1),
+            identity: crate::bytecode::ModuleIdentity(1),
             procedures: (0..8)
                 .map(|index| {
                     Arc::new(if index == 7 {

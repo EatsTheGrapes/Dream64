@@ -9,10 +9,10 @@ use dm_core::{DmNumberBits, SourceSpan};
 use dm_value::{FieldName, TypePath};
 use sha2::{Digest as _, Sha256};
 
+use crate::compile::dynamic_name_index;
 use crate::{
     CompoundAssignmentOperator, CompoundListIndexOperator, Instruction, ListEntryKind, Module,
-    ProcedureId, Program, TypePredicateKind, VerbParameterType, dynamic_name_index,
-    next_module_identity,
+    ProcedureId, Program, TypePredicateKind, VerbParameterType, next_module_identity,
 };
 
 const MAGIC: &[u8; 8] = b"DM64MOD\0";
@@ -1883,7 +1883,7 @@ mod tests {
         ));
         cache_polluted.names.clear();
         cache_polluted.dynamic_names.clear();
-        cache_polluted.initializer_call_names = Some(crate::InitializerCallNameIndex {
+        cache_polluted.initializer_call_names = Some(crate::bytecode::InitializerCallNameIndex {
             names: Arc::new(HashMap::from([("stale".to_owned(), ProcedureId(0))])),
             module_names_scanned: 99,
         });

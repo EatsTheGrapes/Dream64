@@ -718,7 +718,7 @@ pub struct Program {
     pub source_spans: Vec<SourceSpan>,
 }
 
-/// Client-side conversion supported by OpenDream's explicit verb command line.
+/// Client-side conversion supported by `OpenDream`'s explicit verb command line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VerbParameterType {
     /// `as text`, `as message`, or `as command_text`.
@@ -772,10 +772,10 @@ impl PartialEq for ModuleIdentity {
 impl Eq for ModuleIdentity {}
 
 #[derive(Clone, Debug, Default)]
-struct CompactWordcodeAttachment(Option<Arc<CompactWordcodeImage>>);
+pub(crate) struct CompactWordcodeAttachment(pub(crate) Option<Arc<CompactWordcodeImage>>);
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ProcedureSemanticDigestAttachment(Option<Arc<[[u8; 32]]>>);
+pub(crate) struct ProcedureSemanticDigestAttachment(pub(crate) Option<Arc<[[u8; 32]]>>);
 
 impl PartialEq for ProcedureSemanticDigestAttachment {
     fn eq(&self, _other: &Self) -> bool {
@@ -840,8 +840,8 @@ impl DeferredProcedure {
 /// An initializer expression linked as an entry point in a VM module.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InitializerProgram {
-    module: Module,
-    entry: ProcedureId,
+    pub(crate) module: Module,
+    pub(crate) entry: ProcedureId,
 }
 
 /// One ordered per-instance initializer action executed before `New()`.
