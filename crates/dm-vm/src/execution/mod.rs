@@ -8,6 +8,7 @@
 //! frames stay small.
 
 mod frame;
+mod heap_gc;
 mod host_services;
 mod interpreter;
 mod run;
@@ -30,13 +31,13 @@ pub(crate) use frame::{
     RuinCandidateScan, StepBudgetBehavior, TgmLoadContinuation, TgmLoadPhase,
     declared_argument_count, frame_context, make_frame,
 };
-pub(crate) use run::run_frames;
-pub(crate) use run_support::trace;
-pub(crate) use scheduler::schedule_frames;
 #[cfg(test)]
-pub(crate) use state::adaptive_heap_collection_growth;
+pub(crate) use heap_gc::adaptive_heap_collection_growth;
 #[cfg(test)]
-pub(crate) use state::{
+pub(crate) use heap_gc::{
     MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH, MAXIMUM_LOW_YIELD_COLLECTION_GROWTH,
     MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH, MINIMUM_HEAP_COLLECTION_GROWTH,
 };
+pub(crate) use run::run_frames;
+pub(crate) use run_support::trace;
+pub(crate) use scheduler::schedule_frames;
