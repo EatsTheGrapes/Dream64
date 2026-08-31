@@ -47,111 +47,12 @@ use flate2::write::GzEncoder;
 
 const MAX_EAGER_ARTIFACT_DIAGNOSTICS: usize = 32;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Command {
-    Compile,
-    Plan,
-    Boot,
-    Sweep,
-    SweepClosure,
-    LobbyPreflight,
-    LobbyPreview,
-}
+mod server;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ProductionReadyWorldIdentity {
-    random_seed: u64,
-    deployment_id: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ReadyWorldMode {
-    Disabled,
-    Development,
-    Prewarm(ProductionReadyWorldIdentity),
-    Activate(ProductionReadyWorldIdentity),
-}
-
-impl ReadyWorldMode {
-    const fn production_identity(&self) -> Option<&ProductionReadyWorldIdentity> {
-        match self {
-            Self::Prewarm(identity) | Self::Activate(identity) => Some(identity),
-            Self::Disabled | Self::Development => None,
-        }
-    }
-
-    const fn writes_snapshot(&self) -> bool {
-        matches!(self, Self::Development | Self::Prewarm(_))
-    }
-}
-
-fn parse_ready_world_mode(
-    prewarm: bool,
-    activate: bool,
-    development: bool,
-    disabled: bool,
-    random_seed: Option<&str>,
-    deployment_id: Option<&str>,
-) -> Result<ReadyWorldMode, String> {
-    if disabled {
-        return Ok(ReadyWorldMode::Disabled);
-    }
-    if prewarm && activate {
-        return Err(
-            "DREAM64_PREWARM_READY_WORLD and DREAM64_ACTIVATE_READY_WORLD are mutually exclusive"
-                .to_owned(),
-        );
-    }
-    if !prewarm && !activate {
-        return Ok(if development {
-            ReadyWorldMode::Development
-        } else {
-            ReadyWorldMode::Disabled
-        });
-    }
-    let random_seed = random_seed
-        .ok_or_else(|| "production ready-world mode requires DREAM64_RANDOM_SEED".to_owned())?
-        .parse::<u64>()
-        .map_err(|_| "DREAM64_RANDOM_SEED must be a nonzero u64".to_owned())?;
-    if random_seed == 0 {
-        return Err("DREAM64_RANDOM_SEED must be a nonzero u64".to_owned());
-    }
-    let deployment_id = deployment_id
-        .map(str::trim)
-        .filter(|identity| !identity.is_empty())
-        .ok_or_else(|| "production ready-world mode requires DREAM64_DEPLOYMENT_ID".to_owned())?
-        .to_owned();
-    let identity = ProductionReadyWorldIdentity {
-        random_seed,
-        deployment_id,
-    };
-    Ok(if prewarm {
-        ReadyWorldMode::Prewarm(identity)
-    } else {
-        ReadyWorldMode::Activate(identity)
-    })
-}
-
-fn ready_world_mode_from_environment() -> Result<ReadyWorldMode, String> {
-    let enabled = |name| env::var(name).is_ok_and(|value| value.trim() == "1");
-    parse_ready_world_mode(
-        enabled("DREAM64_PREWARM_READY_WORLD"),
-        enabled("DREAM64_ACTIVATE_READY_WORLD"),
-        env::var_os("DREAM64_ENABLE_READY_WORLD_CACHE").is_some(),
-        env::var_os("DREAM64_DISABLE_READY_CACHE").is_some(),
-        env::var("DREAM64_RANDOM_SEED").ok().as_deref(),
-        env::var("DREAM64_DEPLOYMENT_ID").ok().as_deref(),
-    )
-}
-
-const fn progress_label(command: Command) -> &'static str {
-    match command {
-        Command::Compile => "compile-progress",
-        Command::LobbyPreflight => "lobby-preflight-progress",
-        Command::LobbyPreview => "lobby-preview-progress",
-        _ => "boot-progress",
-    }
-}
+use server::cli::{
+    Command, ProductionReadyWorldIdentity, ReadyWorldMode, progress_label,
+    ready_world_mode_from_environment,
+};
 
 fn main() -> ExitCode {
     // Large production DM procedures (notably tg/Monk's macro-expanded
@@ -3243,11 +3144,10 @@ mod tests {
 
     use super::{
         ArtifactSection, COMPACT_WORDCODE_ARTIFACT_SECTION, CompiledArtifact,
-        ProductionReadyWorldIdentity, ReadyWorldMode, decode_compiled_executable,
-        executable_artifact_file, fresh_launch_random_seed, launch_random_seed_from,
-        lobby_pregame_readiness, parse_ready_world_mode, prepare_compiled_executable,
-        ready_world_cache_file, restore_ready_world_cache, stable_ids_for_namespace,
-        write_ready_world_cache,
+        ProductionReadyWorldIdentity, decode_compiled_executable, executable_artifact_file,
+        fresh_launch_random_seed, launch_random_seed_from, lobby_pregame_readiness,
+        prepare_compiled_executable, ready_world_cache_file, restore_ready_world_cache,
+        stable_ids_for_namespace, write_ready_world_cache,
     };
 
     static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
@@ -3422,39 +3322,6 @@ mod tests {
         assert_eq!(
             launch_random_seed_from(Some("8675309")),
             (8_675_309, "environment")
-        );
-    }
-
-    #[test]
-    fn production_ready_world_modes_require_exclusive_complete_identity() {
-        assert!(parse_ready_world_mode(true, true, false, false, Some("7"), Some("blue")).is_err());
-        assert!(parse_ready_world_mode(true, false, false, false, None, Some("blue")).is_err());
-        assert!(
-            parse_ready_world_mode(true, false, false, false, Some("0"), Some("blue")).is_err()
-        );
-        assert!(parse_ready_world_mode(true, false, false, false, Some("7"), Some(" ")).is_err());
-        assert_eq!(
-            parse_ready_world_mode(true, false, true, false, Some("7"), Some(" blue ")).unwrap(),
-            ReadyWorldMode::Prewarm(ProductionReadyWorldIdentity {
-                random_seed: 7,
-                deployment_id: "blue".to_owned(),
-            })
-        );
-        assert_eq!(
-            parse_ready_world_mode(false, true, false, false, Some("9"), Some("green")).unwrap(),
-            ReadyWorldMode::Activate(ProductionReadyWorldIdentity {
-                random_seed: 9,
-                deployment_id: "green".to_owned(),
-            })
-        );
-        assert_eq!(
-            parse_ready_world_mode(true, true, true, true, None, None).unwrap(),
-            ReadyWorldMode::Disabled,
-            "the explicit disable switch overrides every cache mode"
-        );
-        assert_eq!(
-            parse_ready_world_mode(false, false, true, false, None, None).unwrap(),
-            ReadyWorldMode::Development
         );
     }
 
