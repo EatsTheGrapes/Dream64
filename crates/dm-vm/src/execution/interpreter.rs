@@ -11,7 +11,7 @@ use crate::builtins;
 use crate::builtins::{
     execute_external_call, execute_list_binary_operator, execute_list_compound_operator,
     execute_list_method, execute_output, execute_regex_method, execute_standard_builtin,
-    execute_standard_builtin_with_usr, is_regex_datum, is_subtype,
+    execute_standard_builtin_with_usr, icon_states_builtin, is_regex_datum, is_subtype,
 };
 use crate::bytecode::{
     CompoundListIndexOperator, Instruction, ListEntryKind, Module, ProcedureId, Program,
@@ -772,6 +772,11 @@ pub(crate) fn dispatch_instruction(
                     apply_icon_set_intensity(src, &arguments, &mut state.heap)
                         .map_err(|message| execution_error(module, frames, message))?;
                     Value::Null
+                }
+                "IconStates" if is_icon_datum(src, &state.heap) => {
+                    let mode = arguments.first().cloned().unwrap_or(Value::Null);
+                    icon_states_builtin(&[Value::Datum(src), mode], state)
+                        .map_err(|message| execution_error(module, frames, message))?
                 }
                 method if is_icon_datum(src, &state.heap) => {
                     execute_icon_method(src, method, &arguments, &mut state.heap)
@@ -4285,6 +4290,7 @@ pub(crate) fn dispatch_instruction(
                         | "Turn"
                         | "Flip"
                         | "SwapColor"
+                        | "IconStates"
                 )
             {
                 let result = match method {
@@ -4295,6 +4301,10 @@ pub(crate) fn dispatch_instruction(
                     }
                     "SetIntensity" => apply_icon_set_intensity(*datum, &arguments, &mut state.heap)
                         .map(|()| Value::Null),
+                    "IconStates" => {
+                        let mode = arguments.first().cloned().unwrap_or(Value::Null);
+                        icon_states_builtin(&[Value::Datum(*datum), mode], state)
+                    }
                     method => execute_icon_method(*datum, method, &arguments, &mut state.heap),
                 }
                 .map_err(|message| execution_error(module, frames, message))?;

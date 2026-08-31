@@ -15779,6 +15779,81 @@ fn contextual_icon_new_matches_icon_builtin_constructor_fields() {
 }
 
 #[test]
+fn icon_icon_states_method_dispatches_natively_against_backing_dmi() {
+    // Monkestation's greyscale_previews subsystem calls `map_icon.IconStates()`
+    // on a statically typed `var/icon`. This must resolve as a native method,
+    // not fall through to a dynamic `/icon/proc/IconStates` lookup.
+    use std::io::Write as _;
+
+    use flate2::Compression;
+    use flate2::write::ZlibEncoder;
+
+    let root = std::env::temp_dir().join(format!(
+        "dream64-icon-states-dispatch-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("icons")).unwrap();
+    let description = concat!(
+        "# BEGIN DMI\n",
+        "version = 4.0\n",
+        "width = 32\n",
+        "height = 32\n",
+        "state = \"error\"\n",
+        "dirs = 1\n",
+        "frames = 1\n",
+        "state = \"template\"\n",
+        "dirs = 1\n",
+        "frames = 1\n",
+        "# END DMI\n",
+    );
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(description.as_bytes()).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut push_chunk = |kind: &[u8; 4], data: &[u8]| {
+        png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        png.extend_from_slice(kind);
+        png.extend_from_slice(data);
+        png.extend_from_slice(&[0; 4]);
+    };
+    let mut header = Vec::new();
+    header.extend_from_slice(&32u32.to_be_bytes());
+    header.extend_from_slice(&32u32.to_be_bytes());
+    header.extend_from_slice(&[8, 6, 0, 0, 0]);
+    push_chunk(b"IHDR", &header);
+    let mut text = b"Description\0\0".to_vec();
+    text.extend_from_slice(&compressed);
+    push_chunk(b"zTXt", &text);
+    push_chunk(b"IEND", &[]);
+    std::fs::write(root.join("icons/greyscale.dmi"), png).unwrap();
+
+    let syntax = parse(
+        "/proc/probe()\n\
+             \tvar/icon/map_icon = icon('icons/greyscale.dmi')\n\
+             \treturn list(\"template\" in map_icon.IconStates(), \"missing\" in map_icon.IconStates())\n",
+    )
+    .unwrap();
+    let module = compile_module(&syntax.definitions).unwrap();
+    let mut state = ExecutionState::new();
+    state.set_project_root(root.clone());
+    let result = execute_module_in_state(
+        &module,
+        module.procedure_id("/proc/probe").unwrap(),
+        &[],
+        &mut state,
+    )
+    .unwrap();
+    let Value::List(result) = result else {
+        panic!("probe should return a list");
+    };
+    let result = state.heap().list(result).unwrap();
+    assert_eq!(result.get(1), Ok(&Value::number(1.0)));
+    assert_eq!(result.get(2), Ok(&Value::number(0.0)));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn icon_copy_constructor_preserves_render_state_and_mutates_independently() {
     // Exact constructor shape at the start of Monkestation's getFlatIcon:
     // `flat_template = icon(file, state); flat = icon(flat_template)`.

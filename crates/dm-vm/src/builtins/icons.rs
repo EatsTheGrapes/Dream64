@@ -242,12 +242,22 @@ pub(crate) fn icon_states_builtin(
             resolved.display()
         )
     })?;
+    // BYOND's `mode` argument: 0 (default) yields every state, 1 restricts the
+    // result to movement states. DMI metadata carries the `movement` flag per
+    // state, so both modes are honoured exactly.
+    let movement_only = arguments
+        .get(1)
+        .and_then(Value::as_number)
+        .is_some_and(|mode| mode as i64 == 1);
     let list = state.heap_mut().allocate_list();
     let values = state
         .heap_mut()
         .list_mut(list)
         .map_err(|error| error.to_string())?;
     for icon_state in metadata.states {
+        if movement_only && icon_state.movement == 0 {
+            continue;
+        }
         values.add(Value::text(icon_state.name));
     }
     Ok(Value::List(list))
