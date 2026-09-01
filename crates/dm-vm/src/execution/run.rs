@@ -14,9 +14,9 @@ use crate::{
     atoms_profile_enabled, atoms_profile_snapshot_lines_if_due, boot_dashboard_enabled,
     boot_trace_enabled, canonical_tgm_load_path, drive_ruin_candidate_scan, drive_tgm_load,
     execute_compact_fast_instruction, is_atoms_initialize_path, is_subsystem_initialize_path,
-    numeric_dispatch_candidate, startup_instruction_category, startup_instruction_profile_enabled,
-    startup_profile_enabled, tgm_profiling_enabled, trace_tgm_route,
-    try_run_build_coordinate_prefix, try_run_camera_chunk_fast_path,
+    numeric_dispatch_candidate, slow_instruction_trace_threshold, startup_instruction_category,
+    startup_instruction_profile_enabled, startup_profile_enabled, tgm_profiling_enabled,
+    trace_tgm_route, try_run_build_coordinate_prefix, try_run_camera_chunk_fast_path,
     try_run_discover_offset_fast_path, try_run_dmm_preload_measurement_fast_path,
     try_run_guarded_jit, try_run_numeric_dispatch_block, try_run_numeric_local_update,
     try_run_numeric_loop_branch, try_run_parsed_dmm_new_fast_path,
@@ -67,6 +67,9 @@ pub(crate) fn run_frames(
         .then_some(limits.wall_clock_budget)
         .flatten();
     let mut next_wall_clock_poll = 0_u64;
+    // Diagnostic: env-gated per-instruction wall-time watchdog for locating a
+    // single builtin/native op that overshoots the scheduler wall deadline.
+    let slow_instruction_threshold = slow_instruction_trace_threshold();
     // A frame retains only its stable procedure identity so scheduled continuations
     // remain self-contained. Cache the immutable program for the currently executing
     // identity within one dispatch, resolving again only after a call/return switches
@@ -795,7 +798,8 @@ pub(crate) fn run_frames(
             instruction
         };
 
-        match dispatch_instruction(
+        let slow_instruction_started = slow_instruction_threshold.map(|_| Instant::now());
+        let dispatch_flow = dispatch_instruction(
             module,
             state,
             &mut frames,
@@ -810,7 +814,35 @@ pub(crate) fn run_frames(
             &mut remaining_steps,
             trace_enabled,
             ordinary_field_fast_path_enabled,
-        )? {
+        )?;
+        if let Some(started) = slow_instruction_started {
+            let elapsed = started.elapsed();
+            if slow_instruction_threshold.is_some_and(|threshold| elapsed >= threshold) {
+                let span = program.source_spans.get(instruction_index).copied();
+                let mut opcode = format!("{instruction:?}");
+                if opcode.len() > 160 {
+                    let cut = (0..=160)
+                        .rev()
+                        .find(|index| opcode.is_char_boundary(*index))
+                        .unwrap_or(0);
+                    opcode.truncate(cut);
+                    opcode.push('…');
+                }
+                eprintln!(
+                    "boot-vm: slow-instruction elapsed_us={} depth={} procedure={} instruction={} source={}..{} opcode={opcode}",
+                    elapsed.as_micros(),
+                    frames.len(),
+                    module
+                        .paths
+                        .get(procedure.index())
+                        .map_or("<missing>", String::as_str),
+                    instruction_index,
+                    span.map_or(0, |span| span.start),
+                    span.map_or(0, |span| span.end),
+                );
+            }
+        }
+        match dispatch_flow {
             DispatchFlow::Exit(outcome) => return *outcome,
             DispatchFlow::Continue => (),
         }
