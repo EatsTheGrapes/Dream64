@@ -66,6 +66,13 @@ pub use execution::{
 pub(crate) use execution::adaptive_heap_collection_growth;
 #[cfg(test)]
 pub(crate) use execution::make_frame_owned;
+#[cfg(test)]
+pub(crate) use execution::{
+    BULK_INIT_LOW_YIELD_STREAK, DEFAULT_HEAP_IDENTITY_CEILING,
+    MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH, MAXIMUM_LOW_YIELD_COLLECTION_GROWTH,
+    MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH, MINIMUM_HEAP_COLLECTION_GROWTH,
+    bulk_init_aware_collection_growth,
+};
 pub(crate) use execution::{
     CallFrame, CallFrameCold, OwnedContinuation, PackedNumericState, RuinCandidateScan,
     TgmLoadContinuation, TgmLoadPhase,
@@ -73,11 +80,6 @@ pub(crate) use execution::{
 pub(crate) use execution::{
     FrameRunOutcome, StepBudgetBehavior, declared_argument_count, frame_context, make_frame,
     run_frames, schedule_frames, trace,
-};
-#[cfg(test)]
-pub(crate) use execution::{
-    MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH, MAXIMUM_LOW_YIELD_COLLECTION_GROWTH,
-    MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH, MINIMUM_HEAP_COLLECTION_GROWTH,
 };
 
 #[cfg(test)]

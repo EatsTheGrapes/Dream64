@@ -12,15 +12,16 @@ use super::compile::{
     condition_tokens, dm_builtin_numeric_constant, interpolated_expression_close,
 };
 use super::{
-    CANONICAL_TYPE2PARENT_SOURCE, CallFrame, CompoundListIndexOperator, ExecutionContext,
-    ExecutionLimits, ExecutionState, InitializerBinding, InstanceInitializer, Instruction,
-    LocalClientPromptKind, LocalClientPromptResponse, LocalClientUiEvent,
-    MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES, MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE,
-    MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH, MAXIMUM_LOW_YIELD_COLLECTION_GROWTH,
-    MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH, MINIMUM_HEAP_COLLECTION_GROWTH, Module, ProcedureId,
-    ProcedureSpec, Program, REGISTER_SIGNAL_FAST_CACHE, TypePredicateKind, Value,
-    VerbParameterType, adaptive_heap_collection_growth, advance_scheduler,
-    allocate_initialized_datum, allocate_matrix, assign_datum_field, compile_initializer,
+    BULK_INIT_LOW_YIELD_STREAK, CANONICAL_TYPE2PARENT_SOURCE, CallFrame, CompoundListIndexOperator,
+    DEFAULT_HEAP_IDENTITY_CEILING, ExecutionContext, ExecutionLimits, ExecutionState,
+    InitializerBinding, InstanceInitializer, Instruction, LocalClientPromptKind,
+    LocalClientPromptResponse, LocalClientUiEvent, MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES,
+    MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE, MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH,
+    MAXIMUM_LOW_YIELD_COLLECTION_GROWTH, MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH,
+    MINIMUM_HEAP_COLLECTION_GROWTH, Module, ProcedureId, ProcedureSpec, Program,
+    REGISTER_SIGNAL_FAST_CACHE, TypePredicateKind, Value, VerbParameterType,
+    adaptive_heap_collection_growth, advance_scheduler, allocate_initialized_datum,
+    allocate_matrix, assign_datum_field, bulk_init_aware_collection_growth, compile_initializer,
     compile_initializer_into_module, compile_module, compile_module_specs,
     compile_module_specs_selective, compile_module_specs_selective_with_errors,
     compile_module_with_global_fields, compile_procedure,
@@ -1334,6 +1335,95 @@ fn heap_gc_growth_window_has_deterministic_memory_bounds() {
     assert_eq!(
         adaptive_heap_collection_growth(usize::MAX / 4, usize::MAX / 2),
         MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH,
+    );
+}
+
+#[test]
+fn bulk_init_growth_matches_base_policy_before_a_low_yield_streak() {
+    // Below the streak threshold the window is exactly the base policy, so an
+    // ordinary churny heap is unaffected by bulk-init awareness.
+    for streak in 0..BULK_INIT_LOW_YIELD_STREAK {
+        assert_eq!(
+            bulk_init_aware_collection_growth(
+                10_000_000,
+                50_000,
+                streak,
+                DEFAULT_HEAP_IDENTITY_CEILING
+            ),
+            adaptive_heap_collection_growth(10_000_000, 50_000),
+            "streak {streak} must not widen the window",
+        );
+    }
+}
+
+#[test]
+fn bulk_init_growth_widens_toward_the_ceiling_during_a_monotonic_phase() {
+    let ceiling = 16_000_000;
+    let growth =
+        bulk_init_aware_collection_growth(10_000_000, 50_000, BULK_INIT_LOW_YIELD_STREAK, ceiling);
+    assert_eq!(
+        growth, 6_000_000,
+        "a sustained near-zero-yield streak runs the window to the ceiling",
+    );
+    assert_eq!(
+        10_000_000 + growth,
+        ceiling,
+        "the next collection lands exactly at the identity ceiling",
+    );
+    assert!(
+        growth > adaptive_heap_collection_growth(10_000_000, 50_000) * 10,
+        "the widened window must dwarf the low-yield cap it replaces",
+    );
+}
+
+#[test]
+fn bulk_init_growth_step_is_a_bounded_doubling() {
+    // Far from the ceiling the window grows by at most the current live size,
+    // so committed memory at worst doubles between passes.
+    assert_eq!(
+        bulk_init_aware_collection_growth(2_000_000, 0, BULK_INIT_LOW_YIELD_STREAK, 64_000_000),
+        2_000_000,
+    );
+}
+
+#[test]
+fn bulk_init_growth_resumes_base_policy_at_or_above_the_ceiling() {
+    for &live in &[16_000_000usize, 20_000_000] {
+        assert_eq!(
+            bulk_init_aware_collection_growth(live, 0, BULK_INIT_LOW_YIELD_STREAK + 5, 16_000_000),
+            adaptive_heap_collection_growth(live, 0),
+            "at/above the ceiling the tight base window forces frequent passes",
+        );
+    }
+}
+
+#[test]
+fn heap_collection_tracks_and_resets_the_near_zero_yield_streak() {
+    let mut state = ExecutionState::new();
+
+    // A large, fully-reachable list population models a monotonic bulk-init
+    // phase: every collection visits many identities and frees ~none of them.
+    for _ in 0..8_192 {
+        let list = state.heap.allocate_list();
+        state.host_value_roots.push(Value::List(list));
+    }
+    for expected in 1..=4u32 {
+        state.next_list_collection = 1;
+        state.maybe_collect_unreachable_lists(&[]);
+        assert_eq!(
+            state.low_yield_collection_streak, expected,
+            "each near-zero-yield collection extends the streak",
+        );
+    }
+
+    // Dropping every root makes the next collection high-yield, which ends the
+    // phase and snaps the streak back to zero.
+    state.host_value_roots.clear();
+    state.next_list_collection = 1;
+    state.maybe_collect_unreachable_lists(&[]);
+    assert_eq!(
+        state.low_yield_collection_streak, 0,
+        "a high-yield collection ends the bulk-allocation phase",
     );
 }
 

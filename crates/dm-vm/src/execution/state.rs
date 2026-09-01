@@ -141,6 +141,12 @@ pub struct ExecutionState {
     // sparse roots while collecting the far more numerous frame temporaries.
     pub(crate) host_value_roots: Vec<Value>,
     pub(crate) next_list_collection: usize,
+    /// Consecutive near-zero-yield list collections. A run of these identifies a
+    /// monotonic bulk-allocation phase and widens the next collection window.
+    pub(crate) low_yield_collection_streak: u32,
+    /// Live-identity ceiling that forces a collection even mid-bulk-init so
+    /// committed memory stays bounded. Resolved once from the environment.
+    pub(crate) heap_identity_ceiling: usize,
     /// Authoritative coordinate-to-cell identities for the mutable headless map.
     pub(crate) world_turfs: BTreeMap<(i32, i32, i32), DatumId>,
     // Ordered storage preserves BYOND traversal order while this dense
@@ -241,6 +247,8 @@ impl ExecutionState {
             procedure_static_locals: BTreeMap::new(),
             host_value_roots: Vec::new(),
             next_list_collection: 262_144,
+            low_yield_collection_streak: 0,
+            heap_identity_ceiling: super::heap_gc::resolve_heap_identity_ceiling(),
             world_turfs: BTreeMap::new(),
             world_turf_lookup: Vec::new(),
             world_turf_lookup_dimensions: (0, 0, 0),
