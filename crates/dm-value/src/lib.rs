@@ -7,9 +7,11 @@
 //!
 //! Confirmed contracts represented here include binary32 numbers, 1-based list
 //! positions, reference identity for lists/datums, and shallow list copies.
-//! Cross-type coercive equality, sparse positional assignment, duplicate-value
-//! removal breadth, and numeric assignment through an associative key's
-//! iteration position still require differential BYOND fixtures.
+//! Cross-type coercive equality, sparse positional assignment, and duplicate-value
+//! removal breadth still require differential BYOND fixtures. Numeric assignment
+//! onto an associative key's iteration position is pinned by the
+//! `assoc_positional_key_assign` oracle: the slot is rebound to a bare
+//! positional value, dropping the association, with length and order intact.
 
 #![cfg_attr(not(test), deny(missing_docs))]
 
@@ -1960,18 +1962,46 @@ impl DmList {
         })
     }
 
-    /// Replaces a 1-based positional entry and returns its previous value.
+    /// Replaces a 1-based entry and returns its previous value.
+    ///
+    /// A numeric write onto an iteration slot that currently holds an
+    /// associative pair `K = V` follows BYOND: the slot keeps its length and
+    /// order position, its key becomes `value`, and any association is dropped
+    /// (the new entry has a null value until written through its key). The
+    /// previous key `K` is returned, matching a positional read of that slot.
+    /// No key deduplication occurs, even when `value` already exists elsewhere.
     ///
     /// # Errors
     ///
     /// Returns a precise index error for zero or an index beyond `len`.
     pub fn set(&mut self, index: usize, value: Value) -> Result<Value, ValueError> {
         let zero_based = checked_index(index, self.len())? + self.prefix_head;
-        let Some(position) = self.order[zero_based].positional_index() else {
-            return Err(ValueError::AssociativeIndexAssignment { index });
-        };
+        if let Some(position) = self.order[zero_based].positional_index() {
+            self.invalidate_positional_remove_index();
+            return Ok(std::mem::replace(&mut self.positional[position], value));
+        }
+
+        // An associative order entry never coexists with a lazily removed
+        // prefix (prefixes are reserved for purely positional lists), so
+        // `zero_based` already addresses the live entry.
+        let association = self.order[zero_based]
+            .associative_index()
+            .ok_or(ValueError::CorruptListStorage)?;
         self.invalidate_positional_remove_index();
-        Ok(std::mem::replace(&mut self.positional[position], value))
+        let storage = &mut **self;
+        let (previous_key, _) = storage.associative.remove(association);
+        for entry in &mut storage.order {
+            if let Some(other) = entry.associative_index()
+                && other > association
+            {
+                *entry = ListOrder::associative(other - 1);
+            }
+        }
+        let position = storage.positional.len();
+        storage.positional.push(value);
+        storage.order[zero_based] = ListOrder::positional(position);
+        self.rebuild_associative_index();
+        Ok(previous_key)
     }
 
     /// Removes and returns a 1-based positional entry.
@@ -2565,11 +2595,6 @@ pub enum ValueError {
     InvalidListIndex(String),
     /// Internal ordered and associative storage lost synchronization.
     CorruptListStorage,
-    /// Numeric assignment targeted an associative key's iteration position.
-    AssociativeIndexAssignment {
-        /// Attempted 1-based index.
-        index: usize,
-    },
     /// List identity is stale or does not belong to a live slot.
     StaleList(ListId),
     /// Datum identity is stale or does not belong to a live slot.
@@ -2594,10 +2619,6 @@ impl fmt::Display for ValueError {
             Self::MissingKey => formatter.write_str("associative list key is absent"),
             Self::InvalidListIndex(message) => formatter.write_str(message),
             Self::CorruptListStorage => formatter.write_str("DM list storage is inconsistent"),
-            Self::AssociativeIndexAssignment { index } => write!(
-                formatter,
-                "DM list position {index} is an associative key; assign through the key"
-            ),
             Self::StaleList(id) => write!(formatter, "stale list handle {id:?}"),
             Self::StaleDatum(id) => write!(formatter, "stale datum handle {id:?}"),
         }
@@ -4567,10 +4588,59 @@ mod tests {
         assert!(list.get(1).unwrap().semantic_eq(&Value::number(1.0)));
         assert!(list.get(2).unwrap().semantic_eq(&text("key")));
         assert!(list.get(3).unwrap().semantic_eq(&Value::number(2.0)));
-        assert_eq!(
-            list.set(2, Value::number(3.0)),
-            Err(ValueError::AssociativeIndexAssignment { index: 2 })
+
+        // A numeric write onto the associative slot rebinds its key in place,
+        // matching BYOND: the previous key is returned, length and order hold,
+        // the association is dropped, and the key lookup no longer resolves.
+        let previous = list.set(2, Value::number(3.0)).unwrap();
+        assert!(previous.semantic_eq(&text("key")));
+        assert_eq!(list.len(), 3);
+        assert_eq!(list.positional_len(), 3);
+        assert_eq!(list.associative_len(), 0);
+        assert!(list.get(2).unwrap().semantic_eq(&Value::number(3.0)));
+        assert!(matches!(
+            list.get_key(&text("key")),
+            Err(ValueError::MissingKey)
+        ));
+        assert!(list.get(1).unwrap().semantic_eq(&Value::number(1.0)));
+        assert!(list.get(3).unwrap().semantic_eq(&Value::number(2.0)));
+    }
+
+    #[test]
+    fn numeric_write_onto_associative_slot_preserves_order_without_dedup() {
+        let mut list = DmList::default();
+        list.set_key(text("a"), Value::number(1.0));
+        list.set_key(text("b"), Value::number(2.0));
+        list.set_key(text("c"), Value::number(3.0));
+
+        // Rebind position 2's key to one that already exists at position 1.
+        let previous = list.set(2, text("a")).unwrap();
+        assert!(previous.semantic_eq(&text("b")));
+        assert_eq!(list.len(), 3);
+        assert!(list.get(1).unwrap().semantic_eq(&text("a")));
+        assert!(list.get(2).unwrap().semantic_eq(&text("a")));
+        assert!(list.get(3).unwrap().semantic_eq(&text("c")));
+        // Key "a" still resolves to its original value; "b" is gone.
+        assert!(
+            list.get_key(&text("a"))
+                .unwrap()
+                .semantic_eq(&Value::number(1.0))
         );
+        assert!(matches!(
+            list.get_key(&text("b")),
+            Err(ValueError::MissingKey)
+        ));
+
+        // Position 2 is now a bare positional entry, so a write through key "a"
+        // lands on the surviving association at position 1 and leaves the
+        // rebound slot alone.
+        list.set_key(text("a"), Value::number(9.0));
+        assert!(
+            list.get_key(&text("a"))
+                .unwrap()
+                .semantic_eq(&Value::number(9.0))
+        );
+        assert!(list.get(2).unwrap().semantic_eq(&text("a")));
     }
 
     #[test]
