@@ -1,0 +1,15 @@
+[package]
+name = "dm-icon"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+png = "0.17"
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[lints]
+workspace = true

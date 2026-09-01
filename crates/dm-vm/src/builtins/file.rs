@@ -262,6 +262,19 @@ pub(super) fn fcopy(arguments: &[Value], state: &ExecutionState) -> Result<Value
     if matches!(source, Value::Null) {
         return Ok(Value::number(0.0));
     }
+    // A mutated /icon: composite its recorded raster journal into a real DMI
+    // rather than copying the untouched backing resource.
+    if let Value::Datum(icon) = source
+        && super::icons::icon_journal_len(&state.heap, icon) > 0
+        && let Ok(Some(bitmap)) = super::icons::materialize_icon_bitmap(icon, state, 0)
+        && let Ok(dmi_bytes) = bitmap.to_dmi_bytes()
+        && let Some(destination) =
+            prepare_write_file_path(&arguments[1..], state, "fcopy destination")?
+    {
+        return Ok(Value::number(f32::from(
+            fs::write(destination, dmi_bytes).is_ok(),
+        )));
+    }
     if let Value::Datum(_) = source {
         source = icon_backing_resource(&source, state, 0)?;
     }

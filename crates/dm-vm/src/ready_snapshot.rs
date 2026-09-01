@@ -58,7 +58,7 @@ pub struct ReadyWorldCoreSnapshot {
     external_timers: Vec<(String, u64)>,
     iconforge_jobs: Vec<(String, bool, String)>,
     iconforge_next_job: u64,
-    iconforge_gags_configs: Vec<(String, String)>,
+    iconforge_gags_configs: Vec<(String, String, String)>,
     sql_jobs: Vec<(String, bool, String)>,
     sql_next_job: u64,
     procedure_static_locals: Vec<(String, Vec<(u16, HeapSnapshotValue)>)>,
@@ -567,7 +567,13 @@ impl ExecutionState {
             iconforge_gags_configs: self
                 .iconforge_gags_configs
                 .iter()
-                .map(|(name, path)| (name.clone(), path.to_string_lossy().into_owned()))
+                .map(|(name, (path, json))| {
+                    (
+                        name.clone(),
+                        path.to_string_lossy().into_owned(),
+                        json.clone(),
+                    )
+                })
                 .collect(),
             sql_jobs: self
                 .sql_jobs
@@ -717,7 +723,7 @@ impl ExecutionState {
         self.iconforge_gags_configs = snapshot
             .iconforge_gags_configs
             .into_iter()
-            .map(|(name, path)| (name, PathBuf::from(path)))
+            .map(|(name, path, json)| (name, (PathBuf::from(path), json)))
             .collect();
         self.sql_jobs = snapshot
             .sql_jobs

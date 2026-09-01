@@ -5,10 +5,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
-use dm_value::{FieldName, Value};
+use dm_value::{DatumId, FieldName, Value, ValueHeap};
 
 use super::generator::resource_datum_builtin;
 use super::{ExecutionState, relaxed_resolved_file_path};
@@ -477,4 +477,222 @@ pub(crate) fn icon_backing_resource(
             "fcopy_rsc icon has an unsupported backing resource {value}"
         )),
     }
+}
+
+/// Decoded-DMI cache shared by GAGS compositing and `/icon` materialisation.
+/// Asset generation runs a handful of source DMIs through many operations; a
+/// path+mtime keyed cache turns each repeat into an `Arc` clone.
+type DmiBitmapCache = HashMap<PathBuf, (Option<SystemTime>, Arc<dm_icon::IconBitmap>)>;
+static DMI_BITMAP_CACHE: OnceLock<Mutex<DmiBitmapCache>> = OnceLock::new();
+
+/// Read and decode a DMI, returning a shared cached copy when the file is
+/// unchanged since the last decode.
+pub(crate) fn load_dmi_bitmap_cached(path: &Path) -> Result<Arc<dm_icon::IconBitmap>, String> {
+    let modified = fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok());
+    let cache = DMI_BITMAP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock()
+        && let Some((cached_mtime, bitmap)) = cache.get(path)
+        && *cached_mtime == modified
+    {
+        return Ok(Arc::clone(bitmap));
+    }
+    let bytes =
+        fs::read(path).map_err(|error| format!("cannot read DMI '{}': {error}", path.display()))?;
+    let bitmap = Arc::new(
+        dm_icon::IconBitmap::from_dmi_bytes(&bytes)
+            .map_err(|error| format!("cannot decode DMI '{}': {error}", path.display()))?,
+    );
+    if let Ok(mut cache) = cache.lock() {
+        if cache.len() >= 128 {
+            cache.clear();
+        }
+        cache.insert(path.to_path_buf(), (modified, Arc::clone(&bitmap)));
+    }
+    Ok(bitmap)
+}
+
+fn icon_field<'a>(heap: &'a ValueHeap, icon: DatumId, name: &str) -> Option<&'a Value> {
+    let field = FieldName::parse(name).ok()?;
+    heap.datum_field(icon, &field).ok()
+}
+
+/// Length of an icon's `_dream64_icon_journal` (0 when never mutated).
+pub(crate) fn icon_journal_len(heap: &ValueHeap, icon: DatumId) -> usize {
+    match icon_field(heap, icon, "_dream64_icon_journal") {
+        Some(Value::List(list)) => match heap.list(*list) {
+            Ok(entries) => entries.len(),
+            Err(_) => 0,
+        },
+        _ => 0,
+    }
+}
+
+fn journal_color(value: &Value) -> Option<dm_icon::Rgba> {
+    match value {
+        Value::Text(text) => dm_icon::parse_color(text),
+        _ => None,
+    }
+}
+
+/// Build a composited [`dm_icon::IconBitmap`] for `icon` by decoding its backing
+/// DMI and replaying every recorded `_dream64_icon_journal` entry in order.
+///
+/// Returns `Ok(None)` when the icon has no resolvable backing DMI (a synthetic
+/// headless icon) so callers can fall back to their existing behaviour.
+pub(crate) fn materialize_icon_bitmap(
+    icon: DatumId,
+    state: &ExecutionState,
+    depth: usize,
+) -> Result<Option<dm_icon::IconBitmap>, String> {
+    if depth >= 32 {
+        return Err("icon materialization recursed too deeply".to_owned());
+    }
+    let heap = &state.heap;
+    if !super::is_icon_datum(icon, heap) {
+        return Ok(None);
+    }
+
+    // Resolve the base bitmap from the backing resource.
+    let mut bitmap = match icon_field(heap, icon, "icon").cloned() {
+        Some(Value::File(path) | Value::Text(path)) => {
+            let resolved = relaxed_resolved_file_path(
+                &[Value::text(path.to_string())],
+                state,
+                "icon materialization resource",
+            )?;
+            load_dmi_bitmap_cached(&resolved)?.as_ref().clone()
+        }
+        Some(Value::Datum(backing)) => match materialize_icon_bitmap(backing, state, depth + 1)? {
+            Some(bitmap) => bitmap,
+            None => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+
+    // `icon(file, "state")` narrows the icon to a single state.
+    if let Some(Value::Text(state_name)) = icon_field(heap, icon, "icon_state")
+        && !state_name.is_empty()
+    {
+        bitmap = bitmap.select_state(state_name);
+    }
+
+    let Some(Value::List(journal)) = icon_field(heap, icon, "_dream64_icon_journal").cloned()
+    else {
+        return Ok(Some(bitmap));
+    };
+    let entries = heap.list(journal).map_err(|error| error.to_string())?.len();
+    for index in 1..=entries {
+        let Value::List(op) = heap
+            .list(journal)
+            .map_err(|error| error.to_string())?
+            .get(index)
+            .map_err(|error| error.to_string())?
+            .clone()
+        else {
+            continue;
+        };
+        let op = heap.list(op).map_err(|error| error.to_string())?;
+        let entry: Vec<Value> = (1..=op.len())
+            .filter_map(|i| op.get(i).ok().cloned())
+            .collect();
+        apply_journal_entry(&mut bitmap, &entry, state, depth)?;
+    }
+    Ok(Some(bitmap))
+}
+
+/// Apply one `_dream64_icon_journal` entry (`[method, args...]`) to `bitmap`.
+fn apply_journal_entry(
+    bitmap: &mut dm_icon::IconBitmap,
+    entry: &[Value],
+    state: &ExecutionState,
+    depth: usize,
+) -> Result<(), String> {
+    let Some(Value::Text(method)) = entry.first() else {
+        return Ok(());
+    };
+    let method = method.to_string();
+    // `arg(1)` is the first argument after the method name.
+    let arg = |i: usize| entry.get(i);
+    let num = |i: usize| arg(i).and_then(Value::as_number);
+    match method.as_str() {
+        "Scale" => {
+            if let (Some(w), Some(h)) = (num(1), num(2).or_else(|| num(1))) {
+                bitmap.scale(w.max(1.0) as u32, h.max(1.0) as u32);
+            }
+        }
+        "Crop" => {
+            if let (Some(x1), Some(y1), Some(x2), Some(y2)) = (num(1), num(2), num(3), num(4)) {
+                bitmap.crop(x1 as i32, y1 as i32, x2 as i32, y2 as i32);
+            }
+        }
+        "Flip" => {
+            if let Some(dir) = num(1) {
+                bitmap.flip(dir as i64);
+            }
+        }
+        "Turn" => {
+            if let Some(angle) = num(1) {
+                bitmap.turn(f64::from(angle));
+            }
+        }
+        "Shift" => {
+            if let (Some(dir), Some(offset)) = (num(1), num(2)) {
+                let wrap = arg(3).is_some_and(super::truthy);
+                bitmap.shift(dir as i64, offset as i32, wrap);
+            }
+        }
+        "SwapColor" => {
+            if let (Some(old), Some(new)) = (
+                arg(1).and_then(journal_color),
+                arg(2).and_then(journal_color),
+            ) {
+                bitmap.swap_color(old, new);
+            }
+        }
+        "DrawBox" => {
+            if let (Some(x1), Some(y1), Some(x2), Some(y2)) = (num(2), num(3), num(4), num(5)) {
+                let color = arg(1).and_then(journal_color);
+                bitmap.draw_box(color, x1 as i32, y1 as i32, x2 as i32, y2 as i32);
+            }
+        }
+        "MapColors" => {
+            let matrix: Vec<f32> = entry[1..].iter().filter_map(Value::as_number).collect();
+            bitmap.map_colors(&matrix);
+        }
+        "Blend" => {
+            let mode = num(2)
+                .and_then(|m| dm_icon::BlendMode::from_byond(m as i64))
+                .unwrap_or(dm_icon::BlendMode::Overlay);
+            let x = num(3).unwrap_or(1.0) as i32;
+            let y = num(4).unwrap_or(1.0) as i32;
+            match arg(1) {
+                Some(Value::Text(color)) => {
+                    if let Some(rgba) = dm_icon::parse_color(color) {
+                        bitmap.blend_color(rgba, mode);
+                    }
+                }
+                Some(Value::Datum(other)) => {
+                    if let Some(overlay) = materialize_icon_bitmap(*other, state, depth + 1)? {
+                        bitmap.blend_icon(&overlay, mode, x, y);
+                    }
+                }
+                _ => {}
+            }
+        }
+        "Insert" => {
+            if let Some(Value::Datum(other)) = arg(1)
+                && let Some(piece) = materialize_icon_bitmap(*other, state, depth + 1)?
+            {
+                let state_name = match arg(2) {
+                    Some(Value::Text(name)) => name.to_string(),
+                    _ => String::new(),
+                };
+                bitmap.insert(&piece, &state_name);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
