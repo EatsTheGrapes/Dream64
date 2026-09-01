@@ -12693,6 +12693,72 @@ fn world_geometry_honors_sparse_declared_area_and_turf_types_and_refreshes_area_
 }
 
 #[test]
+fn incremental_world_growth_keeps_existing_turf_identity_and_fills_new_slabs() {
+    let world_path = TypePath::parse("/world").unwrap();
+    let mut state = ExecutionState::new();
+    state.set_initial_values(BTreeMap::from([(
+        world_path.clone(),
+        BTreeMap::from([
+            (
+                field("area"),
+                Value::TypePath(TypePath::parse("/area").unwrap()),
+            ),
+            (
+                field("turf"),
+                Value::TypePath(TypePath::parse("/turf").unwrap()),
+            ),
+        ]),
+    )]));
+    let world = state.heap_mut().allocate_datum(world_path);
+
+    state.resize_world_geometry(world, (3, 3, 2)).unwrap();
+    let mut original = std::collections::BTreeMap::new();
+    for z in 1..=2 {
+        for y in 1..=3 {
+            for x in 1..=3 {
+                original.insert((x, y, z), state.turf_at(x, y, z).expect("turf exists"));
+            }
+        }
+    }
+
+    // Grow one slab at a time, exactly as a DM engine drives `world.maxz++`.
+    state.resize_world_geometry(world, (3, 3, 3)).unwrap();
+    state.resize_world_geometry(world, (3, 3, 4)).unwrap();
+
+    // The fast existence probe must not recreate turfs that already exist.
+    for (&(x, y, z), &turf) in &original {
+        assert_eq!(
+            state.turf_at(x, y, z),
+            Some(turf),
+            "existing turf identity at {x},{y},{z} must be stable across incremental growth"
+        );
+    }
+    // New slabs are fully populated.
+    for z in 3..=4 {
+        for y in 1..=3 {
+            for x in 1..=3 {
+                let turf = state.turf_at(x, y, z).expect("new slab turf exists");
+                assert_eq!(
+                    state.heap().datum_field(turf, &field("z")).unwrap(),
+                    &Value::number(z as f32)
+                );
+            }
+        }
+    }
+
+    // Shrinking then regrowing (a separate resize each way, as an engine does)
+    // drops the removed slab and rebuilds it with fresh turfs.
+    let dropped = state.turf_at(1, 1, 4).unwrap();
+    state.resize_world_geometry(world, (3, 3, 2)).unwrap();
+    assert_eq!(state.turf_at(1, 1, 4), None);
+    state.resize_world_geometry(world, (3, 3, 4)).unwrap();
+    let regrown = state.turf_at(1, 1, 4).expect("regrown slab turf exists");
+    assert_ne!(regrown, dropped);
+    // The slab that was never removed keeps its identity throughout.
+    assert_eq!(state.turf_at(1, 1, 1), Some(original[&(1, 1, 1)]));
+}
+
+#[test]
 fn world_geometry_preserves_runtime_turf_initializer_programs() {
     let turf_path = TypePath::parse("/turf/runtime_initialized").unwrap();
     let world_path = TypePath::parse("/world").unwrap();
@@ -12723,6 +12789,88 @@ fn world_geometry_preserves_runtime_turf_initializer_programs() {
             &Value::number(7.0)
         );
     }
+}
+
+#[test]
+fn bulk_turf_fill_replays_runtime_initializers_without_aliasing_list_state() {
+    // `world.turf` with a runtime initializer that allocates a fresh list per
+    // instance: the bulk fill must run the program once for a template and then
+    // give every sibling its own distinct, independently mutable list.
+    let turf_path = TypePath::parse("/turf/space").unwrap();
+    let world_path = TypePath::parse("/world").unwrap();
+    let syntax = parse(
+        "/proc/init_scalar()\n\treturn 42\n/proc/init_list()\n\tvar/list/L = list()\n\tL += \"seed\"\n\treturn L\n",
+    )
+    .unwrap();
+    let module = Arc::new(compile_module(&syntax.definitions).unwrap());
+    let scalar_entry = module.procedure_id("/proc/init_scalar").unwrap();
+    let list_entry = module.procedure_id("/proc/init_list").unwrap();
+    let mut state = ExecutionState::new();
+    state.set_initial_values(BTreeMap::from([(
+        world_path.clone(),
+        BTreeMap::from([(field("turf"), Value::TypePath(turf_path.clone()))]),
+    )]));
+    state.set_instance_initializers(
+        Arc::new(BTreeMap::from([(
+            turf_path,
+            vec![
+                InstanceInitializer::Program {
+                    field: field("blueprint_data"),
+                    entry: list_entry,
+                },
+                InstanceInitializer::Program {
+                    field: field("temperature"),
+                    entry: scalar_entry,
+                },
+            ],
+        )])),
+        Some(module),
+    );
+    let world = state.heap_mut().allocate_datum(world_path);
+    state.set_global(field("world"), Value::Datum(world));
+    state.resize_world_geometry(world, (3, 2, 1)).unwrap();
+
+    let mut lists = Vec::new();
+    for y in 1..=2 {
+        for x in 1..=3 {
+            let turf = state.turf_at(x, y, 1).expect("turf exists");
+            assert_eq!(
+                state
+                    .heap()
+                    .datum_field(turf, &field("temperature"))
+                    .unwrap(),
+                &Value::number(42.0),
+                "scalar initializer result is replayed onto every cell"
+            );
+            let Value::List(list) = state
+                .heap()
+                .datum_field(turf, &field("blueprint_data"))
+                .unwrap()
+            else {
+                panic!("list initializer result must be a list on every cell");
+            };
+            assert_eq!(state.heap().list(*list).unwrap().len(), 1);
+            lists.push(*list);
+        }
+    }
+    // Every cell owns a distinct list handle.
+    let mut unique = lists.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        lists.len(),
+        "no two cells share a list handle"
+    );
+
+    // Mutating one cell's list leaves the others untouched.
+    state
+        .heap_mut()
+        .list_mut(lists[0])
+        .unwrap()
+        .add(Value::text("mutated"));
+    assert_eq!(state.heap().list(lists[0]).unwrap().len(), 2);
+    assert_eq!(state.heap().list(lists[1]).unwrap().len(), 1);
 }
 
 #[test]
