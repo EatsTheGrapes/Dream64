@@ -465,34 +465,114 @@ impl ExecutionState {
             .iter()
             .any(|initializer| matches!(initializer, InstanceInitializer::Program { .. }));
         let mut bulk_area_members = Vec::new();
-        let bulk_world_contents = (!turf_has_runtime_initializers)
-            .then(|| {
-                self.global(&FieldName::parse("world").ok()?)
-                    .and_then(|value| (value == &Value::Datum(world)).then_some(()))?;
+        // A full `world.maxz++` slab is thousands of identically-typed turfs.
+        // Resolve `world.contents` once so both the compact path and the
+        // template-clone path below can append their new cells in one shot.
+        let world_contents = self
+            .global(&FieldName::parse("world").expect("built-in world global"))
+            .and_then(|value| (value == &Value::Datum(world)).then_some(()))
+            .and_then(|()| {
                 self.heap
-                    .datum_field(world, &FieldName::parse("contents").ok()?)
+                    .datum_field(
+                        world,
+                        &FieldName::parse("contents").expect("contents field"),
+                    )
                     .ok()
-                    .and_then(|value| match value {
-                        Value::List(list) => Some(*list),
-                        _ => None,
-                    })
             })
-            .flatten();
+            .and_then(|value| match value {
+                Value::List(list) => Some(*list),
+                _ => None,
+            });
         let mut bulk_world_members = Vec::new();
         let coordinate_fields = ["x", "y", "z"]
             .map(|name| FieldName::parse(name).expect("built-in coordinate field is valid"));
         let loc = FieldName::parse("loc").expect("built-in loc field is valid");
+        // `world.maxz` (and friends) are grown one slab at a time by DM engines,
+        // so this loop is re-entered many times over the same coordinate space.
+        // Consult the flattened lookup grid for the existence probe (O(1), and
+        // exactly equivalent to `world_turfs.contains_key` for in-bounds
+        // coordinates, as `turf_at` relies on) so an incremental grow pays only
+        // for its genuinely new cells.
+        let (lookup_maxx, lookup_maxy, lookup_maxz) = self.world_turf_lookup_dimensions;
+        let cell_exists = |state: &Self, x: i32, y: i32, z: i32| -> bool {
+            if x >= 1
+                && y >= 1
+                && z >= 1
+                && x <= lookup_maxx
+                && y <= lookup_maxy
+                && z <= lookup_maxz
+            {
+                let index = ((z - 1) as usize * lookup_maxy as usize + (y - 1) as usize)
+                    * lookup_maxx as usize
+                    + (x - 1) as usize;
+                if let Some(slot) = state.world_turf_lookup.get(index) {
+                    return slot.is_some();
+                }
+            }
+            state.world_turfs.contains_key(&(x, y, z))
+        };
+        // Every turf in a fresh slab is the same type initialized in the same
+        // (src-independent) context, so its runtime initializer programs
+        // otherwise re-run their bytecode tens of thousands of times to compute
+        // the identical field set. Run them once for a template cell, then
+        // replay the resulting fields onto its siblings (deep-copying any list
+        // value so instances never alias mutable state). A datum-valued
+        // initializer result is not safely shareable, so fall back to the
+        // per-cell path if one appears.
+        let mut template_fields: Option<Vec<(FieldName, Value)>> = None;
+        let mut template_shareable = true;
         for z in 1..=maxz {
             for y in 1..=maxy {
                 for x in 1..=maxx {
                     let coordinate = (x, y, z);
-                    if self.world_turfs.contains_key(&coordinate) {
+                    if cell_exists(self, x, y, z) {
                         continue;
                     }
-                    let turf = if turf_has_runtime_initializers {
-                        allocate_initialized_datum(self, turf_path.clone())?
-                    } else {
+                    let turf = if !turf_has_runtime_initializers {
                         self.heap.allocate_datum(turf_path.clone())
+                    } else if let Some(fields) =
+                        template_fields.as_ref().filter(|_| template_shareable)
+                    {
+                        let turf = self.heap.allocate_datum(turf_path.clone());
+                        for (name, value) in fields {
+                            let value = match value {
+                                Value::List(list) => Value::List(
+                                    self.heap
+                                        .copy_list(*list)
+                                        .map_err(|error| error.to_string())?,
+                                ),
+                                other => other.clone(),
+                            };
+                            self.heap
+                                .set_datum_field(turf, name.clone(), value)
+                                .map_err(|error| error.to_string())?;
+                        }
+                        if world_contents.is_some() {
+                            bulk_world_members.push(Value::Datum(turf));
+                        }
+                        turf
+                    } else {
+                        // `allocate_initialized_datum` adds the cell to
+                        // `world.contents` itself, so it is never pushed to the
+                        // bulk list below.
+                        let turf = allocate_initialized_datum(self, turf_path.clone())?;
+                        if template_fields.is_none() {
+                            let snapshot = self
+                                .heap
+                                .datum_fields(turf)
+                                .map_err(|error| error.to_string())?
+                                .filter(|(name, _)| {
+                                    !coordinate_fields.iter().any(|field| field == *name)
+                                        && *name != &loc
+                                })
+                                .map(|(name, value)| (name.clone(), value.clone()))
+                                .collect::<Vec<_>>();
+                            template_shareable = snapshot
+                                .iter()
+                                .all(|(_, value)| !matches!(value, Value::Datum(_)));
+                            template_fields = Some(snapshot);
+                        }
+                        turf
                     };
                     for (field, value) in coordinate_fields.iter().zip([x, y, z]) {
                         self.heap
@@ -502,16 +582,9 @@ impl ExecutionState {
                     self.heap
                         .set_datum_field(turf, loc.clone(), Value::Datum(area))
                         .map_err(|error| error.to_string())?;
-                    if turf_has_runtime_initializers {
-                        self.heap
-                            .list_mut(area_contents)
-                            .map_err(|error| error.to_string())?
-                            .add(Value::Datum(turf));
-                    } else {
-                        bulk_area_members.push(Value::Datum(turf));
-                        if bulk_world_contents.is_some() {
-                            bulk_world_members.push(Value::Datum(turf));
-                        }
+                    bulk_area_members.push(Value::Datum(turf));
+                    if !turf_has_runtime_initializers && world_contents.is_some() {
+                        bulk_world_members.push(Value::Datum(turf));
                     }
                     self.world_turfs.insert(coordinate, turf);
                     self.world_areas.insert(coordinate, area);
@@ -524,7 +597,7 @@ impl ExecutionState {
                 .map_err(|error| error.to_string())?
                 .extend_positional(bulk_area_members);
         }
-        if let Some(world_contents) = bulk_world_contents
+        if let Some(world_contents) = world_contents
             && !bulk_world_members.is_empty()
         {
             self.heap

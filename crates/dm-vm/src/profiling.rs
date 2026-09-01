@@ -480,6 +480,27 @@ pub(crate) fn boot_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("DREAM64_BOOT_TRACE").is_some())
 }
 
+/// Wall-time threshold, if any, above which a single interpreter instruction is
+/// reported to stderr. Gated by `DREAM64_TRACE_SLOW_INSTRUCTION`: unset disables
+/// it, a bare/truthy value uses a 5 ms threshold, and a positive integer sets an
+/// explicit millisecond threshold. Diagnostic only.
+pub(crate) fn slow_instruction_trace_threshold() -> Option<Duration> {
+    static THRESHOLD: OnceLock<Option<Duration>> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        let raw = std::env::var("DREAM64_TRACE_SLOW_INSTRUCTION").ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || matches!(trimmed, "0" | "off" | "false" | "no") {
+            return None;
+        }
+        let millis = trimmed
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .unwrap_or(5);
+        Some(Duration::from_millis(millis))
+    })
+}
+
 pub(crate) fn boot_dashboard_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("DREAM64_BOOT_DASHBOARD").is_some())
