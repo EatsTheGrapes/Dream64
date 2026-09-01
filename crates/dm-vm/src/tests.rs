@@ -14188,6 +14188,52 @@ fn tgm_rejection_diagnostics_ignore_unrelated_procedure_paths() {
 }
 
 #[test]
+fn drive_tgm_load_declines_without_engaging_when_semantic_identity_drifts() {
+    // Regression: `CANONICAL_MONKE_TGM_LOAD_DIGEST` is pinned to a specific
+    // production compile. When the project advances and shifts procedure
+    // numbering, `_tgm_load`'s semantic digest changes even though its own DM
+    // body did not, so the guard stops matching. The native sidecar must then
+    // decline cleanly and let the reference interpreter run the map load — it
+    // must never panic or half-attach.
+    let locals = (0..16)
+        .map(|index| format!("\tvar/scratch_{index}\n"))
+        .collect::<String>();
+    let source = format!(
+        "/datum/parsed_map/proc/_tgm_load(x_offset, y_offset, z_offset, crop_map, no_changeturf, x_lower, x_upper, y_lower, y_upper, z_lower, z_upper, place_on_top, new_z)\n{locals}\treturn\n"
+    );
+    let syntax = parse(&source).unwrap();
+    let module = compile_module(&syntax.definitions).unwrap();
+    let procedure = module
+        .procedure_id("/datum/parsed_map/proc/_tgm_load")
+        .unwrap();
+    let program = module.procedure(procedure).unwrap();
+    // The path and arity pre-checks pass; only the pinned semantic identity
+    // fails (a bare `compile_module` never attaches semantic digests).
+    assert!(crate::canonical_tgm_load_path(&module, procedure));
+    assert_eq!(program.parameter_count, 13);
+    assert!(program.local_count >= 13);
+
+    let mut frame = make_frame(procedure, program, &[], &ExecutionContext::default());
+    frame.instruction = 274;
+    let mut state = ExecutionState::new();
+    let activations_before = crate::native_tgm_load_activations();
+    let drive = crate::drive_tgm_load(&module, procedure, program, &mut frame, &mut state, 4);
+    assert!(matches!(drive, crate::TgmDrive::None));
+    assert!(
+        frame
+            .cold()
+            .and_then(|cold| cold.tgm_load.as_ref())
+            .is_none(),
+        "a drifted _tgm_load must not leave a partial native sidecar attached"
+    );
+    assert_eq!(
+        crate::native_tgm_load_activations(),
+        activations_before,
+        "the native TGM loader must not count an activation for a rejected proc"
+    );
+}
+
+#[test]
 fn tgm_attach_accepts_pre_iterator_and_legacy_seams_only() {
     let syntax = parse("/proc/run()\n\treturn\n").unwrap();
     let module = compile_module(&syntax.definitions).unwrap();
