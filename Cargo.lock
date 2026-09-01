@@ -938,6 +938,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dm-icon"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "png 0.17.16",
+ "serde_json",
+]
+
+[[package]]
 name = "dm-jit"
 version = "0.1.0"
 dependencies = [
