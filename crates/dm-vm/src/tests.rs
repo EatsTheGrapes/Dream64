@@ -15635,6 +15635,226 @@ fn native_walks_schedule_replace_stop_and_terminate_without_dm_tasks() {
     );
 }
 
+/// `step`/`step_to`/`step_towards` used to locate the destination turf by
+/// scanning every datum on the heap, which made each call scale with the total
+/// atom count (~0.5 s on a populated station during gib-streak loops). The
+/// lookup now goes through the world geometry index. This locks the greedy
+/// move sequences against the BYOND 516.1680 oracle in
+/// `fixtures/oracle/step_to/` for the scenarios where BYOND's bounded stepper
+/// and Dream64's greedy stepper agree (open ground, cardinal approach, `Min`
+/// range ring, and `step_towards`).
+#[test]
+fn step_to_move_sequences_match_the_byond_oracle_over_the_world_index() {
+    let syntax = parse(concat!(
+        "/proc/trace_to(mob/m, atom/trg, count, minrange)\n",
+        "\tvar/list/seq = list()\n",
+        "\tfor(var/i in 1 to count)\n",
+        "\t\tstep_to(m, trg, minrange)\n",
+        "\t\tseq += \"[m.x],[m.y]\"\n",
+        "\treturn jointext(seq, \";\")\n",
+        "/proc/trace_towards(mob/m, atom/trg, count)\n",
+        "\tvar/list/seq = list()\n",
+        "\tfor(var/i in 1 to count)\n",
+        "\t\tstep_towards(m, trg)\n",
+        "\t\tseq += \"[m.x],[m.y]\"\n",
+        "\treturn jointext(seq, \";\")\n",
+    ))
+    .expect("step_to trace fixture should parse");
+    let module = compile_module(&syntax.definitions).expect("step_to trace fixture should compile");
+
+    let mut state = ExecutionState::new();
+    // A 15x15 single-z floor, matching the oracle world dimensions. Populating
+    // world_turfs is what routes the builtin through the O(1) geometry index
+    // instead of the historical all-datums scan.
+    for x in 1..=15 {
+        for y in 1..=15 {
+            let turf = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/turf/floor").unwrap());
+            for (name, value) in [("x", x), ("y", y), ("z", 1)] {
+                state
+                    .heap_mut()
+                    .set_datum_field(turf, field(name), Value::number(value as f32))
+                    .unwrap();
+            }
+            state.world_turfs.insert((x, y, 1), turf);
+        }
+    }
+    state.rebuild_world_turf_lookup();
+
+    let probe = state
+        .heap_mut()
+        .allocate_datum(TypePath::parse("/mob/probe").unwrap());
+    let beacon = state
+        .heap_mut()
+        .allocate_datum(TypePath::parse("/obj/beacon").unwrap());
+
+    let place = |state: &mut ExecutionState, atom, x: i32, y: i32| {
+        let turf = state.turf_at(x, y, 1).unwrap();
+        for (name, value) in [("x", x as f32), ("y", y as f32), ("z", 1.0)] {
+            state
+                .heap_mut()
+                .set_datum_field(atom, field(name), Value::number(value))
+                .unwrap();
+        }
+        state
+            .heap_mut()
+            .set_datum_field(atom, field("loc"), Value::Datum(turf))
+            .unwrap();
+    };
+
+    let run_to = |state: &mut ExecutionState, count: f32, minrange: f32| {
+        execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/trace_to").unwrap(),
+            &[
+                Value::Datum(probe),
+                Value::Datum(beacon),
+                Value::number(count),
+                Value::number(minrange),
+            ],
+            state,
+        )
+    };
+
+    // open: diagonal approach from (2,2) toward (8,6).
+    place(&mut state, probe, 2, 2);
+    place(&mut state, beacon, 8, 6);
+    assert_eq!(
+        run_to(&mut state, 8.0, 0.0),
+        Ok(Value::text("3,3;4,4;5,5;6,6;7,6;8,6;8,6;8,6")),
+    );
+
+    // cardinal: straight east from (2,10) toward (9,10).
+    place(&mut state, probe, 2, 10);
+    place(&mut state, beacon, 9, 10);
+    assert_eq!(
+        run_to(&mut state, 8.0, 0.0),
+        Ok(Value::text("3,10;4,10;5,10;6,10;7,10;8,10;9,10;9,10")),
+    );
+
+    // min_range: step_to with Min=2 halts on the range ring (x=8).
+    place(&mut state, probe, 2, 13);
+    place(&mut state, beacon, 10, 13);
+    assert_eq!(
+        run_to(&mut state, 10.0, 2.0),
+        Ok(Value::text(
+            "3,13;4,13;5,13;6,13;7,13;8,13;8,13;8,13;8,13;8,13"
+        )),
+    );
+
+    // step_towards matches step_to on open ground.
+    place(&mut state, probe, 2, 4);
+    place(&mut state, beacon, 8, 4);
+    assert_eq!(
+        execute_module_in_state(
+            &module,
+            module.procedure_id("/proc/trace_towards").unwrap(),
+            &[
+                Value::Datum(probe),
+                Value::Datum(beacon),
+                Value::number(8.0)
+            ],
+            &mut state,
+        ),
+        Ok(Value::text("3,4;4,4;5,4;6,4;7,4;8,4;8,4;8,4")),
+    );
+}
+
+/// Reproduces the destination-turf resolution `step_builtin` used before it
+/// was routed through the `get_step` world-geometry index: an O(all datums)
+/// scan of the heap for a `/turf` whose x/y/z fields equal the target
+/// coordinate. On a fully populated station-sized heap this scan is what made
+/// every `step`/`step_to`/`step_towards`/`walk_*` call scale with total atom
+/// count instead of world area, and is what the boot's slow-instruction
+/// watchdog flagged on `step_to` calls in gib-streak loops (~0.5 s/call).
+/// Run explicitly in release: `cargo test -p dm-vm --release
+/// step_to_destination_turf_lookup_release_microbenchmark -- --ignored --nocapture`.
+#[test]
+#[ignore = "release-only step_to destination-turf lookup microbenchmark"]
+fn step_to_destination_turf_lookup_release_microbenchmark() {
+    let side = 550_i32; // ~300k turfs, in the neighborhood of a populated station z-level.
+    let mut state = ExecutionState::new();
+    for x in 1..=side {
+        for y in 1..=side {
+            let turf = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/turf/open/floor/microbench").unwrap());
+            for (name, value) in [("x", x), ("y", y), ("z", 1)] {
+                state
+                    .heap_mut()
+                    .set_datum_field(turf, field(name), Value::number(value as f32))
+                    .unwrap();
+            }
+            state.world_turfs.insert((x, y, 1), turf);
+        }
+    }
+    // Interleave a population of non-turf movables, as a live station would
+    // have between mobs, items, and structures.
+    for _ in 0..50_000 {
+        state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/item/microbench_filler").unwrap());
+    }
+    state.rebuild_world_turf_lookup();
+
+    let target = (side - 1, side - 1, 1);
+    let x_field = field("x");
+    let y_field = field("y");
+    let z_field = field("z");
+
+    // The historical resolver: linear-scan every heap datum for a matching
+    // `/turf`, exactly as `step_builtin` used to before this fix.
+    let old_scan = || {
+        state.heap().datums().find_map(|(id, datum)| {
+            let path = datum.type_path().as_str();
+            if path != "/turf" && !path.starts_with("/turf/") {
+                return None;
+            }
+            let coordinate = |field: &FieldName| datum.field(field).ok()?.as_number();
+            ((
+                coordinate(&x_field)?,
+                coordinate(&y_field)?,
+                coordinate(&z_field)?,
+            ) == (target.0 as f32, target.1 as f32, target.2 as f32))
+                .then_some(id)
+        })
+    };
+    let rounds = 200;
+    let started = Instant::now();
+    let mut found = 0usize;
+    for _ in 0..rounds {
+        if old_scan().is_some() {
+            found += 1;
+        }
+    }
+    let old_elapsed = started.elapsed();
+    assert_eq!(found, rounds, "the target turf must exist in the scan");
+
+    // The current resolver: the O(1) world-geometry index used by `get_step`.
+    let started = Instant::now();
+    let mut hits = 0usize;
+    for _ in 0..rounds {
+        if state.turf_at(target.0, target.1, target.2).is_some() {
+            hits += 1;
+        }
+    }
+    let indexed_elapsed = started.elapsed();
+    assert_eq!(hits, rounds);
+
+    eprintln!(
+        "step_to-destination-turf-lookup datums={} rounds={rounds} old_scan_ms={} indexed_ms={} speedup={:.1}x",
+        state.heap().datums().count(),
+        old_elapsed.as_millis(),
+        indexed_elapsed.as_millis(),
+        old_elapsed.as_secs_f64() / indexed_elapsed.as_secs_f64().max(1e-9),
+    );
+    assert!(
+        indexed_elapsed < old_elapsed,
+        "the indexed lookup must be faster than the historical all-datums scan"
+    );
+}
+
 #[test]
 fn mapping_multiz_get_step_resolves_up_down_and_world_bounds() {
     let syntax = parse(

@@ -538,20 +538,14 @@ pub(super) fn step_builtin(
         y + f32::from(u8::from(direction & 1 != 0)) - f32::from(u8::from(direction & 2 != 0)),
         z,
     );
-    let turf = state.heap.datums().find_map(|(id, datum)| {
-        let path = datum.type_path().as_str();
-        if path != "/turf" && !path.starts_with("/turf/") {
-            return None;
-        }
-        let coordinate = |name: &str| {
-            datum
-                .field(&FieldName::parse(name).expect("coordinate field"))
-                .ok()?
-                .as_number()
-        };
-        ((coordinate("x")?, coordinate("y")?, coordinate("z")?) == target).then_some(id)
-    });
-    let Some(turf) = turf else {
+    // Resolve the destination turf through the shared, world-indexed
+    // `get_step` lookup. The previous inline resolver scanned every datum on
+    // the heap for each call, so `step`/`step_to`/`step_towards`/`walk_*`
+    // scaled with the total atom count. On a fully populated station that is
+    // ~0.5 s per call and dominates gib-streak loops during boot.
+    // `get_step` retains an all-datums fallback only for geometry-free
+    // fixtures, matching the old behaviour there.
+    let Value::Datum(turf) = super::get_step_builtin(&arguments[0], &arguments[1], state)? else {
         return Ok(Value::number(0.0));
     };
     let loc_name = FieldName::parse("loc").expect("movement field");
