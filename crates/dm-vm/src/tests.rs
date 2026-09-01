@@ -15953,6 +15953,53 @@ fn icon_copy_constructor_preserves_render_state_and_mutates_independently() {
 }
 
 #[test]
+fn fcopy_of_a_mutated_icon_writes_a_composited_dmi() {
+    // A real BYOND-authored 32x32 template (states "box" = opaque #808080
+    // bottom-left quadrant, and "stripe").
+    const TEMPLATE: &[u8] = include_bytes!("../../../fixtures/oracle/icon_ops/template.dmi");
+    let root = std::env::temp_dir().join(format!(
+        "dream64-icon-fcopy-composite-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("icons")).unwrap();
+    std::fs::write(root.join("icons/template.dmi"), TEMPLATE).unwrap();
+
+    let syntax = parse(
+        "/proc/probe()\n\
+             \tvar/icon/sprite = icon('icons/template.dmi', \"box\")\n\
+             \tsprite.Scale(16, 16)\n\
+             \tsprite.Blend(\"#ff0000\", ICON_MULTIPLY)\n\
+             \treturn fcopy(sprite, \"gen/out.dmi\")\n",
+    )
+    .expect("mutated-icon fcopy fixture should parse");
+    let module = compile_module(&syntax.definitions).expect("fixture compiles");
+    let mut state = ExecutionState::new();
+    state.set_project_root(root.clone());
+    let result = execute_module_in_state(
+        &module,
+        module.procedure_id("/proc/probe").unwrap(),
+        &[],
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(result, Value::number(1.0), "fcopy must report success");
+
+    let written = std::fs::read(root.join("gen/out.dmi")).expect("output DMI written");
+    let dmi = dm_icon::IconBitmap::from_dmi_bytes(&written).expect("output is a valid PNG DMI");
+    assert_eq!((dmi.width, dmi.height), (16, 16), "Scale(16,16) must apply");
+    assert_eq!(dmi.state_names(), vec!["box".to_owned()]);
+    // #ff0000 multiplied over the #808080 fill -> #800000, opaque.
+    let opaque_red = dmi.states[0].cells[0]
+        .pixels
+        .iter()
+        .any(|p| *p == [128, 0, 0, 255]);
+    assert!(opaque_red, "the colourised fill pixels must survive fcopy");
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn icon_geometry_methods_mutate_headless_dimensions_and_dispatch_both_ways() {
     let syntax = parse(
             "/icon/proc/resize_inside()\n\tScale(48, 64)\n\treturn Width() * 100 + Height()\n/proc/resize_outside()\n\tvar/icon/value = icon()\n\tvalue.Scale(20)\n\tvalue.Crop(2, 3, 11, 18)\n\tvalue.Shift(NORTH, 2)\n\tvalue.DrawBox(\"#ffffff\", 1, 1, 2, 2)\n\tvalue.Insert(icon(), \"state\")\n\treturn value.Width() * 100 + value.Height()\n",

@@ -64,8 +64,11 @@ pub(crate) fn icon_number(
         .ok_or_else(|| format!("icon.{method} requires numeric {name}"))
 }
 
-pub(crate) fn record_icon_operation(
+/// Append `[method, args...]` to a named list field on the icon, allocating the
+/// list on first use.
+fn append_icon_op_list(
     icon: DatumId,
+    field_name: &str,
     method: &str,
     arguments: &[Value],
     heap: &mut ValueHeap,
@@ -80,8 +83,7 @@ pub(crate) fn record_icon_operation(
             values.add(argument.clone());
         }
     }
-    let field = FieldName::parse("_dream64_icon_operations")
-        .expect("internal icon operation field is valid");
+    let field = FieldName::parse(field_name).expect("internal icon list field is valid");
     let operations = if let Ok(Value::List(operations)) = heap.datum_field(icon, &field) {
         *operations
     } else {
@@ -94,6 +96,29 @@ pub(crate) fn record_icon_operation(
         .map_err(|error| error.to_string())?
         .add(Value::List(operation));
     Ok(())
+}
+
+/// Records a single ordered entry in `_dream64_icon_journal` so the raster
+/// pipeline can replay every mutation (geometry ops, blends, colour maps) in
+/// the exact order the DM program issued them when a DMI is finally
+/// materialised on `fcopy` / `fcopy_rsc`.
+pub(crate) fn record_icon_journal(
+    icon: DatumId,
+    method: &str,
+    arguments: &[Value],
+    heap: &mut ValueHeap,
+) -> Result<(), String> {
+    append_icon_op_list(icon, "_dream64_icon_journal", method, arguments, heap)
+}
+
+pub(crate) fn record_icon_operation(
+    icon: DatumId,
+    method: &str,
+    arguments: &[Value],
+    heap: &mut ValueHeap,
+) -> Result<(), String> {
+    append_icon_op_list(icon, "_dream64_icon_operations", method, arguments, heap)?;
+    record_icon_journal(icon, method, arguments, heap)
 }
 
 pub(crate) fn execute_icon_method(
@@ -180,8 +205,8 @@ pub(crate) fn apply_icon_map_colors(
         FieldName::parse("_dream64_color_matrix").expect("headless icon field is valid"),
         Value::List(matrix),
     )
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    record_icon_journal(icon, "MapColors", arguments, heap)
 }
 
 pub(crate) fn apply_icon_blend(
@@ -205,13 +230,14 @@ pub(crate) fn apply_icon_blend(
             .map_err(|error| error.to_string())?;
         history
     };
-    let operation = heap.allocate_list();
-    for value in [
+    let normalized = [
         arguments[0].clone(),
         arguments.get(1).cloned().unwrap_or(Value::number(0.0)),
         arguments.get(2).cloned().unwrap_or(Value::number(1.0)),
         arguments.get(3).cloned().unwrap_or(Value::number(1.0)),
-    ] {
+    ];
+    let operation = heap.allocate_list();
+    for value in normalized.clone() {
         heap.list_mut(operation)
             .map_err(|error| error.to_string())?
             .add(value);
@@ -219,7 +245,7 @@ pub(crate) fn apply_icon_blend(
     heap.list_mut(history)
         .map_err(|error| error.to_string())?
         .add(Value::List(operation));
-    Ok(())
+    record_icon_journal(icon, "Blend", &normalized, heap)
 }
 
 pub(crate) fn apply_icon_set_intensity(
