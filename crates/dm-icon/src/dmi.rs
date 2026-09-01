@@ -359,6 +359,9 @@ pub(crate) fn encode(bitmap: &IconBitmap) -> Result<Vec<u8>, DmiError> {
         let mut encoder = png::Encoder::new(Cursor::new(&mut bytes), img_w, img_h);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
+        // BYOND ignores the compression level; asset generation writes hundreds
+        // of these, so trade a little size for encode speed.
+        encoder.set_compression(png::Compression::Fast);
         encoder
             .add_ztxt_chunk("Description".to_owned(), description)
             .map_err(|e| DmiError::Png(e.to_string()))?;
