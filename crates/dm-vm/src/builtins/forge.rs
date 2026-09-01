@@ -135,7 +135,10 @@ pub(super) fn iconforge_gags(
         parent = resolved;
     }
     let output = resolved_file_path(&arguments[2..3], state, "iconforge output path")?;
-    let colors = strict_text(&arguments[1], state, "iconforge colors")?;
+    // SS13 always joins the palette into a "#rrggbb#rrggbb" string before the
+    // native call; tolerate anything else by falling back to an empty palette
+    // so the output DMI still carries the config's state set.
+    let colors = strict_text(&arguments[1], state, "iconforge colors").unwrap_or_default();
     let source = state
         .iconforge_gags_source(&config_path)
         .ok_or_else(|| format!("IconForge error: Config {config_path} lost its source DMI"))?
