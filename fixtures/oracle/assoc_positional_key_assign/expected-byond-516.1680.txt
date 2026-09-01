@@ -1,0 +1,7 @@
+case1_newkey: len=3 keys: a z c | z=null b=null a=1
+case2_collide: len=3 keys: a a c | a=1 b=null
+case3_numkey: len=3 keys: a 5 c | k5= b=null
+case4_mixed: len=3 keys: x z b | z=null a=null x=null
+case5_same: len=3 keys: a b c | b=null
+case6_rewrite: len=3 keys: a z c | z=99
+case7_assoc_after: cut? len=3 keys: a z c | z=10

@@ -10625,6 +10625,84 @@ fn list_assignment_preserves_alias_identity() {
 }
 
 #[test]
+fn numeric_index_assignment_rebinds_an_associative_slot_in_place() {
+    // Monkestation's /datum/species/proc/on_species_loss rebinds an associative
+    // `mutation_index` entry by its numeric position: `L.Find(key)` yields a
+    // position, then `L[position] = new_key` rebinds that slot. BYOND keeps the
+    // slot and its order, replacing the key and dropping the association.
+    let source = concat!(
+        "/proc/rebind(mutation_index, default_genes, old_key, new_key)\n",
+        "\tvar/location = mutation_index.Find(old_key)\n",
+        "\tmutation_index[location] = new_key\n",
+        "\tdefault_genes[location] = mutation_index[location]\n",
+        "\treturn \"[location]|[mutation_index[location]]|[default_genes[location]]\"\n",
+    );
+    let syntax = parse(source).expect("species-loss shaped source should parse");
+    let program = compile_procedure(&syntax.definitions[0])
+        .expect("numeric rebind of an associative slot should compile");
+    assert!(
+        program
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::SetListIndex))
+    );
+
+    let mut state = ExecutionState::new();
+    let mutation_index = state.heap_mut().allocate_list();
+    let default_genes = state.heap_mut().allocate_list();
+    for (key, value) in [("a", 1.0), ("b", 2.0), ("c", 3.0)] {
+        state
+            .heap_mut()
+            .list_mut(mutation_index)
+            .unwrap()
+            .set_key(Value::text(key), Value::number(value));
+        state
+            .heap_mut()
+            .list_mut(default_genes)
+            .unwrap()
+            .set_key(Value::text(key), Value::text("seq"));
+    }
+
+    assert_eq!(
+        execute_in_state(
+            &program,
+            &[
+                Value::List(mutation_index),
+                Value::List(default_genes),
+                Value::text("b"),
+                Value::text("q"),
+            ],
+            &mut state,
+        ),
+        Ok(Value::text("2|q|q"))
+    );
+
+    let values = state.heap().list(mutation_index).unwrap();
+    assert_eq!(values.len(), 3);
+    assert!(values.get(1).unwrap().semantic_eq(&Value::text("a")));
+    assert!(values.get(2).unwrap().semantic_eq(&Value::text("q")));
+    assert!(values.get(3).unwrap().semantic_eq(&Value::text("c")));
+    assert!(matches!(
+        values.get_key(&Value::text("b")),
+        Err(ValueError::MissingKey)
+    ));
+    // The untouched keys keep their associations.
+    assert!(
+        values
+            .get_key(&Value::text("a"))
+            .unwrap()
+            .semantic_eq(&Value::number(1.0))
+    );
+
+    let genes = state.heap().list(default_genes).unwrap();
+    assert!(genes.get(2).unwrap().semantic_eq(&Value::text("q")));
+    assert!(matches!(
+        genes.get_key(&Value::text("b")),
+        Err(ValueError::MissingKey)
+    ));
+}
+
+#[test]
 fn compound_list_index_assignment_updates_positional_and_associative_entries() {
     let source = "/proc/update(items)\n\titems[1] += 4\n\titems[\"score\"] *= 3\n\treturn items[1] + items[\"score\"]\n";
     let syntax = parse(source).expect("source should parse");
