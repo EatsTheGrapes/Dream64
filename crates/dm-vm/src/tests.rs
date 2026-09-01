@@ -6,7 +6,7 @@ use dm_core::{DmNumberBits, SourceSpan};
 use dm_dmf::{ControlTree, parse as parse_dmf};
 use dm_lexer::{SpannedToken, TokenKind, lex};
 use dm_syntax::{DefinitionKind, parse};
-use dm_value::{DatumId, FieldName, ModifiedTypePath, TypePath, ValueError};
+use dm_value::{DatumId, FieldName, ListId, ModifiedTypePath, TypePath, ValueError};
 
 use super::compile::{
     condition_tokens, dm_builtin_numeric_constant, interpolated_expression_close,
@@ -33,6 +33,7 @@ use super::{
     try_run_numeric_dispatch_block, try_run_packed_numeric_dispatch_block,
     try_run_register_signal_fast_path, try_run_rich_numeric_dispatch_block,
 };
+use super::{atom_contents_iteration_snapshot, world_contents_iteration_snapshot};
 
 #[test]
 fn builtin_mob_sight_flag_family_has_byond_bit_values() {
@@ -11375,6 +11376,201 @@ fn world_geometry_registers_atoms_once_and_iteration_uses_byond_category_order()
     );
     assert!(registered.contains(&Value::Datum(object)));
     assert!(registered.contains(&Value::Datum(mob)));
+}
+
+#[test]
+fn world_contents_iteration_snapshot_batch_fill_matches_per_element_add() {
+    // Replays the pre-`extend_positional` population: bucket by BYOND category,
+    // then build the list with per-element `add`.
+    fn reference_snapshot(state: &mut ExecutionState, contents: ListId) -> ListId {
+        let values: Vec<Value> = state
+            .heap()
+            .list(contents)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect();
+        let mob = TypePath::parse("/mob").unwrap();
+        let movable = TypePath::parse("/atom/movable").unwrap();
+        let area = TypePath::parse("/area").unwrap();
+        let turf = TypePath::parse("/turf").unwrap();
+        let mut buckets: [Vec<Value>; 5] = std::array::from_fn(|_| Vec::new());
+        for value in values {
+            let path = match &value {
+                Value::Datum(datum) => state
+                    .heap()
+                    .datum(*datum)
+                    .ok()
+                    .map(|datum| datum.type_path().clone()),
+                _ => None,
+            };
+            let category = match &path {
+                Some(path) if is_subtype(state, path, &mob) => 0,
+                Some(path) if is_subtype(state, path, &movable) => 1,
+                Some(path) if is_subtype(state, path, &area) => 2,
+                Some(path) if is_subtype(state, path, &turf) => 3,
+                _ => 4,
+            };
+            buckets[category].push(value);
+        }
+        let snapshot = state.heap_mut().allocate_list();
+        for value in buckets.into_iter().flatten() {
+            state.heap_mut().list_mut(snapshot).unwrap().add(value);
+        }
+        snapshot
+    }
+
+    let mut state = ExecutionState::new();
+    let datum = |state: &mut ExecutionState, path: &str| {
+        state
+            .heap_mut()
+            .allocate_datum(TypePath::parse(path).unwrap())
+    };
+    let mob_a = datum(&mut state, "/mob/living/carbon/human");
+    let obj_a = datum(&mut state, "/obj/item/gun");
+    let area_a = datum(&mut state, "/area/station/engineering");
+    let turf_a = datum(&mut state, "/turf/open/floor/plating");
+    let obj_b = datum(&mut state, "/obj/machinery/door");
+    let mob_b = datum(&mut state, "/mob/living/silicon/robot");
+    let turf_b = datum(&mut state, "/turf/closed/wall");
+    let plain = datum(&mut state, "/datum/reagent");
+
+    let contents = state.heap_mut().allocate_list();
+    for value in [turf_a, obj_a, mob_a, area_a, plain, obj_b, mob_b, turf_b] {
+        state
+            .heap_mut()
+            .list_mut(contents)
+            .unwrap()
+            .add(Value::Datum(value));
+    }
+    state
+        .heap_mut()
+        .list_mut(contents)
+        .unwrap()
+        .add(Value::number(7.0));
+
+    let reference = reference_snapshot(&mut state, contents);
+    let snapshot = world_contents_iteration_snapshot(&mut state, contents).unwrap();
+
+    let positions = |state: &ExecutionState, id| {
+        state
+            .heap()
+            .list(id)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(positions(&state, snapshot), positions(&state, reference));
+    assert_eq!(
+        positions(&state, snapshot),
+        vec![
+            Value::Datum(mob_a),
+            Value::Datum(mob_b),
+            Value::Datum(obj_a),
+            Value::Datum(obj_b),
+            Value::Datum(area_a),
+            Value::Datum(turf_a),
+            Value::Datum(turf_b),
+            Value::Datum(plain),
+            Value::number(7.0),
+        ],
+    );
+    let list = state.heap().list(snapshot).unwrap();
+    assert_eq!(list.len(), 9);
+    assert_eq!(
+        list.associative_len(),
+        0,
+        "a PrepareIteration snapshot is a plain positional list"
+    );
+}
+
+#[test]
+fn atom_contents_iteration_snapshot_batch_fill_matches_per_element_add() {
+    let mut state = ExecutionState::new();
+    let area = state
+        .heap_mut()
+        .allocate_datum(TypePath::parse("/area/space").unwrap());
+    let other = state
+        .heap_mut()
+        .allocate_datum(TypePath::parse("/area/station").unwrap());
+    let member = |state: &mut ExecutionState, path: &str, loc: DatumId| {
+        let id = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse(path).unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(id, field("loc"), Value::Datum(loc))
+            .unwrap();
+        id
+    };
+    let t1 = member(&mut state, "/turf/open/space", area);
+    let stray = member(&mut state, "/turf/open/floor", other);
+    let t2 = member(&mut state, "/turf/open/space/nearstar", area);
+    let t3 = member(&mut state, "/turf/closed/wall", area);
+    let no_loc = state
+        .heap_mut()
+        .allocate_datum(TypePath::parse("/turf/open/space").unwrap());
+
+    let contents = state.heap_mut().allocate_list();
+    for value in [t1, stray, t2, no_loc, t3] {
+        state
+            .heap_mut()
+            .list_mut(contents)
+            .unwrap()
+            .add(Value::Datum(value));
+    }
+    state
+        .heap_mut()
+        .list_mut(contents)
+        .unwrap()
+        .add(Value::text("junk"));
+
+    // Pre-`extend_positional` reference: per-element `add` of the members whose
+    // `loc` resolves to the owner, in their original contents order.
+    let members: Vec<Value> = state
+        .heap()
+        .list(contents)
+        .unwrap()
+        .positions()
+        .map(|(_, value)| value.clone())
+        .collect();
+    let reference = state.heap_mut().allocate_list();
+    for value in members {
+        let Value::Datum(datum) = value else { continue };
+        let owns = matches!(
+            state.heap().datum_field(datum, &field("loc")),
+            Ok(Value::Datum(loc)) if *loc == area
+        );
+        if owns {
+            state
+                .heap_mut()
+                .list_mut(reference)
+                .unwrap()
+                .add(Value::Datum(datum));
+        }
+    }
+
+    let snapshot = atom_contents_iteration_snapshot(&mut state, area, contents).unwrap();
+    let positions = |state: &ExecutionState, id| {
+        state
+            .heap()
+            .list(id)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(positions(&state, snapshot), positions(&state, reference));
+    assert_eq!(
+        positions(&state, snapshot),
+        vec![Value::Datum(t1), Value::Datum(t2), Value::Datum(t3)],
+    );
+    assert_eq!(
+        state.heap().list(snapshot).unwrap().associative_len(),
+        0,
+        "an atom contents snapshot is a plain positional list"
+    );
 }
 
 #[test]
