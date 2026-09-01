@@ -27,6 +27,7 @@ pub struct Project {
     /// Active compiler diagnostic policies in source encounter order.
     pub diagnostic_pragmas: Vec<DiagnosticPragma>,
     object_macros: HashMap<String, String>,
+    defines: ProjectDefines,
 }
 
 impl Project {
@@ -66,7 +67,26 @@ impl Project {
     /// when a source file is not UTF-8, or when an include escapes the project
     /// directory.
     pub fn load(root_file: impl AsRef<Path>) -> Result<Self, ProjectError> {
-        Loader::new(root_file.as_ref())?.load()
+        Self::load_with_defines(root_file, &ProjectDefines::new())
+    }
+
+    /// Loads a `.dme` like [`Self::load`], seeding the preprocessor with
+    /// caller-supplied `-D` defines.
+    ///
+    /// The defines are merged into the initial macro table alongside
+    /// `DM_VERSION` / `DM_BUILD`; a later source `#define` or `#undef` still
+    /// overrides them. The define set participates in
+    /// [`Self::content_fingerprint`] so a `-D`-flavoured build never shares a
+    /// cache entry with a differently defined one.
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`Self::load`].
+    pub fn load_with_defines(
+        root_file: impl AsRef<Path>,
+        defines: &ProjectDefines,
+    ) -> Result<Self, ProjectError> {
+        Loader::new(root_file.as_ref(), defines)?.load()
     }
 
     /// Returns a deterministic identity for the complete discovered project.
@@ -98,6 +118,8 @@ impl Project {
             context.consume([file.kind.identity_tag()]);
             fingerprint_bytes(&mut context, &file.contents);
         }
+        context.consume(b"\0defines\0");
+        self.defines.fingerprint(&mut context);
         ProjectContentFingerprint(context.compute().0)
     }
 
@@ -119,6 +141,23 @@ impl Project {
         root_file: impl AsRef<Path>,
         cache_file: impl AsRef<Path>,
     ) -> Result<(Self, bool), ProjectError> {
+        Self::load_cached_with_defines(root_file, cache_file, &ProjectDefines::new())
+    }
+
+    /// [`Self::load_cached`] with caller-supplied `-D` defines.
+    ///
+    /// A warm cache entry is rejected when its recorded define set differs from
+    /// `defines`, so a `-D`-flavoured build cannot reuse a snapshot produced by
+    /// a differently defined one at the same cache path.
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`Self::load_cached`].
+    pub fn load_cached_with_defines(
+        root_file: impl AsRef<Path>,
+        cache_file: impl AsRef<Path>,
+        defines: &ProjectDefines,
+    ) -> Result<(Self, bool), ProjectError> {
         let root_file = root_file.as_ref();
         let canonical_root = fs::canonicalize(root_file).map_err(|source| ProjectError::Io {
             path: root_file.to_path_buf(),
@@ -135,6 +174,7 @@ impl Project {
             && let Ok(bytes) = fs::read(cache_file)
             && bytes.len() as u64 == manifest.cache_length
             && let Some(project) = decode_cached_project(&bytes)
+            && &project.defines == defines
             && project
                 .files
                 .first()
@@ -147,7 +187,7 @@ impl Project {
         {
             return Ok((project, true));
         }
-        let project = Self::load(&canonical_root)?;
+        let project = Self::load_with_defines(&canonical_root, defines)?;
         write_cached_project_best_effort(&project, cache_file, &manifest_file);
         Ok((project, false))
     }
@@ -169,7 +209,21 @@ impl Project {
         root_file: impl AsRef<Path>,
         cache_file: impl AsRef<Path>,
     ) -> Result<(Self, bool), ProjectError> {
-        let (project, hit, _) = Self::load_cached_exact_with_fingerprint(root_file, cache_file)?;
+        Self::load_cached_exact_with_defines(root_file, cache_file, &ProjectDefines::new())
+    }
+
+    /// [`Self::load_cached_exact`] with caller-supplied `-D` defines.
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`Self::load_cached_exact`].
+    pub fn load_cached_exact_with_defines(
+        root_file: impl AsRef<Path>,
+        cache_file: impl AsRef<Path>,
+        defines: &ProjectDefines,
+    ) -> Result<(Self, bool), ProjectError> {
+        let (project, hit, _) =
+            Self::load_cached_exact_with_fingerprint_and_defines(root_file, cache_file, defines)?;
         Ok((project, hit))
     }
 
@@ -182,9 +236,29 @@ impl Project {
         root_file: impl AsRef<Path>,
         cache_file: impl AsRef<Path>,
     ) -> Result<(Self, bool, ProjectContentFingerprint), ProjectError> {
+        Self::load_cached_exact_with_fingerprint_and_defines(
+            root_file,
+            cache_file,
+            &ProjectDefines::new(),
+        )
+    }
+
+    /// [`Self::load_cached_exact_with_fingerprint`] with caller-supplied `-D`
+    /// defines.
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`Self::load_cached_exact_with_fingerprint`].
+    #[doc(hidden)]
+    pub fn load_cached_exact_with_fingerprint_and_defines(
+        root_file: impl AsRef<Path>,
+        cache_file: impl AsRef<Path>,
+        defines: &ProjectDefines,
+    ) -> Result<(Self, bool, ProjectContentFingerprint), ProjectError> {
         let root_file = root_file.as_ref();
         let cache_file = cache_file.as_ref();
-        let (project, metadata_hit) = Self::load_cached(root_file, cache_file)?;
+        let (project, metadata_hit) =
+            Self::load_cached_with_defines(root_file, cache_file, defines)?;
         let cached_fingerprint = project.content_fingerprint();
         if metadata_hit {
             if project
@@ -201,7 +275,7 @@ impl Project {
             path: root_file.to_path_buf(),
             source,
         })?;
-        let project = Self::load(&canonical_root)?;
+        let project = Self::load_with_defines(&canonical_root, defines)?;
         let manifest_file = cache_manifest_path(cache_file);
         write_cached_project_best_effort(&project, cache_file, &manifest_file);
         let fingerprint = project.content_fingerprint();
@@ -225,6 +299,8 @@ impl Project {
             context.consume([file.kind.identity_tag()]);
             fingerprint_bytes(&mut context, &fs::read(&file.path)?);
         }
+        context.consume(b"\0defines\0");
+        self.defines.fingerprint(&mut context);
         Ok(ProjectContentFingerprint(context.compute().0))
     }
 
@@ -250,6 +326,12 @@ impl Project {
     #[must_use]
     pub fn object_macro(&self, name: &str) -> Option<&str> {
         self.object_macros.get(name).map(String::as_str)
+    }
+
+    /// Returns the caller-supplied `-D` defines this project was loaded with.
+    #[must_use]
+    pub fn defines(&self) -> &ProjectDefines {
+        &self.defines
     }
 
     /// Returns the project source stream after quoted includes are spliced in.
@@ -316,6 +398,138 @@ impl Project {
     }
 }
 
+/// Failure to interpret a caller-supplied `-D NAME[=VALUE]` define spec.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProjectDefineError {
+    /// The spec had no macro name before the optional `=`.
+    EmptyName,
+    /// The macro name is not a valid preprocessor identifier.
+    InvalidName(String),
+}
+
+impl fmt::Display for ProjectDefineError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyName => formatter.write_str("preprocessor define has an empty name"),
+            Self::InvalidName(name) => {
+                write!(formatter, "`{name}` is not a valid preprocessor identifier")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProjectDefineError {}
+
+/// An ordered set of caller-supplied preprocessor object-like macros, matching
+/// BYOND's and gcc's `-D NAME[=VALUE]` command-line defines.
+///
+/// A bare `NAME` takes the replacement `"1"`, exactly like BYOND's `-D`. The
+/// defines are seeded into the initial macro table alongside `DM_VERSION` and
+/// `DM_BUILD`, so a later source `#define` or `#undef` still overrides a
+/// supplied define. Entries are kept canonical (sorted by name, last value for
+/// a repeated name wins) so that permuting the command line neither changes the
+/// compile nor the project content fingerprint / cache key.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub struct ProjectDefines {
+    entries: Vec<(String, String)>,
+}
+
+impl ProjectDefines {
+    /// Creates an empty define set.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Returns `true` when no defines are configured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns the number of distinct defines.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Inserts or replaces one define. A `None` value becomes `"1"`.
+    pub fn insert(&mut self, name: impl Into<String>, value: Option<impl Into<String>>) {
+        let name = name.into();
+        let value = value.map_or_else(|| "1".to_owned(), Into::into);
+        self.entries.retain(|(existing, _)| existing != &name);
+        let position = self
+            .entries
+            .partition_point(|(existing, _)| existing.as_str() < name.as_str());
+        self.entries.insert(position, (name, value));
+    }
+
+    /// Parses and inserts a `NAME` or `NAME=VALUE` spec.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectDefineError`] when the name before `=` is empty or is
+    /// not a valid preprocessor identifier.
+    pub fn push_spec(&mut self, spec: &str) -> Result<(), ProjectDefineError> {
+        let (name, value) = spec
+            .split_once('=')
+            .map_or((spec, None), |(name, value)| (name, Some(value.to_owned())));
+        if name.is_empty() {
+            return Err(ProjectDefineError::EmptyName);
+        }
+        let mut characters = name.chars();
+        let valid = characters
+            .next()
+            .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+            && characters.all(|character| character == '_' || character.is_ascii_alphanumeric());
+        if !valid {
+            return Err(ProjectDefineError::InvalidName(name.to_owned()));
+        }
+        self.insert(name, value);
+        Ok(())
+    }
+
+    /// Builds a define set from an iterator of `NAME[=VALUE]` specs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectDefineError`] for the first spec that cannot be parsed.
+    pub fn from_specs<I, S>(specs: I) -> Result<Self, ProjectDefineError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut defines = Self::new();
+        for spec in specs {
+            defines.push_spec(spec.as_ref())?;
+        }
+        Ok(defines)
+    }
+
+    /// Iterates the canonical `(name, value)` pairs in sorted order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
+    fn apply_to(&self, macros: &mut HashMap<String, MacroDefinition>) {
+        for (name, value) in &self.entries {
+            macros.insert(name.clone(), MacroDefinition::object(value.clone()));
+        }
+    }
+
+    fn fingerprint(&self, context: &mut md5::Context) {
+        fingerprint_u64(context, self.entries.len() as u64);
+        for (name, value) in &self.entries {
+            fingerprint_bytes(context, name.as_bytes());
+            fingerprint_bytes(context, value.as_bytes());
+        }
+    }
+}
+
 /// Compact deterministic identity of all compiler-visible project inputs.
 ///
 /// The 128-bit checksum is intentionally an efficient cache key, not a
@@ -370,7 +584,7 @@ fn normalized_identity_path(path: &Path) -> String {
     }
 }
 
-const PROJECT_CACHE_MAGIC: &[u8] = b"DREAM64-PROJECT-CACHE\0\x01";
+const PROJECT_CACHE_MAGIC: &[u8] = b"DREAM64-PROJECT-CACHE\0\x02";
 const PROJECT_CACHE_MANIFEST_MAGIC: &[u8] = b"DREAM64-PROJECT-MANIFEST\0\x01";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -559,6 +773,11 @@ fn encode_cached_project(project: &Project) -> Vec<u8> {
         write_string(&mut output, name);
         write_string(&mut output, replacement);
     }
+    write_len(&mut output, project.defines.entries.len());
+    for (name, value) in &project.defines.entries {
+        write_string(&mut output, name);
+        write_string(&mut output, value);
+    }
     output
 }
 
@@ -646,6 +865,13 @@ fn decode_cached_project(bytes: &[u8]) -> Option<Project> {
     for _ in 0..macro_count {
         object_macros.insert(read_string(&mut input)?, read_string(&mut input)?);
     }
+    let define_count = read_len(&mut input)?;
+    let mut defines = ProjectDefines::new();
+    for _ in 0..define_count {
+        let name = read_string(&mut input)?;
+        let value = read_string(&mut input)?;
+        defines.insert(name, Some(value));
+    }
     if input.position() != bytes.len() as u64
         || files.iter().enumerate().any(|(index, file)| file.id.index() != index)
         || includes.iter().any(|include| {
@@ -661,6 +887,7 @@ fn decode_cached_project(bytes: &[u8]) -> Option<Project> {
         includes,
         diagnostic_pragmas,
         object_macros,
+        defines,
     })
 }
 
@@ -1066,16 +1293,17 @@ struct Loader {
     warning_directive_is_error: bool,
     duplicate_include_is_error: bool,
     diagnostic_pragmas: Vec<DiagnosticPragma>,
+    defines: ProjectDefines,
 }
 
 impl Loader {
-    fn new(root_file: &Path) -> Result<Self, ProjectError> {
+    fn new(root_file: &Path, defines: &ProjectDefines) -> Result<Self, ProjectError> {
         let root_file = canonicalize(root_file)?;
         let root_directory = root_file
             .parent()
             .expect("a canonical file path has a parent")
             .to_path_buf();
-        let macros = HashMap::from([
+        let mut macros = HashMap::from([
             (
                 "DM_VERSION".to_owned(),
                 MacroDefinition::object(TARGET_DM_VERSION.to_string()),
@@ -1085,6 +1313,7 @@ impl Loader {
                 MacroDefinition::object(TARGET_DM_BUILD.to_string()),
             ),
         ]);
+        defines.apply_to(&mut macros);
         Ok(Self {
             root_file,
             root_directory,
@@ -1096,6 +1325,7 @@ impl Loader {
             warning_directive_is_error: false,
             duplicate_include_is_error: false,
             diagnostic_pragmas: Vec::new(),
+            defines: defines.clone(),
         })
     }
 
@@ -1119,6 +1349,7 @@ impl Loader {
             includes: self.includes.into_iter().map(|(_, edge)| edge).collect(),
             diagnostic_pragmas: self.diagnostic_pragmas,
             object_macros,
+            defines: self.defines,
         })
     }
 
@@ -3189,7 +3420,10 @@ mod tests {
 
     use dm_core::SourceSpan;
 
-    use super::{FileKind, IncludeTarget, PragmaSeverity, Project, ProjectError};
+    use super::{
+        FileKind, IncludeTarget, PragmaSeverity, Project, ProjectDefineError, ProjectDefines,
+        ProjectError,
+    };
 
     struct ScratchDirectory(PathBuf);
 
@@ -3982,6 +4216,150 @@ mod tests {
 
         assert_eq!(project.files.len(), 2);
         assert_eq!(project.includes.len(), 1);
+    }
+
+    #[test]
+    fn supplied_define_spec_parsing_normalizes_value_and_rejects_bad_names() {
+        let mut defines = ProjectDefines::new();
+        defines.push_spec("CBT").expect("bare name is valid");
+        defines
+            .push_spec("FEATURE_LEVEL=3")
+            .expect("name=value is valid");
+        defines
+            .push_spec("EMPTY=")
+            .expect("an explicit empty value is allowed");
+        assert_eq!(
+            defines.iter().collect::<Vec<_>>(),
+            vec![("CBT", "1"), ("EMPTY", ""), ("FEATURE_LEVEL", "3")],
+            "a bare name takes the value \"1\" and entries are kept sorted",
+        );
+
+        // A repeated name keeps the last value and the canonical ordering.
+        defines.push_spec("CBT=0").expect("repeat is valid");
+        assert_eq!(
+            defines.iter().collect::<Vec<_>>(),
+            vec![("CBT", "0"), ("EMPTY", ""), ("FEATURE_LEVEL", "3")],
+        );
+
+        assert_eq!(
+            ProjectDefines::new().push_spec("=1"),
+            Err(ProjectDefineError::EmptyName),
+        );
+        assert_eq!(
+            ProjectDefines::new().push_spec("2BAD"),
+            Err(ProjectDefineError::InvalidName("2BAD".to_owned())),
+        );
+
+        // Command-line order must not matter for distinct names.
+        let forward = ProjectDefines::from_specs(["A=1", "B=2"]).expect("valid");
+        let reverse = ProjectDefines::from_specs(["B=2", "A=1"]).expect("valid");
+        assert_eq!(forward, reverse);
+    }
+
+    #[test]
+    fn supplied_define_drives_conditionals_and_expansion_then_yields_to_source() {
+        let scratch = ScratchDirectory::new();
+        fs::write(
+            scratch.path().join("world.dme"),
+            "#ifdef GAMEMODE\n#include \"mode.dm\"\n#endif\nvar/build = GAMEMODE\n#define GAMEMODE \"redefined\"\nvar/rebuild = GAMEMODE\n#undef CBT\n",
+        )
+        .expect("environment should be written");
+        fs::write(scratch.path().join("mode.dm"), "/datum/mode\n")
+            .expect("mode source should be written");
+
+        let defines =
+            ProjectDefines::from_specs(["GAMEMODE=arcade", "CBT"]).expect("valid defines");
+        let project = Project::load_with_defines(scratch.path().join("world.dme"), &defines)
+            .expect("supplied defines should load");
+
+        assert_eq!(
+            project.files.len(),
+            2,
+            "the -D define activated the include"
+        );
+        assert_eq!(project.includes.len(), 1);
+        assert_eq!(project.defines(), &defines);
+
+        let expanded = project.files[0]
+            .compiler_text()
+            .expect("expanded UTF-8 source");
+        assert!(
+            expanded.contains("var/build = arcade"),
+            "the supplied define expands before the source redefinition: {expanded:?}",
+        );
+        assert!(
+            expanded.contains("var/rebuild = \"redefined\""),
+            "a later source #define overrides the supplied define: {expanded:?}",
+        );
+        assert_eq!(project.object_macro("GAMEMODE"), Some("\"redefined\""));
+        assert_eq!(
+            project.object_macro("CBT"),
+            None,
+            "a later source #undef removes the supplied define",
+        );
+    }
+
+    #[test]
+    fn differing_define_sets_change_the_content_fingerprint_and_cache_key() {
+        let scratch = ScratchDirectory::new();
+        let environment = scratch.path().join("world.dme");
+        fs::write(&environment, "/world\n").expect("environment should be written");
+
+        let plain = Project::load(&environment).expect("plain load");
+        let with_cbt = Project::load_with_defines(
+            &environment,
+            &ProjectDefines::from_specs(["CBT"]).expect("valid"),
+        )
+        .expect("defined load");
+        let with_other = Project::load_with_defines(
+            &environment,
+            &ProjectDefines::from_specs(["CBT=2"]).expect("valid"),
+        )
+        .expect("defined load");
+
+        assert_ne!(
+            plain.content_fingerprint(),
+            with_cbt.content_fingerprint(),
+            "a -D build must not collide with a no-define build",
+        );
+        assert_ne!(
+            with_cbt.content_fingerprint(),
+            with_other.content_fingerprint(),
+            "different define values must not collide",
+        );
+
+        // The encoded artifact payload round-trips the define set.
+        let encoded = with_cbt.encode_compiled_artifact();
+        let decoded = Project::decode_compiled_artifact(&encoded).expect("payload decodes");
+        assert_eq!(decoded.defines(), with_cbt.defines());
+        assert_eq!(
+            decoded.content_fingerprint(),
+            with_cbt.content_fingerprint()
+        );
+
+        // A warm preprocessing cache entry is never shared across define sets.
+        let cache = scratch.path().join("world.cache");
+        let (_, cbt_cold) = Project::load_cached_with_defines(
+            &environment,
+            &cache,
+            &ProjectDefines::from_specs(["CBT"]).expect("valid"),
+        )
+        .expect("cold cached load");
+        assert!(!cbt_cold, "first load with -DCBT is a miss");
+        let (_, cbt_warm) = Project::load_cached_with_defines(
+            &environment,
+            &cache,
+            &ProjectDefines::from_specs(["CBT"]).expect("valid"),
+        )
+        .expect("warm cached load");
+        assert!(cbt_warm, "an identical define set reuses the cache entry");
+        let (plain_project, plain_hit) = Project::load_cached(&environment, &cache)
+            .expect("no-define load at the same cache path");
+        assert!(
+            !plain_hit,
+            "a no-define build must not reuse the -DCBT cache entry",
+        );
+        assert!(plain_project.defines().is_empty());
     }
 
     #[test]
