@@ -286,7 +286,7 @@ pub fn advance_persistent_scheduler(
         ExecutionLimits::default(),
     );
     precompiled.persistent_state = Some(state);
-    Ok(result)
+    result.map_err(InitializationExecutionError::Scheduler)
 }
 
 /// Advances persistent work with an instruction-bounded cooperative dispatch.
@@ -313,7 +313,7 @@ pub fn advance_persistent_scheduler_responsive(
         },
     );
     precompiled.persistent_state = Some(state);
-    Ok(result)
+    result.map_err(InitializationExecutionError::Scheduler)
 }
 
 fn scheduler_wall_clock_budget() -> Option<Duration> {
@@ -334,12 +334,27 @@ fn startup_scheduler_max_steps() -> u64 {
         .max(1)
 }
 
+/// Canonical path of the Master Controller initialization thread. If an
+/// uncaught runtime error tears this `set waitfor = 0` continuation down, the
+/// codebase never advances `init_stage_completed`, `Master.Loop` spins on the
+/// unchanged stage forever, and the world never becomes ready. Isolating that
+/// failure the way ordinary background threads are isolated would turn a boot
+/// abort into a silent multi-minute hang, so it is surfaced as fatal instead.
+const MASTER_INITIALIZE_PROC: &str = "/datum/controller/master/proc/Initialize";
+
+fn runtime_error_unwound_master_initialize(error: &RuntimeError) -> bool {
+    error
+        .call_stack
+        .iter()
+        .any(|frame| frame.procedure.split('@').next() == Some(MASTER_INITIALIZE_PROC))
+}
+
 fn drain_persistent_scheduler(
     module: &Module,
     state: &mut dm_vm::ExecutionState,
     limits: SchedulerDrainLimits,
     execution_limits: ExecutionLimits,
-) -> SchedulerDrain {
+) -> Result<SchedulerDrain, RuntimeError> {
     let start_tick = state.scheduler_tick();
     let tick_limit = start_tick.saturating_add(limits.max_ticks);
     let mut drain = SchedulerDrain {
@@ -373,12 +388,21 @@ fn drain_persistent_scheduler(
                     drain.final_tick = state.scheduler_tick();
                     continue;
                 }
+                state.release_host_value_roots();
+                if runtime_error_unwound_master_initialize(&error) {
+                    // Losing the MC initialization thread is unrecoverable: no
+                    // other continuation advances `init_stage_completed`, so the
+                    // world never becomes ready. Surface it instead of spinning.
+                    eprintln!(
+                        "server-runtime: fatal scheduled thread failure — the Master Controller initialization thread was terminated by an uncaught runtime error: {error}"
+                    );
+                    return Err(error);
+                }
                 // `advance_scheduler` drops only the failing continuation and
                 // restores every later due task to scheduler state. Match the
                 // server scheduler's thread isolation here: report the full
                 // source-mapped failure, then keep draining the other work.
                 drain.failed_tasks = drain.failed_tasks.saturating_add(1);
-                state.release_host_value_roots();
                 eprintln!(
                     "server-runtime: isolated scheduled thread failure (continuing): {error}"
                 );
@@ -414,5 +438,105 @@ fn drain_persistent_scheduler(
     } else if drain.termination != SchedulerDrainTermination::RoundLimit {
         drain.termination = SchedulerDrainTermination::TickLimit;
     }
-    drain
+    Ok(drain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dm_syntax::parse;
+    use dm_vm::{CallTrace, ExecutionState, compile_module, execute_module_in_state};
+
+    fn runtime_error_with_stack(procedures: &[&str]) -> RuntimeError {
+        RuntimeError {
+            message: "CRASH: boom".to_owned(),
+            instruction: 0,
+            source_span: None,
+            call_stack: procedures
+                .iter()
+                .map(|procedure| CallTrace {
+                    procedure: (*procedure).to_owned(),
+                    instruction: 0,
+                    source_span: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn master_initialize_unwind_detection_ignores_the_procedure_id_suffix() {
+        assert!(runtime_error_unwound_master_initialize(
+            &runtime_error_with_stack(&[
+                "/datum/controller/master/proc/Initialize@5486",
+                "/datum/controller/master/proc/init_subsystem@5487",
+            ])
+        ));
+        assert!(runtime_error_unwound_master_initialize(
+            &runtime_error_with_stack(&["/datum/controller/master/proc/Initialize",])
+        ));
+        assert!(!runtime_error_unwound_master_initialize(
+            &runtime_error_with_stack(&[
+                "/datum/controller/master/proc/InitializeSomethingElse@1",
+                "/datum/controller/master/proc/Loop@5490",
+            ])
+        ));
+        assert!(!runtime_error_unwound_master_initialize(
+            &runtime_error_with_stack(&[])
+        ));
+    }
+
+    /// A crafted `set waitfor = 0` `Master.Initialize` continuation that fails
+    /// after it has already been detached must abort the persistent drain, and
+    /// an identically shaped background thread must still be isolated.
+    #[test]
+    fn persistent_drain_is_fatal_only_when_master_initialize_unwinds() {
+        const SOURCE: &str = concat!(
+            "/datum/controller/master/proc/Initialize()\n",
+            "\tset waitfor = 0\n",
+            "\tsleep(1)\n",
+            "\tboom_helper()\n",
+            "/proc/boom_helper()\n",
+            "\tCRASH(\"mc boom\")\n",
+            "/proc/background_thread()\n",
+            "\tset waitfor = 0\n",
+            "\tsleep(1)\n",
+            "\tCRASH(\"background boom\")\n",
+            "/proc/boot_master()\n",
+            "\tvar/datum/controller/master/controller = new /datum/controller/master\n",
+            "\tcontroller.Initialize()\n",
+            "/proc/boot_background()\n",
+            "\tbackground_thread()\n",
+        );
+        let syntax = parse(SOURCE).expect("scheduler fixture should parse");
+        let module = compile_module(&syntax.definitions).expect("scheduler fixture should compile");
+
+        let limits = SchedulerDrainLimits {
+            max_ticks: 10,
+            max_rounds: 10,
+        };
+
+        let mut mc_state = ExecutionState::new();
+        let boot_master = module
+            .procedure_id("/proc/boot_master")
+            .expect("boot_master entry");
+        execute_module_in_state(&module, boot_master, &[], &mut mc_state)
+            .expect("boot detaches the waitfor=0 Master.Initialize continuation");
+        assert_eq!(mc_state.scheduled_task_count(), 1);
+        let error =
+            drain_persistent_scheduler(&module, &mut mc_state, limits, ExecutionLimits::default())
+                .expect_err("losing Master.Initialize must abort the drain");
+        assert!(runtime_error_unwound_master_initialize(&error));
+
+        let mut bg_state = ExecutionState::new();
+        let boot_background = module
+            .procedure_id("/proc/boot_background")
+            .expect("boot_background entry");
+        execute_module_in_state(&module, boot_background, &[], &mut bg_state)
+            .expect("boot detaches the waitfor=0 background continuation");
+        assert_eq!(bg_state.scheduled_task_count(), 1);
+        let bg_drain =
+            drain_persistent_scheduler(&module, &mut bg_state, limits, ExecutionLimits::default())
+                .expect("an ordinary background thread failure stays isolated");
+        assert_eq!(bg_drain.failed_tasks, 1);
+    }
 }
