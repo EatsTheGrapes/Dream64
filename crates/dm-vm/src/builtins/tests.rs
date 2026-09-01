@@ -765,7 +765,33 @@ mod color_text_file_tests {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("icons")).unwrap();
-        fs::write(root.join("icons/base.dmi"), b"headless fixture").unwrap();
+        // A real 2x2 PNG-backed DMI template with the state the config layers on.
+        let template = dm_icon::IconBitmap {
+            width: 2,
+            height: 2,
+            states: vec![dm_icon::IconState {
+                name: "sprite".to_owned(),
+                dirs: 1,
+                frame_count: 1,
+                delays: Vec::new(),
+                loop_count: 0,
+                rewind: false,
+                movement: false,
+                hotspot: None,
+                cells: vec![dm_icon::Frame {
+                    width: 2,
+                    height: 2,
+                    pixels: vec![[255, 255, 255, 255]; 4],
+                }],
+            }],
+        };
+        fs::write(
+            root.join("icons/base.dmi"),
+            template.to_dmi_bytes().unwrap(),
+        )
+        .unwrap();
+        let gags_config = "{\"colored\":[{\"type\":\"icon_state\",\"icon_state\":\"sprite\",\
+             \"blend_mode\":\"overlay\",\"color_ids\":[1]}]}";
         let mut state = ExecutionState::new();
         state.set_project_root(root.clone());
         let library = Value::text("rust_g");
@@ -774,7 +800,7 @@ mod color_text_file_tests {
             &Value::text("iconforge_load_gags_config_async"),
             &[
                 Value::text("/datum/greyscale_config/test"),
-                Value::text("{\"layers\":[]}"),
+                Value::text(gags_config),
                 Value::text("icons/base.dmi"),
             ],
             &mut state,
@@ -804,7 +830,7 @@ mod color_text_file_tests {
                 &Value::text("iconforge_gags"),
                 &[
                     Value::text("/datum/greyscale_config/test"),
-                    Value::text("#ffffff"),
+                    Value::text("#ff0000"),
                     Value::text("tmp/gags/test.dmi"),
                 ],
                 &mut state,
@@ -812,11 +838,16 @@ mod color_text_file_tests {
             Ok(Value::text("OK"))
         );
         assert!(root.join("tmp/gags/test.dmi").is_file());
-        assert_eq!(
-            fs::read(root.join("tmp/gags/test.dmi")).unwrap(),
-            b"headless fixture",
-            "headless GAGS output must remain a valid copy of the source DMI rather than an empty placeholder",
-        );
+        // The output DMI must carry the config-defined output state (this is the
+        // set SS13's SSearly_assets validates against) and be a real composite,
+        // not a raw copy of the greyscale template.
+        let generated_dmi =
+            dm_icon::IconBitmap::from_dmi_bytes(&fs::read(root.join("tmp/gags/test.dmi")).unwrap())
+                .expect("GAGS output must be a valid PNG-backed DMI");
+        assert_eq!(generated_dmi.state_names(), vec!["colored".to_owned()]);
+        assert_eq!((generated_dmi.width, generated_dmi.height), (2, 2));
+        // #ff0000 multiplied over a white sprite -> red.
+        assert_eq!(generated_dmi.states[0].cells[0].pixels[0], [255, 0, 0, 255]);
         let generated = execute_external_call(
             &library,
             &Value::text("iconforge_generate"),

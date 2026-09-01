@@ -126,7 +126,9 @@ pub struct ExecutionState {
     pub(crate) external_timers: BTreeMap<String, Instant>,
     pub(crate) iconforge_jobs: BTreeMap<String, (bool, String)>,
     pub(crate) iconforge_next_job: u64,
-    pub(crate) iconforge_gags_configs: BTreeMap<String, PathBuf>,
+    /// GAGS config path -> (source template DMI, raw config JSON). The JSON is
+    /// retained so `iconforge_gags` can composite the layer stacks natively.
+    pub(crate) iconforge_gags_configs: BTreeMap<String, (PathBuf, String)>,
     pub(crate) sql_jobs: BTreeMap<String, (bool, String)>,
     pub(crate) sql_next_job: u64,
     // Group slots by procedure so the hot cached-static read can borrow the

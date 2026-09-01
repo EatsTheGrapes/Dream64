@@ -1,0 +1,17 @@
+base_dims=32x32
+base_states=box,stripe
+base_fill=#808080
+base_hole=
+multiply_fill=#204060
+add_fill=#a0a0a0
+overlay_fill=#c0c0c0
+scaled_dims=64x64
+scaled_fill=#808080
+scaled_hole=
+cropped_dims=16x16
+cropped_fill=#808080
+cropped_far=#808080
+flip_low=
+flip_high=#808080
+turn_dims=32x32
+swap_fill=#ff00ff

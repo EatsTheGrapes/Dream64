@@ -83,7 +83,7 @@ pub(super) fn iconforge_load_gags_config(
             icon_path.display()
         )));
     }
-    state.load_iconforge_gags_config(config_path, icon_path);
+    state.load_iconforge_gags_config(config_path, icon_path, config_json);
     Ok(Value::text("OK"))
 }
 
@@ -135,17 +135,48 @@ pub(super) fn iconforge_gags(
         parent = resolved;
     }
     let output = resolved_file_path(&arguments[2..3], state, "iconforge output path")?;
+    let colors = strict_text(&arguments[1], state, "iconforge colors")?;
     let source = state
         .iconforge_gags_source(&config_path)
-        .ok_or_else(|| format!("IconForge error: Config {config_path} lost its source DMI"))?;
-    fs::copy(source, &output).map_err(|error| {
-        format!(
-            "IconForge error: Failed to create headless output '{}' from '{}': {error}",
-            output.display(),
-            source.display()
-        )
-    })?;
-    Ok(Value::text("OK"))
+        .ok_or_else(|| format!("IconForge error: Config {config_path} lost its source DMI"))?
+        .to_path_buf();
+    let config_json = state
+        .iconforge_gags_json(&config_path)
+        .ok_or_else(|| format!("IconForge error: Config {config_path} lost its JSON"))?
+        .to_owned();
+
+    match composite_gags_dmi(&source, &config_json, &colors) {
+        Ok(dmi_bytes) => {
+            fs::write(&output, dmi_bytes).map_err(|error| {
+                format!(
+                    "IconForge error: Failed to write headless output '{}': {error}",
+                    output.display()
+                )
+            })?;
+            Ok(Value::text("OK"))
+        }
+        Err(error) => Ok(Value::text(format!(
+            "IconForge error: GAGS compositing failed for {config_path}: {error}"
+        ))),
+    }
+}
+
+/// Composite a GAGS bundle DMI: load the template, render every output state's
+/// layer stack with the supplied palette, and serialise the result.
+fn composite_gags_dmi(
+    template_path: &std::path::Path,
+    config_json: &str,
+    colors: &str,
+) -> Result<Vec<u8>, String> {
+    let template_bytes =
+        fs::read(template_path).map_err(|error| format!("cannot read template DMI: {error}"))?;
+    let template = dm_icon::IconBitmap::from_dmi_bytes(&template_bytes)
+        .map_err(|error| format!("cannot decode template DMI: {error}"))?;
+    let palette = dm_icon::gags::parse_color_string(colors);
+    let output = dm_icon::gags::composite(config_json, &template, &palette)?;
+    output
+        .to_dmi_bytes()
+        .map_err(|error| format!("cannot encode output DMI: {error}"))
 }
 
 pub(super) fn validate_git_revision(revision: &str) -> Result<(), String> {

@@ -1093,6 +1093,7 @@ dependencies = [
  "bincode",
  "dm-core",
  "dm-dmf",
+ "dm-icon",
  "dm-jit",
  "dm-lexer",
  "dm-syntax",

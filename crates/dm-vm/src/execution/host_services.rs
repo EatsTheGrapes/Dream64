@@ -57,8 +57,13 @@ impl ExecutionState {
         self.iconforge_jobs.remove(id).map(|(_, result)| result)
     }
 
-    pub(crate) fn load_iconforge_gags_config(&mut self, path: String, source: PathBuf) {
-        self.iconforge_gags_configs.insert(path, source);
+    pub(crate) fn load_iconforge_gags_config(
+        &mut self,
+        path: String,
+        source: PathBuf,
+        json: String,
+    ) {
+        self.iconforge_gags_configs.insert(path, (source, json));
     }
 
     pub(crate) fn has_iconforge_gags_config(&self, path: &str) -> bool {
@@ -66,7 +71,15 @@ impl ExecutionState {
     }
 
     pub(crate) fn iconforge_gags_source(&self, path: &str) -> Option<&std::path::Path> {
-        self.iconforge_gags_configs.get(path).map(PathBuf::as_path)
+        self.iconforge_gags_configs
+            .get(path)
+            .map(|(source, _)| source.as_path())
+    }
+
+    pub(crate) fn iconforge_gags_json(&self, path: &str) -> Option<&str> {
+        self.iconforge_gags_configs
+            .get(path)
+            .map(|(_, json)| json.as_str())
     }
 
     pub(crate) fn enqueue_sql_job(&mut self, result: String) -> String {
