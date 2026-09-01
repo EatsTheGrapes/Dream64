@@ -24,7 +24,10 @@ use server::artifact_pipeline::{
     PreparedCacheStats, cached_world_plan, executable_artifact_file, prepare_compiled_executable,
     prepare_standalone_artifact, project_cache_file, run_standalone_linked_boot,
 };
-use server::cli::{Command, ReadyWorldMode, progress_label, ready_world_mode_from_environment};
+use server::cli::{
+    Command, ReadyWorldMode, parse_trailing_arguments, progress_label,
+    ready_world_mode_from_environment,
+};
 use server::lobby_preflight::run_lobby_preflight;
 use server::ready_world::{
     ready_world_cache_file, restore_ready_world_cache, write_ready_world_cache,
@@ -109,13 +112,16 @@ fn run_main() -> ExitCode {
     } else {
         (Command::Plan, PathBuf::from(first))
     };
-    let requested_map = arguments.next().map(PathBuf::from);
-    if arguments.next().is_some() {
-        eprintln!(
-            "usage: dream64-server [plan|boot|sweep|sweep-closure|lobby-preflight] <world.dme> [map.dmm]"
-        );
-        return ExitCode::from(2);
-    }
+    let (requested_map, defines) = match parse_trailing_arguments(arguments) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("{error}");
+            eprintln!(
+                "usage: dream64-server [plan|boot|sweep|sweep-closure|lobby-preflight] <world.dme> [map.dmm] [-D NAME[=VALUE]]..."
+            );
+            return ExitCode::from(2);
+        }
+    };
     if command == Command::Compile && requested_map.is_some() {
         eprintln!("usage: dm-lifecycle {} <world.dme>", "compile");
         return ExitCode::from(2);
@@ -205,6 +211,7 @@ fn run_main() -> ExitCode {
                 &cache_file,
                 &artifact_file,
                 command == Command::Compile,
+                &defines,
             )
         }
         .map(|prepared| {
@@ -233,7 +240,7 @@ fn run_main() -> ExitCode {
         })
     } else {
         CompilerDatabase::new()
-            .compile(&environment)
+            .compile_with_defines(&environment, &defines)
             .map(|compilation| (compilation, None))
             .map_err(|error| error.to_string())
     };
