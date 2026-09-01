@@ -35,8 +35,10 @@ pub(crate) use frame::{
 pub(crate) use heap_gc::adaptive_heap_collection_growth;
 #[cfg(test)]
 pub(crate) use heap_gc::{
+    BULK_INIT_LOW_YIELD_STREAK, DEFAULT_HEAP_IDENTITY_CEILING,
     MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH, MAXIMUM_LOW_YIELD_COLLECTION_GROWTH,
     MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH, MINIMUM_HEAP_COLLECTION_GROWTH,
+    bulk_init_aware_collection_growth,
 };
 pub(crate) use run::run_frames;
 pub(crate) use run_support::trace;

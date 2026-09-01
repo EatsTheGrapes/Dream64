@@ -344,7 +344,22 @@ impl ExecutionState {
         let after_datums = self.heap.live_datum_count();
         let after = after_lists.saturating_add(after_datums);
         let reclaimed = reclaimed_datums.saturating_add(reclaimed_lists);
-        let growth = adaptive_heap_collection_growth(after, reclaimed);
+        // A run of collections that each free almost nothing means the heap is
+        // in a monotonic bulk-allocation phase (map load, `SSatoms` init).
+        // Track the streak so the growth window can widen past its low-yield
+        // cap and stop punctuating that phase with dozens of full-heap walks.
+        let visited = after.saturating_add(reclaimed);
+        if reclaimed.saturating_mul(NEAR_ZERO_YIELD_RECIPROCAL) <= visited {
+            self.low_yield_collection_streak = self.low_yield_collection_streak.saturating_add(1);
+        } else {
+            self.low_yield_collection_streak = 0;
+        }
+        let growth = bulk_init_aware_collection_growth(
+            after,
+            reclaimed,
+            self.low_yield_collection_streak,
+            self.heap_identity_ceiling,
+        );
         self.next_list_collection = after.saturating_add(growth);
         if boot_trace_enabled() || boot_dashboard_enabled() {
             let elapsed_ms = collection_started.elapsed().as_millis();
@@ -492,6 +507,64 @@ pub(crate) const MINIMUM_HEAP_COLLECTION_GROWTH: usize = 65_536;
 pub(crate) const MAXIMUM_LOW_YIELD_COLLECTION_GROWTH: usize = 262_144;
 pub(crate) const MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH: usize = 262_144;
 pub(crate) const MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH: usize = 262_144;
+
+/// A collection whose reclaim count is at most `1 / NEAR_ZERO_YIELD_RECIPROCAL`
+/// of the identities it visited counts as near-zero-yield for bulk-init phase
+/// detection. Deliberately tighter than the 5% "low yield" growth bucket below:
+/// this is meant to fire only when a pass frees essentially nothing.
+pub(crate) const NEAR_ZERO_YIELD_RECIPROCAL: usize = 100;
+
+/// Consecutive near-zero-yield collections that identify a monotonic
+/// bulk-allocation phase (map load, `SSatoms.InitializeAtoms`). Until the streak
+/// reaches this length the base growth policy is unchanged.
+pub(crate) const BULK_INIT_LOW_YIELD_STREAK: u32 = 3;
+
+/// Default ceiling on live heap identities that forces a collection regardless
+/// of recent reclaim yield. Bounds committed memory during a long bulk-init
+/// phase where the yield heuristic would otherwise keep widening the window.
+/// Overridable with `DREAM64_HEAP_IDENTITY_CEILING`.
+pub(crate) const DEFAULT_HEAP_IDENTITY_CEILING: usize = 16_777_216;
+
+/// Resolves the live-identity ceiling from the environment once per state.
+pub(crate) fn resolve_heap_identity_ceiling() -> usize {
+    std::env::var("DREAM64_HEAP_IDENTITY_CEILING")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value >= MINIMUM_HEAP_COLLECTION_GROWTH)
+        .unwrap_or(DEFAULT_HEAP_IDENTITY_CEILING)
+}
+
+/// Chooses the next collection window, widening it past the low-yield cap once a
+/// run of near-zero-yield passes shows the heap is in a monotonic
+/// bulk-allocation phase.
+///
+/// During `SSatoms.InitializeAtoms` almost every identity stays reachable (each
+/// of ~1M space turfs lazily materialises structurally-identical overlay
+/// lists), so [`adaptive_heap_collection_growth`] pins the window to
+/// [`MAXIMUM_LOW_YIELD_COLLECTION_GROWTH`] and every ~260k allocations pays
+/// another multi-second full-heap walk. Once `low_yield_streak` reaches
+/// [`BULK_INIT_LOW_YIELD_STREAK`] the window instead runs toward `ceiling` (by
+/// at most the current live size, so growth stays a bounded per-pass doubling),
+/// collapsing dozens of passes into a handful. `ceiling` still forces a pass, so
+/// committed memory stays bounded; above it the base policy resumes.
+///
+/// This changes only *when* collections run, never what they observe: a
+/// collection is already required to be observationally transparent, and the
+/// window is a deterministic function of heap counts plus collection history,
+/// so identical executions still collect at identical points.
+pub(crate) fn bulk_init_aware_collection_growth(
+    live: usize,
+    reclaimed: usize,
+    low_yield_streak: u32,
+    ceiling: usize,
+) -> usize {
+    let base = adaptive_heap_collection_growth(live, reclaimed);
+    if low_yield_streak < BULK_INIT_LOW_YIELD_STREAK || live >= ceiling {
+        return base;
+    }
+    let headroom = ceiling - live;
+    base.max(headroom.min(live))
+}
 
 /// Chooses how many additional heap identities may be allocated before the
 /// next full reachability pass.
