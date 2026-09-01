@@ -361,6 +361,9 @@ impl ExecutionState {
             self.heap_identity_ceiling,
         );
         self.next_list_collection = after.saturating_add(growth);
+        if list_field_identity_profile_enabled() {
+            self.report_list_field_identities(before_lists, after_lists);
+        }
         if boot_trace_enabled() || boot_dashboard_enabled() {
             let elapsed_ms = collection_started.elapsed().as_millis();
             let lists = collection.list_storage;
@@ -454,6 +457,81 @@ impl ExecutionState {
             }
         }
     }
+
+    /// Diagnostic: reports how many distinct heap list identities the per-atom
+    /// list fields (`overlays`, `underlays`, ...) account for and how many of
+    /// those identities hold structurally identical content, i.e. how many
+    /// could be collapsed by content interning without changing observable
+    /// element data. Gated by `DREAM64_PROFILE_LIST_FIELDS`; diagnostic only.
+    fn report_list_field_identities(&self, lists_before: usize, lists_after: usize) {
+        use std::hash::{Hash, Hasher};
+        use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // The scan is O(live datums x fields x list length). Throttle it to at
+        // most once every few seconds so the diagnostic never dominates the
+        // boot it is measuring.
+        static LAST_RUN_MS: AtomicU64 = AtomicU64::new(0);
+        static START: OnceLock<Instant> = OnceLock::new();
+        let now_ms = START.get_or_init(Instant::now).elapsed().as_millis() as u64;
+        let previous = LAST_RUN_MS.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(previous) < 4_000 && previous != 0 {
+            return;
+        }
+        LAST_RUN_MS.store(now_ms.max(1), Ordering::Relaxed);
+        const FIELDS: &[&str] = &[
+            "overlays",
+            "underlays",
+            "vis_contents",
+            "vis_locs",
+            "filters",
+            "verbs",
+            "contents",
+        ];
+        let mut segments = Vec::new();
+        let mut total_redundant = 0usize;
+        for name in FIELDS {
+            let Ok(field) = FieldName::parse(name) else {
+                continue;
+            };
+            let mut identities: std::collections::HashSet<ListId> =
+                std::collections::HashSet::new();
+            let mut nonempty = 0usize;
+            let mut groups: HashMap<u64, usize> = HashMap::new();
+            for (datum, _datum_ref) in self.heap.datums() {
+                let Ok(Value::List(list)) = self.heap.datum_field(datum, &field) else {
+                    continue;
+                };
+                identities.insert(*list);
+                let Ok(contents) = self.heap.list(*list) else {
+                    continue;
+                };
+                if contents.is_empty() {
+                    continue;
+                }
+                nonempty += 1;
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                for (_, entry) in contents.positions() {
+                    format!("{entry:?}").hash(&mut hasher);
+                }
+                for (key, entry) in contents.associations() {
+                    format!("{key:?}={entry:?}").hash(&mut hasher);
+                }
+                *groups.entry(hasher.finish()).or_default() += 1;
+            }
+            let distinct = identities.len();
+            let structural_groups = groups.len();
+            let largest = groups.values().copied().max().unwrap_or(0);
+            let redundant = nonempty.saturating_sub(structural_groups);
+            total_redundant += redundant;
+            segments.push(format!(
+                "{name}[ids={distinct} nonempty={nonempty} groups={structural_groups} largest_group={largest} redundant={redundant}]"
+            ));
+        }
+        eprintln!(
+            "boot-vm: list-field-identity lists_before={lists_before} lists_after={lists_after} interning_headroom={total_redundant} {}",
+            segments.join(" ")
+        );
+    }
 }
 
 fn bounded_progress_value(value: &Value, heap: &ValueHeap) -> String {
@@ -524,6 +602,14 @@ pub(crate) const BULK_INIT_LOW_YIELD_STREAK: u32 = 3;
 /// phase where the yield heuristic would otherwise keep widening the window.
 /// Overridable with `DREAM64_HEAP_IDENTITY_CEILING`.
 pub(crate) const DEFAULT_HEAP_IDENTITY_CEILING: usize = 16_777_216;
+
+/// Whether the per-collection list-field identity diagnostic is enabled.
+/// Gated by `DREAM64_PROFILE_LIST_FIELDS`; resolved once. Diagnostic only.
+fn list_field_identity_profile_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DREAM64_PROFILE_LIST_FIELDS").is_some())
+}
 
 /// Resolves the live-identity ceiling from the environment once per state.
 pub(crate) fn resolve_heap_identity_ceiling() -> usize {
