@@ -19,7 +19,7 @@ use dm_object_tree::{
     BuildOutput, CodeTree, DefinitionUnit, DiagnosticKind as TreeDiagnosticKind,
     DiagnosticSeverity as TreeDiagnosticSeverity, NodeId, TreeDiagnostic,
 };
-use dm_project::{FileKind, PragmaSeverity, Project, ProjectError};
+use dm_project::{FileKind, PragmaSeverity, Project, ProjectDefines, ProjectError};
 use dm_syntax::{
     Definition, DefinitionKind, DefinitionPath, Indentation, ParameterSyntax, SourceLine,
     SyntaxError, SyntaxFile,
@@ -67,7 +67,23 @@ impl CompilerDatabase {
     /// Returns [`CompilerError`] when project discovery or source loading
     /// fails.
     pub fn compile(&self, root_file: impl AsRef<Path>) -> Result<Compilation, CompilerError> {
-        let project = Project::load(root_file).map_err(CompilerError::Project)?;
+        self.compile_with_defines(root_file, &ProjectDefines::new())
+    }
+
+    /// Loads and compiles a `.dme` frontend, seeding the preprocessor with
+    /// caller-supplied `-D` defines.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompilerError`] when project discovery or source loading
+    /// fails.
+    pub fn compile_with_defines(
+        &self,
+        root_file: impl AsRef<Path>,
+        defines: &ProjectDefines,
+    ) -> Result<Compilation, CompilerError> {
+        let project =
+            Project::load_with_defines(root_file, defines).map_err(CompilerError::Project)?;
         Ok(compile_project(project))
     }
 
