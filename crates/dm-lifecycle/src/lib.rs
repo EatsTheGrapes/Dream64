@@ -318,6 +318,138 @@ mod tests {
         }
     }
 
+    /// Drives the tgstation timsort port through the whole frontend + semantics
+    /// + lowering + VM + `RuntimeImage` pipeline (real `#define fetchElement`,
+    /// `CREATE_SORT_INSTANCE`, `call(cmp)()`, a reused `GLOB.sortInstance`, and
+    /// interleaved associative sorts) and asserts the sorted list keeps its
+    /// length and order for every size class.
+    #[test]
+    fn timsort_full_pipeline_holds_bounds() {
+        let source = include_str!("../../../fixtures/runtime/timsort_repro/repro.dm");
+        let (_fixture, compilation) = Fixture::compile(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let executable = procedures
+            .compile_vm(&compilation)
+            .expect("timsort fixture should lower");
+        let resolve = |name: &str| {
+            let target = procedures
+                .procedures()
+                .iter()
+                .find(|procedure| procedure.path.to_string() == name)
+                .and_then(|procedure| procedure.effective_target)
+                .unwrap_or_else(|| panic!("{name} should have an effective implementation"));
+            executable
+                .implementation(target)
+                .unwrap_or_else(|| panic!("{name} should be in the VM module"))
+        };
+        let run_repro = resolve("/proc/run_repro");
+        let assoc_then_plain = resolve("/proc/run_repro_assoc_then_plain");
+        let repeated = resolve("/proc/run_repro_repeated");
+        let mut runtime = RuntimeImage::from_compilation(&compilation)
+            .expect("runtime image should materialize defaults");
+        let mut run = |entry, args: &[Value], label: String| {
+            let mut state = runtime.take_execution_state();
+            let got = execute_module_in_state(executable.module(), entry, args, &mut state);
+            eprintln!("{label} => {got:?}");
+            assert_eq!(got, Ok(Value::text("OK")), "{label}");
+            runtime.restore_execution_state(state);
+        };
+        for mode in [0.0, 1.0, 2.0] {
+            for count in [8.0, 33.0, 40.0, 64.0, 100.0] {
+                run(
+                    run_repro,
+                    &[Value::number(count), Value::number(mode)],
+                    format!("run_repro mode={mode} count={count}"),
+                );
+            }
+        }
+        for count in [33.0, 40.0, 64.0, 100.0] {
+            run(
+                assoc_then_plain,
+                &[Value::number(count)],
+                format!("assoc_then_plain count={count}"),
+            );
+            run(
+                repeated,
+                &[Value::number(count)],
+                format!("repeated count={count}"),
+            );
+        }
+
+        // Inherited instance-var list initializer feeds the merge path (from-compilation).
+        run(
+            resolve("/proc/run_repro_inherited"),
+            &[],
+            "run_repro_inherited (from_compilation)".to_owned(),
+        );
+    }
+
+    #[test]
+    fn timsort_merge_path_over_inherited_linked_artifact_list_initializer() {
+        // Regression for the reported "DM list position N exceeds length M" fatal
+        // inside gallopRight while booting Monkestation: a merge-path-sized list
+        // literal declared on a parent type, inherited unchanged by a child type,
+        // and sorted from the child's constructor after a `.d64` linked-artifact
+        // restore (the boot path for map atoms such as the chem dispensers).
+        let source = include_str!("../../../fixtures/runtime/timsort_repro/repro.dm");
+        let (_fixture, compilation) = Fixture::compile(source);
+        let procedures = ProcedureRegistry::build(&compilation);
+        let executable = procedures
+            .compile_vm(&compilation)
+            .expect("timsort fixture should lower");
+        let target = procedures
+            .procedures()
+            .iter()
+            .find(|procedure| procedure.path.to_string() == "/proc/run_repro_inherited")
+            .and_then(|procedure| procedure.effective_target)
+            .expect("run_repro_inherited should have an effective implementation");
+        let entry = executable
+            .implementation(target)
+            .expect("run_repro_inherited should be in the VM module");
+
+        let mut image =
+            RuntimeImage::from_compilation(&compilation).expect("image should materialize");
+        image
+            .materialize_linked_artifact_initializers(8)
+            .expect("deferred initializer module should become portable");
+        let encoded = image
+            .encode_linked_artifact(executable.module())
+            .expect("linked artifact should encode");
+        let mut restored = RuntimeImage::decode_linked_artifact(&encoded, executable.module())
+            .expect("linked artifact should decode");
+
+        // Direct restored allocation: the child must receive the parent's
+        // `list(...)` initializer through the restored VM catalog
+        // (`instance_initializer_plan` -> `linked_catalog_plan`), the exact path
+        // 64f577d repaired. Without it `dispensable` is null and the sort throws.
+        let child = TypePath::parse("/obj/dispenser/fullupgrade").unwrap();
+        let datum = restored
+            .allocate_datum(&child)
+            .expect("child should allocate from the linked artifact");
+        let dispensable = restored
+            .heap()
+            .datum_field(datum, &FieldName::parse("dispensable").unwrap())
+            .expect("child must expose the inherited dispensable field")
+            .clone();
+        let Value::List(list) = dispensable else {
+            panic!("inherited dispensable must be a list, got {dispensable:?}");
+        };
+        assert_eq!(
+            restored.heap().list(list).unwrap().len(),
+            45,
+            "the child must inherit the full parent list initializer, not a truncated one"
+        );
+
+        // End-to-end: construct the child through the VM and sort the inherited list.
+        let mut state = restored.take_execution_state();
+        let got = execute_module_in_state(executable.module(), entry, &[], &mut state);
+        assert_eq!(
+            got,
+            Ok(Value::text("OK")),
+            "sorting a child-inherited 45-element list initializer must not corrupt the list"
+        );
+    }
+
     #[test]
     fn cached_lobby_lifecycle_index_does_not_force_procedure_dependencies() {
         let (_fixture, compilation) = Fixture::compile(concat!(

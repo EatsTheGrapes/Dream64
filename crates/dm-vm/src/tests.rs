@@ -19788,3 +19788,90 @@ fn canonical_synthetic_builtin_release_microbenchmark() {
         bytecode_elapsed.as_secs_f64() / fast_elapsed.as_secs_f64(),
     );
 }
+
+/// Guards the primitives the tgstation timsort port leans on: an unset/`FALSE`
+/// parameter is falsy in the `fetchElement` ternary, `list.Copy()` preserves
+/// length, in-bounds `L[i] = x` does not resize, and a plain `L[i]` never
+/// degrades into the associative `L[L[i]]` form.
+#[test]
+fn timsort_ternary_copy_and_index_primitives_are_sound() {
+    let source = concat!(
+        "/proc/ternary_unset(associative)\n",
+        "\treturn (associative) ? 100 : 200\n",
+        "/proc/param_default(x = 5)\n",
+        "\treturn x\n",
+        "/proc/copy_len()\n",
+        "\tvar/list/a = list(1, 2, 3, 4, 5)\n",
+        "\tvar/list/b = a.Copy()\n",
+        "\treturn b.len\n",
+        "/proc/copy_range_len()\n",
+        "\tvar/list/a = list(1, 2, 3, 4, 5)\n",
+        "\tvar/list/b = a.Copy(2, 4)\n",
+        "\treturn b.len\n",
+        "/proc/idx_assign_len()\n",
+        "\tvar/list/a = list(10, 20, 30, 40)\n",
+        "\ta[2] = a[3]\n",
+        "\ta[3] = a[1]\n",
+        "\treturn a.len\n",
+        "/proc/nested_index()\n",
+        "\tvar/list/L = list(7, 2)\n",
+        "\tvar/associative = null\n",
+        "\treturn (associative) ? L[L[1]] : L[1]\n",
+        "/proc/multi_default(a, b = 1, c = 0, d = 1, e = 0)\n",
+        "\treturn (c) ? 100 : (b + d + e + 200)\n",
+        "/datum/box2/proc/setup(v)\n",
+        "\tsrc.assoc = v\n",
+        "/datum/box2/proc/probe2(list/L)\n",
+        "\treturn (src.assoc) ? L[L[1]] : L[1]\n",
+        "/proc/datum_field_false_ternary()\n",
+        "\tvar/datum/box2/b = new\n",
+        "\tb.setup(0)\n",
+        "\tvar/list/L = list(7, 2)\n",
+        "\treturn b.probe2(L)\n",
+    );
+    let syntax = parse(source).expect("parse repro");
+    let module = compile_module(&syntax.definitions).expect("compile repro");
+    for (name, expected) in [
+        ("/proc/ternary_unset", 200.0),
+        ("/proc/param_default", 5.0),
+        ("/proc/copy_len", 5.0),
+        ("/proc/copy_range_len", 2.0),
+        ("/proc/idx_assign_len", 4.0),
+        ("/proc/nested_index", 7.0),
+        ("/proc/multi_default", 202.0),
+        ("/proc/datum_field_false_ternary", 7.0),
+    ] {
+        let id = module.procedure_id(name).unwrap();
+        let got = execute_module(&module, id, &[]);
+        eprintln!("{name} => {got:?} (expected {expected})");
+        assert_eq!(got, Ok(Value::number(expected)), "{name}");
+    }
+}
+
+/// Runs a near-verbatim port of tgstation's `/datum/sort_instance` timsort
+/// (natural-run detection, `mergeCollapse`/`mergeForceCollapse`, `gallopLeft`/
+/// `gallopRight`, `mergeLo`/`mergeHi`, and the `move_element`/`move_range`/
+/// `reverse_range` list helpers) over numeric and datum element lists of every
+/// size class and initial ordering. Regression cover for the reported
+/// "DM list position N exceeds length M" fault inside `gallopRight`.
+#[test]
+fn timsort_full_port_merge_path_holds_bounds() {
+    let source = include_str!("../../../fixtures/runtime/timsort_repro/vm_port.dm");
+    let syntax = parse(source).expect("parse timsort fixture");
+    let module = compile_module(&syntax.definitions).expect("compile timsort fixture");
+    for entry_name in ["/proc/run_repro", "/proc/run_repro_datum"] {
+        let entry = module.procedure_id(entry_name).unwrap();
+        for mode in [0.0, 1.0, 2.0] {
+            for count in [8.0, 33.0, 40.0, 64.0, 100.0] {
+                let got =
+                    execute_module(&module, entry, &[Value::number(count), Value::number(mode)]);
+                eprintln!("{entry_name} mode={mode} count={count} => {got:?}");
+                assert_eq!(
+                    got,
+                    Ok(Value::text(format!("OK len={count}"))),
+                    "{entry_name} mode={mode} count={count}"
+                );
+            }
+        }
+    }
+}
