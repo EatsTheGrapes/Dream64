@@ -30,7 +30,7 @@ use dm_lifecycle::{
     encode_procedure_semantics, execute_boot_initialization_plan_with_precompiled,
     precompile_portable_lifecycle_for_world,
 };
-use dm_project::Project;
+use dm_project::{Project, ProjectDefines};
 use dm_runtime::{RuntimeImage, RuntimeStructuralSeed};
 use dm_semantics::{ExecutableProcedures, ProcedureRegistry};
 use dm_value::TypePath;
@@ -341,6 +341,7 @@ pub(crate) fn prepare_compiled_executable(
     cache_file: &Path,
     artifact_file: &Path,
     allow_compile: bool,
+    defines: &ProjectDefines,
 ) -> Result<PreparedCompiledExecutable, String> {
     // The compact project snapshot validates every discovered input before we
     // trust the heavyweight executable. Normal interactive boots use the
@@ -361,10 +362,10 @@ pub(crate) fn prepare_compiled_executable(
         environment.display(),
     );
     let (project, project_snapshot_hit, project_fingerprint) = if strict_source_hash {
-        Project::load_cached_exact_with_fingerprint(environment, cache_file)
+        Project::load_cached_exact_with_fingerprint_and_defines(environment, cache_file, defines)
             .map_err(|error| format!("project snapshot: {error}"))?
     } else {
-        let (project, hit) = Project::load_cached(environment, cache_file)
+        let (project, hit) = Project::load_cached_with_defines(environment, cache_file, defines)
             .map_err(|error| format!("project snapshot: {error}"))?;
         let fingerprint = project.content_fingerprint();
         (project, hit, fingerprint)
@@ -433,7 +434,7 @@ pub(crate) fn prepare_compiled_executable(
             &compiler_database_file,
             BuildMode::Incremental,
             persistent_semantic_digest(),
-            persistent_build_configuration_digest(),
+            persistent_build_configuration_digest(defines),
         )
         .map_err(|error| error.to_string())?;
     eprintln!(
@@ -1049,13 +1050,20 @@ fn persistent_semantic_digest() -> [u8; 32] {
     )
 }
 
-fn persistent_build_configuration_digest() -> [u8; 32] {
+fn persistent_build_configuration_digest(defines: &ProjectDefines) -> [u8; 32] {
     let compact = if env::var_os("DREAM64_DISABLE_COMPACT_WORDCODE").is_some() {
         b"compact=disabled".as_slice()
     } else {
         b"compact=enabled".as_slice()
     };
-    digest32(b"dream64-compiler-build-v1", compact)
+    let mut value = compact.to_vec();
+    for (name, replacement) in defines.iter() {
+        value.push(0);
+        value.extend_from_slice(name.as_bytes());
+        value.push(b'=');
+        value.extend_from_slice(replacement.as_bytes());
+    }
+    digest32(b"dream64-compiler-build-v2", &value)
 }
 
 fn digest32(domain: &[u8], value: &[u8]) -> [u8; 32] {
@@ -1108,6 +1116,7 @@ mod tests {
     use dm_compiler::persistent_database::PersistentCompilerDatabase;
     use dm_compiler::{BuildMode, CompilerDatabase};
     use dm_lifecycle::readiness_probe_matches;
+    use dm_project::ProjectDefines;
     use dm_runtime::{RuntimeImage, RuntimeStructuralSeed};
     use dm_semantics::ProcedureRegistry;
     use dm_value::{FieldName, TypePath, Value};
@@ -1175,8 +1184,14 @@ mod tests {
         }
 
         fn prepare(&self) -> super::PreparedCompiledExecutable {
-            prepare_compiled_executable(&self.environment, &self.cache, &self.artifact, true)
-                .expect("artifact preparation should succeed")
+            prepare_compiled_executable(
+                &self.environment,
+                &self.cache,
+                &self.artifact,
+                true,
+                &ProjectDefines::new(),
+            )
+            .expect("artifact preparation should succeed")
         }
     }
 
@@ -1437,6 +1452,7 @@ mod tests {
             &fixture.cache,
             &fixture.artifact,
             false,
+            &ProjectDefines::new(),
         )
         .expect("runtime should load a compiler-produced artifact");
         assert!(runtime.artifact_hit);
@@ -1448,6 +1464,7 @@ mod tests {
             &fixture.cache,
             &fixture.artifact,
             false,
+            &ProjectDefines::new(),
         )
         .err()
         .expect("runtime must fail instead of compiling");

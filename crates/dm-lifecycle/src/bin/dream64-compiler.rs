@@ -15,7 +15,7 @@ use dm_lifecycle::{
     LifecycleIndex, build_parsed_dmm_cache, derive_lobby_readiness, dmm_measurements_from_parsed,
     encode_dmm_measurements, encode_parsed_dmm_cache, encode_procedure_semantics,
 };
-use dm_project::Project;
+use dm_project::{Project, ProjectDefines};
 use dm_runtime::{RuntimeImage, RuntimeStructuralSeed};
 use dm_semantics::{ExecutableProcedures, ProcedureRegistry};
 
@@ -54,28 +54,49 @@ fn run() -> ExitCode {
     {
         arguments.next();
     }
-    let Some(environment) = arguments.next().map(PathBuf::from) else {
-        print_usage();
-        return ExitCode::from(2);
-    };
+    let mut environment = None;
     let mut output = None;
     let mut reuse_artifact = None;
+    let mut defines = ProjectDefines::new();
     while let Some(argument) = arguments.next() {
-        let target = if argument == OsStr::new("--output") && output.is_none() {
-            &mut output
+        if argument == OsStr::new("--output") && output.is_none() {
+            let Some(path) = arguments.next() else {
+                eprintln!("--output requires a path");
+                return ExitCode::from(2);
+            };
+            output = Some(PathBuf::from(path));
         } else if argument == OsStr::new("--reuse-artifact") && reuse_artifact.is_none() {
-            &mut reuse_artifact
+            let Some(path) = arguments.next() else {
+                eprintln!("--reuse-artifact requires a path");
+                return ExitCode::from(2);
+            };
+            reuse_artifact = Some(PathBuf::from(path));
+        } else if let Some(spec) = define_spec(&argument, &mut arguments) {
+            let Some(spec) = spec else {
+                eprintln!("-D/--define requires a NAME[=VALUE] argument");
+                return ExitCode::from(2);
+            };
+            if let Err(error) = defines.push_spec(&spec) {
+                eprintln!("invalid define {spec:?}: {error}");
+                return ExitCode::from(2);
+            }
+        } else if !argument.to_string_lossy().starts_with('-') && environment.is_none() {
+            environment = Some(PathBuf::from(argument));
         } else {
             print_usage();
             return ExitCode::from(2);
-        };
-        let Some(path) = arguments.next() else {
-            eprintln!("{} requires a path", Path::new(&argument).display());
-            return ExitCode::from(2);
-        };
-        *target = Some(PathBuf::from(path));
+        }
     }
-    match compile(&environment, output.as_deref(), reuse_artifact.as_deref()) {
+    let Some(environment) = environment else {
+        print_usage();
+        return ExitCode::from(2);
+    };
+    match compile(
+        &environment,
+        output.as_deref(),
+        reuse_artifact.as_deref(),
+        &defines,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{}: {error}", environment.display());
@@ -84,9 +105,34 @@ fn run() -> ExitCode {
     }
 }
 
+/// Recognizes `-DNAME`, `-D NAME`, `--define NAME`, and `--define=NAME`.
+///
+/// Returns `None` when `argument` is not a define flag, `Some(None)` when it is
+/// a define flag with a missing value, and `Some(Some(spec))` otherwise.
+fn define_spec(
+    argument: &OsStr,
+    arguments: &mut impl Iterator<Item = std::ffi::OsString>,
+) -> Option<Option<String>> {
+    let argument = argument.to_str()?;
+    if argument == "-D" || argument == "--define" {
+        return Some(
+            arguments
+                .next()
+                .and_then(|value| value.to_str().map(str::to_owned)),
+        );
+    }
+    if let Some(spec) = argument.strip_prefix("-D") {
+        return Some((!spec.is_empty()).then(|| spec.to_owned()));
+    }
+    if let Some(spec) = argument.strip_prefix("--define=") {
+        return Some(Some(spec.to_owned()));
+    }
+    None
+}
+
 fn print_usage() {
     eprintln!(
-        "usage: dream64-compiler [compile] <world.dme> [--output <world.d64>] [--reuse-artifact <previous.d64>]"
+        "usage: dream64-compiler [compile] <world.dme> [-D NAME[=VALUE] | --define NAME[=VALUE]]... [--output <world.d64>] [--reuse-artifact <previous.d64>]"
     );
 }
 
@@ -94,6 +140,7 @@ fn compile(
     environment: &Path,
     output: Option<&Path>,
     reuse_artifact: Option<&Path>,
+    defines: &ProjectDefines,
 ) -> Result<(), String> {
     let started = Instant::now();
     let cache_file = project_cache_file(environment);
@@ -112,12 +159,15 @@ fn compile(
         environment.display()
     );
     let (project, project_hit, fingerprint) = if strict_source_hash {
-        let (project, hit, fingerprint) =
-            Project::load_cached_exact_with_fingerprint(environment, &cache_file)
-                .map_err(|error| format!("project snapshot: {error}"))?;
+        let (project, hit, fingerprint) = Project::load_cached_exact_with_fingerprint_and_defines(
+            environment,
+            &cache_file,
+            defines,
+        )
+        .map_err(|error| format!("project snapshot: {error}"))?;
         (project, hit, *fingerprint.as_bytes())
     } else {
-        let (project, hit) = Project::load_cached(environment, &cache_file)
+        let (project, hit) = Project::load_cached_with_defines(environment, &cache_file, defines)
             .map_err(|error| format!("project snapshot: {error}"))?;
         let fingerprint = *project.content_fingerprint().as_bytes();
         (project, hit, fingerprint)
@@ -169,7 +219,7 @@ fn compile(
             &compiler_database_file,
             BuildMode::Incremental,
             persistent_semantic_digest(),
-            persistent_build_configuration_digest(),
+            persistent_build_configuration_digest(defines),
         )
         .map_err(|error| error.to_string())?;
     eprintln!(
@@ -544,13 +594,20 @@ fn persistent_semantic_digest() -> [u8; 32] {
     )
 }
 
-fn persistent_build_configuration_digest() -> [u8; 32] {
+fn persistent_build_configuration_digest(defines: &ProjectDefines) -> [u8; 32] {
     let compact = if env::var_os("DREAM64_DISABLE_COMPACT_WORDCODE").is_some() {
         b"compact=disabled".as_slice()
     } else {
         b"compact=enabled".as_slice()
     };
-    digest32(b"dream64-compiler-build-v1", compact)
+    let mut value = compact.to_vec();
+    for (name, replacement) in defines.iter() {
+        value.push(0);
+        value.extend_from_slice(name.as_bytes());
+        value.push(b'=');
+        value.extend_from_slice(replacement.as_bytes());
+    }
+    digest32(b"dream64-compiler-build-v2", &value)
 }
 
 fn digest32(domain: &[u8], value: &[u8]) -> [u8; 32] {
