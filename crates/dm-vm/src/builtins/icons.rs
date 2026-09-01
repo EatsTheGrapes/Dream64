@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use dm_value::{DatumId, FieldName, Value, ValueHeap};
@@ -479,6 +479,40 @@ pub(crate) fn icon_backing_resource(
     }
 }
 
+/// Decoded-DMI cache shared by GAGS compositing and `/icon` materialisation.
+/// Asset generation runs a handful of source DMIs through many operations; a
+/// path+mtime keyed cache turns each repeat into an `Arc` clone.
+type DmiBitmapCache = HashMap<PathBuf, (Option<SystemTime>, Arc<dm_icon::IconBitmap>)>;
+static DMI_BITMAP_CACHE: OnceLock<Mutex<DmiBitmapCache>> = OnceLock::new();
+
+/// Read and decode a DMI, returning a shared cached copy when the file is
+/// unchanged since the last decode.
+pub(crate) fn load_dmi_bitmap_cached(path: &Path) -> Result<Arc<dm_icon::IconBitmap>, String> {
+    let modified = fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok());
+    let cache = DMI_BITMAP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock()
+        && let Some((cached_mtime, bitmap)) = cache.get(path)
+        && *cached_mtime == modified
+    {
+        return Ok(Arc::clone(bitmap));
+    }
+    let bytes =
+        fs::read(path).map_err(|error| format!("cannot read DMI '{}': {error}", path.display()))?;
+    let bitmap = Arc::new(
+        dm_icon::IconBitmap::from_dmi_bytes(&bytes)
+            .map_err(|error| format!("cannot decode DMI '{}': {error}", path.display()))?,
+    );
+    if let Ok(mut cache) = cache.lock() {
+        if cache.len() >= 128 {
+            cache.clear();
+        }
+        cache.insert(path.to_path_buf(), (modified, Arc::clone(&bitmap)));
+    }
+    Ok(bitmap)
+}
+
 fn icon_field<'a>(heap: &'a ValueHeap, icon: DatumId, name: &str) -> Option<&'a Value> {
     let field = FieldName::parse(name).ok()?;
     heap.datum_field(icon, &field).ok()
@@ -528,11 +562,7 @@ pub(crate) fn materialize_icon_bitmap(
                 state,
                 "icon materialization resource",
             )?;
-            let bytes = fs::read(&resolved).map_err(|error| {
-                format!("cannot read backing DMI '{}': {error}", resolved.display())
-            })?;
-            dm_icon::IconBitmap::from_dmi_bytes(&bytes)
-                .map_err(|error| format!("cannot decode backing DMI: {error}"))?
+            load_dmi_bitmap_cached(&resolved)?.as_ref().clone()
         }
         Some(Value::Datum(backing)) => match materialize_icon_bitmap(backing, state, depth + 1)? {
             Some(bitmap) => bitmap,

@@ -7,6 +7,7 @@ use std::process::Command;
 
 use dm_value::Value;
 
+use super::icons::load_dmi_bitmap_cached;
 use super::{ExecutionState, resolved_file_path, strict_text};
 pub(super) fn format_unix_timestamp(unix_millis: i64, format: &str, offset_hours: f32) -> String {
     let offset_seconds = (offset_hours * 3_600.0).round() as i64;
@@ -171,12 +172,9 @@ fn composite_gags_dmi(
     config_json: &str,
     colors: &str,
 ) -> Result<Vec<u8>, String> {
-    let template_bytes =
-        fs::read(template_path).map_err(|error| format!("cannot read template DMI: {error}"))?;
-    let template = dm_icon::IconBitmap::from_dmi_bytes(&template_bytes)
-        .map_err(|error| format!("cannot decode template DMI: {error}"))?;
+    let template = load_dmi_bitmap_cached(template_path)?;
     let palette = dm_icon::gags::parse_color_string(colors);
-    let output = dm_icon::gags::composite(config_json, &template, &palette)?;
+    let output = dm_icon::gags::composite(config_json, template.as_ref(), &palette)?;
     output
         .to_dmi_bytes()
         .map_err(|error| format!("cannot encode output DMI: {error}"))
