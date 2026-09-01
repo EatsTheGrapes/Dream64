@@ -15761,6 +15761,100 @@ fn step_to_move_sequences_match_the_byond_oracle_over_the_world_index() {
     );
 }
 
+/// Reproduces the destination-turf resolution `step_builtin` used before it
+/// was routed through the `get_step` world-geometry index: an O(all datums)
+/// scan of the heap for a `/turf` whose x/y/z fields equal the target
+/// coordinate. On a fully populated station-sized heap this scan is what made
+/// every `step`/`step_to`/`step_towards`/`walk_*` call scale with total atom
+/// count instead of world area, and is what the boot's slow-instruction
+/// watchdog flagged on `step_to` calls in gib-streak loops (~0.5 s/call).
+/// Run explicitly in release: `cargo test -p dm-vm --release
+/// step_to_destination_turf_lookup_release_microbenchmark -- --ignored --nocapture`.
+#[test]
+#[ignore = "release-only step_to destination-turf lookup microbenchmark"]
+fn step_to_destination_turf_lookup_release_microbenchmark() {
+    let side = 550_i32; // ~300k turfs, in the neighborhood of a populated station z-level.
+    let mut state = ExecutionState::new();
+    for x in 1..=side {
+        for y in 1..=side {
+            let turf = state
+                .heap_mut()
+                .allocate_datum(TypePath::parse("/turf/open/floor/microbench").unwrap());
+            for (name, value) in [("x", x), ("y", y), ("z", 1)] {
+                state
+                    .heap_mut()
+                    .set_datum_field(turf, field(name), Value::number(value as f32))
+                    .unwrap();
+            }
+            state.world_turfs.insert((x, y, 1), turf);
+        }
+    }
+    // Interleave a population of non-turf movables, as a live station would
+    // have between mobs, items, and structures.
+    for _ in 0..50_000 {
+        state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/obj/item/microbench_filler").unwrap());
+    }
+    state.rebuild_world_turf_lookup();
+
+    let target = (side - 1, side - 1, 1);
+    let x_field = field("x");
+    let y_field = field("y");
+    let z_field = field("z");
+
+    // The historical resolver: linear-scan every heap datum for a matching
+    // `/turf`, exactly as `step_builtin` used to before this fix.
+    let old_scan = || {
+        state.heap().datums().find_map(|(id, datum)| {
+            let path = datum.type_path().as_str();
+            if path != "/turf" && !path.starts_with("/turf/") {
+                return None;
+            }
+            let coordinate = |field: &FieldName| datum.field(field).ok()?.as_number();
+            ((
+                coordinate(&x_field)?,
+                coordinate(&y_field)?,
+                coordinate(&z_field)?,
+            ) == (target.0 as f32, target.1 as f32, target.2 as f32))
+                .then_some(id)
+        })
+    };
+    let rounds = 200;
+    let started = Instant::now();
+    let mut found = 0usize;
+    for _ in 0..rounds {
+        if old_scan().is_some() {
+            found += 1;
+        }
+    }
+    let old_elapsed = started.elapsed();
+    assert_eq!(found, rounds, "the target turf must exist in the scan");
+
+    // The current resolver: the O(1) world-geometry index used by `get_step`.
+    let started = Instant::now();
+    let mut hits = 0usize;
+    for _ in 0..rounds {
+        if state.turf_at(target.0, target.1, target.2).is_some() {
+            hits += 1;
+        }
+    }
+    let indexed_elapsed = started.elapsed();
+    assert_eq!(hits, rounds);
+
+    eprintln!(
+        "step_to-destination-turf-lookup datums={} rounds={rounds} old_scan_ms={} indexed_ms={} speedup={:.1}x",
+        state.heap().datums().count(),
+        old_elapsed.as_millis(),
+        indexed_elapsed.as_millis(),
+        old_elapsed.as_secs_f64() / indexed_elapsed.as_secs_f64().max(1e-9),
+    );
+    assert!(
+        indexed_elapsed < old_elapsed,
+        "the indexed lookup must be faster than the historical all-datums scan"
+    );
+}
+
 #[test]
 fn mapping_multiz_get_step_resolves_up_down_and_world_bounds() {
     let syntax = parse(
