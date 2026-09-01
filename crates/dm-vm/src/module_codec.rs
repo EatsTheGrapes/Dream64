@@ -74,10 +74,18 @@ impl Module {
         let mut semantic = program.clone();
         semantic.source_spans.clear();
         let mut writer = Writer::new();
-        writer.bytes.extend_from_slice(b"D64-PROC-SEMANTIC\0\x01");
+        // Domain tag `\x02`: call targets are hashed by canonical path, not by
+        // the project-wide numeric `ProcedureId`, so the digest is invariant
+        // under procedure renumbering (`-DCBT`, upstream content updates).
+        writer.bytes.extend_from_slice(b"D64-PROC-SEMANTIC\0\x02");
         writer.string(path).map_err(|error| error.to_string())?;
         writer.string(owner).map_err(|error| error.to_string())?;
-        encode_program(&mut writer, &semantic).map_err(|error| error.to_string())?;
+        encode_program(
+            &mut writer,
+            &semantic,
+            ProcedureRefEncoding::SemanticPath(&self.paths),
+        )
+        .map_err(|error| error.to_string())?;
         Ok(Sha256::digest(&writer.bytes).into())
     }
 
@@ -110,7 +118,7 @@ impl Module {
             writer.string(path.as_str())?;
         }
         for program in &self.procedures {
-            encode_program(&mut writer, program)?;
+            encode_program(&mut writer, program, ProcedureRefEncoding::RawId)?;
         }
         if writer.bytes.len() > MAX_ARTIFACT_BYTES {
             return Err(ModuleCodecError::new(
@@ -348,7 +356,25 @@ fn validate_procedure(
     }
 }
 
-fn encode_program(writer: &mut Writer, program: &Program) -> Result<(), ModuleCodecError> {
+/// Selects how `Call` / `CallParent` procedure targets are serialized.
+///
+/// The portable module codec round-trips within a single module, where numeric
+/// [`ProcedureId`]s are authoritative, so it uses [`ProcedureRefEncoding::RawId`].
+/// The semantic digest must stay stable when the whole project is renumbered
+/// (compiling with `-DCBT`, or any upstream content change that adds or removes
+/// an unrelated procedure), so it uses [`ProcedureRefEncoding::SemanticPath`],
+/// which hashes each target's canonical path string instead of its id.
+#[derive(Clone, Copy)]
+enum ProcedureRefEncoding<'a> {
+    RawId,
+    SemanticPath(&'a [String]),
+}
+
+fn encode_program(
+    writer: &mut Writer,
+    program: &Program,
+    procedure_refs: ProcedureRefEncoding<'_>,
+) -> Result<(), ModuleCodecError> {
     writer.boolean(program.wait_for);
     writer.u32(program.parameter_count as u32);
     writer.len(
@@ -387,7 +413,7 @@ fn encode_program(writer: &mut Writer, program: &Program) -> Result<(), ModuleCo
         "instruction count",
     )?;
     for instruction in &program.instructions {
-        encode_instruction(writer, instruction)?;
+        encode_instruction(writer, instruction, procedure_refs)?;
     }
     writer.len(
         program.source_spans.len(),
@@ -495,6 +521,7 @@ fn decode_program(
 fn encode_instruction(
     writer: &mut Writer,
     instruction: &Instruction,
+    procedure_refs: ProcedureRefEncoding<'_>,
 ) -> Result<(), ModuleCodecError> {
     macro_rules! unit {
         ($tag:expr) => {{
@@ -815,7 +842,7 @@ fn encode_instruction(
             argument_names,
         } => {
             writer.u8(117);
-            writer.u32(procedure.0);
+            writer.procedure_ref(*procedure, procedure_refs)?;
             writer.u16(*argument_count);
             writer.optional_strings(argument_names)?;
         }
@@ -828,7 +855,15 @@ fn encode_instruction(
             argument_count,
         } => {
             writer.u8(119);
-            writer.optional_procedure(*procedure);
+            match procedure_refs {
+                ProcedureRefEncoding::RawId => writer.optional_procedure(*procedure),
+                ProcedureRefEncoding::SemanticPath(_) => {
+                    writer.boolean(procedure.is_some());
+                    if let Some(procedure) = procedure {
+                        writer.procedure_ref(*procedure, procedure_refs)?;
+                    }
+                }
+            }
             writer.optional_u16(*argument_count);
         }
         Instruction::CallDynamic {
@@ -1343,6 +1378,45 @@ impl Writer {
         if let Some(value) = value {
             self.u32(value.0);
         }
+    }
+    /// Serializes one resolved call target under the selected encoding.
+    ///
+    /// [`ProcedureRefEncoding::RawId`] writes the numeric module-local id;
+    /// [`ProcedureRefEncoding::SemanticPath`] writes a renumbering-invariant
+    /// canonical-path token instead (see [`Writer::semantic_procedure_path`]).
+    fn procedure_ref(
+        &mut self,
+        procedure: ProcedureId,
+        encoding: ProcedureRefEncoding<'_>,
+    ) -> Result<(), ModuleCodecError> {
+        match encoding {
+            ProcedureRefEncoding::RawId => self.u32(procedure.0),
+            ProcedureRefEncoding::SemanticPath(paths) => {
+                self.semantic_procedure_path(paths.get(procedure.index()).map(String::as_str))?;
+            }
+        }
+        Ok(())
+    }
+    /// Writes a stable identity token for a call target's canonical path.
+    ///
+    /// The `@ordinal` / `@dream64_*` disambiguation suffix is dropped so the
+    /// token depends only on the DM-level procedure path, which does not move
+    /// when unrelated procedures are added or removed. Tag `1` precedes a
+    /// canonical `/`-rooted path, tag `2` a non-canonical path string, and tag
+    /// `0` an unresolvable target (deferred or out of range).
+    fn semantic_procedure_path(&mut self, path: Option<&str>) -> Result<(), ModuleCodecError> {
+        match path {
+            Some(path) if path.starts_with('/') => {
+                self.u8(1);
+                self.string(path.split('@').next().unwrap_or(path))?;
+            }
+            Some(path) => {
+                self.u8(2);
+                self.string(path)?;
+            }
+            None => self.u8(0),
+        }
+        Ok(())
     }
     fn fields(&mut self, values: &[FieldName]) -> Result<(), ModuleCodecError> {
         self.len(values.len(), MAX_VECTOR_ELEMENTS, "field vector length")?;

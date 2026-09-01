@@ -59,12 +59,12 @@ pub(crate) fn canonical_type2parent_program(program: &Program) -> bool {
 }
 
 const CANONICAL_MONKE_TGM_LOAD_DIGEST: [u8; 32] = [
-    0x85, 0x4b, 0x62, 0x18, 0x63, 0x82, 0x20, 0x9f, 0x21, 0xc2, 0x6a, 0x32, 0xb0, 0x0b, 0x04, 0x49,
-    0x36, 0x17, 0x87, 0xa8, 0xe8, 0x30, 0xd0, 0xc4, 0x59, 0x91, 0xf2, 0x1e, 0xd1, 0xdd, 0xac, 0x8a,
+    0x61, 0xcb, 0x14, 0xf4, 0xba, 0xbf, 0x77, 0xc6, 0xb6, 0xd6, 0x5d, 0xcf, 0xf7, 0xaf, 0x87, 0xb6,
+    0xdd, 0x9d, 0x52, 0x40, 0xae, 0xf7, 0x9b, 0xaa, 0xe1, 0x1a, 0x91, 0xf8, 0xa1, 0x3b, 0x41, 0xf8,
 ];
 pub(crate) const CANONICAL_MONKE_BUILD_COORDINATE_DIGEST: [u8; 32] = [
-    0xb6, 0x0a, 0xef, 0x32, 0xef, 0x56, 0x9c, 0xf2, 0x67, 0x4a, 0x81, 0x30, 0xb5, 0x7a, 0x7a, 0xd4,
-    0xb4, 0x90, 0x87, 0x80, 0x0a, 0xf5, 0x82, 0xc5, 0x2d, 0x0a, 0xcd, 0x9f, 0x1d, 0x69, 0xf9, 0xc0,
+    0x83, 0x48, 0x6d, 0xc2, 0xdf, 0x91, 0x89, 0x69, 0x08, 0x6f, 0x33, 0x91, 0xab, 0xfd, 0xaf, 0x7d,
+    0xf3, 0xee, 0xfe, 0xcc, 0x4c, 0x7f, 0x69, 0xf1, 0x2c, 0xf6, 0xa5, 0x86, 0x2e, 0x93, 0x83, 0x50,
 ];
 static NATIVE_TGM_LOAD_ACTIVATIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -203,12 +203,12 @@ pub fn native_discover_offset_activations() -> u64 {
 }
 
 const CANONICAL_MONKE_RUIN_TRY_TO_PLACE_DIGEST: [u8; 32] = [
-    0xfa, 0x0c, 0x5c, 0x43, 0xc2, 0x93, 0xb7, 0x67, 0x3c, 0xe6, 0xce, 0xad, 0xf7, 0xed, 0xce, 0xdb,
-    0xbd, 0x99, 0x33, 0x06, 0x1c, 0x5a, 0x2b, 0x59, 0x90, 0xa6, 0x0d, 0xba, 0xbb, 0x40, 0x74, 0x6a,
+    0x2d, 0xd5, 0x57, 0xe1, 0xf3, 0x0c, 0xb1, 0xff, 0x42, 0xa5, 0xe3, 0xc1, 0xe1, 0x03, 0xe4, 0x40,
+    0x49, 0x0b, 0x84, 0x92, 0x1e, 0x7c, 0x98, 0x8f, 0x4e, 0x60, 0xc5, 0x8d, 0xda, 0x0d, 0x4d, 0x78,
 ];
 const CANONICAL_MONKE_GET_AFFECTED_TURFS_DIGEST: [u8; 32] = [
-    0x4a, 0x1e, 0xdc, 0x92, 0xb4, 0xa2, 0x60, 0x70, 0xa9, 0x9d, 0x61, 0xea, 0xc7, 0x62, 0x2e, 0x8b,
-    0x98, 0xf3, 0x3f, 0x84, 0xf8, 0x12, 0x9e, 0x77, 0x2e, 0x3d, 0xd5, 0xc7, 0xd6, 0x4d, 0xbc, 0x0d,
+    0x12, 0xe1, 0x69, 0x37, 0xa4, 0xe6, 0x0a, 0x36, 0xf3, 0xba, 0xaa, 0x87, 0x1a, 0xd8, 0x73, 0x9e,
+    0x37, 0x07, 0x20, 0x41, 0x77, 0xf8, 0xd4, 0xe3, 0xfe, 0x3a, 0xf6, 0xa3, 0x25, 0xfb, 0x2e, 0x59,
 ];
 
 fn trusted_get_affected_turfs_target(module: &Module) -> bool {
@@ -393,12 +393,13 @@ pub(crate) fn canonical_tgm_load_path(module: &Module, procedure: ProcedureId) -
 }
 
 /// Emits a single boot-log line when the canonical `_tgm_load` is present but
-/// its pinned semantic identity no longer matches. The digest depends on the
-/// numbering of every procedure the loader calls, so it drifts whenever the
-/// production project or the lowering pipeline changes even though the loader's
-/// own DM body did not. Without this notice the only symptom is every map cell
-/// silently falling back to the reference interpreter, which is far slower per
-/// tick and can keep a heavy boot from ever reaching lobby pregame.
+/// its pinned semantic identity no longer matches. The digest is invariant
+/// under project-wide procedure renumbering (`-DCBT`, upstream content updates),
+/// so a mismatch now means the loader's own DM body, or a procedure it calls,
+/// genuinely changed and the pin must be re-measured. Without this notice the
+/// only symptom is every map cell silently falling back to the reference
+/// interpreter, which is far slower per tick and can keep a heavy boot from
+/// ever reaching lobby pregame.
 fn warn_tgm_guard_mismatch_once(module: &Module, procedure: ProcedureId) {
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
@@ -410,8 +411,8 @@ fn warn_tgm_guard_mismatch_once(module: &Module, procedure: ProcedureId) {
 }
 
 const CANONICAL_MONKE_TGM_BUILD_CACHE_DIGEST: [u8; 32] = [
-    0x8c, 0x40, 0xc0, 0x46, 0xba, 0x52, 0xa6, 0x53, 0x38, 0xf5, 0xcf, 0x6d, 0xa7, 0xb3, 0x79, 0x4e,
-    0x54, 0x9a, 0xe9, 0xf3, 0xd2, 0x2e, 0xea, 0x76, 0xeb, 0x42, 0xd7, 0x78, 0xe9, 0xc3, 0x71, 0xad,
+    0x16, 0xc6, 0x25, 0x6e, 0xb0, 0xb2, 0x4a, 0xe9, 0x5c, 0xe6, 0xaf, 0x2d, 0x61, 0x95, 0x7b, 0x3a,
+    0xa6, 0x35, 0xb8, 0xfd, 0x3d, 0x9e, 0x44, 0x26, 0x11, 0x77, 0x84, 0x84, 0xe7, 0x76, 0x12, 0xaa,
 ];
 
 fn trusted_tgm_load_target(module: &Module, procedure: ProcedureId, program: &Program) -> bool {
@@ -1163,6 +1164,11 @@ pub(crate) fn revalidated_ruin_rejection(
     turf_flags: &FieldName,
 ) -> bool {
     let (low_x, low_y, z, high_x, high_y, _) = bounds;
+    // An inverted bounding box selects no coordinates; guarding here keeps the
+    // `(low_y, _)..=(high_y, _)` range below from panicking on `low_y > high_y`.
+    if low_x > high_x || low_y > high_y {
+        return false;
+    }
     let Some(by_coordinate) = state.ruin_rejection_witnesses.get(&z) else {
         return false;
     };
@@ -1215,9 +1221,11 @@ pub(crate) fn drive_ruin_candidate_scan(
         {
             return TgmDrive::None;
         }
-        if attach_at_call {
-            frame.stack.clear();
-        }
+        // The pending `get_affected_turfs()` call arguments stay on the stack
+        // until we are committed to driving natively: every `return
+        // TgmDrive::None` below must leave the frame exactly as the interpreter
+        // expects it at instruction 65, so the stack is cleared only at the two
+        // takeover points further down.
         let Value::Datum(center) = frame.locals.get(8).cloned().unwrap_or(Value::Null) else {
             return TgmDrive::None;
         };
@@ -1252,9 +1260,19 @@ pub(crate) fn drive_ruin_candidate_scan(
             .turf_at(requested_low.0, requested_low.1, requested_low.2)
             .map_or((center_x, center_y, center_z), |_| requested_low);
         let high = (low.0 + width - 1, low.1 + height - 1, low.2);
+        // A non-positive template width or height inverts the bounding box.
+        // Such degenerate geometry has no turfs to scan; defer it wholesale to
+        // the reference interpreter rather than feed an inverted range to the
+        // scan or to `revalidated_ruin_rejection`.
+        if high.0 < low.0 || high.1 < low.1 {
+            return TgmDrive::None;
+        }
         let empty = state.turf_at(high.0, high.1, high.2).is_none();
         let bounds = (low.0, low.1, low.2, high.0, high.1, high.2);
         if revalidated_ruin_rejection(state, bounds, &FieldName::parse("turf_flags").unwrap()) {
+            if attach_at_call {
+                frame.stack.clear();
+            }
             frame.locals[9] = Value::number(0.0);
             frame.instruction = 14;
             NATIVE_RUIN_SCAN_ACTIVATIONS.fetch_add(1, Ordering::Relaxed);
@@ -1262,6 +1280,9 @@ pub(crate) fn drive_ruin_candidate_scan(
             NATIVE_RUIN_FLAG_REJECTIONS.fetch_add(1, Ordering::Relaxed);
             NATIVE_RUIN_REJECTION_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             return TgmDrive::Continue;
+        }
+        if attach_at_call {
+            frame.stack.clear();
         }
         frame.cold_mut().ruin_scan = Some(RuinCandidateScan {
             low,

@@ -14234,6 +14234,69 @@ fn drive_tgm_load_declines_without_engaging_when_semantic_identity_drifts() {
 }
 
 #[test]
+fn procedure_semantic_digest_is_invariant_under_project_wide_renumbering() {
+    // The guarded body and its call target are byte-identical between the two
+    // projects; the second only inserts an unrelated procedure ahead of them,
+    // which renumbers every `ProcedureId` (exactly what compiling with `-DCBT`
+    // or an upstream content update does). The digest must not move.
+    let guarded = concat!(
+        "/proc/helper(a)\n\treturn a + 1\n",
+        "/proc/guarded(x)\n\treturn helper(x) + helper(x)\n",
+    );
+    let with_unrelated_proc = concat!(
+        "/proc/aaa_unrelated()\n\treturn 7\n",
+        "/proc/helper(a)\n\treturn a + 1\n",
+        "/proc/guarded(x)\n\treturn helper(x) + helper(x)\n",
+    );
+
+    let base = compile_module(&parse(guarded).unwrap().definitions).unwrap();
+    let renumbered = compile_module(&parse(with_unrelated_proc).unwrap().definitions).unwrap();
+
+    let base_id = base.procedure_id("/proc/guarded").unwrap();
+    let renumbered_id = renumbered.procedure_id("/proc/guarded").unwrap();
+    assert_ne!(
+        base_id.index(),
+        renumbered_id.index(),
+        "the inserted procedure must actually renumber /proc/guarded",
+    );
+    assert_eq!(
+        base.compute_procedure_semantic_digest(base_id).unwrap(),
+        renumbered
+            .compute_procedure_semantic_digest(renumbered_id)
+            .unwrap(),
+        "renumbering an unrelated procedure must not change the digest",
+    );
+}
+
+#[test]
+fn procedure_semantic_digest_tracks_the_identity_of_call_targets() {
+    // `helper` and `other` are byte-identical apart from their path, so the only
+    // difference between the two `guarded` bodies is *which* procedure they
+    // call. The digest must still change — the call graph is load-bearing.
+    let calls_helper = concat!(
+        "/proc/helper(a)\n\treturn a + 1\n",
+        "/proc/other(a)\n\treturn a + 1\n",
+        "/proc/guarded(x)\n\treturn helper(x)\n",
+    );
+    let calls_other = concat!(
+        "/proc/helper(a)\n\treturn a + 1\n",
+        "/proc/other(a)\n\treturn a + 1\n",
+        "/proc/guarded(x)\n\treturn other(x)\n",
+    );
+
+    let a = compile_module(&parse(calls_helper).unwrap().definitions).unwrap();
+    let b = compile_module(&parse(calls_other).unwrap().definitions).unwrap();
+    let a_id = a.procedure_id("/proc/guarded").unwrap();
+    let b_id = b.procedure_id("/proc/guarded").unwrap();
+    assert_eq!(a_id.index(), b_id.index(), "control: same numbering");
+    assert_ne!(
+        a.compute_procedure_semantic_digest(a_id).unwrap(),
+        b.compute_procedure_semantic_digest(b_id).unwrap(),
+        "changing a call target must change the digest",
+    );
+}
+
+#[test]
 fn tgm_attach_accepts_pre_iterator_and_legacy_seams_only() {
     let syntax = parse("/proc/run()\n\treturn\n").unwrap();
     let module = compile_module(&syntax.definitions).unwrap();
@@ -14876,6 +14939,34 @@ fn ruin_rejection_witness_is_revalidated_and_never_caches_success() {
         &mut state,
         bounds,
         &turf_flags
+    ));
+}
+
+#[test]
+fn revalidated_ruin_rejection_tolerates_inverted_bounds_without_panicking() {
+    // A non-positive template width/height inverts the bounding box, which used
+    // to feed `(low_y, _)..=(high_y, _)` with `low_y > high_y` and panic the
+    // headless host ("range start is greater than range end in BTreeMap") once
+    // the native ruin scan actually engaged.
+    let mut state = ExecutionState::new();
+    let turf = state
+        .heap_mut()
+        .allocate_datum(TypePath::parse("/turf/test").unwrap());
+    state
+        .ruin_rejection_witnesses
+        .entry(1)
+        .or_default()
+        .insert((3, 2), turf);
+    let turf_flags = field("turf_flags");
+    assert!(!crate::revalidated_ruin_rejection(
+        &mut state,
+        (5, 5, 1, 1, 1, 1),
+        &turf_flags,
+    ));
+    assert!(!crate::revalidated_ruin_rejection(
+        &mut state,
+        (1, 5, 1, 5, 1, 1),
+        &turf_flags,
     ));
 }
 

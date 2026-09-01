@@ -69,7 +69,11 @@ pub use execute::{
 use dm_vm::Module;
 
 const PROCEDURE_SEMANTICS_MAGIC: &[u8; 8] = b"D64PSEM\0";
-const PROCEDURE_SEMANTICS_VERSION: u16 = 1;
+// Version 2: procedure semantic digests hash call targets by canonical path
+// rather than by numeric `ProcedureId`, so a directory produced by an older
+// engine must be rejected rather than silently recomputed against the new
+// scheme.
+const PROCEDURE_SEMANTICS_VERSION: u16 = 2;
 const MAX_PROCEDURE_SEMANTICS_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Builds a portable semantic-identity directory for every eager procedure.
