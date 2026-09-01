@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
@@ -76,38 +77,71 @@ impl DmiState {
 struct CachedDmiMetadata {
     len: u64,
     modified: Option<SystemTime>,
+    /// Monotonic tick of the last read that served or filled this entry. Used
+    /// for bounded least-recently-used eviction instead of clearing the whole
+    /// cache when it fills.
+    last_used: u64,
     metadata: DmiMetadata,
 }
 
-const MAX_DMI_METADATA_CACHE_ENTRIES: usize = 4_096;
+// A `DmiMetadata` is small, and SS13 references far more than a few thousand
+// distinct DMIs (`SSgreyscale_previews` alone `icon()`s thousands of preview
+// sheets). Keep the cap generous and evict one entry at a time.
+const MAX_DMI_METADATA_CACHE_ENTRIES: usize = 16_384;
 static DMI_METADATA_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedDmiMetadata>>> = OnceLock::new();
+static DMI_METADATA_CLOCK: AtomicU64 = AtomicU64::new(0);
+
 #[cfg(test)]
 pub(crate) static DMI_METADATA_PHYSICAL_READS: OnceLock<Mutex<HashMap<PathBuf, u64>>> =
     OnceLock::new();
+
+/// Inserts `entry` for `path`, first making room with bounded least-recently-used
+/// eviction: while the cache is at capacity and this is a new key, drop the
+/// single entry with the oldest `last_used` tick. This replaces the previous
+/// clear-the-whole-cache-when-full behaviour, which forced every subsequent
+/// `icon()` / `IconStates()` to re-decode a PNG once a boot referenced more than
+/// the cap's worth of distinct DMIs.
+fn store_dmi_metadata(
+    cache: &mut HashMap<PathBuf, CachedDmiMetadata>,
+    path: &Path,
+    entry: CachedDmiMetadata,
+) {
+    while cache.len() >= MAX_DMI_METADATA_CACHE_ENTRIES && !cache.contains_key(path) {
+        let Some(victim) = cache
+            .iter()
+            .min_by_key(|(_, cached)| cached.last_used)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&victim);
+    }
+    cache.insert(path.to_path_buf(), entry);
+}
 
 pub(crate) fn read_dmi_metadata(path: &Path) -> Result<DmiMetadata, String> {
     let file = fs::metadata(path).map_err(|error| error.to_string())?;
     let len = file.len();
     let modified = file.modified().ok();
     let cache = DMI_METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(cache) = cache.lock()
-        && let Some(entry) = cache.get(path)
+    if let Ok(mut cache) = cache.lock()
+        && let Some(entry) = cache.get_mut(path)
         && entry.len == len
         && entry.modified == modified
     {
+        entry.last_used = DMI_METADATA_CLOCK.fetch_add(1, Ordering::Relaxed);
         return Ok(entry.metadata.clone());
     }
 
     let metadata = read_dmi_metadata_uncached(path)?;
     if let Ok(mut cache) = cache.lock() {
-        if cache.len() >= MAX_DMI_METADATA_CACHE_ENTRIES && !cache.contains_key(path) {
-            cache.clear();
-        }
-        cache.insert(
-            path.to_path_buf(),
+        store_dmi_metadata(
+            &mut cache,
+            path,
             CachedDmiMetadata {
                 len,
                 modified,
+                last_used: DMI_METADATA_CLOCK.fetch_add(1, Ordering::Relaxed),
                 metadata: metadata.clone(),
             },
         );
@@ -695,4 +729,113 @@ fn apply_journal_entry(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod dmi_cache_tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use super::{
+        CachedDmiMetadata, DMI_METADATA_PHYSICAL_READS, DmiMetadata,
+        MAX_DMI_METADATA_CACHE_ENTRIES, read_dmi_metadata, store_dmi_metadata,
+    };
+
+    fn synthetic_entry(last_used: u64) -> CachedDmiMetadata {
+        CachedDmiMetadata {
+            len: 0,
+            modified: None,
+            last_used,
+            metadata: DmiMetadata {
+                width: 0,
+                height: 0,
+                states: Vec::new(),
+                error: None,
+            },
+        }
+    }
+
+    fn minimal_dmi(width: u32, height: u32) -> Vec<u8> {
+        // PNG signature + IHDR + IEND, no BYOND `Description`.
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut push_chunk = |kind: &[u8; 4], data: &[u8]| {
+            png.extend_from_slice(&(u32::try_from(data.len()).unwrap()).to_be_bytes());
+            png.extend_from_slice(kind);
+            png.extend_from_slice(data);
+            png.extend_from_slice(&[0; 4]);
+        };
+        let mut header = Vec::new();
+        header.extend_from_slice(&width.to_be_bytes());
+        header.extend_from_slice(&height.to_be_bytes());
+        header.extend_from_slice(&[8, 6, 0, 0, 0]);
+        push_chunk(b"IHDR", &header);
+        push_chunk(b"IEND", &[]);
+        png
+    }
+
+    #[test]
+    fn store_evicts_one_lru_entry_at_a_time_without_clearing() {
+        // Exercise far more distinct DMI paths than the cache can hold. The old
+        // behaviour cleared the entire map at the boundary; bounded LRU eviction
+        // must instead drop exactly one (the least-recently-used) entry.
+        let mut cache: HashMap<PathBuf, CachedDmiMetadata> = HashMap::new();
+        let total = MAX_DMI_METADATA_CACHE_ENTRIES + 500;
+        for index in 0..total {
+            let path = PathBuf::from(format!("/virtual/dmi/{index}.dmi"));
+            store_dmi_metadata(&mut cache, &path, synthetic_entry(index as u64));
+        }
+
+        assert_eq!(
+            cache.len(),
+            MAX_DMI_METADATA_CACHE_ENTRIES,
+            "eviction keeps the cache exactly at capacity, never clears it"
+        );
+        // The 500 oldest keys were evicted one-by-one; everything newer survived.
+        assert!(!cache.contains_key(&PathBuf::from("/virtual/dmi/0.dmi")));
+        assert!(!cache.contains_key(&PathBuf::from("/virtual/dmi/499.dmi")));
+        assert!(cache.contains_key(&PathBuf::from("/virtual/dmi/500.dmi")));
+        assert!(cache.contains_key(&PathBuf::from(format!("/virtual/dmi/{}.dmi", total - 1))));
+
+        // Re-touching an existing key must not evict anything.
+        let hot = PathBuf::from("/virtual/dmi/500.dmi");
+        store_dmi_metadata(&mut cache, &hot, synthetic_entry(u64::MAX));
+        assert_eq!(cache.len(), MAX_DMI_METADATA_CACHE_ENTRIES);
+        assert!(cache.contains_key(&hot));
+    }
+
+    #[test]
+    fn repeated_reads_under_the_cap_decode_each_dmi_once() {
+        let root = std::env::temp_dir().join(format!(
+            "dream64-dmi-cache-bounded-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut paths = Vec::new();
+        for index in 0..24u32 {
+            let path = root.join(format!("sheet-{index}.dmi"));
+            std::fs::write(&path, minimal_dmi(16 + index, 32)).unwrap();
+            paths.push(path);
+        }
+
+        for _ in 0..8 {
+            for (index, path) in paths.iter().enumerate() {
+                let metadata = read_dmi_metadata(path).unwrap();
+                assert_eq!(metadata.width, 16 + index as u32);
+            }
+        }
+
+        let reads = DMI_METADATA_PHYSICAL_READS.get().unwrap().lock().unwrap();
+        for path in &paths {
+            assert_eq!(
+                reads.get(path).copied(),
+                Some(1),
+                "each DMI under the cache cap is decoded once across repeated references"
+            );
+        }
+        drop(reads);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

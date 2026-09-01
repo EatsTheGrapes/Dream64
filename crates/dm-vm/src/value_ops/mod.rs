@@ -854,13 +854,14 @@ pub(crate) fn world_contents_iteration_snapshot(
     }
 
     let snapshot = state.heap.allocate_list();
-    for value in buckets.into_iter().flatten() {
-        state
-            .heap
-            .list_mut(snapshot)
-            .expect("newly allocated world iteration snapshot is live")
-            .add(value);
-    }
+    // A `PrepareIteration` snapshot is a plain positional list; fill it in one
+    // batch instead of per-element `add`, which re-does O(n) bookkeeping and
+    // reallocation over the whole loaded world just before `SSatoms`.
+    state
+        .heap
+        .list_mut(snapshot)
+        .expect("newly allocated world iteration snapshot is live")
+        .extend_positional(buckets.into_iter().flatten());
     Ok(snapshot)
 }
 
@@ -891,13 +892,14 @@ pub(crate) fn atom_contents_iteration_snapshot(
         })
         .collect::<Vec<_>>();
     let snapshot = state.heap.allocate_list();
-    for value in values {
-        state
-            .heap
-            .list_mut(snapshot)
-            .expect("newly allocated atom contents snapshot is live")
-            .add(value);
-    }
+    // Plain positional snapshot: one batch fill instead of per-element `add`,
+    // which is O(n) reallocation / bookkeeping over huge areas such as
+    // `/area/space` (100k+ turfs) during `add_base_lighting`.
+    state
+        .heap
+        .list_mut(snapshot)
+        .expect("newly allocated atom contents snapshot is live")
+        .extend_positional(values);
     Ok(snapshot)
 }
 

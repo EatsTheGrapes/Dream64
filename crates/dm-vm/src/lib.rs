@@ -164,8 +164,9 @@ pub(crate) use builtins::is_subtype;
 
 #[cfg(test)]
 pub(crate) use value_ops::{
-    assign_datum_or_shared_field, canonicalize_owned_value, canonicalize_value,
-    datum_field_or_shared, dm_list_length_number, read_list_value, write_list_value,
+    assign_datum_or_shared_field, atom_contents_iteration_snapshot, canonicalize_owned_value,
+    canonicalize_value, datum_field_or_shared, dm_list_length_number, read_list_value,
+    world_contents_iteration_snapshot, write_list_value,
 };
 
 use bytecode::next_module_identity;
