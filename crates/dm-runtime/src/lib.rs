@@ -26,7 +26,7 @@ use dm_value::{
 };
 use dm_vm::{
     ExecutionContext, ExecutionState, InitializerBinding, InitializerProgram, InstanceInitializer,
-    Module, RuntimeError, append_initializer_program, compile_initializer,
+    Module, ProcedureId, RuntimeError, append_initializer_program, compile_initializer,
     compile_initializer_into_module, compile_initializer_program, execute_module_in_context,
     initializer_compile_context,
 };
@@ -718,6 +718,11 @@ pub struct RuntimeImageStats {
     pub instance_initializer_unique_programs_compiled: usize,
     /// Shared compiled-program references installed into per-type plans.
     pub instance_initializer_plan_references: usize,
+    /// Bulk-world-allocation instance initializers that could not run before the
+    /// `/world/Genesis()` lifecycle hook has created the subsystem singletons
+    /// (e.g. a `list(new /obj/...)` default whose nested constructor reaches
+    /// `SSatoms`). Their fields keep the nearest inherited default instead.
+    pub instance_initializer_predecessor_deferrals: usize,
     /// Identifier/index probes used to construct initializer binding maps.
     pub initializer_binding_index_lookups: usize,
     /// Referenced bindings emitted across compiled initializer programs.
@@ -1567,6 +1572,16 @@ struct CompiledInstanceInitializer {
 enum CompiledInstanceInitializerAction {
     Constant(Value),
     Program(Arc<InitializerProgram>),
+    /// An initializer entry point in the restored, shared VM initializer module.
+    ///
+    /// A `.d64` linked artifact discards the per-candidate source inventory that
+    /// `Program` is compiled from, but keeps the fully compiled VM catalog and
+    /// its module. Linked-artifact allocation runs its ancestors' initializers
+    /// through this variant.
+    SharedProgram {
+        module: Arc<Module>,
+        entry: ProcedureId,
+    },
 }
 
 #[derive(Clone)]
@@ -3007,6 +3022,21 @@ impl RuntimeImage {
                                 }
                             })?
                         }
+                        CompiledInstanceInitializerAction::SharedProgram { module, entry } => {
+                            execute_module_in_context(
+                                module,
+                                *entry,
+                                &[],
+                                &mut state,
+                                &ExecutionContext::new(Value::Datum(datum), Value::Null),
+                            )
+                            .map_err(|error| {
+                                RuntimeImageError::InstanceInitializer {
+                                    path: initializer.path.clone(),
+                                    message: error.message,
+                                }
+                            })?
+                        }
                     };
                     state
                         .heap_mut()
@@ -3055,23 +3085,50 @@ impl RuntimeImage {
         materialize_builtin_world_defaults(state.heap_mut(), datum, type_path, &self.world_name)?;
         let plan = self.instance_initializer_plan(type_path, &allocation.ancestors)?;
         for initializer in plan.iter() {
-            let value = match &initializer.action {
-                CompiledInstanceInitializerAction::Constant(value) => value.clone(),
-                CompiledInstanceInitializerAction::Program(program) => execute_module_in_context(
-                    program.module(),
-                    program.entry(),
-                    &[],
-                    state,
-                    &ExecutionContext::new(Value::Datum(datum), Value::Null),
-                )
-                .map_err(|error| RuntimeImageError::InstanceInitializer {
-                    path: initializer.path.clone(),
-                    message: error.message,
-                })?,
+            let (program_module, program_entry) = match &initializer.action {
+                CompiledInstanceInitializerAction::Constant(value) => {
+                    state.heap_mut().set_datum_field(
+                        datum,
+                        initializer.field.clone(),
+                        value.clone(),
+                    )?;
+                    continue;
+                }
+                CompiledInstanceInitializerAction::Program(program) => {
+                    (program.module(), program.entry())
+                }
+                CompiledInstanceInitializerAction::SharedProgram { module, entry } => {
+                    (module.as_ref(), *entry)
+                }
             };
-            state
-                .heap_mut()
-                .set_datum_field(datum, initializer.field.clone(), value)?;
+            match execute_module_in_context(
+                program_module,
+                program_entry,
+                &[],
+                state,
+                &ExecutionContext::new(Value::Datum(datum), Value::Null),
+            ) {
+                Ok(value) => {
+                    state
+                        .heap_mut()
+                        .set_datum_field(datum, initializer.field.clone(), value)?;
+                }
+                // Bulk world allocation runs before `/world/Genesis()` has built
+                // the subsystem singletons. An initializer whose nested `new` or
+                // proc call reaches an absent subsystem (e.g. `SSatoms`) cannot
+                // complete here; leave the field at its inherited default rather
+                // than aborting the whole map. `allocate_datum` (post-Genesis)
+                // still surfaces such errors.
+                Err(error) => {
+                    self.stats.instance_initializer_predecessor_deferrals += 1;
+                    if self.stats.instance_initializer_predecessor_deferrals <= 32 {
+                        eprintln!(
+                            "boot-progress: deferred pre-Genesis instance initializer {} ({})",
+                            initializer.path, error.message,
+                        );
+                    }
+                }
+            }
         }
         self.stats.dynamic_initializers_materialized += plan.len();
         self.stats.datums_allocated += 1;
@@ -3175,6 +3232,22 @@ impl RuntimeImage {
             return Ok(plan.clone());
         }
 
+        // A `.d64` linked artifact restores the fully compiled VM initializer
+        // catalog and its module but discards the per-candidate source inventory
+        // that the branch below compiles from. Build the plan directly from the
+        // shared catalog so map-loaded movables (allocated through
+        // `allocate_datum_in_state`) still receive every ancestor's
+        // `list()` / `new(...)` instance-var initializer.
+        if self.instance_initializers.is_empty() && !self.vm_instance_initializers.is_empty() {
+            let plan =
+                Arc::<[CompiledInstanceInitializer]>::from(self.linked_catalog_plan(ancestors)?);
+            self.stats.instance_initializer_plan_references += plan.len();
+            self.instance_initializer_plans
+                .insert(type_path.clone(), Arc::clone(&plan));
+            self.stats.instance_initializer_plans_compiled += 1;
+            return Ok(plan);
+        }
+
         let applicable = ancestors
             .iter()
             .filter_map(|owner| self.instance_initializer_indices_by_owner.get(owner))
@@ -3233,6 +3306,54 @@ impl RuntimeImage {
         self.instance_initializer_plans
             .insert(type_path.clone(), Arc::clone(&plan));
         self.stats.instance_initializer_plans_compiled += 1;
+        Ok(plan)
+    }
+
+    /// Flattens the restored VM initializer catalog over an ancestor chain.
+    ///
+    /// Used only when the per-candidate source inventory is absent (linked
+    /// artifact). `ancestors` is already ordered parent-to-child, and each
+    /// owner's catalog entries retain their source ordinal order, so the
+    /// resulting plan matches the ordering that [`Self::instance_initializer_plan`]
+    /// produces from the source inventory.
+    fn linked_catalog_plan(
+        &self,
+        ancestors: &[TypePath],
+    ) -> Result<Vec<CompiledInstanceInitializer>, RuntimeImageError> {
+        let mut plan = Vec::new();
+        for owner in ancestors {
+            let Some(initializers) = self.vm_instance_initializers.get(owner) else {
+                continue;
+            };
+            for initializer in initializers {
+                let compiled = match initializer {
+                    InstanceInitializer::Constant { field, value } => CompiledInstanceInitializer {
+                        path: format!("{owner}::{}", field.as_str()),
+                        field: field.clone(),
+                        action: CompiledInstanceInitializerAction::Constant(value.clone()),
+                    },
+                    InstanceInitializer::Program { field, entry } => {
+                        let module =
+                            self.vm_instance_initializer_module.clone().ok_or_else(|| {
+                                RuntimeImageError::InstanceInitializer {
+                                    path: format!("{owner}::{}", field.as_str()),
+                                    message: "linked runtime initializer module is absent"
+                                        .to_owned(),
+                                }
+                            })?;
+                        CompiledInstanceInitializer {
+                            path: format!("{owner}::{}", field.as_str()),
+                            field: field.clone(),
+                            action: CompiledInstanceInitializerAction::SharedProgram {
+                                module,
+                                entry: *entry,
+                            },
+                        }
+                    }
+                };
+                plan.push(compiled);
+            }
+        }
         Ok(plan)
     }
 
@@ -5194,6 +5315,76 @@ mod tests {
     }
 
     #[test]
+    fn deep_builtin_subtype_inherits_base_list_initializer_on_every_path() {
+        // Mirrors Monkestation's `/mob { var/list/alerts = list() }` inherited by
+        // the deep builtin subtype `/mob/living/basic/slime`.
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/mob\n\tvar/list/alerts = list()\n\
+             /mob/living\n/mob/living/basic\n/mob/living/basic/slime\n\
+             /mob/living/carbon\n/mob/living/carbon/human\n\
+             /proc/run()\n\
+             \tvar/mob/living/basic/slime/deep = new\n\
+             \tvar/mob/living/carbon/human/shallow = new\n\
+             \treturn list(islist(deep.alerts), islist(shallow.alerts))\n",
+        );
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.0.join("world.dme"))
+            .expect("fixture should compile");
+        let executable = ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("fixture should lower");
+        let module = executable.module();
+        let mut image =
+            RuntimeImage::from_compilation(&compilation).expect("fixture should materialize");
+        assert!(image.diagnostics().is_empty(), "{:?}", image.diagnostics());
+
+        // Image allocation path.
+        for path in ["/mob/living/basic/slime", "/mob/living/carbon/human"] {
+            let datum = image
+                .allocate_datum(&type_path(path))
+                .unwrap_or_else(|error| panic!("{path} should allocate: {error}"));
+            let alerts = image
+                .heap()
+                .datum_field(datum, &field("alerts"))
+                .unwrap_or_else(|_| panic!("{path} should expose alerts"));
+            assert!(
+                matches!(alerts, Value::List(_)),
+                "{path}.alerts must be a fresh list on the image path, got {alerts:?}"
+            );
+        }
+
+        // VM `new` path.
+        let mut state = image.take_execution_state();
+        let run = (0..)
+            .map_while(|index| module.procedure_id_at(index))
+            .find(|procedure| {
+                module
+                    .procedure_path(*procedure)
+                    .is_some_and(|path| path == "/proc/run" || path.starts_with("/proc/run@"))
+            })
+            .expect("run procedure");
+        let Value::List(result) =
+            execute_module_in_state(module, run, &[], &mut state).expect("run should execute")
+        else {
+            panic!("run should return a list");
+        };
+        let result = state.heap().list(result).unwrap();
+        assert_eq!(
+            result.get(1),
+            Ok(&Value::number(1.0)),
+            "deep slime subtype must inherit `/mob` list initializer on the VM path"
+        );
+        assert_eq!(
+            result.get(2),
+            Ok(&Value::number(1.0)),
+            "shallow human subtype must inherit `/mob` list initializer on the VM path"
+        );
+    }
+
+    #[test]
     fn suffix_arrays_materialize_before_descendant_new_with_fresh_multidimensional_storage() {
         const SOURCE: &str = "#define TOTAL_LAYERS 45\nvar/global/global_grid[2][3]\nvar/global/constructor_result = 0\n/datum/array_owner\n\tvar/static/list/shared[4]\n/mob/living/carbon\n\tvar/list/overlays_standing[TOTAL_LAYERS]\n\tvar/width = 2\n\tvar/list/dynamic_grid[width][3]\n/mob/living/carbon/human/dummy\n\tNew()\n\t\tglobal.constructor_result = overlays_standing.len * 100 + dynamic_grid.len * 10 + dynamic_grid[1].len\n/proc/run()\n\tvar/mob/living/carbon/human/dummy/first = new /mob/living/carbon/human/dummy\n\tvar/mob/living/carbon/human/dummy/second = new /mob/living/carbon/human/dummy\n\tfirst.overlays_standing[1] = 9\n\treturn list(global.constructor_result, isnull(second.overlays_standing[1]), first.overlays_standing == second.overlays_standing)\n";
         let fixture = Fixture::new();
@@ -6833,5 +7024,111 @@ mod tests {
             execute_module_in_state(executable.module(), read_shared, &[], &mut state).unwrap(),
             Value::number(9.0),
         );
+    }
+
+    #[test]
+    fn linked_artifact_allocation_applies_inherited_list_initializers() {
+        // Regression: a `.d64` linked artifact drops the per-candidate initializer
+        // inventory, so map-loaded movables allocated by `allocate_world` must fall
+        // back to the restored VM catalog. Mirrors Monkestation's
+        // `/mob { var/list/alerts = list() }` inherited by `/mob/living/basic/slime`.
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/mob\n\tvar/list/alerts = list()\n\tvar/list/screens = list()\n\
+             /mob/living\n/mob/living/basic\n\tvar/list/damage_coeff = list(1, 2)\n\
+             /mob/living/basic/slime\n/mob/living/carbon\n/mob/living/carbon/human\n",
+        );
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.0.join("world.dme"))
+            .expect("fixture should compile");
+        let mut image = RuntimeImage::from_compilation(&compilation).unwrap();
+        image
+            .materialize_linked_artifact_initializers(8)
+            .expect("deferred initializer module should become portable");
+        let executable = ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("fixture procedures should lower");
+        let encoded = image.encode_linked_artifact(executable.module()).unwrap();
+        drop(compilation);
+
+        let mut restored =
+            RuntimeImage::decode_linked_artifact(&encoded, executable.module()).unwrap();
+
+        for path in ["/mob/living/basic/slime", "/mob/living/carbon/human"] {
+            let datum = restored
+                .allocate_datum(&type_path(path))
+                .unwrap_or_else(|error| {
+                    panic!("{path} should allocate from linked artifact: {error}")
+                });
+            let alerts = restored
+                .heap()
+                .datum_field(datum, &field("alerts"))
+                .unwrap_or_else(|_| panic!("{path} must expose an inherited alerts field"));
+            assert!(
+                matches!(alerts, Value::List(_)),
+                "{path}.alerts must be a fresh list after linked-artifact restore, got {alerts:?}"
+            );
+        }
+
+        // Fresh identities per instance, not a shared aliased list.
+        let first = restored
+            .allocate_datum(&type_path("/mob/living/basic/slime"))
+            .unwrap();
+        let second = restored
+            .allocate_datum(&type_path("/mob/living/basic/slime"))
+            .unwrap();
+        let first_alerts = restored
+            .heap()
+            .datum_field(first, &field("alerts"))
+            .unwrap()
+            .clone();
+        let second_alerts = restored
+            .heap()
+            .datum_field(second, &field("alerts"))
+            .unwrap()
+            .clone();
+        assert_ne!(
+            first_alerts, second_alerts,
+            "each instance must get its own list"
+        );
+    }
+
+    #[test]
+    fn linked_artifact_new_bearing_initializer_resolves_restored_global_datums() {
+        // A `new(...)` instance initializer's nested constructor must still reach
+        // global datums created during compile-time global init (tgstation's
+        // `/atom/New` reads `SSatoms`) after a linked-artifact restore.
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            "/datum/holder\n\tvar/ready = 7\n\
+             /var/global/datum/holder/the_holder = new /datum/holder\n\
+             /obj/thing\n\tNew()\n\t\t..()\n\t\tif(the_holder.ready != 7)\n\t\t\tCRASH(\"holder unavailable\")\n\
+             /obj/box\n\tvar/list/contents_seed = list(new /obj/thing())\n",
+        );
+        let compilation = CompilerDatabase::new()
+            .compile(fixture.0.join("world.dme"))
+            .expect("fixture should compile");
+        let mut image = RuntimeImage::from_compilation(&compilation).unwrap();
+        image.materialize_linked_artifact_initializers(8).unwrap();
+        let executable = ProcedureRegistry::build(&compilation)
+            .compile_vm(&compilation)
+            .expect("fixture procedures should lower");
+        let encoded = image.encode_linked_artifact(executable.module()).unwrap();
+        drop(compilation);
+
+        let mut restored =
+            RuntimeImage::decode_linked_artifact(&encoded, executable.module()).unwrap();
+        let datum = restored
+            .allocate_datum(&type_path("/obj/box"))
+            .unwrap_or_else(|error| panic!("box allocation must run the new() seed: {error}"));
+        let seed = restored
+            .heap()
+            .datum_field(datum, &field("contents_seed"))
+            .expect("contents_seed initializer must materialize");
+        assert!(matches!(seed, Value::List(_)));
     }
 }
