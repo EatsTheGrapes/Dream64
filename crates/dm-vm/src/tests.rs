@@ -2527,6 +2527,43 @@ fn packed_numeric_dispatch_matches_rich_state_and_side_exits() {
 }
 
 #[test]
+fn packed_numeric_state_materializes_when_budget_ends_on_a_non_numeric_op() {
+    // A packed run that exhausts its step budget exactly as control reaches a
+    // non-resumable instruction (here `LoadSrc`; a call / `sleep` / `return` is
+    // the shape that bit `/datum/controller/master/proc/RunQueue` on the
+    // Monkestation boot) must materialize its operand stack, not strand it in
+    // cold state where the rich interpreter and the `waitfor=FALSE` frame-detach
+    // path both read a stale `frame.stack`.
+    let mut program = manual_program(
+        vec![
+            Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+            Instruction::PushNumber(DmNumberBits::from_f32(2.0)),
+            Instruction::Add,
+            Instruction::LoadSrc,
+            Instruction::Pop,
+            Instruction::Return,
+        ],
+        0,
+    );
+    program.local_count = 0;
+    let state = ExecutionState::new();
+    let mut frame = make_frame(ProcedureId(0), &program, &[], &ExecutionContext::default());
+    assert_eq!(
+        try_run_packed_numeric_dispatch_block(&program, &mut frame, 3, &state),
+        Some(3),
+        "the block runs its full 3-step budget: push, push, add",
+    );
+    assert_eq!(frame.instruction, 3, "control is parked on the LoadSrc");
+    assert!(
+        frame
+            .cold()
+            .is_none_or(|cold| cold.packed_numeric_state.is_none()),
+        "packed state must be flushed, not retained, ahead of a non-numeric op",
+    );
+    assert_eq!(frame.stack.as_slice(), &[Value::number(3.0)]);
+}
+
+#[test]
 fn packed_numeric_state_persists_across_budgets_and_materializes_on_side_exit() {
     let mut program = manual_program(
         vec![
