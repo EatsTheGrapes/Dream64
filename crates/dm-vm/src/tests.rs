@@ -14,15 +14,16 @@ use super::compile::{
 use super::{
     BULK_INIT_LOW_YIELD_STREAK, CANONICAL_TYPE2PARENT_SOURCE, CallFrame, CompoundListIndexOperator,
     DEFAULT_HEAP_IDENTITY_CEILING, ExecutionContext, ExecutionLimits, ExecutionState,
-    InitializerBinding, InstanceInitializer, Instruction, LocalClientPromptKind,
-    LocalClientPromptResponse, LocalClientUiEvent, MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES,
-    MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE, MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH,
-    MAXIMUM_LOW_YIELD_COLLECTION_GROWTH, MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH,
-    MINIMUM_HEAP_COLLECTION_GROWTH, Module, ProcedureId, ProcedureSpec, Program,
-    REGISTER_SIGNAL_FAST_CACHE, TypePredicateKind, Value, VerbParameterType,
-    adaptive_heap_collection_growth, advance_scheduler, allocate_initialized_datum,
-    allocate_matrix, assign_datum_field, bulk_init_aware_collection_growth, compile_initializer,
-    compile_initializer_into_module, compile_module, compile_module_specs,
+    InitializerBinding, InstanceInitializer, Instruction, LARGE_HEAP_STREAK_IDENTITIES,
+    LocalClientPromptKind, LocalClientPromptResponse, LocalClientUiEvent,
+    MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES, MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE,
+    MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH, MAXIMUM_LOW_YIELD_COLLECTION_GROWTH,
+    MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH, MINIMUM_HEAP_COLLECTION_GROWTH, Module, ProcedureId,
+    ProcedureSpec, Program, REGISTER_SIGNAL_FAST_CACHE, TypePredicateKind, Value,
+    VerbParameterType, adaptive_heap_collection_growth, advance_scheduler,
+    allocate_initialized_datum, allocate_matrix, assign_datum_field,
+    bulk_init_aware_collection_growth, collection_counts_toward_bulk_init_streak,
+    compile_initializer, compile_initializer_into_module, compile_module, compile_module_specs,
     compile_module_specs_selective, compile_module_specs_selective_with_errors,
     compile_module_with_global_fields, compile_procedure,
     compile_procedure_with_resolver_and_fields, datum_field_or_initial, datum_field_or_shared,
@@ -1395,6 +1396,46 @@ fn bulk_init_growth_resumes_base_policy_at_or_above_the_ceiling() {
             "at/above the ceiling the tight base window forces frequent passes",
         );
     }
+}
+
+#[test]
+fn bulk_init_streak_yield_bar_loosens_for_a_large_live_heap() {
+    // Small heap: only a near-zero-yield pass (<1%) counts toward the streak.
+    assert!(collection_counts_toward_bulk_init_streak(
+        100_000, 500, 100_500
+    ));
+    assert!(!collection_counts_toward_bulk_init_streak(
+        100_000, 6_000, 106_000
+    ));
+
+    // Large heap (at/over the threshold): a pass that reclaims a single-digit
+    // percentage still counts, because re-walking millions of reachable
+    // identities to free that little is not worth the multi-second stall. This
+    // is the `SSatoms.InitializeAtoms` heavy-seed shape.
+    let large = LARGE_HEAP_STREAK_IDENTITIES;
+    assert!(collection_counts_toward_bulk_init_streak(
+        large,
+        large / 20,
+        large + large / 20
+    ));
+    // …but a genuinely productive large-heap pass (>~12.5%) still ends the phase.
+    assert!(!collection_counts_toward_bulk_init_streak(
+        large,
+        large / 4,
+        large + large / 4
+    ));
+
+    // The threshold itself gates which bar applies.
+    assert!(!collection_counts_toward_bulk_init_streak(
+        LARGE_HEAP_STREAK_IDENTITIES - 1,
+        50_000,
+        1_550_000
+    ));
+    assert!(collection_counts_toward_bulk_init_streak(
+        LARGE_HEAP_STREAK_IDENTITIES,
+        50_000,
+        1_550_000
+    ));
 }
 
 #[test]

@@ -68,10 +68,10 @@ pub(crate) use execution::adaptive_heap_collection_growth;
 pub(crate) use execution::make_frame_owned;
 #[cfg(test)]
 pub(crate) use execution::{
-    BULK_INIT_LOW_YIELD_STREAK, DEFAULT_HEAP_IDENTITY_CEILING,
+    BULK_INIT_LOW_YIELD_STREAK, DEFAULT_HEAP_IDENTITY_CEILING, LARGE_HEAP_STREAK_IDENTITIES,
     MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH, MAXIMUM_LOW_YIELD_COLLECTION_GROWTH,
     MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH, MINIMUM_HEAP_COLLECTION_GROWTH,
-    bulk_init_aware_collection_growth,
+    bulk_init_aware_collection_growth, collection_counts_toward_bulk_init_streak,
 };
 pub(crate) use execution::{
     CallFrame, CallFrameCold, OwnedContinuation, PackedNumericState, RuinCandidateScan,
@@ -114,9 +114,9 @@ pub(crate) use profiling::{
     AtomsProfile, AtomsProfileInstruction, AtomsProfileProcedure,
     STARTUP_INSTRUCTION_CATEGORY_COUNT, ShuttleTracePostReturn, TgmProfile, atoms_profile_enabled,
     atoms_profile_snapshot_lines_if_due, boot_dashboard_enabled, boot_trace_enabled,
-    emit_atoms_profile, emit_tgm_profile, is_atoms_initialize_path, is_subsystem_initialize_path,
-    mark_boot_trace_frame, shuttle_trace_emit_snapshot, shuttle_trace_enabled,
-    shuttle_trace_prepare_call, shuttle_trace_slot_from_arguments,
+    dcs_trace_enabled, emit_atoms_profile, emit_tgm_profile, is_atoms_initialize_path,
+    is_subsystem_initialize_path, mark_boot_trace_frame, shuttle_trace_emit_snapshot,
+    shuttle_trace_enabled, shuttle_trace_prepare_call, shuttle_trace_slot_from_arguments,
     slow_instruction_trace_threshold, startup_instruction_category,
     startup_instruction_profile_enabled, startup_profile_enabled, tgm_profiling_enabled,
 };
