@@ -112,6 +112,28 @@ pub(crate) fn run_frames(
                 program
             }
         };
+        // A packed numeric dispatch block that exhausts its step budget stashes
+        // the live operand stack / locals / result in cold frame state instead
+        // of materializing them, expecting the next loop iteration to resume the
+        // same block. That resume only happens when the next instruction is a
+        // `numeric_dispatch_candidate`. When it is not — a call, a `sleep`, a
+        // pointer-typed field or global read, a `return` — the retained state is
+        // stranded: every fast path below and the plain interpreter then read a
+        // stale `frame.stack`, and the frame can even be detached mid-limbo by a
+        // `waitfor=FALSE` callee that sleeps. Flush it here before anything else
+        // touches the rich frame.
+        if frames[frame_index]
+            .cold()
+            .is_some_and(|cold| cold.packed_numeric_state.is_some())
+            && !program
+                .instructions
+                .get(instruction_index)
+                .is_some_and(numeric_dispatch_candidate)
+        {
+            if let Some(packed) = frames[frame_index].take_packed_numeric_state() {
+                packed.materialize(&mut frames[frame_index]);
+            }
+        }
         if tgm_profiling_enabled()
             && state.tgm_profile.is_none()
             && instruction_index == 0

@@ -464,7 +464,19 @@ pub(crate) fn try_run_packed_numeric_dispatch_block(
         frame.set_packed_numeric_state(None);
         return None;
     }
-    if steps == max_steps {
+    // Only carry packed state across the budget boundary when the very next
+    // instruction is one the packed block can actually resume on. Otherwise the
+    // retained state is stranded: the caller re-enters the rich interpreter (or
+    // a non-numeric fast path, or detaches the frame) with a stale `frame.stack`
+    // / `locals` / `result`. `run_frames` has a matching guard, but stopping
+    // here keeps the invariant "packed state implies the next op is numeric"
+    // local to the one place that establishes it.
+    if steps == max_steps
+        && program
+            .instructions
+            .get(frame.instruction)
+            .is_some_and(numeric_dispatch_candidate)
+    {
         frame.set_packed_numeric_state(Some(packed));
     } else {
         packed.materialize(frame);
