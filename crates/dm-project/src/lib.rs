@@ -3416,7 +3416,8 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::SystemTime;
 
     use dm_core::SourceSpan;
 
@@ -3429,12 +3430,17 @@ mod tests {
 
     impl ScratchDirectory {
         fn new() -> Self {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("test clock should follow the Unix epoch")
-                .as_nanos();
+            // A process-wide counter, not a wall clock: these tests run in
+            // parallel and Windows `SystemTime` granularity (~15 ms) lets two of
+            // them read an identical `as_nanos()`, derive the same path, and
+            // fail the second `create_dir` with `AlreadyExists`.
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
             let path =
                 std::env::temp_dir().join(format!("dm64-project-test-{}-{unique}", process::id()));
+            // A crashed earlier run under a since-reused PID can leave the
+            // directory behind; clear it before claiming the name.
+            let _ = fs::remove_dir_all(&path);
             fs::create_dir(&path).expect("scratch directory should be created");
             Self(path)
         }
