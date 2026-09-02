@@ -2,7 +2,9 @@ use crc32fast::hash;
 use dm_vm::Module;
 
 const PROCEDURE_SEMANTICS_MAGIC: &[u8; 8] = b"D64PSEM\0";
-const PROCEDURE_SEMANTICS_VERSION: u16 = 1;
+// Version 2: see `crate::PROCEDURE_SEMANTICS_VERSION`. Procedure semantic
+// digests now hash call targets by canonical path rather than numeric id.
+const PROCEDURE_SEMANTICS_VERSION: u16 = 2;
 const MAX_PROCEDURE_SEMANTICS_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Builds a portable semantic-identity directory for every eager procedure.

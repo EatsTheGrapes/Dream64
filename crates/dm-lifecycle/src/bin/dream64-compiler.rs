@@ -425,24 +425,35 @@ fn write_artifact(
     let executable_payload = executable.encode_compiled_artifact()?;
     let procedure_semantics = encode_procedure_semantics(executable.module())?;
     let compilation_payload = compilation.encode_compiled_artifact();
+    // Emit the semantic digest of every procedure guarding a native fast-path so
+    // the six `CANONICAL_MONKE_*_DIGEST` pins can be re-measured from one compile
+    // (including a `-DCBT` compile) rather than six throwaway boots.
     for path in [
         "/datum/parsed_map/proc/_tgm_load",
-        "/datum/parsed_map/_tgm_load",
+        "/datum/parsed_map/proc/build_coordinate",
+        "/datum/parsed_map/proc/tgm_build_cache",
+        "/datum/map_template/ruin/proc/try_to_place",
+        "/datum/map_template/proc/get_affected_turfs",
+        "/datum/map_template/proc/discover_offset",
     ] {
-        if let Some(procedure) = executable.module().effective_procedure_id(path) {
-            let digest = executable
-                .module()
-                .compute_procedure_semantic_digest(procedure)?;
-            let hex = digest
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            eprintln!(
-                "compile-progress: procedure-semantic path={path} id={} sha256={hex}",
-                procedure.index(),
-            );
-            break;
-        }
+        let Some(procedure) = executable
+            .module()
+            .effective_procedure_id(path)
+            .or_else(|| executable.module().procedure_id(path))
+        else {
+            continue;
+        };
+        let digest = executable
+            .module()
+            .compute_procedure_semantic_digest(procedure)?;
+        let hex = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        eprintln!(
+            "compile-progress: procedure-semantic path={path} id={} sha256={hex}",
+            procedure.index(),
+        );
     }
     let structural = RuntimeStructuralSeed::build_with_stable_ids(compilation, type_ids)
         .map_err(|error| format!("runtime structural seed: {error}"))?
