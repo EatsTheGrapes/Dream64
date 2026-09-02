@@ -13,14 +13,19 @@ details, or promise compatibility from syntax acceptance alone. Compatibility
 is measured with public documentation and black-box fixtures that run through
 both Dream Maker/Dream Daemon and this engine.
 
-## Development status — August 2026
+## Development status — September 2026
 
 Dream64 has moved beyond isolated language fixtures and is now booting the real
-MonkeStation 2.0 codebase far enough to attach its own native client. The client
-loads the project's DMF skin, exchanges sequenced UI and input messages with the
-server, fetches resources, decodes DMI sprites, and renders the first live lobby
-screen objects. This is engine output—not a screenshot or a BYOND client embedded
-inside Dream64.
+MonkeStation 2.0 codebase through the full Master Controller subsystem-init
+sequence. The complete source graph compiles with zero deferred procedures; the
+native map/ruin loader places ~130k cells without falling back to the
+interpreter; every subsystem's `Initialize()` runs; and the Master Controller
+reaches its final init stage with its main loop cycling — subsystems fire, the
+failsafe watchdog runs, and a heavy random seed no longer livelocks. The native
+client attaches its own loopback session, loads the project's DMF skin,
+exchanges sequenced UI and input messages, fetches resources, decodes DMI
+sprites, and renders the first live lobby screen objects. This is engine
+output—not a screenshot or a BYOND client embedded inside Dream64.
 
 The current lobby is not release-complete. Its assets are present, but several
 BYOND-compatible composition rules still need work, including viewport scaling,
@@ -55,10 +60,18 @@ Current measured progress:
 - Expensive heap-independent atmosphere work has a worker lane. DM-visible
   mutation remains on one authoritative owner thread so datum IDs, globals,
   lists, RNG, constructors, and lifecycle ordering stay deterministic.
-- The present bottleneck is MonkeStation's dynamic map and subsystem
-  initialization. The latest bounded cold run reached its five-minute limit
-  before the global `Initialize()` phase, so the sub-five-minute boot goal is
-  **not achieved yet**.
+- The Master Controller now completes every subsystem `Initialize()` and enters
+  its running main loop. Getting there closed several engine gaps: the native
+  TGM/ruin map loader is drift-proofed against procedure renumbering, the
+  list-GC collection window widens during monotonic bulk-allocation phases, and
+  a numeric fast-path bug that stranded operand state across a step-budget
+  boundary — which crash-looped the controller's subsystem-fire loop — is fixed.
+- The boot does not yet reach `SSticker` pregame. What remains is a `waitfor=0`
+  `Master.Initialize` continuation whose tail does not resume, and the list
+  garbage collector, which still pauses for several seconds once a large-seed
+  boot fills its identity ceiling. The sub-five-minute boot goal is **not
+  achieved yet**, but the wall has moved from *before* the global `Initialize()`
+  phase to the controller tail *after* it.
 
 The immediate release path is:
 
