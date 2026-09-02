@@ -46,7 +46,7 @@ use crate::{
     ExceptionHandler, ExecutionLimits, PendingLocalPrompt, PendingPromptContinuation, RuntimeError,
     ShuttleTracePostReturn, SimpleIterationValue, allocate_initialized_datum, assign_datum_field,
     canonical_istext, canonical_static_native_builtin, canonical_type2parent,
-    canonical_type2parent_target, datum_field_or_initial, datum_shared_storage,
+    canonical_type2parent_target, datum_field_or_initial, datum_shared_storage, dcs_trace_enabled,
     dynamic_call_target_named, emit_atoms_profile, emit_tgm_profile, engine_builtin_initial_fields,
     engine_builtin_initial_value, false_tick_check_target, is_atom_type_path, lazy_atom_list_field,
     local_prompt_spec, mark_boot_trace_frame, prepare_iteration_consumes_fresh_block,
@@ -106,7 +106,6 @@ pub(crate) fn dispatch_instruction(
     step_budget_behavior: StepBudgetBehavior,
     executed_steps: &mut u64,
     remaining_steps: &mut u64,
-    trace_enabled: bool,
     ordinary_field_fast_path_enabled: bool,
 ) -> Result<DispatchFlow, RuntimeError> {
     match instruction {
@@ -2707,7 +2706,7 @@ pub(crate) fn dispatch_instruction(
                 ));
             };
             let value = canonicalize_owned_value(&state.heap, value);
-            if trace_enabled && name.as_str() == "SSdcs" {
+            if dcs_trace_enabled() && name.as_str() == "SSdcs" {
                 eprintln!(
                     "boot-vm: global-read name=SSdcs value={} procedure={}",
                     value,
@@ -2892,7 +2891,7 @@ pub(crate) fn dispatch_instruction(
                 Ok(value) => value,
                 Err(message) => return Err(execution_error(module, frames, message)),
             };
-            if trace_enabled && name.as_str() == "SSdcs" {
+            if dcs_trace_enabled() && name.as_str() == "SSdcs" {
                 eprintln!(
                     "boot-vm: global-write name=SSdcs value={} procedure={}",
                     value,
@@ -4408,7 +4407,7 @@ pub(crate) fn dispatch_instruction(
             let finish_atoms_profile = finished.atoms_profile_root;
             let finish_tgm_profile = finished.tgm_profile_root;
             let result = finished.caller_result_override().cloned().unwrap_or(result);
-            if trace_enabled
+            if dcs_trace_enabled()
                 && module
                     .procedure_path(finished.procedure)
                     .is_some_and(|path| path.contains("/subsystem/processing/dcs/proc/GetElement@"))

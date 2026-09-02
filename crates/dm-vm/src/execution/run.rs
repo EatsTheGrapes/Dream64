@@ -812,7 +812,6 @@ pub(crate) fn run_frames(
             step_budget_behavior,
             &mut executed_steps,
             &mut remaining_steps,
-            trace_enabled,
             ordinary_field_fast_path_enabled,
         )?;
         if let Some(started) = slow_instruction_started {

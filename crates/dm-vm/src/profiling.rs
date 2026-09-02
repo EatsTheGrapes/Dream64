@@ -480,6 +480,15 @@ pub(crate) fn boot_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("DREAM64_BOOT_TRACE").is_some())
 }
 
+/// Per-instruction `SSdcs` / `dcs/GetElement` result tracing. This fires on the
+/// order of a million times during `SSatoms` init on a full map, so it is no
+/// longer folded into the broad `DREAM64_BOOT_TRACE`: opt in explicitly with
+/// `DREAM64_TRACE_DCS` when debugging element resolution. Diagnostic only.
+pub(crate) fn dcs_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DREAM64_TRACE_DCS").is_some())
+}
+
 /// Wall-time threshold, if any, above which a single interpreter instruction is
 /// reported to stderr. Gated by `DREAM64_TRACE_SLOW_INSTRUCTION`: unset disables
 /// it, a bare/truthy value uses a 5 ms threshold, and a positive integer sets an

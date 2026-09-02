@@ -348,8 +348,17 @@ impl ExecutionState {
         // in a monotonic bulk-allocation phase (map load, `SSatoms` init).
         // Track the streak so the growth window can widen past its low-yield
         // cap and stop punctuating that phase with dozens of full-heap walks.
+        //
+        // The yield bar for "almost nothing" loosens once the live heap is
+        // large: at a few million reachable identities a pass costs seconds of
+        // full-heap walk, and reclaiming even ~10% of a transient churn on top
+        // of that stable set is not worth paying that walk every quarter-million
+        // allocations. `SSatoms.InitializeAtoms` on a heavy random seed sits
+        // exactly here — ~5% yield against a 4M+ identity heap — so the strict
+        // near-zero test alone never lets the window widen and the boot spends
+        // minutes in back-to-back collections.
         let visited = after.saturating_add(reclaimed);
-        if reclaimed.saturating_mul(NEAR_ZERO_YIELD_RECIPROCAL) <= visited {
+        if collection_counts_toward_bulk_init_streak(after, reclaimed, visited) {
             self.low_yield_collection_streak = self.low_yield_collection_streak.saturating_add(1);
         } else {
             self.low_yield_collection_streak = 0;
@@ -591,6 +600,42 @@ pub(crate) const MAXIMUM_HIGH_YIELD_COLLECTION_GROWTH: usize = 262_144;
 /// detection. Deliberately tighter than the 5% "low yield" growth bucket below:
 /// this is meant to fire only when a pass frees essentially nothing.
 pub(crate) const NEAR_ZERO_YIELD_RECIPROCAL: usize = 100;
+
+/// Above this many live identities a collection is a multi-second full-heap
+/// walk, so the streak's yield bar loosens from `NEAR_ZERO_YIELD_RECIPROCAL`
+/// to [`LARGE_HEAP_YIELD_RECIPROCAL`]: re-walking millions of reachable
+/// identities every quarter-million allocations is not worth a single-digit
+/// percent transient reclaim.
+pub(crate) const LARGE_HEAP_STREAK_IDENTITIES: usize = 1_500_000;
+
+/// Loosened bulk-init yield bar for a large live heap: a pass that reclaims at
+/// most `1 / LARGE_HEAP_YIELD_RECIPROCAL` (~12.5%) of what it visited still
+/// counts toward the low-yield streak. The window it eventually opens is bounded
+/// by `DREAM64_HEAP_IDENTITY_CEILING`, so committed memory stays capped.
+pub(crate) const LARGE_HEAP_YIELD_RECIPROCAL: usize = 8;
+
+/// Whether a just-finished collection counts toward the monotonic
+/// bulk-allocation streak that [`bulk_init_aware_collection_growth`] widens the
+/// window for.
+///
+/// `live` and `reclaimed` are post-pass identity counts; `visited` is their
+/// sum (what the reachability walk actually touched). A pass counts when it
+/// reclaimed a small enough fraction of `visited`: below
+/// `1 / NEAR_ZERO_YIELD_RECIPROCAL` normally, and — once the heap is large
+/// enough that each pass is a multi-second walk — below the looser
+/// `1 / LARGE_HEAP_YIELD_RECIPROCAL`.
+pub(crate) fn collection_counts_toward_bulk_init_streak(
+    live: usize,
+    reclaimed: usize,
+    visited: usize,
+) -> bool {
+    let reciprocal = if live >= LARGE_HEAP_STREAK_IDENTITIES {
+        LARGE_HEAP_YIELD_RECIPROCAL
+    } else {
+        NEAR_ZERO_YIELD_RECIPROCAL
+    };
+    reclaimed.saturating_mul(reciprocal) <= visited
+}
 
 /// Consecutive near-zero-yield collections that identify a monotonic
 /// bulk-allocation phase (map load, `SSatoms.InitializeAtoms`). Until the streak
