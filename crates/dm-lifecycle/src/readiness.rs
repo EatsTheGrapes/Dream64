@@ -161,7 +161,15 @@ pub fn readiness_probe_matches(state: &ExecutionState, probe: &HeadlessReadiness
         };
         value = next.clone();
     }
-    value == probe.expected
+    // Milestone markers (Master init stage, `SSticker.current_state`) only ever
+    // advance, so the gate is "reached or passed", not "equal right now". A
+    // headless boot has no players to wait on, so the ticker moves through
+    // `GAME_STATE_PREGAME` into setup/playing within a single tick — an exact
+    // `== PREGAME` check races that transition and usually misses it.
+    match (value.as_number(), probe.expected.as_number()) {
+        (Some(actual), Some(expected)) => actual >= expected,
+        _ => value == probe.expected,
+    }
 }
 
 fn put_manifest_len(output: &mut Vec<u8>, value: usize) -> Result<(), String> {
@@ -219,5 +227,60 @@ fn get_manifest_field(input: &mut std::io::Cursor<&[u8]>) -> Result<Option<Field
             .map(Some)
             .map_err(|error| error.to_string()),
         _ => Err("invalid boot manifest optional-field tag".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HeadlessReadinessProbe, readiness_probe_matches};
+    use dm_value::{FieldName, Value};
+    use dm_vm::ExecutionState;
+
+    fn global_probe(name: &str, expected: Value) -> HeadlessReadinessProbe {
+        HeadlessReadinessProbe {
+            qualified_storage: None,
+            global: FieldName::parse(name).unwrap(),
+            fields: vec![],
+            expected,
+        }
+    }
+
+    #[test]
+    fn numeric_milestone_probe_opens_once_the_marker_reaches_or_passes_it() {
+        let mut state = ExecutionState::new();
+        let name = FieldName::parse("ticker_state").unwrap();
+        // Mirrors SSticker.current_state: STARTUP(0) -> PREGAME(1) -> PLAYING(3).
+        let probe = global_probe("ticker_state", Value::number(1.0));
+
+        state.set_global(name.clone(), Value::number(0.0));
+        assert!(
+            !readiness_probe_matches(&state, &probe),
+            "startup is before the gate"
+        );
+
+        state.set_global(name.clone(), Value::number(1.0));
+        assert!(
+            readiness_probe_matches(&state, &probe),
+            "pregame opens the gate"
+        );
+
+        state.set_global(name, Value::number(3.0));
+        assert!(
+            readiness_probe_matches(&state, &probe),
+            "a headless boot runs past pregame within a tick; the gate must stay open",
+        );
+    }
+
+    #[test]
+    fn non_numeric_probe_still_requires_exact_equality() {
+        let mut state = ExecutionState::new();
+        let name = FieldName::parse("marker").unwrap();
+        let probe = global_probe("marker", Value::text("ready"));
+
+        state.set_global(name.clone(), Value::text("starting"));
+        assert!(!readiness_probe_matches(&state, &probe));
+
+        state.set_global(name, Value::text("ready"));
+        assert!(readiness_probe_matches(&state, &probe));
     }
 }
