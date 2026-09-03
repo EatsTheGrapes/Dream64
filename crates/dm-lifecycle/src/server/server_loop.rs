@@ -241,6 +241,7 @@ pub(crate) fn run_persistent_server_loop(
                 max_rounds: 1,
             },
             scheduled_steps,
+            None,
         ) {
             Ok(scheduler) => scheduler,
             Err(error) => {
@@ -287,6 +288,117 @@ pub(crate) fn run_persistent_server_loop(
     }
 }
 
+/// Diagnostic: dump the Master Controller / `SSticker` state that governs the
+/// activation-phase pregame gate. Gated by `DREAM64_TRACE_TICKER`.
+///
+/// Fields are read raw from datum storage with no initial-value fallback, so a
+/// field that Monke only ever leaves at its compile-time initial value reads as
+/// absent. That is itself the signal for `SSticker.current_state`: absent means
+/// still `GAME_STATE_STARTUP`; `fire()` writing `GAME_STATE_PREGAME` is what the
+/// readiness probe waits for and what shows up here as `current_state=1`.
+fn trace_ticker_state(precompiled: &mut dm_lifecycle::PrecompiledLifecycle, slice: u64) {
+    if env::var_os("DREAM64_TRACE_TICKER").is_none() {
+        return;
+    }
+    let Some(state) = precompiled.persistent_state_mut() else {
+        return;
+    };
+    let dump = |state: &dm_vm::ExecutionState, label: &str, datum, names: &[&str]| {
+        let dm_value::Value::Datum(datum) = datum else {
+            eprintln!("ticker-trace slice={slice} {label}=<not a datum: {datum:?}>");
+            return;
+        };
+        let mut parts = Vec::new();
+        for name in names {
+            let Ok(field) = dm_value::FieldName::parse(name) else {
+                continue;
+            };
+            match state.heap().datum_field(datum, &field) {
+                Ok(dm_value::Value::Datum(d)) => parts.push(format!("{name}=datum({d:?})")),
+                Ok(dm_value::Value::List(l)) => {
+                    let len = state.heap().list(*l).map_or(0, dm_value::DmList::len);
+                    parts.push(format!("{name}=list(len={len})"));
+                }
+                Ok(value) => parts.push(format!("{name}={value:?}")),
+                Err(_) => parts.push(format!("{name}=<unwritten>")),
+            }
+        }
+        eprintln!("ticker-trace slice={slice} {label}: {}", parts.join(" "));
+    };
+    let global = |state: &dm_vm::ExecutionState, name: &str| {
+        dm_value::FieldName::parse(name)
+            .ok()
+            .and_then(|field| state.global(&field).cloned())
+            .unwrap_or(dm_value::Value::Null)
+    };
+
+    let ssticker = global(state, "SSticker");
+    dump(
+        state,
+        "SSticker",
+        ssticker,
+        &["current_state", "times_fired", "initialized"],
+    );
+    let master = global(state, "Master");
+    dump(
+        state,
+        "Master",
+        master,
+        &[
+            "current_runlevel",
+            "processing",
+            "last_type_processed",
+            "iteration",
+        ],
+    );
+}
+
+/// Slice ceiling for the lobby-generation activation loop.
+///
+/// The loop advances Monke's post-`Initialize` Master Controller tail one
+/// scheduler tick per slice until `SSticker` enters pregame. A stock
+/// `tgstation.d64` reaches pregame in ~3.7k ticks, so the default keeps a >2x
+/// margin: a healthy boot always exits early on the readiness check, while a
+/// genuinely stuck controller tail is still bounded rather than spinning
+/// forever. Override with `DREAM64_ACTIVATION_MAX_SLICES`.
+const DEFAULT_ACTIVATION_MAX_SLICES: u64 = 8_000;
+const _: () = assert!(
+    DEFAULT_ACTIVATION_MAX_SLICES >= 7_000,
+    "activation slice ceiling must stay well above the ~3.7k ticks a stock boot needs to reach pregame",
+);
+
+/// Per-slice VM wall-time target for the activation loop.
+///
+/// The steady-state persistent loop stays latency-sensitive for connected
+/// sessions, but the activation phase serves only a read-only "finishing
+/// initialization" lobby, so it runs for throughput. One Master Controller tick
+/// in this phase costs ~200-250ms of VM time on the reference machine; a target
+/// below that makes every slice overshoot, so the adaptive step controller
+/// collapses to its floor, no tick ever completes, and the boot livelocks short
+/// of pregame. Override with `DREAM64_SCHEDULER_WALL_BUDGET_MS`.
+const DEFAULT_ACTIVATION_WALL_BUDGET_MS: u64 = 400;
+const _: () = assert!(
+    DEFAULT_ACTIVATION_WALL_BUDGET_MS >= 300,
+    "activation wall budget must stay above the ~200-250ms cost of one activation-phase MC tick",
+);
+
+/// Step floor for the activation loop's adaptive budget. Large enough that even
+/// a slice which overshoots the wall target still clears one tick's fixed
+/// per-round setup cost and makes forward progress.
+const ACTIVATION_MIN_SLICE_STEPS: u64 = 250_000;
+
+fn activation_max_slices_from(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|slices| *slices > 0)
+        .unwrap_or(DEFAULT_ACTIVATION_MAX_SLICES)
+}
+
+fn activation_wall_budget_ms_from(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .unwrap_or(DEFAULT_ACTIVATION_WALL_BUDGET_MS)
+}
+
 fn activate_lobby_generation(
     runtime: &mut RuntimeImage,
     precompiled: &mut dm_lifecycle::PrecompiledLifecycle,
@@ -328,22 +440,21 @@ fn activate_lobby_generation(
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    let max_slices = env::var("DREAM64_ACTIVATION_MAX_SLICES")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(1_000);
-    let target_millis = env::var("DREAM64_SCHEDULER_WALL_BUDGET_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(50)
-        .max(1);
-    // Native quickening must translate into more startup progress, not merely
-    // finish the same fixed 100k legacy instructions earlier. The VM's wall
-    // deadline remains authoritative for responsiveness; this controller
-    // raises the logical ceiling while slices are comfortably under it.
+    let max_slices =
+        activation_max_slices_from(env::var("DREAM64_ACTIVATION_MAX_SLICES").ok().as_deref());
+    let target_millis = activation_wall_budget_ms_from(
+        env::var("DREAM64_SCHEDULER_WALL_BUDGET_MS").ok().as_deref(),
+    );
+    // The activation phase is not latency-sensitive — no session interacts with
+    // the read-only lobby yet — so it runs large slices for throughput. Native
+    // quickening then translates into more startup progress per slice rather
+    // than merely finishing a fixed instruction count sooner. The step floor is
+    // high enough that even a slice which overshoots the wall target still
+    // pushes one Master Controller tick past its fixed setup cost; below that a
+    // stock boot livelocks here, well short of `SSticker` pregame.
     let mut activation_budget = HostSliceBudget::new(
-        100_000,
-        10_000,
+        ACTIVATION_MIN_SLICE_STEPS,
+        ACTIVATION_MIN_SLICE_STEPS,
         10_000_000,
         Duration::from_millis(target_millis),
     );
@@ -366,10 +477,14 @@ fn activate_lobby_generation(
                 max_rounds: 1,
             },
             scheduled_steps,
+            Some(Duration::from_millis(target_millis)),
         )
         .map_err(|error| error.to_string())?;
         let vm_elapsed = vm_started.elapsed();
         activation_budget.observe(vm_elapsed);
+        if slice == 1 || slice % 500 == 0 {
+            trace_ticker_state(precompiled, slice);
+        }
         if slice == 1 || slice % 100 == 0 {
             eprintln!(
                 "boot-progress: generation activation slice={slice} tick={} rounds={} completed={} failed={} pending={} termination={:?} vm_us={} step_budget={} next_step_budget={}",
@@ -393,6 +508,16 @@ fn activate_lobby_generation(
             return Ok(());
         }
     }
+    report_activation_timeout_diagnostics(precompiled);
+    Err(format!(
+        "Monke lobby did not enter pregame within {max_slices} activation slices"
+    ))
+}
+
+/// Dumps the native-quickening counters and the parked DM frames after the
+/// activation loop gives up, so a stuck controller tail is diagnosable from the
+/// boot log alone.
+fn report_activation_timeout_diagnostics(precompiled: &mut dm_lifecycle::PrecompiledLifecycle) {
     for line in precompiled.bounded_scheduler_progress() {
         eprintln!("boot-progress: activation-timeout-dm-frame {line}");
     }
@@ -441,9 +566,6 @@ fn activate_lobby_generation(
     for sample in dm_vm::native_ruin_area_rejection_samples() {
         eprintln!("boot-progress: ruin-area-rejection {sample}");
     }
-    Err(format!(
-        "Monke lobby did not enter pregame within {max_slices} activation slices"
-    ))
 }
 
 pub(crate) fn startup_scheduler_limits() -> SchedulerDrainLimits {
@@ -462,7 +584,33 @@ pub(crate) fn startup_scheduler_limits() -> SchedulerDrainLimits {
 
 #[cfg(test)]
 mod tests {
-    use super::{fresh_launch_random_seed, launch_random_seed_from};
+    use super::{
+        DEFAULT_ACTIVATION_MAX_SLICES, DEFAULT_ACTIVATION_WALL_BUDGET_MS,
+        activation_max_slices_from, activation_wall_budget_ms_from, fresh_launch_random_seed,
+        launch_random_seed_from,
+    };
+
+    #[test]
+    fn activation_slice_ceiling_falls_back_on_absent_or_invalid_overrides() {
+        for raw in [None, Some("  "), Some("0"), Some("not-a-number")] {
+            assert_eq!(
+                activation_max_slices_from(raw),
+                DEFAULT_ACTIVATION_MAX_SLICES
+            );
+        }
+        assert_eq!(activation_max_slices_from(Some(" 60000 ")), 60_000);
+    }
+
+    #[test]
+    fn activation_wall_budget_falls_back_on_absent_or_invalid_overrides() {
+        for raw in [None, Some("0"), Some("garbage")] {
+            assert_eq!(
+                activation_wall_budget_ms_from(raw),
+                DEFAULT_ACTIVATION_WALL_BUDGET_MS
+            );
+        }
+        assert_eq!(activation_wall_budget_ms_from(Some("1000")), 1_000);
+    }
 
     #[test]
     fn launch_entropy_never_uses_the_deterministic_test_seed() {

@@ -292,11 +292,18 @@ pub fn advance_persistent_scheduler(
 /// Advances persistent work with an instruction-bounded cooperative dispatch.
 /// Budget exhaustion retains the scheduled continuation at the same tick, so
 /// the host can service transport queues before resuming exact VM state.
+///
+/// `wall_clock_budget` overrides the per-round VM wall deadline. `None` falls
+/// back to `DREAM64_SCHEDULER_WALL_BUDGET_MS` / the latency-oriented default,
+/// which is right for the steady-state loop but starves the activation phase:
+/// one Master Controller tick there costs more wall time than that default, so
+/// every round bails mid-tick and the boot never advances to pregame.
 pub fn advance_persistent_scheduler_responsive(
     precompiled: &mut PrecompiledLifecycle,
     _runtime: &mut RuntimeImage,
     limits: SchedulerDrainLimits,
     max_steps_per_round: u64,
+    wall_clock_budget: Option<Duration>,
 ) -> Result<SchedulerDrain, InitializationExecutionError> {
     let mut state = precompiled
         .persistent_state
@@ -308,7 +315,7 @@ pub fn advance_persistent_scheduler_responsive(
         limits,
         ExecutionLimits {
             max_steps: max_steps_per_round.max(1),
-            wall_clock_budget: scheduler_wall_clock_budget(),
+            wall_clock_budget: wall_clock_budget.or_else(scheduler_wall_clock_budget),
             ..ExecutionLimits::default()
         },
     );
