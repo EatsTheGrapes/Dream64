@@ -646,7 +646,15 @@ pub(crate) const BULK_INIT_LOW_YIELD_STREAK: u32 = 3;
 /// of recent reclaim yield. Bounds committed memory during a long bulk-init
 /// phase where the yield heuristic would otherwise keep widening the window.
 /// Overridable with `DREAM64_HEAP_IDENTITY_CEILING`.
-pub(crate) const DEFAULT_HEAP_IDENTITY_CEILING: usize = 16_777_216;
+///
+/// Sized so the Monkestation activation heap plateaus below it (RSS ~5GB) and
+/// the bulk-init window keeps collecting on a regular cadence. A much larger
+/// ceiling lets the heap balloon past ~10M identities during subsystem init,
+/// which — until the signal-registration GC desync it exposes is fixed
+/// (`_SendSignal` observing a null handler for a still-registered listener) —
+/// pushes that intermittent failure onto the Master Controller init fiber and
+/// aborts the boot. Raise it only with the RAM headroom to match.
+pub(crate) const DEFAULT_HEAP_IDENTITY_CEILING: usize = 7_000_000;
 
 /// Whether the per-collection list-field identity diagnostic is enabled.
 /// Gated by `DREAM64_PROFILE_LIST_FIELDS`; resolved once. Diagnostic only.

@@ -15,17 +15,18 @@ both Dream Maker/Dream Daemon and this engine.
 
 ## Development status — September 2026
 
-Dream64 has moved beyond isolated language fixtures and is now booting the real
-MonkeStation 2.0 codebase through the full Master Controller subsystem-init
-sequence. The complete source graph compiles with zero deferred procedures; the
-native map/ruin loader places ~130k cells without falling back to the
-interpreter; every subsystem's `Initialize()` runs; and the Master Controller
-reaches its final init stage with its main loop cycling — subsystems fire, the
-failsafe watchdog runs, and a heavy random seed no longer livelocks. The native
-client attaches its own loopback session, loads the project's DMF skin,
-exchanges sequenced UI and input messages, fetches resources, decodes DMI
-sprites, and renders the first live lobby screen objects. This is engine
-output—not a screenshot or a BYOND client embedded inside Dream64.
+Dream64 has moved beyond isolated language fixtures and now boots the real
+MonkeStation 2.0 codebase all the way to the lobby. The complete source graph
+compiles with zero deferred procedures; the native map/ruin loader places ~130k
+cells without falling back to the interpreter; every subsystem's `Initialize()`
+runs; the Master Controller reaches its final init stage and runs its main loop;
+and a stock `dream64-server boot` now reaches `startup=accepting lobby=pregame` —
+`SSticker` enters pregame and the loopback server opens for client sessions —
+with no environment tuning. The native client attaches its own loopback session,
+loads the project's DMF skin, exchanges sequenced UI and input messages, fetches
+resources, decodes DMI sprites, and renders the first live lobby screen objects.
+This is engine output—not a screenshot or a BYOND client embedded inside
+Dream64.
 
 The current lobby is not release-complete. Its assets are present, but several
 BYOND-compatible composition rules still need work, including viewport scaling,
@@ -60,18 +61,21 @@ Current measured progress:
 - Expensive heap-independent atmosphere work has a worker lane. DM-visible
   mutation remains on one authoritative owner thread so datum IDs, globals,
   lists, RNG, constructors, and lifecycle ordering stay deterministic.
-- The Master Controller now completes every subsystem `Initialize()` and enters
-  its running main loop. Getting there closed several engine gaps: the native
-  TGM/ruin map loader is drift-proofed against procedure renumbering, the
-  list-GC collection window widens during monotonic bulk-allocation phases, and
-  a numeric fast-path bug that stranded operand state across a step-budget
-  boundary — which crash-looped the controller's subsystem-fire loop — is fixed.
-- The boot does not yet reach `SSticker` pregame. What remains is a `waitfor=0`
-  `Master.Initialize` continuation whose tail does not resume, and the list
-  garbage collector, which still pauses for several seconds once a large-seed
-  boot fills its identity ceiling. The sub-five-minute boot goal is **not
-  achieved yet**, but the wall has moved from *before* the global `Initialize()`
-  phase to the controller tail *after* it.
+- A stock boot reaches `SSticker` pregame. Getting there closed several engine
+  gaps: the native TGM/ruin map loader is drift-proofed against procedure
+  renumbering; the list-GC collection window widens during monotonic
+  bulk-allocation phases; a numeric fast-path bug that stranded operand state
+  across a step-budget boundary is fixed; the post-`Initialize` activation phase
+  runs a throughput budget instead of the steady-state loop's latency budget,
+  which was starving the scheduler below the cost of one controller tick; and
+  the readiness gate treats `SSticker.current_state` as a threshold, since a
+  headless boot with no players runs through pregame within a tick or two.
+- Speed is the remaining wall. A stock boot to pregame is ~15–20 minutes on the
+  test machine, dominated by O(heap) iteration re-scans that repeat on every
+  tick yield; the sub-five-minute goal needs a mutation-versioned iteration
+  cache and faster per-atom init. A known intermittent GC desync (a signal
+  registration whose handler reads back null) is why the heap-identity ceiling
+  is kept conservative for now.
 
 The immediate release path is:
 

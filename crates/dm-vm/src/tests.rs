@@ -1342,16 +1342,20 @@ fn heap_gc_growth_window_has_deterministic_memory_bounds() {
 #[test]
 fn bulk_init_growth_matches_base_policy_before_a_low_yield_streak() {
     // Below the streak threshold the window is exactly the base policy, so an
-    // ordinary churny heap is unaffected by bulk-init awareness.
+    // ordinary churny heap is unaffected by bulk-init awareness. `live` stays
+    // under the default ceiling so the pre-streak path — not the at-ceiling
+    // fallback — is what the assertion exercises.
+    let live = DEFAULT_HEAP_IDENTITY_CEILING / 8;
+    let reclaimed = live / 25;
     for streak in 0..BULK_INIT_LOW_YIELD_STREAK {
         assert_eq!(
             bulk_init_aware_collection_growth(
-                10_000_000,
-                50_000,
+                live,
+                reclaimed,
                 streak,
                 DEFAULT_HEAP_IDENTITY_CEILING
             ),
-            adaptive_heap_collection_growth(10_000_000, 50_000),
+            adaptive_heap_collection_growth(live, reclaimed),
             "streak {streak} must not widen the window",
         );
     }
