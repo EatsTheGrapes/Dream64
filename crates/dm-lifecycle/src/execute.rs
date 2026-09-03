@@ -1178,6 +1178,67 @@ impl PrecompiledLifecycle {
         self.persistent_state.as_mut()
     }
 
+    /// Marks the startup/steady-state boundary for `DREAM64_PROFILE_INSTRUCTIONS`.
+    /// The server calls this once, when it opens the lobby.
+    pub fn mark_profile_steady_state(&mut self) {
+        if let Some(state) = self.persistent_state.as_mut() {
+            state.mark_profile_steady_state();
+        }
+    }
+
+    /// `(gc_count, gc_ms, executed_steps)` accumulated by the live world, for
+    /// the boot benchmark. `(0, 0, 0)` before the persistent world exists.
+    #[must_use]
+    pub fn boot_execution_totals(&self) -> (u64, u128, u64) {
+        self.persistent_state.as_ref().map_or((0, 0, 0), |state| {
+            let (count, elapsed) = state.list_gc_totals();
+            (count, elapsed.as_millis(), state.total_executed_steps())
+        })
+    }
+
+    /// `(hits, misses, invalidations)` for the static-field slot quickening that
+    /// backs every `obj.field` read. `(0, 0, 0)` before the persistent world
+    /// exists. A low hit ratio here explains a large `field-read` profile line.
+    #[must_use]
+    pub fn field_quickening_totals(&self) -> (u64, u64, u64) {
+        self.persistent_state.as_ref().map_or((0, 0, 0), |state| {
+            let metrics = state.declared_field_quickening_metrics();
+            (metrics.hits, metrics.misses, metrics.invalidations)
+        })
+    }
+
+    /// `DREAM64_PROFILE_INSTRUCTIONS` histogram lines for the phase
+    /// (`false` = startup, `true` = steady-state). Empty unless enabled.
+    #[must_use]
+    pub fn instruction_profile_lines(&self, phase_steady: bool) -> Vec<String> {
+        self.persistent_state
+            .as_ref()
+            .map_or_else(Vec::new, |state| {
+                state.instruction_profile_lines(phase_steady)
+            })
+    }
+
+    /// `DREAM64_PROFILE_PROC_STEPS` accounting: the `limit` procedures with the
+    /// most self-time steps as `steps=N pct=P.P procedure=/path`. Empty unless set.
+    #[must_use]
+    pub fn proc_step_profile_lines(&self, limit: usize) -> Vec<String> {
+        let module = self.executable.module();
+        self.persistent_state
+            .as_ref()
+            .map_or_else(Vec::new, |state| {
+                let total = state.total_executed_steps().max(1);
+                state
+                    .proc_step_profile_top(module, limit)
+                    .into_iter()
+                    .map(|(path, steps)| {
+                        #[allow(clippy::cast_precision_loss)]
+                        let pct = (steps as f64 / total as f64) * 100.0;
+                        format!("steps={steps} pct={pct:.1} procedure={path}")
+                    })
+                    .collect()
+            })
+    }
+
     /// Host duration of one current BYOND world tick for persistent pacing.
     #[must_use]
     pub fn persistent_tick_duration(&self) -> std::time::Duration {

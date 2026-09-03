@@ -530,6 +530,382 @@ pub(crate) fn startup_instruction_profile_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("DREAM64_PROFILE_STARTUP_OPCODES").is_some())
 }
 
+/// Per-procedure self-time instruction accounting for the whole run (not just an
+/// `Initialize` subtree). Gated by `DREAM64_PROFILE_PROC_STEPS`; a cheap
+/// per-instruction map increment while on, nothing while off.
+pub(crate) fn proc_step_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DREAM64_PROFILE_PROC_STEPS").is_some())
+}
+
+/// Whole-boot instruction-category histogram. Gated by
+/// `DREAM64_PROFILE_INSTRUCTIONS`. When on it times every dispatched
+/// instruction and fast-path block (~2 `Instant::now()` calls per opcode — a
+/// few percent slower); when off, one `is_some()` branch per opcode.
+pub(crate) fn instruction_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DREAM64_PROFILE_INSTRUCTIONS").is_some())
+}
+
+// ---------------------------------------------------------------------------
+// DREAM64_PROFILE_INSTRUCTIONS — whole-boot instruction taxonomy histogram
+// ---------------------------------------------------------------------------
+
+/// Coarse operation category for an instruction, grouped so a Monkestation
+/// startup histogram answers "what is the VM actually doing" without 150 rows.
+/// `NumericFastBlock` / `NativeFastBlock` / `CompactWord` are attributed by the
+/// run loop for work that bypasses `dispatch_instruction`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub(crate) enum InstrCategory {
+    PushConst = 0,
+    LocalRead,
+    LocalWrite,
+    StackShuffle,
+    FieldRead,
+    FieldWrite,
+    GlobalRead,
+    GlobalWrite,
+    Arith,
+    Compare,
+    Branch,
+    ProcCall,
+    ParentDispatch,
+    ProcReturn,
+    Builtin,
+    TypeCheck,
+    ListCreate,
+    ListRead,
+    ListWrite,
+    IterPrepare,
+    IterNext,
+    DatumAlloc,
+    Locate,
+    Rng,
+    SpawnSleep,
+    Exception,
+    NumericFastBlock,
+    NativeFastBlock,
+    Other,
+}
+
+pub(crate) const INSTR_CATEGORY_COUNT: usize = InstrCategory::Other as usize + 1;
+
+pub(crate) const INSTR_CATEGORY_LABELS: [&str; INSTR_CATEGORY_COUNT] = [
+    "push-const",
+    "local-read",
+    "local-write",
+    "stack-shuffle",
+    "field-read",
+    "field-write",
+    "global-read",
+    "global-write",
+    "arithmetic",
+    "comparison",
+    "branch",
+    "proc-call",
+    "parent-dispatch",
+    "return",
+    "builtin",
+    "type-check",
+    "list-create",
+    "list-read",
+    "list-write",
+    "iter-prepare",
+    "iter-next",
+    "datum-alloc",
+    "locate/spatial",
+    "rng",
+    "spawn/sleep",
+    "exception",
+    "numeric-fast-block",
+    "native-fast-block",
+    "other",
+];
+
+// The arms below happen to cover every `Instruction` variant today, so the
+// trailing `_` is currently unreachable. It stays as deliberate forward
+// compatibility: a newly added opcode buckets into `Other` (a visible,
+// investigable line in the histogram) instead of breaking this build.
+#[allow(clippy::match_same_arms, clippy::too_many_lines, unreachable_patterns)]
+pub(crate) fn instr_category(instruction: &Instruction) -> InstrCategory {
+    use InstrCategory as C;
+    match instruction {
+        Instruction::PushNull
+        | Instruction::PushNumber(_)
+        | Instruction::PushText(_)
+        | Instruction::PushFile(_)
+        | Instruction::PushTypePath(_)
+        | Instruction::MakeModifiedTypePath { .. } => C::PushConst,
+
+        Instruction::LoadLocal(_)
+        | Instruction::LoadLocalRaw(_)
+        | Instruction::AddressLocal(_)
+        | Instruction::LoadStaticLocalOrJump { .. }
+        | Instruction::LoadSrc
+        | Instruction::LoadUsr
+        | Instruction::LoadCaller
+        | Instruction::LoadResult => C::LocalRead,
+
+        Instruction::StoreLocal(_)
+        | Instruction::StoreSrc
+        | Instruction::StoreUsr
+        | Instruction::StoreResult
+        | Instruction::InitializeStaticLocal(_)
+        | Instruction::MutateLocal { .. }
+        | Instruction::MutateResult { .. } => C::LocalWrite,
+
+        Instruction::Duplicate | Instruction::Pop | Instruction::PrepareRhsFirstIndexAssignment => {
+            C::StackShuffle
+        }
+
+        Instruction::LoadField(_)
+        | Instruction::LoadDeclaredField(_)
+        | Instruction::LoadDynamicField
+        | Instruction::InitialField(_)
+        | Instruction::InitialDynamicField
+        | Instruction::LoadInitialGlobal(_)
+        | Instruction::LogicalOrEmptyListField(_) => C::FieldRead,
+
+        Instruction::StoreField(_)
+        | Instruction::StoreFieldKeep(_)
+        | Instruction::StoreDynamicField
+        | Instruction::MutateField { .. } => C::FieldWrite,
+
+        Instruction::LoadGlobal(_)
+        | Instruction::LoadGlobalVars
+        | Instruction::LoadDatumVars
+        | Instruction::LogicalOrEmptyListGlobal(_) => C::GlobalRead,
+
+        Instruction::StoreGlobal(_) | Instruction::MutateGlobal { .. } => C::GlobalWrite,
+
+        Instruction::Add
+        | Instruction::Subtract
+        | Instruction::Multiply
+        | Instruction::Divide
+        | Instruction::Power
+        | Instruction::Remainder
+        | Instruction::FractionalRemainder
+        | Instruction::BitAnd
+        | Instruction::BitOr
+        | Instruction::BitXor
+        | Instruction::ShiftLeft
+        | Instruction::ShiftRight
+        | Instruction::BitNot
+        | Instruction::Negate
+        | Instruction::CompoundAssignment(_)
+        | Instruction::Round { .. } => C::Arith,
+
+        Instruction::Equal
+        | Instruction::NotEqual
+        | Instruction::Equivalent
+        | Instruction::NotEquivalent
+        | Instruction::Compare
+        | Instruction::Less
+        | Instruction::LessEqual
+        | Instruction::Greater
+        | Instruction::GreaterEqual
+        | Instruction::Not
+        | Instruction::And
+        | Instruction::Or => C::Compare,
+
+        Instruction::Jump(_)
+        | Instruction::JumpIfFalse(_)
+        | Instruction::JumpIfNull(_)
+        | Instruction::JumpIfArgumentSupplied { .. }
+        | Instruction::IterationTypeFilter(_) => C::Branch,
+
+        Instruction::Call { .. }
+        | Instruction::CallCurrent { .. }
+        | Instruction::CallDynamic { .. }
+        | Instruction::ExpandArgumentLists { .. }
+        | Instruction::HasCall => C::ProcCall,
+
+        Instruction::CallParent { .. } => C::ParentDispatch,
+
+        Instruction::Return => C::ProcReturn,
+
+        Instruction::StandardBuiltin { .. }
+        | Instruction::NativeSrcMethod { .. }
+        | Instruction::ExternalCall { .. }
+        | Instruction::Output
+        | Instruction::Input
+        | Instruction::Animate { .. }
+        | Instruction::MakeRegex { .. }
+        | Instruction::MakeFilter { .. }
+        | Instruction::ReplaceText { .. }
+        | Instruction::CopyText { .. }
+        | Instruction::GetStep
+        | Instruction::GetStepTowards
+        | Instruction::Length => C::Builtin,
+
+        Instruction::TypePredicate { .. }
+        | Instruction::TypesOf { .. }
+        | Instruction::TypeInstances(_)
+        | Instruction::Range { .. } => C::TypeCheck,
+
+        Instruction::MakeList(_)
+        | Instruction::MakeArray(_)
+        | Instruction::MakeArgs
+        | Instruction::MakeListEntries(_)
+        | Instruction::MakeAssociativeListEntries(_)
+        | Instruction::Block { .. }
+        | Instruction::MakeMutableAppearance { .. }
+        | Instruction::MakeMatrix { .. }
+        | Instruction::MakeVector { .. } => C::ListCreate,
+
+        Instruction::IndexList
+        | Instruction::IndexLocalList(_)
+        | Instruction::ListLength
+        | Instruction::ListLengthLocal(_)
+        | Instruction::Contains
+        | Instruction::LogicalOrEmptyListLocal(_)
+        | Instruction::LogicalOrEmptyListIndex => C::ListRead,
+
+        Instruction::SetListIndex
+        | Instruction::SetListIndexKeep
+        | Instruction::CompoundListIndex(_)
+        | Instruction::CompoundListIndexKeep(_)
+        | Instruction::MutateListIndex { .. } => C::ListWrite,
+
+        Instruction::PrepareIteration => C::IterPrepare,
+        Instruction::NextLocalListIteration { .. } => C::IterNext,
+
+        Instruction::AllocateDatum { .. } | Instruction::AllocateCurrentDatum { .. } => {
+            C::DatumAlloc
+        }
+
+        Instruction::Locate { .. } | Instruction::LocateIn { .. } | Instruction::Ref => C::Locate,
+
+        Instruction::Rand { .. }
+        | Instruction::Roll { .. }
+        | Instruction::Pick { .. }
+        | Instruction::PickExpandedArguments
+        | Instruction::Prob => C::Rng,
+
+        Instruction::Spawn { .. } | Instruction::Sleep => C::SpawnSleep,
+
+        Instruction::Crash
+        | Instruction::BeginTry { .. }
+        | Instruction::EndTry
+        | Instruction::Throw => C::Exception,
+
+        _ => C::Other,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CategoryBucket {
+    pub(crate) count: u64,
+    pub(crate) wall_nanos: u128,
+}
+
+/// Whole-boot instruction histogram, split at the startup/steady-state boundary
+/// the host marks when it opens the lobby.
+pub struct StartupInstructionProfile {
+    started: Instant,
+    steady: bool,
+    startup: [CategoryBucket; INSTR_CATEGORY_COUNT],
+    steady_state: [CategoryBucket; INSTR_CATEGORY_COUNT],
+    gc_startup: CategoryBucket,
+    gc_steady: CategoryBucket,
+}
+
+impl Default for StartupInstructionProfile {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            steady: false,
+            startup: [CategoryBucket::default(); INSTR_CATEGORY_COUNT],
+            steady_state: [CategoryBucket::default(); INSTR_CATEGORY_COUNT],
+            gc_startup: CategoryBucket::default(),
+            gc_steady: CategoryBucket::default(),
+        }
+    }
+}
+
+impl StartupInstructionProfile {
+    pub(crate) fn record(&mut self, category: InstrCategory, count: u64, elapsed: Duration) {
+        let bucket = if self.steady {
+            &mut self.steady_state[category as usize]
+        } else {
+            &mut self.startup[category as usize]
+        };
+        bucket.count = bucket.count.saturating_add(count);
+        bucket.wall_nanos = bucket.wall_nanos.saturating_add(elapsed.as_nanos());
+    }
+
+    pub(crate) fn record_gc(&mut self, elapsed: Duration) {
+        let bucket = if self.steady {
+            &mut self.gc_steady
+        } else {
+            &mut self.gc_startup
+        };
+        bucket.count = bucket.count.saturating_add(1);
+        bucket.wall_nanos = bucket.wall_nanos.saturating_add(elapsed.as_nanos());
+    }
+
+    pub(crate) fn mark_steady_state(&mut self) {
+        self.steady = true;
+    }
+
+    /// Formatted histogram, most expensive category first. `phase` selects the
+    /// startup or steady-state accumulator; the startup phase is what the
+    /// Monkestation boot benchmark reports on.
+    #[must_use]
+    pub fn lines(&self, phase_steady: bool) -> Vec<String> {
+        let (buckets, gc) = if phase_steady {
+            (&self.steady_state, &self.gc_steady)
+        } else {
+            (&self.startup, &self.gc_startup)
+        };
+        let phase = if phase_steady { "steady" } else { "startup" };
+
+        let mut rows: Vec<(&str, CategoryBucket)> = INSTR_CATEGORY_LABELS
+            .iter()
+            .zip(buckets.iter())
+            .map(|(label, bucket)| (*label, *bucket))
+            .filter(|(_, bucket)| bucket.count > 0 || bucket.wall_nanos > 0)
+            .collect();
+        if gc.wall_nanos > 0 {
+            rows.push(("gc-sweep", *gc));
+        }
+        rows.sort_by_key(|(_, bucket)| Reverse(bucket.wall_nanos));
+
+        let total_instr: u64 = buckets.iter().map(|bucket| bucket.count).sum();
+        let total_nanos: u128 =
+            buckets.iter().map(|bucket| bucket.wall_nanos).sum::<u128>() + gc.wall_nanos;
+        let total_secs = total_nanos as f64 / 1e9;
+        let elapsed = self.started.elapsed();
+
+        let mut lines = Vec::with_capacity(rows.len() + 4);
+        lines.push(format!(
+            "instr-profile phase={phase} total_instructions={total_instr} measured_s={total_secs:.2} wall_s={:.2} instr_per_s={:.2e} avg_ns_per_instr={:.1}",
+            elapsed.as_secs_f64(),
+            if total_secs > 0.0 { total_instr as f64 / total_secs } else { 0.0 },
+            if total_instr > 0 { total_nanos as f64 / total_instr as f64 } else { 0.0 },
+        ));
+        for (label, bucket) in rows {
+            let ms = bucket.wall_nanos as f64 / 1e6;
+            let pct = if total_nanos > 0 {
+                bucket.wall_nanos as f64 / total_nanos as f64 * 100.0
+            } else {
+                0.0
+            };
+            let per = if bucket.count > 0 {
+                bucket.wall_nanos as f64 / bucket.count as f64
+            } else {
+                0.0
+            };
+            lines.push(format!(
+                "instr-profile phase={phase} category={label:<20} count={:>13} time_ms={ms:>11.1} pct={pct:>5.1} ns_each={per:>7.0}",
+                bucket.count,
+            ));
+        }
+        lines
+    }
+}
+
 pub(crate) const ATOMS_INITIALIZE_PATH: &str = "/datum/controller/subsystem/atoms/proc/Initialize";
 
 pub(crate) fn is_atoms_initialize_path(path: &str) -> bool {

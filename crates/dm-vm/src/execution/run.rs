@@ -10,11 +10,12 @@ use std::time::{Duration, Instant};
 use crate::bytecode::{Instruction, Module, ProcedureId, Program};
 use crate::{
     AtomsProfile, AtomsProfileInstruction, AtomsProfileProcedure, CompactWordcodeImage,
-    ExecutionLimits, RuntimeError, STARTUP_INSTRUCTION_CATEGORY_COUNT, TgmDrive, TgmProfile,
-    atoms_profile_enabled, atoms_profile_snapshot_lines_if_due, boot_dashboard_enabled,
+    ExecutionLimits, InstrCategory, RuntimeError, STARTUP_INSTRUCTION_CATEGORY_COUNT, TgmDrive,
+    TgmProfile, atoms_profile_enabled, atoms_profile_snapshot_lines_if_due, boot_dashboard_enabled,
     boot_trace_enabled, canonical_tgm_load_path, drive_ruin_candidate_scan, drive_tgm_load,
-    execute_compact_fast_instruction, is_atoms_initialize_path, is_subsystem_initialize_path,
-    numeric_dispatch_candidate, slow_instruction_trace_threshold, startup_instruction_category,
+    execute_compact_fast_instruction, instr_category, is_atoms_initialize_path,
+    is_subsystem_initialize_path, numeric_dispatch_candidate, proc_step_profile_enabled,
+    slow_instruction_trace_threshold, startup_instruction_category,
     startup_instruction_profile_enabled, startup_profile_enabled, tgm_profiling_enabled,
     trace_tgm_route, try_run_build_coordinate_prefix, try_run_camera_chunk_fast_path,
     try_run_discover_offset_fast_path, try_run_dmm_preload_measurement_fast_path,
@@ -70,6 +71,11 @@ pub(crate) fn run_frames(
     // Diagnostic: env-gated per-instruction wall-time watchdog for locating a
     // single builtin/native op that overshoots the scheduler wall deadline.
     let slow_instruction_threshold = slow_instruction_trace_threshold();
+    // Env-gated whole-boot diagnostics. Both are one branch per instruction
+    // while off; the instruction histogram adds two `Instant::now()` per opcode
+    // while on.
+    let proc_step_profiling = proc_step_profile_enabled();
+    let instr_profiling = state.instruction_profile.is_some();
     // A frame retains only its stable procedure identity so scheduled continuations
     // remain self-contained. Cache the immutable program for the currently executing
     // identity within one dispatch, resolving again only after a call/return switches
@@ -80,11 +86,16 @@ pub(crate) fn run_frames(
             && executed_steps >= next_wall_clock_poll
         {
             if wall_clock_started.elapsed() >= budget {
+                state.total_executed_steps =
+                    state.total_executed_steps.saturating_add(executed_steps);
                 state.maybe_collect_unreachable_lists(&frames);
                 return Ok(FrameRunOutcome::Yielded { frames, delay: 0.0 });
             }
             next_wall_clock_poll = executed_steps.saturating_add(256);
         }
+        // Loop-top timestamp for attributing fast-path blocks that `continue`
+        // before reaching the precise per-instruction timing below.
+        let iter_start = instr_profiling.then(Instant::now);
         if trace_enabled
             && let Some((started, prior_procedure, prior_index)) = prior_instruction.take()
             && started.elapsed().as_millis() >= 250
@@ -568,6 +579,18 @@ pub(crate) fn run_frames(
             } else {
                 accounted_steps
             };
+            if proc_step_profiling {
+                *state.proc_step_samples.entry(procedure).or_default() += accounted_steps;
+            }
+            if let Some(started) = iter_start
+                && let Some(profile) = state.instruction_profile.as_mut()
+            {
+                profile.record(
+                    InstrCategory::NativeFastBlock,
+                    accounted_steps,
+                    started.elapsed(),
+                );
+            }
             let scheduler_batches_before = executed_steps / 4_096;
             remaining_steps -= charged_steps;
             executed_steps += charged_steps;
@@ -599,6 +622,18 @@ pub(crate) fn run_frames(
             REPORTED.get_or_init(|| {
                 eprintln!("boot-vm: tier1 enabled optimization=numeric-dispatch-block");
             });
+            if proc_step_profiling {
+                *state.proc_step_samples.entry(procedure).or_default() += accounted_steps;
+            }
+            if let Some(started) = iter_start
+                && let Some(profile) = state.instruction_profile.as_mut()
+            {
+                profile.record(
+                    InstrCategory::NumericFastBlock,
+                    accounted_steps,
+                    started.elapsed(),
+                );
+            }
             let scheduler_batches_before = executed_steps / 4_096;
             remaining_steps -= accounted_steps;
             executed_steps += accounted_steps;
@@ -629,6 +664,8 @@ pub(crate) fn run_frames(
                         instruction_index,
                     );
                 }
+                state.total_executed_steps =
+                    state.total_executed_steps.saturating_add(executed_steps);
                 state.maybe_collect_unreachable_lists(&frames);
                 return Ok(FrameRunOutcome::Yielded { frames, delay: 0.0 });
             }
@@ -640,6 +677,9 @@ pub(crate) fn run_frames(
         }
         remaining_steps -= 1;
         executed_steps += 1;
+        if proc_step_profiling {
+            *state.proc_step_samples.entry(procedure).or_default() += 1;
+        }
         if let Some(profile) = &mut state.atoms_profile {
             profile.total_instructions = profile.total_instructions.saturating_add(1);
             if let Some(counts) = &mut profile.instruction_categories {
@@ -758,8 +798,18 @@ pub(crate) fn run_frames(
                 .word(procedure, instruction_index)
                 .and_then(CompactWordcodeImage::fast_instruction)
             {
+                let started = instr_profiling.then(Instant::now);
+                let category = instr_profiling.then(|| instr_category(instruction));
                 execute_compact_fast_instruction(operation, &mut frames[frame_index], state)
                     .map_err(|message| execution_error(module, &frames, message))?;
+                if proc_step_profiling {
+                    *state.proc_step_samples.entry(procedure).or_default() += 1;
+                }
+                if let (Some(started), Some(category)) = (started, category)
+                    && let Some(profile) = state.instruction_profile.as_mut()
+                {
+                    profile.record(category, 1, started.elapsed());
+                }
                 frames[frame_index].instruction += 1;
                 continue;
             }
@@ -821,6 +871,9 @@ pub(crate) fn run_frames(
         };
 
         let slow_instruction_started = slow_instruction_threshold.map(|_| Instant::now());
+        let instr_profile_started = instr_profiling.then(Instant::now);
+        let instr_profile_category = instr_profiling.then(|| instr_category(instruction));
+        let steps_before_dispatch = executed_steps;
         let dispatch_flow = dispatch_instruction(
             module,
             state,
@@ -836,6 +889,12 @@ pub(crate) fn run_frames(
             &mut remaining_steps,
             ordinary_field_fast_path_enabled,
         )?;
+        if let (Some(started), Some(category)) = (instr_profile_started, instr_profile_category)
+            && let Some(profile) = state.instruction_profile.as_mut()
+        {
+            let steps = executed_steps.saturating_sub(steps_before_dispatch).max(1);
+            profile.record(category, steps, started.elapsed());
+        }
         if let Some(started) = slow_instruction_started {
             let elapsed = started.elapsed();
             if slow_instruction_threshold.is_some_and(|threshold| elapsed >= threshold) {
@@ -864,7 +923,11 @@ pub(crate) fn run_frames(
             }
         }
         match dispatch_flow {
-            DispatchFlow::Exit(outcome) => return *outcome,
+            DispatchFlow::Exit(outcome) => {
+                state.total_executed_steps =
+                    state.total_executed_steps.saturating_add(executed_steps);
+                return *outcome;
+            }
             DispatchFlow::Continue => (),
         }
     }

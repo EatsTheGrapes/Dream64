@@ -207,6 +207,7 @@ pub(crate) fn run_persistent_server_loop(
     if let Some(state) = precompiled.persistent_state_mut() {
         ipc_address.enable_session_interaction(state);
     }
+    precompiled.mark_profile_steady_state();
     eprintln!(
         "server-progress: loopback-ipc={} startup=accepting lobby=pregame",
         ipc_address.local_addr()
@@ -280,11 +281,43 @@ pub(crate) fn run_persistent_server_loop(
             for line in precompiled.bounded_scheduler_progress() {
                 eprintln!("boot-progress: shutdown-dm-frame {line}");
             }
+            report_boot_profiles(precompiled, "boot-max-slices");
             return ExitCode::SUCCESS;
         }
         if let Some(remaining) = tick_duration.checked_sub(slice_started.elapsed()) {
             std::thread::sleep(remaining);
         }
+    }
+}
+
+/// Diagnostic: emit the always-on field-slot quickening ratio, plus — when
+/// enabled — the whole-boot instruction-category histogram
+/// (`DREAM64_PROFILE_INSTRUCTIONS`) and the per-procedure self-time top
+/// (`DREAM64_PROFILE_PROC_STEPS`).
+fn report_boot_profiles(precompiled: &dm_lifecycle::PrecompiledLifecycle, at: &str) {
+    let (fq_hits, fq_misses, fq_invalidations) = precompiled.field_quickening_totals();
+    let fq_total = fq_hits + fq_misses;
+    #[allow(clippy::cast_precision_loss)]
+    let fq_hit_pct = if fq_total == 0 {
+        0.0
+    } else {
+        (fq_hits as f64 / fq_total as f64) * 100.0
+    };
+    eprintln!(
+        "boot-profile at={at} field_quickening hits={fq_hits} misses={fq_misses} invalidations={fq_invalidations} hit_pct={fq_hit_pct:.1}"
+    );
+    for line in precompiled.instruction_profile_lines(false) {
+        eprintln!("boot-profile at={at} {line}");
+    }
+    for line in precompiled.instruction_profile_lines(true) {
+        eprintln!("boot-profile at={at} {line}");
+    }
+    for (rank, line) in precompiled
+        .proc_step_profile_lines(30)
+        .into_iter()
+        .enumerate()
+    {
+        eprintln!("boot-profile at={at} proc_rank={} {line}", rank + 1);
     }
 }
 
@@ -486,8 +519,9 @@ fn activate_lobby_generation(
             trace_ticker_state(precompiled, slice);
         }
         if slice == 1 || slice % 100 == 0 {
+            let (gc_count, gc_ms, exec_steps) = precompiled.boot_execution_totals();
             eprintln!(
-                "boot-progress: generation activation slice={slice} tick={} rounds={} completed={} failed={} pending={} termination={:?} vm_us={} step_budget={} next_step_budget={}",
+                "boot-progress: generation activation slice={slice} tick={} rounds={} completed={} failed={} pending={} termination={:?} vm_us={} step_budget={} next_step_budget={} gc_count={gc_count} gc_ms={gc_ms} exec_steps={exec_steps}",
                 scheduler.final_tick,
                 scheduler.rounds,
                 scheduler.completed_tasks,
@@ -501,10 +535,12 @@ fn activate_lobby_generation(
         }
         ipc.apply_lifecycle_tick_boundary(precompiled);
         if is_ready(precompiled) {
+            let (gc_count, gc_ms, exec_steps) = precompiled.boot_execution_totals();
             eprintln!(
-                "boot-progress: generation activation complete slices={slice} tick={} completed={} pending={} lobby=pregame",
+                "boot-progress: generation activation complete slices={slice} tick={} completed={} pending={} lobby=pregame gc_count={gc_count} gc_ms={gc_ms} exec_steps={exec_steps}",
                 scheduler.final_tick, scheduler.completed_tasks, scheduler.pending_tasks,
             );
+            report_boot_profiles(precompiled, "activation-complete");
             return Ok(());
         }
     }

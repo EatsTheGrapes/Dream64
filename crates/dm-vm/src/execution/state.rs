@@ -141,6 +141,20 @@ pub struct ExecutionState {
     // sparse roots while collecting the far more numerous frame temporaries.
     pub(crate) host_value_roots: Vec<Value>,
     pub(crate) next_list_collection: usize,
+    /// Cumulative executed-collection count and the wall time they took. Cheap
+    /// to maintain (a collection is infrequent) and always on, so a host can
+    /// attribute boot wall time to GC without a trace build.
+    pub(crate) list_gc_count: u64,
+    pub(crate) list_gc_elapsed: std::time::Duration,
+    /// Cumulative interpreted instruction steps executed by `run_frames`,
+    /// flushed at each frame-run boundary. Always on; one add per boundary.
+    pub(crate) total_executed_steps: u64,
+    /// Per-procedure self-time step counts. Populated only while
+    /// `DREAM64_PROFILE_PROC_STEPS` is set.
+    pub(crate) proc_step_samples: HashMap<ProcedureId, u64>,
+    /// Whole-boot instruction-category histogram. `Some` only while
+    /// `DREAM64_PROFILE_INSTRUCTIONS` is set.
+    pub(crate) instruction_profile: Option<Box<crate::StartupInstructionProfile>>,
     /// Consecutive near-zero-yield list collections. A run of these identifies a
     /// monotonic bulk-allocation phase and widens the next collection window.
     pub(crate) low_yield_collection_streak: u32,
@@ -247,6 +261,12 @@ impl ExecutionState {
             procedure_static_locals: BTreeMap::new(),
             host_value_roots: Vec::new(),
             next_list_collection: 262_144,
+            list_gc_count: 0,
+            list_gc_elapsed: std::time::Duration::ZERO,
+            total_executed_steps: 0,
+            proc_step_samples: HashMap::new(),
+            instruction_profile: crate::instruction_profile_enabled()
+                .then(|| Box::new(crate::StartupInstructionProfile::default())),
             low_yield_collection_streak: 0,
             heap_identity_ceiling: super::heap_gc::resolve_heap_identity_ceiling(),
             world_turfs: BTreeMap::new(),
@@ -347,6 +367,59 @@ impl ExecutionState {
     pub fn heap_mut(&mut self) -> &mut ValueHeap {
         self.assert_owner_thread();
         &mut self.heap
+    }
+
+    /// Cumulative heap-collection count and wall time since this state existed.
+    #[must_use]
+    pub fn list_gc_totals(&self) -> (u64, std::time::Duration) {
+        (self.list_gc_count, self.list_gc_elapsed)
+    }
+
+    /// Cumulative interpreted instruction steps executed since this state existed.
+    #[must_use]
+    pub fn total_executed_steps(&self) -> u64 {
+        self.total_executed_steps
+    }
+
+    /// `DREAM64_PROFILE_PROC_STEPS` accounting: the `limit` procedures with the
+    /// most self-time steps, as `(path, steps)` descending. Empty unless set.
+    #[must_use]
+    pub fn proc_step_profile_top(&self, module: &Module, limit: usize) -> Vec<(String, u64)> {
+        let mut rows: Vec<(String, u64)> = self
+            .proc_step_samples
+            .iter()
+            .map(|(procedure, steps)| {
+                (
+                    module
+                        .procedure_path(*procedure)
+                        .unwrap_or("<missing>")
+                        .to_owned(),
+                    *steps,
+                )
+            })
+            .collect();
+        rows.sort_unstable_by(|left, right| right.1.cmp(&left.1));
+        rows.truncate(limit);
+        rows
+    }
+
+    /// Marks the boundary between startup initialization and steady-state
+    /// execution for `DREAM64_PROFILE_INSTRUCTIONS`. The host calls this once,
+    /// when it opens the lobby for connections.
+    pub fn mark_profile_steady_state(&mut self) {
+        if let Some(profile) = &mut self.instruction_profile {
+            profile.mark_steady_state();
+        }
+    }
+
+    /// `DREAM64_PROFILE_INSTRUCTIONS` histogram for the given phase
+    /// (`false` = startup, `true` = steady-state), most expensive first. Empty
+    /// unless the profiler is enabled.
+    #[must_use]
+    pub fn instruction_profile_lines(&self, phase_steady: bool) -> Vec<String> {
+        self.instruction_profile
+            .as_ref()
+            .map_or_else(Vec::new, |profile| profile.lines(phase_steady))
     }
 
     pub(crate) fn is_associative_list(&self, list: ListId) -> bool {

@@ -370,6 +370,12 @@ impl ExecutionState {
             self.heap_identity_ceiling,
         );
         self.next_list_collection = after.saturating_add(growth);
+        let collection_elapsed = collection_started.elapsed();
+        self.list_gc_count = self.list_gc_count.saturating_add(1);
+        self.list_gc_elapsed = self.list_gc_elapsed.saturating_add(collection_elapsed);
+        if let Some(profile) = &mut self.instruction_profile {
+            profile.record_gc(collection_elapsed);
+        }
         if list_field_identity_profile_enabled() {
             self.report_list_field_identities(before_lists, after_lists);
         }

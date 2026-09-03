@@ -35,6 +35,9 @@ use super::{
     try_run_numeric_dispatch_block, try_run_packed_numeric_dispatch_block,
     try_run_register_signal_fast_path, try_run_rich_numeric_dispatch_block,
 };
+use super::{
+    InstrCategory, StartupInstructionProfile, instr_category, instruction_profile_enabled,
+};
 use super::{atom_contents_iteration_snapshot, world_contents_iteration_snapshot};
 
 #[test]
@@ -11654,6 +11657,98 @@ fn world_contents_iteration_snapshot_batch_fill_matches_per_element_add() {
         list.associative_len(),
         0,
         "a PrepareIteration snapshot is a plain positional list"
+    );
+}
+
+#[test]
+fn startup_instruction_profiler_is_off_without_the_env_flag() {
+    // The histogram must not allocate or time anything in an ordinary process.
+    assert!(!instruction_profile_enabled());
+    assert!(ExecutionState::new().total_executed_steps() == 0);
+}
+
+#[test]
+fn instr_category_buckets_representative_opcodes() {
+    use InstrCategory as C;
+    let cases: [(Instruction, C); 12] = [
+        (
+            Instruction::LoadField(FieldName::parse("name").unwrap()),
+            C::FieldRead,
+        ),
+        (
+            Instruction::StoreField(FieldName::parse("name").unwrap()),
+            C::FieldWrite,
+        ),
+        (Instruction::Add, C::Arith),
+        (Instruction::Less, C::Compare),
+        (Instruction::Jump(0), C::Branch),
+        (
+            Instruction::CallCurrent {
+                argument_count: None,
+            },
+            C::ProcCall,
+        ),
+        (
+            Instruction::CallParent {
+                procedure: None,
+                argument_count: None,
+            },
+            C::ParentDispatch,
+        ),
+        (Instruction::Return, C::ProcReturn),
+        (Instruction::PrepareIteration, C::IterPrepare),
+        (
+            Instruction::AllocateCurrentDatum { argument_count: 0 },
+            C::DatumAlloc,
+        ),
+        (Instruction::Sleep, C::SpawnSleep),
+        (Instruction::Crash, C::Exception),
+    ];
+    for (instruction, expected) in cases {
+        assert_eq!(instr_category(&instruction), expected, "{instruction:?}");
+    }
+}
+
+#[test]
+fn startup_instruction_profile_splits_startup_from_steady_state() {
+    let mut profile = StartupInstructionProfile::default();
+    profile.record(InstrCategory::FieldRead, 10, Duration::from_micros(50));
+    profile.record_gc(Duration::from_millis(2));
+    profile.mark_steady_state();
+    profile.record(InstrCategory::Arith, 4, Duration::from_micros(8));
+
+    let startup = profile.lines(false);
+    let steady = profile.lines(true);
+    assert!(
+        startup[0].contains("total_instructions=10"),
+        "{:?}",
+        startup[0]
+    );
+    assert!(
+        startup
+            .iter()
+            .any(|line| line.contains("category=field-read"))
+    );
+    assert!(
+        startup
+            .iter()
+            .any(|line| line.contains("category=gc-sweep"))
+    );
+    assert!(
+        steady[0].contains("total_instructions=4"),
+        "{:?}",
+        steady[0]
+    );
+    assert!(
+        steady
+            .iter()
+            .any(|line| line.contains("category=arithmetic"))
+    );
+    assert!(
+        !steady
+            .iter()
+            .any(|line| line.contains("category=field-read")),
+        "steady-state phase must not carry startup counts",
     );
 }
 

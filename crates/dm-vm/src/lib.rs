@@ -110,12 +110,14 @@ pub(crate) use value_ops::{
     values_equivalent,
 };
 
+pub use profiling::StartupInstructionProfile;
 pub(crate) use profiling::{
-    AtomsProfile, AtomsProfileInstruction, AtomsProfileProcedure,
+    AtomsProfile, AtomsProfileInstruction, AtomsProfileProcedure, InstrCategory,
     STARTUP_INSTRUCTION_CATEGORY_COUNT, ShuttleTracePostReturn, TgmProfile, atoms_profile_enabled,
     atoms_profile_snapshot_lines_if_due, boot_dashboard_enabled, boot_trace_enabled,
-    dcs_trace_enabled, emit_atoms_profile, emit_tgm_profile, is_atoms_initialize_path,
-    is_subsystem_initialize_path, mark_boot_trace_frame, shuttle_trace_emit_snapshot,
+    dcs_trace_enabled, emit_atoms_profile, emit_tgm_profile, instr_category,
+    instruction_profile_enabled, is_atoms_initialize_path, is_subsystem_initialize_path,
+    mark_boot_trace_frame, proc_step_profile_enabled, shuttle_trace_emit_snapshot,
     shuttle_trace_enabled, shuttle_trace_prepare_call, shuttle_trace_slot_from_arguments,
     slow_instruction_trace_threshold, startup_instruction_category,
     startup_instruction_profile_enabled, startup_profile_enabled, tgm_profiling_enabled,
