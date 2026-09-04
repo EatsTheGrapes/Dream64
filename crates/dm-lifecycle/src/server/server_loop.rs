@@ -295,16 +295,18 @@ pub(crate) fn run_persistent_server_loop(
 /// (`DREAM64_PROFILE_INSTRUCTIONS`) and the per-procedure self-time top
 /// (`DREAM64_PROFILE_PROC_STEPS`).
 fn report_boot_profiles(precompiled: &dm_lifecycle::PrecompiledLifecycle, at: &str) {
-    let (fq_hits, fq_misses, fq_invalidations) = precompiled.field_quickening_totals();
-    let fq_total = fq_hits + fq_misses;
+    let fq = precompiled.field_quickening_totals();
+    let fq_total = fq.hits + fq.misses;
     #[allow(clippy::cast_precision_loss)]
     let fq_hit_pct = if fq_total == 0 {
         0.0
     } else {
-        (fq_hits as f64 / fq_total as f64) * 100.0
+        (fq.hits as f64 / fq_total as f64) * 100.0
     };
+    let (eiv_hits, eiv_cold) = precompiled.effective_initial_value_totals();
     eprintln!(
-        "boot-profile at={at} field_quickening hits={fq_hits} misses={fq_misses} invalidations={fq_invalidations} hit_pct={fq_hit_pct:.1}"
+        "boot-profile at={at} field_quickening hits={} misses={} invalidations={} hit_pct={fq_hit_pct:.1} present_hits={} absent_hits={} eiv_hits={eiv_hits} eiv_cold={eiv_cold}",
+        fq.hits, fq.misses, fq.invalidations, fq.present_hits, fq.absent_hits,
     );
     for line in precompiled.instruction_profile_lines(false) {
         eprintln!("boot-profile at={at} {line}");

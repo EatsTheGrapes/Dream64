@@ -412,7 +412,15 @@ impl Default for ExecutionLimits {
 }
 
 const MAX_EFFECTIVE_INITIAL_VALUE_CACHE_ENTRIES: usize = 524_288;
-const MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE: usize = 8;
+// Measured on a full Monkestation boot (DREAM64_PROFILE_INSTRUCTIONS=1): with
+// the old cap of 8, unmaterialized field reads served by the field-slot
+// quickening cache's `InitialValue` routing hint still missed this cache 67%
+// of the time (eiv_cold=34.2M vs eiv_hits=16.9M) — SS13 atom types routinely
+// read 20-40+ distinct default-valued fields during `Initialize()`, so most
+// types hit the 8-entry ceiling immediately and every field past it stayed
+// permanently cold. 128 covers the observed cardinality with headroom; the
+// aggregate `_ENTRIES` cap above remains the outer bound.
+const MAX_EFFECTIVE_INITIAL_VALUE_CACHE_FIELDS_PER_TYPE: usize = 128;
 const MAX_INSTANCE_INITIALIZER_PLAN_CACHE_ENTRIES: usize = 16_384;
 
 /// Dense per-world storage for DM globals.

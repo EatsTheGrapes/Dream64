@@ -755,7 +755,7 @@ impl ExecutionState {
         self.client.pending_local_prompts.clear();
         self.dynamic_receiver_targets.clear();
         self.dynamic_callsite_targets.clear();
-        self.declared_field_slots.clear();
+        self.field_slot_cache.clear();
         self.declared_field_quickening = DeclaredFieldQuickeningMetrics::default();
         self.clear_effective_initial_value_cache();
         self.scheduler_inflight.clear();

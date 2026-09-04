@@ -77,7 +77,7 @@ use crate::execution::run_support::{
 use crate::execution::scheduler::account_scheduler_tick_usage;
 use crate::execution::scheduler::materialize_callee_chain;
 use crate::execution::scheduler::schedule_frames;
-use crate::execution::state::ExecutionState;
+use crate::execution::state::{ExecutionState, FieldResolution};
 use crate::value_ops::bitwise_not;
 
 /// The effect of a dispatched instruction on the interpreter run loop.
@@ -2304,11 +2304,11 @@ pub(crate) fn dispatch_instruction(
                     Value::number(dm_list_length_number(len))
                 }
                 Value::Datum(datum) => {
-                    // Both declared and ordinary static member reads have
-                    // an immutable field name at this callsite. Cache the
-                    // physical slot for either form; the record validates
-                    // the name/layout on every hit, while special engine
-                    // fields stay on the rich path below.
+                    // Both declared and ordinary static member reads have an
+                    // immutable field name at this callsite. Cache the physical
+                    // slot per receiver type; every hit still validates the
+                    // name/layout, while special engine fields stay on the rich
+                    // path below.
                     let quickening_key = ordinary_field_fast_path_enabled
                         .then(|| {
                             u16::try_from(instruction_index).ok().map(|instruction| {
@@ -2320,26 +2320,70 @@ pub(crate) fn dispatch_instruction(
                             })
                         })
                         .flatten();
-                    let quickened_value = quickening_key.and_then(|key| {
-                        let slot = state.declared_field_slots.get(&key).copied()?;
-                        let record = state.heap.datum(datum).ok()?;
+                    let quickened_value = 'quickened: {
+                        let Some(key) = quickening_key else {
+                            break 'quickened None;
+                        };
+                        let Ok(record) = state.heap.datum(datum) else {
+                            break 'quickened None;
+                        };
                         if datum_field_requires_special_read(record.type_path(), name) {
-                            return None;
+                            break 'quickened None;
                         }
-                        if let Some(value) = record.field_at_validated_slot(usize::from(slot), name)
-                        {
+                        let receiver_type = record.type_path().clone();
+                        let Some(resolution) = state
+                            .field_slot_cache
+                            .get_mut(&key)
+                            .and_then(|cache| cache.resolution_for(&receiver_type))
+                        else {
+                            break 'quickened None;
+                        };
+                        // `(value, served_from_initial_value)`.
+                        let served = match resolution {
+                            FieldResolution::Slot(slot) => record
+                                .field_at_validated_slot(usize::from(slot), name)
+                                .cloned()
+                                .map(|value| (value, false)),
+                            FieldResolution::InitialValue => {
+                                if record.field_optional(name).is_some() {
+                                    // Materialized by a runtime write since the
+                                    // hint was recorded — re-resolve.
+                                    None
+                                } else {
+                                    state
+                                        .effective_initial_value(&receiver_type, name)
+                                        .map(|value| (value, true))
+                                }
+                            }
+                        };
+                        if let Some((value, from_initial)) = served {
                             state.declared_field_quickening.hits =
                                 state.declared_field_quickening.hits.saturating_add(1);
-                            Some(value.clone())
-                        } else {
-                            state.declared_field_quickening.invalidations = state
-                                .declared_field_quickening
-                                .invalidations
-                                .saturating_add(1);
-                            state.declared_field_slots.remove(&key);
-                            None
+                            if from_initial {
+                                state.declared_field_quickening.absent_hits = state
+                                    .declared_field_quickening
+                                    .absent_hits
+                                    .saturating_add(1);
+                            } else {
+                                state.declared_field_quickening.present_hits = state
+                                    .declared_field_quickening
+                                    .present_hits
+                                    .saturating_add(1);
+                            }
+                            break 'quickened Some(value);
                         }
-                    });
+                        // The slot shifted, the field materialized, or the
+                        // catalog no longer yields an initial value; forget just
+                        // this receiver type's entry and re-resolve.
+                        state.declared_field_quickening.invalidations = state
+                            .declared_field_quickening
+                            .invalidations
+                            .saturating_add(1);
+                        if let Some(cache) = state.field_slot_cache.get_mut(&key) {
+                            cache.forget(&receiver_type);
+                        }
+                        None
+                    };
                     let ordinary_value = if quickened_value.is_some() {
                         None
                     } else {
@@ -2365,11 +2409,34 @@ pub(crate) fn dispatch_instruction(
                         if let Some(key) = quickening_key {
                             state.declared_field_quickening.misses =
                                 state.declared_field_quickening.misses.saturating_add(1);
-                            if let Ok(record) = state.heap.datum(datum)
-                                && let Some(slot) = record.field_slot(name)
-                                && let Ok(slot) = u16::try_from(slot)
+                            if value.is_ok()
+                                && let Ok(record) = state.heap.datum(datum)
                             {
-                                state.declared_field_slots.insert(key, slot);
+                                let receiver_type = record.type_path().clone();
+                                let resolution = if let Some(slot) = record.field_slot(name)
+                                    && let Ok(slot) = u16::try_from(slot)
+                                {
+                                    Some(FieldResolution::Slot(slot))
+                                } else if record.field_optional(name).is_none()
+                                    && state
+                                        .effective_initial_value(&receiver_type, name)
+                                        .is_some()
+                                {
+                                    // Genuine instance default: not materialized,
+                                    // yet the initial-value catalog yields a
+                                    // value (so it is not a shared/static var and
+                                    // not a missing field).
+                                    Some(FieldResolution::InitialValue)
+                                } else {
+                                    None
+                                };
+                                if let Some(resolution) = resolution {
+                                    state
+                                        .field_slot_cache
+                                        .entry(key)
+                                        .or_default()
+                                        .remember(receiver_type, resolution);
+                                }
                             }
                         }
                         match value {

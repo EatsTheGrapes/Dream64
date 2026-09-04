@@ -10,6 +10,8 @@ use std::sync::{Arc, OnceLock};
 use std::thread::ThreadId;
 use std::time::Instant;
 
+use smallvec::SmallVec;
+
 use crate::builtins;
 use crate::bytecode::{InstanceInitializer, Module, ProcedureId};
 use crate::{
@@ -20,6 +22,88 @@ use crate::{
 use dm_value::{DatumId, FieldName, ListId, TypePath, Value, ValueHeap};
 
 use crate::execution::support::DeclaredFieldQuickeningMetrics;
+
+/// How a `(call site, receiver type)` field read resolves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FieldResolution {
+    /// The field is materialized on the instance at this physical slot. Still
+    /// revalidated against the live datum on every hit.
+    Slot(u16),
+    /// The field is not materialized on the instance and resolves through
+    /// `effective_initial_value(type, field)` — i.e. it is a genuine
+    /// instance-defaulted variable, not a shared/static var (those are absent
+    /// from that catalog) and not a missing field (that returns `None`). The
+    /// hit path re-derives the value live and re-checks that the field is
+    /// still unmaterialized, so runtime mutation and catalog changes are
+    /// always observed.
+    InitialValue,
+}
+
+/// A polymorphic inline cache for one `obj.field` read site.
+///
+/// A static field-read instruction has a fixed field *name*, but how that name
+/// resolves depends on the receiver's type. SS13 init is polymorphic at the
+/// call site — `/atom/proc/Initialize`, the signal dispatchers,
+/// `update_appearance` all run the same `LoadField` over turfs, objs, mobs and
+/// areas — so a single cached resolution per site thrashes on every type
+/// switch. This keeps one resolution *per receiver type* the site has seen.
+/// Every hit revalidates against the live datum and current catalog, so the
+/// type key only affects the hit rate, never correctness.
+#[derive(Default)]
+pub(crate) struct FieldSlotCache {
+    /// `(receiver type, resolution)`, most-recently-used last. Inline capacity
+    /// covers the overwhelming majority of call sites; a wider site spills to
+    /// the heap and is capped at [`Self::MAX_ENTRIES`].
+    entries: SmallVec<[(TypePath, FieldResolution); 4]>,
+}
+
+impl FieldSlotCache {
+    /// Hard cap on distinct receiver types tracked per site. A site past this
+    /// is effectively megamorphic; it keeps its most-recent types and lets the
+    /// rest fall to the ordinary path (still better than the old thrash).
+    pub(crate) const MAX_ENTRIES: usize = 16;
+
+    /// The cached resolution for `receiver_type`, promoted to most-recently-used.
+    pub(crate) fn resolution_for(&mut self, receiver_type: &TypePath) -> Option<FieldResolution> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(cached, _)| cached == receiver_type)?;
+        if index + 1 != self.entries.len() {
+            let entry = self.entries.remove(index);
+            self.entries.push(entry);
+        }
+        Some(self.entries.last().expect("just pushed").1)
+    }
+
+    /// Records `resolution` for `receiver_type`, evicting the least-recently-used
+    /// entry once the cap is reached.
+    pub(crate) fn remember(&mut self, receiver_type: TypePath, resolution: FieldResolution) {
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|(cached, _)| *cached == receiver_type)
+        {
+            existing.1 = resolution;
+            return;
+        }
+        if self.entries.len() >= Self::MAX_ENTRIES {
+            self.entries.remove(0);
+        }
+        self.entries.push((receiver_type, resolution));
+    }
+
+    /// Drops the entry for `receiver_type` after its resolution failed
+    /// revalidation.
+    pub(crate) fn forget(&mut self, receiver_type: &TypePath) {
+        self.entries.retain(|(cached, _)| cached != receiver_type);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_type_count(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 /// Mutable heap state shared by executions in one runtime world.
 ///
@@ -67,10 +151,11 @@ pub struct ExecutionState {
     // retained TypePath keeps the process-local storage identity collision-free.
     pub(crate) dynamic_callsite_targets:
         HashMap<(u64, ProcedureId, usize, usize), (TypePath, ProcedureId)>,
-    // Static field-read sites can retain a dense datum slot. Every hit still
-    // validates both the field name and current layout, and engine-special
-    // fields never enter this path.
-    pub(crate) declared_field_slots: HashMap<(u64, ProcedureId, u16), u16>,
+    // Static field-read sites retain a dense datum slot per receiver type they
+    // have observed. Every hit still validates the field name and current
+    // layout, and engine-special fields never enter this path. See
+    // [`FieldSlotCache`].
+    pub(crate) field_slot_cache: HashMap<(u64, ProcedureId, u16), FieldSlotCache>,
     pub(crate) declared_field_quickening: DeclaredFieldQuickeningMetrics,
     pub(crate) initial_values: Arc<BTreeMap<TypePath, BTreeMap<FieldName, Value>>>,
     // The initial-value catalog is immutable but can contain millions of
@@ -85,6 +170,11 @@ pub struct ExecutionState {
     pub(crate) effective_initial_value_cache:
         RefCell<HashMap<TypePath, HashMap<FieldName, Option<Value>>>>,
     pub(crate) effective_initial_value_cache_entries: Cell<usize>,
+    // Diagnostic: `(cache hits, cold resolves that walked the ancestry)` for
+    // `effective_initial_value`. Reveals whether the field-read miss path's
+    // cost is the walk itself or the surrounding machinery.
+    pub(crate) effective_initial_value_hits: Cell<u64>,
+    pub(crate) effective_initial_value_cold: Cell<u64>,
     // Type-scoped `initial()` reads are immutable after the runtime metadata is
     // installed. Cache their final value separately because a null catalog
     // entry can still require an inherited runtime initializer/prototype.
@@ -227,13 +317,15 @@ impl ExecutionState {
             type_intervals: Arc::new(BTreeMap::new()),
             dynamic_receiver_targets: HashMap::new(),
             dynamic_callsite_targets: HashMap::new(),
-            declared_field_slots: HashMap::new(),
+            field_slot_cache: HashMap::new(),
             declared_field_quickening: DeclaredFieldQuickeningMetrics::default(),
             initial_values: Arc::new(BTreeMap::new()),
             initial_value_datum_roots: Arc::default(),
             initial_value_list_roots: Arc::default(),
             effective_initial_value_cache: RefCell::new(HashMap::new()),
             effective_initial_value_cache_entries: Cell::new(0),
+            effective_initial_value_hits: Cell::new(0),
+            effective_initial_value_cold: Cell::new(0),
             initial_field_value_cache: HashMap::new(),
             initial_field_value_cache_entries: 0,
             compact_default_datums: HashSet::new(),
@@ -568,6 +660,26 @@ impl ExecutionState {
     #[must_use]
     pub const fn static_field_quickening_metrics(&self) -> DeclaredFieldQuickeningMetrics {
         self.declared_field_quickening
+    }
+
+    /// `(cache hits, cold ancestry walks)` for `effective_initial_value`.
+    #[must_use]
+    pub fn effective_initial_value_totals(&self) -> (u64, u64) {
+        (
+            self.effective_initial_value_hits.get(),
+            self.effective_initial_value_cold.get(),
+        )
+    }
+
+    /// The most receiver types any single field-read call site is tracking in
+    /// the inline cache — for asserting megamorphic sites stay bounded.
+    #[cfg(test)]
+    pub(crate) fn field_slot_cache_widest_site(&self) -> usize {
+        self.field_slot_cache
+            .values()
+            .map(FieldSlotCache::tracked_type_count)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Returns the earliest tick at which pending scheduler work is due.
