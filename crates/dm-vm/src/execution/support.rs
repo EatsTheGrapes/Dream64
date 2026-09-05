@@ -27,10 +27,17 @@ pub struct ContinuationMetrics {
 /// reads; dynamic `datum.vars[name]` accesses are not included.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DeclaredFieldQuickeningMetrics {
-    /// Reads served by a validated dense slot.
+    /// Reads served by a validated dense slot or a revalidated initial-value
+    /// routing hint. `hits = present_hits + absent_hits`.
     pub hits: u64,
-    /// Reads that resolved and installed or refreshed a slot.
+    /// Reads that resolved through the full path and installed or refreshed a
+    /// cache entry.
     pub misses: u64,
-    /// Cached slots rejected after a datum layout mutation.
+    /// Cache entries rejected after a datum layout or materialization change.
     pub invalidations: u64,
+    /// Hits served by a materialized dense slot.
+    pub present_hits: u64,
+    /// Hits served by a revalidated "resolves to the effective initial value"
+    /// routing hint (field not materialized on the instance).
+    pub absent_hits: u64,
 }

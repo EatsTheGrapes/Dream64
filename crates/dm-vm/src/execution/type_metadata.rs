@@ -139,6 +139,9 @@ impl ExecutionState {
         fields: Arc<BTreeMap<TypePath, BTreeMap<FieldName, FieldName>>>,
     ) {
         self.shared_fields = fields;
+        // A newly declared shared/static var can shadow what a field read
+        // previously resolved as an instance default.
+        self.field_slot_cache.clear();
     }
 
     /// Installs direct per-type initializer programs used by runtime `new`.
@@ -206,6 +209,9 @@ impl ExecutionState {
     pub(crate) fn clear_effective_initial_value_cache(&mut self) {
         self.effective_initial_value_cache.get_mut().clear();
         self.effective_initial_value_cache_entries.set(0);
+        // Field-read `InitialValue` routing hints are derived from these
+        // catalogs; drop them whenever the catalog is replaced.
+        self.field_slot_cache.clear();
         self.clear_initial_field_value_cache();
     }
 
@@ -221,9 +227,13 @@ impl ExecutionState {
     ) -> Option<Value> {
         let cache = self.effective_initial_value_cache.borrow();
         if let Some(value) = cache.get(path).and_then(|fields| fields.get(field)) {
+            self.effective_initial_value_hits
+                .set(self.effective_initial_value_hits.get().saturating_add(1));
             return value.clone();
         }
         drop(cache);
+        self.effective_initial_value_cold
+            .set(self.effective_initial_value_cold.get().saturating_add(1));
 
         let value = self
             .initial_value(path, field)

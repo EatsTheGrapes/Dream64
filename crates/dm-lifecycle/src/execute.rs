@@ -1196,15 +1196,25 @@ impl PrecompiledLifecycle {
         })
     }
 
-    /// `(hits, misses, invalidations)` for the static-field slot quickening that
-    /// backs every `obj.field` read. `(0, 0, 0)` before the persistent world
-    /// exists. A low hit ratio here explains a large `field-read` profile line.
+    /// Static-field quickening counters for every `obj.field` read. All zero
+    /// before the persistent world exists. A low hit ratio here explains a
+    /// large `field-read` profile line.
     #[must_use]
-    pub fn field_quickening_totals(&self) -> (u64, u64, u64) {
-        self.persistent_state.as_ref().map_or((0, 0, 0), |state| {
-            let metrics = state.declared_field_quickening_metrics();
-            (metrics.hits, metrics.misses, metrics.invalidations)
-        })
+    pub fn field_quickening_totals(&self) -> dm_vm::DeclaredFieldQuickeningMetrics {
+        self.persistent_state
+            .as_ref()
+            .map(dm_vm::ExecutionState::declared_field_quickening_metrics)
+            .unwrap_or_default()
+    }
+
+    /// `(cache hits, cold ancestry walks)` for `effective_initial_value` — the
+    /// resolver every unmaterialized field read goes through.
+    #[must_use]
+    pub fn effective_initial_value_totals(&self) -> (u64, u64) {
+        self.persistent_state.as_ref().map_or(
+            (0, 0),
+            dm_vm::ExecutionState::effective_initial_value_totals,
+        )
     }
 
     /// `DREAM64_PROFILE_INSTRUCTIONS` histogram lines for the phase

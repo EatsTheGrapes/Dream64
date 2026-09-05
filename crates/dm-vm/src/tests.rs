@@ -8763,6 +8763,266 @@ fn declared_field_quickening_hits_and_revalidates_shifted_slots() {
     assert_eq!(shifted.misses, 2);
 }
 
+/// Builds a datum of `type_path` whose fields are inserted in `field_order`, so
+/// a named field lands at a caller-chosen physical slot.
+#[cfg(test)]
+fn datum_with_field_layout(
+    state: &mut ExecutionState,
+    type_path: &str,
+    field_order: &[&str],
+    value_field: &str,
+    value: f32,
+) -> DatumId {
+    let datum = state
+        .heap_mut()
+        .allocate_datum(TypePath::parse(type_path).unwrap());
+    for name in field_order {
+        let slot_value = if *name == value_field {
+            Value::number(value)
+        } else {
+            Value::number(0.0)
+        };
+        state
+            .heap_mut()
+            .set_datum_field(datum, field(name), slot_value)
+            .unwrap();
+    }
+    datum
+}
+
+#[test]
+fn field_slot_cache_keeps_a_slot_per_receiver_type() {
+    // One `LoadField "cell"` call site, two receiver types with `cell` at
+    // different physical slots. The old single-slot cache thrashed one entry;
+    // the polymorphic cache keeps both.
+    let source = parse(concat!(
+        "/proc/read_cell(target)\n",
+        "\treturn target.cell\n",
+    ))
+    .unwrap();
+    let module = compile_module(&source.definitions).unwrap();
+    let entry = module.procedure_id("/proc/read_cell").unwrap();
+    let mut state = ExecutionState::new();
+
+    // `cell` at slot 2 for one type, slot 0 for the other.
+    let wide = datum_with_field_layout(
+        &mut state,
+        "/datum/poly_wide",
+        &["pad_a", "pad_b", "cell"],
+        "cell",
+        11.0,
+    );
+    let narrow = datum_with_field_layout(&mut state, "/datum/poly_narrow", &["cell"], "cell", 22.0);
+
+    // Warm both types, then alternate — every alternating read must hit.
+    for (datum, expected) in [(wide, 11.0), (narrow, 22.0)] {
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::Datum(datum)], &mut state),
+            Ok(Value::number(expected)),
+        );
+    }
+    let warm = state.static_field_quickening_metrics();
+    assert_eq!(warm.misses, 2, "one cold resolve per receiver type");
+    assert_eq!(warm.hits, 0);
+
+    for round in 0..6 {
+        let (datum, expected) = if round % 2 == 0 {
+            (wide, 11.0)
+        } else {
+            (narrow, 22.0)
+        };
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::Datum(datum)], &mut state),
+            Ok(Value::number(expected)),
+        );
+    }
+    let hot = state.static_field_quickening_metrics();
+    assert_eq!(
+        hot.hits, 6,
+        "both types now hit without evicting each other"
+    );
+    assert_eq!(hot.misses, 2, "no further cold resolves");
+    assert_eq!(hot.invalidations, 0, "no thrash between the two layouts");
+}
+
+#[test]
+fn field_slot_cache_revalidates_one_type_without_dropping_the_others() {
+    let source = parse(concat!(
+        "/proc/read_cell(target)\n",
+        "\treturn target.cell\n",
+    ))
+    .unwrap();
+    let module = compile_module(&source.definitions).unwrap();
+    let entry = module.procedure_id("/proc/read_cell").unwrap();
+    let mut state = ExecutionState::new();
+
+    let stable = datum_with_field_layout(&mut state, "/datum/stable", &["cell"], "cell", 1.0);
+    let shifting = datum_with_field_layout(
+        &mut state,
+        "/datum/shifting",
+        &["lead", "cell"],
+        "cell",
+        2.0,
+    );
+
+    for datum in [stable, shifting] {
+        execute_module_in_state(&module, entry, &[Value::Datum(datum)], &mut state).unwrap();
+    }
+    // Shift `cell`'s slot on the second type only.
+    state
+        .heap_mut()
+        .delete_datum_field(shifting, &field("lead"))
+        .unwrap();
+
+    assert_eq!(
+        execute_module_in_state(&module, entry, &[Value::Datum(shifting)], &mut state),
+        Ok(Value::number(2.0)),
+        "stale slot still returns the right value via re-resolve",
+    );
+    // The stable type's entry must be untouched — it keeps hitting.
+    assert_eq!(
+        execute_module_in_state(&module, entry, &[Value::Datum(stable)], &mut state),
+        Ok(Value::number(1.0)),
+    );
+    let metrics = state.static_field_quickening_metrics();
+    assert_eq!(
+        metrics.invalidations, 1,
+        "only the shifted type re-resolved"
+    );
+    assert!(metrics.hits >= 1, "the untouched type still hits");
+}
+
+#[test]
+fn field_slot_cache_bounds_megamorphic_sites() {
+    let source = parse(concat!(
+        "/proc/read_cell(target)\n",
+        "\treturn target.cell\n",
+    ))
+    .unwrap();
+    let module = compile_module(&source.definitions).unwrap();
+    let entry = module.procedure_id("/proc/read_cell").unwrap();
+    let mut state = ExecutionState::new();
+
+    // 40 distinct receiver types through the one call site.
+    for index in 0..40 {
+        let datum = datum_with_field_layout(
+            &mut state,
+            &format!("/datum/mega_{index}"),
+            &["cell"],
+            "cell",
+            index as f32,
+        );
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::Datum(datum)], &mut state),
+            Ok(Value::number(index as f32)),
+        );
+    }
+    assert!(
+        state.field_slot_cache_widest_site() <= 16,
+        "a megamorphic site stays capped, not unbounded: {}",
+        state.field_slot_cache_widest_site(),
+    );
+}
+
+#[test]
+fn field_slot_cache_routes_unmaterialized_reads_through_initial_value() {
+    let source = parse(concat!(
+        "/proc/read_default(target)\n",
+        "\treturn target.tint\n",
+    ))
+    .unwrap();
+    let module = compile_module(&source.definitions).unwrap();
+    let entry = module.procedure_id("/proc/read_default").unwrap();
+    let mut state = ExecutionState::new();
+    let type_path = TypePath::parse("/datum/defaulted").unwrap();
+    state.set_initial_values(BTreeMap::from([(
+        type_path.clone(),
+        BTreeMap::from([(field("tint"), Value::number(5.0))]),
+    )]));
+
+    // A datum that never materializes `tint`.
+    let datum = state.heap_mut().allocate_datum(type_path);
+
+    for _ in 0..5 {
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::Datum(datum)], &mut state),
+            Ok(Value::number(5.0)),
+        );
+    }
+    let warm = state.static_field_quickening_metrics();
+    assert_eq!(warm.misses, 1, "one cold resolve then a routing hint");
+    assert_eq!(
+        warm.absent_hits, 4,
+        "later reads take the initial-value hint"
+    );
+    assert_eq!(warm.present_hits, 0);
+
+    // Materializing the field must invalidate the hint and return the instance
+    // value.
+    state
+        .heap_mut()
+        .set_datum_field(datum, field("tint"), Value::number(99.0))
+        .unwrap();
+    assert_eq!(
+        execute_module_in_state(&module, entry, &[Value::Datum(datum)], &mut state),
+        Ok(Value::number(99.0)),
+    );
+    let shifted = state.static_field_quickening_metrics();
+    assert_eq!(
+        shifted.invalidations, 1,
+        "the hint noticed the field materialize"
+    );
+    assert_eq!(
+        execute_module_in_state(&module, entry, &[Value::Datum(datum)], &mut state),
+        Ok(Value::number(99.0)),
+        "and now serves the materialized slot",
+    );
+    assert_eq!(state.static_field_quickening_metrics().present_hits, 1);
+}
+
+#[test]
+fn field_slot_cache_never_routes_a_shared_var_through_initial_value() {
+    // A `var/static` is not materialized on the instance, but its value is
+    // mutable global state — it must never be cached as an initial value.
+    let source = parse(concat!(
+        "/proc/read_shared(target)\n",
+        "\treturn target.registry\n",
+    ))
+    .unwrap();
+    let module = compile_module(&source.definitions).unwrap();
+    let entry = module.procedure_id("/proc/read_shared").unwrap();
+    let mut state = ExecutionState::new();
+    let type_path = TypePath::parse("/datum/with_static").unwrap();
+    let storage = FieldName::static_storage("/datum/with_static/var/static/registry");
+    state.set_shared_fields(Arc::new(BTreeMap::from([(
+        type_path.clone(),
+        BTreeMap::from([(field("registry"), storage.clone())]),
+    )])));
+    state.set_global(storage.clone(), Value::number(100.0));
+
+    let datum = state.heap_mut().allocate_datum(type_path);
+
+    for _ in 0..4 {
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::Datum(datum)], &mut state),
+            Ok(Value::number(100.0)),
+        );
+    }
+    assert_eq!(
+        state.static_field_quickening_metrics().absent_hits,
+        0,
+        "a shared var must not be served as an initial value",
+    );
+
+    // Mutating the shared global must be observed on the very next read.
+    state.set_global(storage, Value::number(200.0));
+    assert_eq!(
+        execute_module_in_state(&module, entry, &[Value::Datum(datum)], &mut state),
+        Ok(Value::number(200.0)),
+        "shared-var reads always see current global state",
+    );
+}
+
 #[test]
 fn ordinary_static_field_reads_quicken_without_changing_missing_field_errors() {
     let source = parse(concat!(
