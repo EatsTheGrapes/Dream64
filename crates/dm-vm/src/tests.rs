@@ -11930,7 +11930,7 @@ fn startup_instruction_profiler_is_off_without_the_env_flag() {
 #[test]
 fn instr_category_buckets_representative_opcodes() {
     use InstrCategory as C;
-    let cases: [(Instruction, C); 12] = [
+    let cases: [(Instruction, C); 13] = [
         (
             Instruction::LoadField(FieldName::parse("name").unwrap()),
             C::FieldRead,
@@ -11946,7 +11946,15 @@ fn instr_category_buckets_representative_opcodes() {
             Instruction::CallCurrent {
                 argument_count: None,
             },
-            C::ProcCall,
+            C::CallCurrent,
+        ),
+        (
+            Instruction::Call {
+                procedure: ProcedureId::from_index(0).unwrap(),
+                argument_count: 0,
+                argument_names: Vec::new(),
+            },
+            C::CallStatic,
         ),
         (
             Instruction::CallParent {
