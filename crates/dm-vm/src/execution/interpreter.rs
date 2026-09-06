@@ -1039,6 +1039,9 @@ pub(crate) fn dispatch_instruction(
                 Ok(value) => value,
                 Err(message) => return Err(execution_error(module, frames, message)),
             };
+            if let Value::List(list) = value {
+                state.flush_area_uncontain(list);
+            }
             let length = match builtin_length(&value, &state.heap) {
                 Ok(length) => length,
                 Err(message) => return Err(execution_error(module, frames, message)),
@@ -2066,12 +2069,15 @@ pub(crate) fn dispatch_instruction(
             let target = canonicalize_owned_value(&state.heap, target);
             let length = match target {
                 Value::Null => 0,
-                Value::List(list) => match state.heap.list(list) {
-                    Ok(values) => values.len(),
-                    Err(error) => {
-                        return Err(execution_error(module, frames, error.to_string()));
+                Value::List(list) => {
+                    state.flush_area_uncontain(list);
+                    match state.heap.list(list) {
+                        Ok(values) => values.len(),
+                        Err(error) => {
+                            return Err(execution_error(module, frames, error.to_string()));
+                        }
                     }
-                },
+                }
                 value => {
                     return Err(execution_error(
                         module,
@@ -2121,6 +2127,11 @@ pub(crate) fn dispatch_instruction(
                     .unwrap_or(Value::Null),
                 value => value,
             };
+            // Apply any deferred area-`contents` removals before this list is
+            // snapshotted for iteration (a no-op outside a map-load burst).
+            if let Value::List(list) = iterable {
+                state.flush_area_uncontain(list);
+            }
             // BYOND snapshots ordinary list values (and associative
             // mappings) when entering a for-in loop. Mutating the source
             // during the body must not skip shifted entries or append new
@@ -3753,6 +3764,7 @@ pub(crate) fn dispatch_instruction(
                 value => value,
             };
             let contains = if let Value::List(list) = container {
+                state.flush_area_uncontain(list);
                 state
                     .heap
                     .list(list)

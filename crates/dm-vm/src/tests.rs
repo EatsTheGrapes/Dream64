@@ -13888,6 +13888,9 @@ fn spatial_contents_and_atom_new_preserve_byond_map_cell_identity() {
         Value::List(list) => *list,
         _ => unreachable!(),
     };
+    // The old area's removal is batched (mirrors SS13's turfs_to_uncontain
+    // deferral); apply it before asserting the turf has left.
+    state.flush_all_area_uncontain();
     assert!(
         !state
             .heap()
@@ -15063,12 +15066,115 @@ fn tgm_area_then_turf_model_rehomes_the_indexed_cell() {
             .unwrap()
             .contains(&Value::Datum(turf))
     );
+    // The old area's removal is batched (mirrors SS13's turfs_to_uncontain
+    // deferral); it is applied when the map region finishes or the list is
+    // next observed.
+    state.flush_all_area_uncontain();
     assert!(
         !state
             .heap()
             .list(space_contents)
             .unwrap()
             .contains(&Value::Datum(turf))
+    );
+}
+
+#[test]
+fn area_contents_uncontain_is_deferred_then_batched_and_observers_flush_it() {
+    let mut state = ExecutionState::new();
+    let space = state
+        .heap_mut()
+        .allocate_datum(TypePath::parse("/area/space").unwrap());
+    let space_contents = state.ensure_contents(space).unwrap();
+
+    // A large source area, and a handful of destination areas turfs move to.
+    let mut turfs = Vec::new();
+    for _ in 0..400 {
+        let turf = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/turf/open/space/basic").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(turf, field("loc"), Value::Datum(space))
+            .unwrap();
+        state
+            .heap_mut()
+            .list_mut(space_contents)
+            .unwrap()
+            .add(Value::Datum(turf));
+        turfs.push(turf);
+    }
+    let dest = state
+        .heap_mut()
+        .allocate_datum(TypePath::parse("/area/station/hallway").unwrap());
+    let dest_contents = state.ensure_contents(dest).unwrap();
+
+    // Move every turf out via the real `area.contents.Add(turf)` path.
+    for &turf in &turfs {
+        super::builtins::execute_list_method(
+            "Add",
+            dest_contents,
+            &[Value::Datum(turf)],
+            &mut state,
+        )
+        .unwrap()
+        .unwrap();
+    }
+
+    // The removals from `space` are deferred: still physically present, but
+    // queued.
+    assert_eq!(
+        state.heap().list(space_contents).unwrap().len(),
+        400,
+        "old-area removal is batched, not eager"
+    );
+    assert!(state.pending_area_uncontain.contains_key(&space_contents));
+
+    // Observing `space.contents` applies them. `Contains` (`in`) is one such
+    // observer; here call the flush the interpreter hooks would.
+    state.flush_area_uncontain(space_contents);
+    assert_eq!(state.heap().list(space_contents).unwrap().len(), 0);
+    assert!(!state.pending_area_uncontain.contains_key(&space_contents));
+    for &turf in &turfs {
+        assert!(
+            state
+                .heap()
+                .list(dest_contents)
+                .unwrap()
+                .contains(&Value::Datum(turf))
+        );
+        assert_eq!(
+            state.heap().datum_field(turf, &field("loc")),
+            Ok(&Value::Datum(dest))
+        );
+    }
+
+    // A turf coming back to `space` still resolves correctly: the pending
+    // queue for `space` is flushed before the re-add.
+    super::builtins::execute_list_method(
+        "Add",
+        space_contents,
+        &[Value::Datum(turfs[0])],
+        &mut state,
+    )
+    .unwrap()
+    .unwrap();
+    state.flush_all_area_uncontain();
+    assert_eq!(state.heap().list(space_contents).unwrap().len(), 1);
+    assert!(
+        state
+            .heap()
+            .list(space_contents)
+            .unwrap()
+            .contains(&Value::Datum(turfs[0]))
+    );
+    assert!(
+        !state
+            .heap()
+            .list(dest_contents)
+            .unwrap()
+            .contains(&Value::Datum(turfs[0])),
+        "the turf left dest for space"
     );
 }
 

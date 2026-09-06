@@ -299,6 +299,9 @@ pub(crate) fn execute_list_method(
     arguments: &[Value],
     state: &mut ExecutionState,
 ) -> Option<Result<Value, String>> {
+    // Apply any deferred area-`contents` removals before a method reads or
+    // mutates this list (no-op outside a map-load burst).
+    state.flush_area_uncontain(list);
     let alist = state.is_associative_list(list);
     Some(match name {
         "Add" => list_add(list, arguments, state),
@@ -607,17 +610,23 @@ pub(crate) fn move_turf_to_area(
     if let Some(old_area) = old_area
         && let Ok(Value::List(list)) = state.heap.datum_field(old_area, contents)
     {
-        let list = *list;
-        let values = std::iter::once(Value::Datum(turf)).chain(contained.iter().cloned());
-        let target = state
-            .heap
-            .list_mut(list)
-            .map_err(|error| error.to_string())?;
-        for value in values {
-            target.remove_first(&value);
-        }
+        // Defer the old-area removal. Draining a ~200k-element source area
+        // (`/area/space` during map init) one `remove_first` at a time -- an
+        // O(n) scan plus an O(n) vector shift per turf -- is the
+        // `move_turf_to_area` O(n^2). Instead the leaving turf (and the
+        // movables it carried) are queued and applied with a single
+        // `DmList::subtract_entries` when the list is next observed or the map
+        // region finishes. This mirrors SS13's own `turfs_to_uncontain_by_zlevel`
+        // deferral in `reader.dm` / `cannonize_contained_turfs_by_zlevel`.
+        state.queue_area_uncontain(
+            *list,
+            std::iter::once(Value::Datum(turf)).chain(contained.iter().cloned()),
+        );
     }
     let new_contents = state.ensure_contents(new_area)?;
+    // Anything already queued to leave the destination area must be applied
+    // before we test membership / append here.
+    state.flush_area_uncontain(new_contents);
     {
         let target = state
             .heap

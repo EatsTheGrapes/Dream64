@@ -1666,6 +1666,10 @@ pub(crate) fn drive_tgm_load(
                 }
                 None => {
                     let sidecar = frame.cold_mut().tgm_load.take().unwrap();
+                    // The map region is fully placed: apply every area's
+                    // deferred `contents` removal in one bulk pass before DM
+                    // code resumes and can observe those lists.
+                    state.flush_all_area_uncontain();
                     if let (Value::List(bounds), Some(measured)) =
                         (sidecar.bounds, sidecar.plan.bounds)
                     {
