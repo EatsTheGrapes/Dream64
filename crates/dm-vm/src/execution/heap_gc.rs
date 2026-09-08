@@ -153,6 +153,10 @@ impl ExecutionState {
     }
 
     pub(crate) fn maybe_collect_unreachable_lists(&mut self, active_frames: &[CallFrame]) {
+        // Apply any deferred area-`contents` removals so the collector never
+        // has to treat the pending-removal buffers as extra roots (no-op
+        // outside a map-load burst).
+        self.flush_all_area_uncontain();
         if self.next_list_collection == 0 {
             self.next_list_collection = MINIMUM_HEAP_COLLECTION_GROWTH;
         }

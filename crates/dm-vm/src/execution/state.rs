@@ -263,6 +263,16 @@ pub struct ExecutionState {
     pub(crate) ruin_rejection_witnesses: BTreeMap<i32, BTreeMap<(i32, i32), DatumId>>,
     pub(crate) world_areas: BTreeMap<(i32, i32, i32), DatumId>,
     pub(crate) default_world_area: Option<DatumId>,
+    /// Turfs (and their contained movables) that have logically left an area's
+    /// materialized `contents` list during a batched map load but whose removal
+    /// has not been applied yet. Keyed by the contents `ListId`. Draining a
+    /// ~200k-element source area one `remove_first` at a time is the
+    /// `move_turf_to_area` O(n^2); instead the removals are collected here and
+    /// applied with a single `DmList::subtract_entries` per list, flushed
+    /// before anything observes that list and at load/slice/GC boundaries.
+    /// Mirrors SS13's own `turfs_to_uncontain_by_zlevel` deferral
+    /// (`reader.dm` / `cannonize_contained_turfs_by_zlevel`).
+    pub(crate) pending_area_uncontain: HashMap<ListId, Vec<Value>>,
 }
 
 impl Default for ExecutionState {
@@ -367,6 +377,7 @@ impl ExecutionState {
             ruin_rejection_witnesses: BTreeMap::new(),
             world_areas: BTreeMap::new(),
             default_world_area: None,
+            pending_area_uncontain: HashMap::new(),
         };
         state.rebuild_world_geometry();
         state

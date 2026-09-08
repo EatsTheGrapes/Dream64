@@ -23,6 +23,7 @@ impl ExecutionState {
         self.world_turf_lookup.clear();
         self.world_turf_lookup_dimensions = (0, 0, 0);
         self.world_areas.clear();
+        self.pending_area_uncontain.clear();
         self.contents_owners.clear();
         self.vis_contents_owners.clear();
         self.vis_locs_owners.clear();
@@ -147,6 +148,49 @@ impl ExecutionState {
 
     pub(crate) fn contents_owner(&self, list: ListId) -> Option<DatumId> {
         self.contents_owners.get(&list).copied()
+    }
+
+    /// Records that `values` (a turf and the movables it carried) have left the
+    /// area whose materialized `contents` list is `list`, without touching the
+    /// list. The removal is applied in bulk by [`Self::flush_area_uncontain`].
+    pub(crate) fn queue_area_uncontain(
+        &mut self,
+        list: ListId,
+        values: impl IntoIterator<Item = Value>,
+    ) {
+        self.pending_area_uncontain
+            .entry(list)
+            .or_default()
+            .extend(values);
+    }
+
+    /// Applies every deferred removal queued for `list` in one
+    /// `subtract_entries` pass (O(list len + queued), not O(queued x list len)).
+    /// A no-op when nothing is queued, which is the case outside a map-load
+    /// burst.
+    pub(crate) fn flush_area_uncontain(&mut self, list: ListId) {
+        if self.pending_area_uncontain.is_empty() {
+            return;
+        }
+        if let Some(pending) = self.pending_area_uncontain.remove(&list)
+            && !pending.is_empty()
+            && let Ok(contents) = self.heap.list_mut(list)
+        {
+            let _ = contents.subtract_entries(&pending);
+        }
+    }
+
+    /// Flushes every list with deferred area-uncontain removals. Called at
+    /// coarse boundaries (end of a native map-load run, activation slice edges,
+    /// before GC) so nothing ever observes a stale `contents`.
+    pub(crate) fn flush_all_area_uncontain(&mut self) {
+        if self.pending_area_uncontain.is_empty() {
+            return;
+        }
+        let lists: Vec<ListId> = self.pending_area_uncontain.keys().copied().collect();
+        for list in lists {
+            self.flush_area_uncontain(list);
+        }
     }
 
     pub(crate) fn visibility_owner(&self, list: ListId) -> Option<(DatumId, bool)> {

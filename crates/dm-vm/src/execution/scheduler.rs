@@ -82,6 +82,10 @@ pub fn advance_scheduler(
     state: &mut ExecutionState,
 ) -> Result<Vec<Value>, RuntimeError> {
     state.assert_owner_thread();
+    // Catch-all: never let a deferred area-`contents` removal outlive the
+    // scheduler tick that queued it. A no-op (one `is_empty`) outside the
+    // brief map-load window that fills it.
+    state.flush_all_area_uncontain();
     state.scheduler_tick = state.scheduler_tick.saturating_add(ticks);
     advance_headless_world_clock(state, ticks);
     advance_native_walks(state);
