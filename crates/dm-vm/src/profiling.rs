@@ -569,7 +569,10 @@ pub(crate) enum InstrCategory {
     Arith,
     Compare,
     Branch,
-    ProcCall,
+    CallStatic,
+    CallCurrent,
+    CallDynamic,
+    CallExpand,
     ParentDispatch,
     ProcReturn,
     Builtin,
@@ -603,7 +606,10 @@ pub(crate) const INSTR_CATEGORY_LABELS: [&str; INSTR_CATEGORY_COUNT] = [
     "arithmetic",
     "comparison",
     "branch",
-    "proc-call",
+    "call-static",
+    "call-current",
+    "call-dynamic",
+    "call-expand",
     "parent-dispatch",
     "return",
     "builtin",
@@ -715,11 +721,11 @@ pub(crate) fn instr_category(instruction: &Instruction) -> InstrCategory {
         | Instruction::JumpIfArgumentSupplied { .. }
         | Instruction::IterationTypeFilter(_) => C::Branch,
 
-        Instruction::Call { .. }
-        | Instruction::CallCurrent { .. }
-        | Instruction::CallDynamic { .. }
-        | Instruction::ExpandArgumentLists { .. }
-        | Instruction::HasCall => C::ProcCall,
+        Instruction::Call { .. } => C::CallStatic,
+        Instruction::CallCurrent { .. } => C::CallCurrent,
+        Instruction::CallDynamic { .. } => C::CallDynamic,
+        Instruction::ExpandArgumentLists { .. } => C::CallExpand,
+        Instruction::HasCall => C::Builtin,
 
         Instruction::CallParent { .. } => C::ParentDispatch,
 
