@@ -20,7 +20,12 @@ mod numeric_core;
 mod tgm_ruin;
 
 // Numeric-core dispatch counters are public crate APIs for the profiler.
-pub use self::numeric_core::packed_dispatch_counters;
+pub use self::numeric_core::{
+    numeric_block_site_report, numeric_block_telemetry, packed_dispatch_counters,
+};
+
+// Cranelift whole-procedure JIT diagnostic counters.
+pub use self::fastpath_jit::guarded_jit_telemetry;
 
 // TGM/ruin instrumentation counters are public crate APIs for the profiler.
 pub use self::tgm_ruin::{

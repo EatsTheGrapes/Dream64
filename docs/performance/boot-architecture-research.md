@@ -127,6 +127,37 @@ selector caches have repeatedly failed benchmarks because their guard and
 handoff overhead is paid inside the hot loop while too little dispatch work is
 removed.
 
+**JIT telemetry, first Monkestation boot reading (2026-09-08, `main` at
+`4a13c3e`, `guarded_jit_telemetry` / `numeric_block_telemetry`):**
+
+- The Cranelift whole-procedure numeric JIT *does* fire: 2036 procedures
+  compiled, 332 rejected, ~994k trace invocations. But it retires only
+  **1.99M of ~907M startup instructions — 0.22%.** Every compiled trace
+  averages 2 instructions; they are `return CONSTANT` / `return arg` shims. The
+  hand-matched lumcount trace never matches this Monke build (0 compiled, 4
+  rejected).
+- The numeric basic-block fast path (`numeric-fast-block`, ~559M instructions)
+  runs **207M block entries at an average of 2 instructions each; 85% execute
+  1–4 instructions, 99.3% execute ≤16, and not one block exceeds 256.** These
+  are 2–4 op arithmetic fragments between heap operations, not loops or math
+  kernels. Cranelift call plus operand marshalling (~50–100 ns) exceeds the
+  cost of interpreting a 2-op block, so compiling these blocks in isolation is
+  a measured net loss.
+- The adaptive packed value-stack is effectively unused (26k uses against 220M
+  declines); `predicts_profitable_packed_run` forward-scans up to 24
+  instructions on ~207M block entries to almost always decline — a
+  cache-the-verdict cleanup worth ~10 s on its own.
+- The hot procedures themselves — `light_source/update_corners` (10.1% of
+  startup steps), `SSatoms/InitAtom` (6.5%), `atom/bitmask_smooth`,
+  `turf/init_immediate_calculate_adjacent_turfs`, `gas_mixture/compare` — are
+  `view()` / list / `qdel` / dynamic-call bound. A numeric JIT cannot reach
+  them; only a Value-level baseline tier that calls a Rust slow-path ABI for
+  heap operations can.
+
+Conclusion: Tier 1 must specialize the **general** field/list/call/branch
+families and compile Value-level regions, exactly as ranked below. Broadening
+the numeric JIT's procedure selection is not worth doing.
+
 The replacement should be tiered:
 
 1. Give each program a compact mutable execution form and a PC-local cache
