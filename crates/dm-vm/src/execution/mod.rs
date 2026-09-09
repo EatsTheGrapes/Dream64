@@ -14,6 +14,7 @@ mod interpreter;
 mod run;
 mod run_support;
 mod scheduler;
+mod sidecar;
 mod state;
 mod support;
 mod type_metadata;

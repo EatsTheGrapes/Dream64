@@ -141,7 +141,7 @@ impl ExecutionState {
         self.shared_fields = fields;
         // A newly declared shared/static var can shadow what a field read
         // previously resolved as an instance default.
-        self.field_slot_cache.clear();
+        self.program_sidecars.clear();
     }
 
     /// Installs direct per-type initializer programs used by runtime `new`.
@@ -211,7 +211,7 @@ impl ExecutionState {
         self.effective_initial_value_cache_entries.set(0);
         // Field-read `InitialValue` routing hints are derived from these
         // catalogs; drop them whenever the catalog is replaced.
-        self.field_slot_cache.clear();
+        self.program_sidecars.clear();
         self.clear_initial_field_value_cache();
     }
 
