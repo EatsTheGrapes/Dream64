@@ -136,8 +136,11 @@ pub use native::{
     native_ruin_rejection_cache_hits, native_ruin_rejection_causes, native_ruin_scan_metrics,
     native_tgm_build_cache_metrics, native_tgm_commit_samples, native_tgm_continuation_rejections,
     native_tgm_load_activations, native_tgm_load_metrics, native_tgm_route_samples,
-    native_tgm_target_cache_metrics, packed_dispatch_counters,
+    native_tgm_target_cache_metrics, numeric_block_site_report, numeric_block_telemetry,
+    packed_dispatch_counters,
 };
+
+pub use native::guarded_jit_telemetry;
 
 pub(crate) use native::{
     TgmDrive, advance_headless_world_clock, canonical_istext, canonical_static_native_builtin,

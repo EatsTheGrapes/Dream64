@@ -308,6 +308,36 @@ fn report_boot_profiles(precompiled: &dm_lifecycle::PrecompiledLifecycle, at: &s
         "boot-profile at={at} field_quickening hits={} misses={} invalidations={} hit_pct={fq_hit_pct:.1} present_hits={} absent_hits={} eiv_hits={eiv_hits} eiv_cold={eiv_cold}",
         fq.hits, fq.misses, fq.invalidations, fq.present_hits, fq.absent_hits,
     );
+    // JIT / numeric fast-path telemetry — gated by the same profiling flags,
+    // so this is free on a production boot. Answers whether the Cranelift
+    // whole-procedure JIT contributes at all and whether the numeric
+    // basic-block interpreter work is concentrated enough to be worth native
+    // compilation.
+    let (
+        compiled_numeric,
+        rejected_numeric,
+        compiled_lumcount,
+        rejected_lumcount,
+        jit_runs,
+        jit_steps,
+    ) = dm_vm::guarded_jit_telemetry();
+    let (packed_entries, packed_declines) = dm_vm::packed_dispatch_counters();
+    let (block_entries, block_steps, block_len) = dm_vm::numeric_block_telemetry();
+    eprintln!(
+        "boot-profile at={at} jit_guarded numeric_compiled={compiled_numeric} numeric_rejected={rejected_numeric} lumcount_compiled={compiled_lumcount} lumcount_rejected={rejected_lumcount} runs={jit_runs} steps={jit_steps}"
+    );
+    eprintln!(
+        "boot-profile at={at} numeric_blocks entries={block_entries} steps={block_steps} avg={} len_1_4={} len_5_16={} len_17_64={} len_65_256={} len_257up={} packed_entries={packed_entries} packed_declines={packed_declines}",
+        block_steps.checked_div(block_entries).unwrap_or(0),
+        block_len[0],
+        block_len[1],
+        block_len[2],
+        block_len[3],
+        block_len[4],
+    );
+    for line in dm_vm::numeric_block_site_report(30) {
+        eprintln!("boot-profile at={at} {line}");
+    }
     for line in precompiled.instruction_profile_lines(false) {
         eprintln!("boot-profile at={at} {line}");
     }

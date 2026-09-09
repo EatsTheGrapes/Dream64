@@ -230,7 +230,119 @@ pub(crate) fn numeric_dispatch_candidate(instruction: &Instruction) -> bool {
     )
 }
 
+/// Diagnostic accounting for the numeric basic-block fast path. Entirely gated
+/// by `DREAM64_PROFILE_NUMERIC_BLOCKS` — when unset the dispatch wrapper is a
+/// direct tail call with no counters touched. When set, a handful of relaxed
+/// atomic adds per block *entry* (never per instruction) plus, for the
+/// per-site map, one mutex lock per entry. Answers "is the numeric interpreter
+/// work concentrated in a few hot blocks worth compiling to native, or smeared
+/// across millions of cold ones".
+pub(crate) static NUMERIC_BLOCK_ENTRIES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static NUMERIC_BLOCK_STEPS: AtomicU64 = AtomicU64::new(0);
+/// Block-length histogram by steps executed in one entry: 1-4, 5-16, 17-64,
+/// 65-256, 257+.
+pub(crate) static NUMERIC_BLOCK_LEN_BUCKETS: [AtomicU64; 5] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Whole numeric-block accounting toggle (`DREAM64_PROFILE_NUMERIC_BLOCKS`).
+/// Off by default so `try_run_numeric_dispatch_block` is a zero-overhead
+/// forward to its body.
+pub(crate) fn numeric_block_profiling() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DREAM64_PROFILE_NUMERIC_BLOCKS").is_some())
+}
+
+/// `(procedure index, block start pc) -> (entries, total steps)`.
+type NumericBlockSiteMap = std::collections::HashMap<(u32, u32), (u64, u64)>;
+
+/// A process global (not thread-local) so the report is correct no matter which
+/// thread drove the VM; only locked once per numeric-block *entry* and only
+/// while `DREAM64_PROFILE_NUMERIC_BLOCKS` is set.
+static NUMERIC_BLOCK_SITES: std::sync::Mutex<Option<NumericBlockSiteMap>> =
+    std::sync::Mutex::new(None);
+
+/// `(entries, total_steps, [len buckets 1-4 / 5-16 / 17-64 / 65-256 / 257+])`
+/// for the numeric basic-block fast path over the whole run.
+#[must_use]
+pub fn numeric_block_telemetry() -> (u64, u64, [u64; 5]) {
+    (
+        NUMERIC_BLOCK_ENTRIES.load(Ordering::Relaxed),
+        NUMERIC_BLOCK_STEPS.load(Ordering::Relaxed),
+        std::array::from_fn(|index| NUMERIC_BLOCK_LEN_BUCKETS[index].load(Ordering::Relaxed)),
+    )
+}
+
+/// The `limit` numeric block-start sites with the most accumulated fast-path
+/// steps, as `entries=N steps=S avg=A procedure_index=<index> pc=<pc>`. Empty
+/// unless `DREAM64_PROFILE_NUMERIC_BLOCKS` is set.
+///
+/// # Panics
+///
+/// Panics only if the site-map mutex was poisoned by a prior panic while held.
+#[must_use]
+pub fn numeric_block_site_report(limit: usize) -> Vec<String> {
+    if !numeric_block_profiling() {
+        return Vec::new();
+    }
+    let guard = NUMERIC_BLOCK_SITES.lock().expect("numeric-block site map");
+    let Some(sites) = guard.as_ref() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<_> = sites
+        .iter()
+        .map(|(&(procedure, pc), &(entries, steps))| (procedure, pc, entries, steps))
+        .collect();
+    rows.sort_by_key(|&(_, _, _, steps)| std::cmp::Reverse(steps));
+    rows.truncate(limit);
+    rows.into_iter()
+        .map(|(procedure, pc, entries, steps)| {
+            let avg = steps.checked_div(entries).unwrap_or(0);
+            format!(
+                "numeric-block-site entries={entries} steps={steps} avg={avg} procedure_index={procedure} pc={pc}"
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn try_run_numeric_dispatch_block(
+    program: &Program,
+    frame: &mut CallFrame,
+    max_steps: u64,
+    state: &ExecutionState,
+) -> Option<u64> {
+    if !numeric_block_profiling() {
+        return try_run_numeric_dispatch_block_inner(program, frame, max_steps, state);
+    }
+    let site = (frame.procedure.index() as u32, frame.instruction as u32);
+    let accounted = try_run_numeric_dispatch_block_inner(program, frame, max_steps, state);
+    if let Some(steps) = accounted {
+        NUMERIC_BLOCK_ENTRIES.fetch_add(1, Ordering::Relaxed);
+        NUMERIC_BLOCK_STEPS.fetch_add(steps, Ordering::Relaxed);
+        let bucket = match steps {
+            0..=4 => 0,
+            5..=16 => 1,
+            17..=64 => 2,
+            65..=256 => 3,
+            _ => 4,
+        };
+        NUMERIC_BLOCK_LEN_BUCKETS[bucket].fetch_add(1, Ordering::Relaxed);
+        let mut guard = NUMERIC_BLOCK_SITES.lock().expect("numeric-block site map");
+        let entry = guard
+            .get_or_insert_with(std::collections::HashMap::new)
+            .entry(site)
+            .or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += steps;
+    }
+    accounted
+}
+
+fn try_run_numeric_dispatch_block_inner(
     program: &Program,
     frame: &mut CallFrame,
     max_steps: u64,

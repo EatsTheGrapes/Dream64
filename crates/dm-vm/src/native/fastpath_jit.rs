@@ -21,7 +21,7 @@ use dm_value::{DatumId, FieldName, ListId, TypePath, Value, ValueError};
 use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 // The trace fast paths canonicalize type2parent-style shapes and read the dmm
@@ -463,6 +463,33 @@ pub(crate) fn try_run_dmm_preload_measurement_fast_path(
     frame.stack.push(Value::List(bounds));
     frame.instruction = return_index;
     Some(8)
+}
+
+/// Diagnostic counters for the Cranelift whole-procedure numeric JIT
+/// (`try_run_guarded_jit`). `COMPILED`/`REJECTED` count *distinct procedures*
+/// the first time each is considered; `RUNS`/`STEPS` count trace invocations
+/// and the reference instruction budget they retired. On a Monkestation boot
+/// these answer whether the native JIT contributes anything at all.
+pub(crate) static GUARDED_JIT_NUMERIC_COMPILED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GUARDED_JIT_NUMERIC_REJECTED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GUARDED_JIT_LUMCOUNT_COMPILED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GUARDED_JIT_LUMCOUNT_REJECTED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GUARDED_JIT_RUNS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static GUARDED_JIT_STEPS: AtomicU64 = AtomicU64::new(0);
+
+/// `(numeric_compiled, numeric_rejected, lumcount_compiled, lumcount_rejected,
+/// runs, steps)` for the Cranelift whole-procedure JIT over the whole run.
+#[must_use]
+pub fn guarded_jit_telemetry() -> (u64, u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        GUARDED_JIT_NUMERIC_COMPILED.load(Relaxed),
+        GUARDED_JIT_NUMERIC_REJECTED.load(Relaxed),
+        GUARDED_JIT_LUMCOUNT_COMPILED.load(Relaxed),
+        GUARDED_JIT_LUMCOUNT_REJECTED.load(Relaxed),
+        GUARDED_JIT_RUNS.load(Relaxed),
+        GUARDED_JIT_STEPS.load(Relaxed),
+    )
 }
 
 thread_local! {
@@ -1111,6 +1138,12 @@ pub(crate) fn try_run_guarded_jit(
         && let Some(outcome) =
             try_run_lumcount_jit(module, procedure, program, frame, remaining_steps, state)
     {
+        GUARDED_JIT_RUNS.fetch_add(1, Ordering::Relaxed);
+        let steps = match outcome {
+            NumericRunOutcome::Returned { steps, .. }
+            | NumericRunOutcome::BudgetExhausted { steps, .. } => u64::from(steps),
+        };
+        GUARDED_JIT_STEPS.fetch_add(steps, Ordering::Relaxed);
         return Some((outcome, true));
     }
     // Every generic numeric trace must lower every instruction. Most DM
@@ -1180,9 +1213,15 @@ fn try_run_lumcount_jit(
     let key = (module.identity.0, procedure);
     LUMCOUNT_JIT_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let trace = cache
-            .entry(key)
-            .or_insert_with(|| compile_lumcount_trace(program));
+        let trace = cache.entry(key).or_insert_with(|| {
+            let compiled = compile_lumcount_trace(program);
+            if compiled.is_some() {
+                GUARDED_JIT_LUMCOUNT_COMPILED.fetch_add(1, Ordering::Relaxed);
+            } else {
+                GUARDED_JIT_LUMCOUNT_REJECTED.fetch_add(1, Ordering::Relaxed);
+            }
+            compiled
+        });
         let trace = trace.as_ref()?;
         let mut numeric_locals = SmallVec::<[f32; 8]>::new();
         numeric_locals.resize(program.local_count, 0.0);
@@ -1364,9 +1403,15 @@ fn try_run_numeric_jit(
     NUMERIC_JIT_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         let trace = cache.entry(key).or_insert_with(|| {
-            numeric_trace_instructions(program).and_then(|instructions| {
+            let compiled = numeric_trace_instructions(program).and_then(|instructions| {
                 compile_numeric_trace(&instructions, program.local_count).ok()
-            })
+            });
+            if compiled.is_some() {
+                GUARDED_JIT_NUMERIC_COMPILED.fetch_add(1, Ordering::Relaxed);
+            } else {
+                GUARDED_JIT_NUMERIC_REJECTED.fetch_add(1, Ordering::Relaxed);
+            }
+            compiled
         });
         let trace = trace.as_ref()?;
         if frame.numeric_jit_state().is_none() {
@@ -1384,7 +1429,16 @@ fn try_run_numeric_jit(
             frame.set_numeric_jit_state(trace.initial_state(&numeric_locals));
         }
         let budget = u32::try_from(remaining_steps).unwrap_or(u32::MAX);
-        trace.run_budgeted(frame.numeric_jit_state_mut()?, budget)
+        let outcome = trace.run_budgeted(frame.numeric_jit_state_mut()?, budget);
+        if let Some(outcome) = &outcome {
+            GUARDED_JIT_RUNS.fetch_add(1, Ordering::Relaxed);
+            let steps = match outcome {
+                NumericRunOutcome::Returned { steps, .. }
+                | NumericRunOutcome::BudgetExhausted { steps, .. } => u64::from(*steps),
+            };
+            GUARDED_JIT_STEPS.fetch_add(steps, Ordering::Relaxed);
+        }
+        outcome
     })
 }
 
