@@ -77,6 +77,7 @@ use crate::execution::run_support::{
 use crate::execution::scheduler::account_scheduler_tick_usage;
 use crate::execution::scheduler::materialize_callee_chain;
 use crate::execution::scheduler::schedule_frames;
+use crate::execution::sidecar::ProcedureSidecar;
 use crate::execution::state::{ExecutionState, FieldResolution};
 use crate::value_ops::bitwise_not;
 
@@ -96,6 +97,7 @@ pub(crate) enum DispatchFlow {
 pub(crate) fn dispatch_instruction(
     module: &Module,
     state: &mut ExecutionState,
+    sidecar: &mut ProcedureSidecar,
     frames: &mut Vec<CallFrame>,
     frame_index: usize,
     procedure: ProcedureId,
@@ -2333,9 +2335,8 @@ pub(crate) fn dispatch_instruction(
                             break 'quickened None;
                         }
                         let receiver_type = record.type_path().clone();
-                        let Some(resolution) = state
-                            .program_sidecars
-                            .field_read_cache(module.identity.0, procedure, pc)
+                        let Some(resolution) = sidecar
+                            .field_read_cache(pc)
                             .and_then(|cache| cache.resolution_for(&receiver_type))
                         else {
                             break 'quickened None;
@@ -2381,11 +2382,7 @@ pub(crate) fn dispatch_instruction(
                             .declared_field_quickening
                             .invalidations
                             .saturating_add(1);
-                        if let Some(cache) = state.program_sidecars.field_read_cache(
-                            module.identity.0,
-                            procedure,
-                            pc,
-                        ) {
+                        if let Some(cache) = sidecar.field_read_cache(pc) {
                             cache.forget(&receiver_type);
                         }
                         None
@@ -2437,13 +2434,7 @@ pub(crate) fn dispatch_instruction(
                                     None
                                 };
                                 if let Some(resolution) = resolution
-                                    && let Some(cache) =
-                                        state.program_sidecars.field_read_cache_or_install(
-                                            module.identity.0,
-                                            procedure,
-                                            pc,
-                                            program.instructions.len(),
-                                        )
+                                    && let Some(cache) = sidecar.field_read_cache_or_install(pc)
                                 {
                                     cache.remember(receiver_type, resolution);
                                 }
