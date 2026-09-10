@@ -338,6 +338,14 @@ fn report_boot_profiles(precompiled: &dm_lifecycle::PrecompiledLifecycle, at: &s
     for line in dm_vm::numeric_block_site_report(30) {
         eprintln!("boot-profile at={at} {line}");
     }
+    // Whole-heap scans by unqualified `locate()` / `TypeInstances` — reveals an
+    // O(n) `locate(/type)` pattern that grows with the heap during atom init
+    // (the move_turf_to_area class of bug).
+    let (loc_ty, loc_ty_datums, loc_tag, loc_tag_datums, ti_scans, ti_datums) =
+        dm_vm::locate_scan_telemetry();
+    eprintln!(
+        "boot-profile at={at} locate_scans type_scans={loc_ty} type_scan_datums={loc_ty_datums} tag_scans={loc_tag} tag_scan_datums={loc_tag_datums} type_instances_scans={ti_scans} type_instances_scan_datums={ti_datums}"
+    );
     for line in precompiled.instruction_profile_lines(false) {
         eprintln!("boot-profile at={at} {line}");
     }

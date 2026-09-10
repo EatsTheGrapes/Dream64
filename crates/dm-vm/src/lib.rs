@@ -40,7 +40,7 @@ pub use compile::{
 };
 pub use module_codec::ModuleCodecError;
 pub use ready_snapshot::ReadyWorldCoreSnapshot;
-pub use value_ops::ExecutionContext;
+pub use value_ops::{ExecutionContext, locate_scan_telemetry};
 
 pub use local_client::{
     ClientState, LocalClientAppearance, LocalClientError, LocalClientMapSnapshot,
