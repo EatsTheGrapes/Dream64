@@ -21,6 +21,7 @@ use crate::{
 };
 use dm_value::{DatumId, FieldName, ListId, TypePath, Value, ValueHeap};
 
+use crate::execution::sidecar::ProgramSidecars;
 use crate::execution::support::DeclaredFieldQuickeningMetrics;
 
 /// How a `(call site, receiver type)` field read resolves.
@@ -155,7 +156,13 @@ pub struct ExecutionState {
     // have observed. Every hit still validates the field name and current
     // layout, and engine-special fields never enter this path. See
     // [`FieldSlotCache`].
-    pub(crate) field_slot_cache: HashMap<(u64, ProcedureId, u16), FieldSlotCache>,
+    // Per-`(module, procedure)` PC-indexed inline-cache sidecar for the Tier-1
+    // baseline: one dense array beside the immutable bytecode, allocated on a
+    // procedure's first execution and retained for the process lifetime, and
+    // cleared whenever the type/shared-var/initial-value catalogs are replaced.
+    // See [`crate::execution::sidecar`]. Field-read quickening is its first
+    // consumer; global access, resolved calls, and list ops follow.
+    pub(crate) program_sidecars: ProgramSidecars,
     pub(crate) declared_field_quickening: DeclaredFieldQuickeningMetrics,
     pub(crate) initial_values: Arc<BTreeMap<TypePath, BTreeMap<FieldName, Value>>>,
     // The initial-value catalog is immutable but can contain millions of
@@ -327,7 +334,7 @@ impl ExecutionState {
             type_intervals: Arc::new(BTreeMap::new()),
             dynamic_receiver_targets: HashMap::new(),
             dynamic_callsite_targets: HashMap::new(),
-            field_slot_cache: HashMap::new(),
+            program_sidecars: ProgramSidecars::default(),
             declared_field_quickening: DeclaredFieldQuickeningMetrics::default(),
             initial_values: Arc::new(BTreeMap::new()),
             initial_value_datum_roots: Arc::default(),
@@ -686,11 +693,7 @@ impl ExecutionState {
     /// the inline cache — for asserting megamorphic sites stay bounded.
     #[cfg(test)]
     pub(crate) fn field_slot_cache_widest_site(&self) -> usize {
-        self.field_slot_cache
-            .values()
-            .map(FieldSlotCache::tracked_type_count)
-            .max()
-            .unwrap_or(0)
+        self.program_sidecars.widest_field_read_site()
     }
 
     /// Returns the earliest tick at which pending scheduler work is due.

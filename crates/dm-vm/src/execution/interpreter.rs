@@ -2317,22 +2317,13 @@ pub(crate) fn dispatch_instruction(
                 Value::Datum(datum) => {
                     // Both declared and ordinary static member reads have an
                     // immutable field name at this callsite. Cache the physical
-                    // slot per receiver type; every hit still validates the
-                    // name/layout, while special engine fields stay on the rich
-                    // path below.
-                    let quickening_key = ordinary_field_fast_path_enabled
-                        .then(|| {
-                            u16::try_from(instruction_index).ok().map(|instruction| {
-                                (
-                                    module.identity.0,
-                                    frames[frame_index].procedure,
-                                    instruction,
-                                )
-                            })
-                        })
-                        .flatten();
+                    // slot per receiver type in the procedure's PC sidecar;
+                    // every hit still validates the name/layout, while special
+                    // engine fields stay on the rich path below.
+                    let quickening_pc =
+                        ordinary_field_fast_path_enabled.then_some(instruction_index);
                     let quickened_value = 'quickened: {
-                        let Some(key) = quickening_key else {
+                        let Some(pc) = quickening_pc else {
                             break 'quickened None;
                         };
                         let Ok(record) = state.heap.datum(datum) else {
@@ -2343,8 +2334,8 @@ pub(crate) fn dispatch_instruction(
                         }
                         let receiver_type = record.type_path().clone();
                         let Some(resolution) = state
-                            .field_slot_cache
-                            .get_mut(&key)
+                            .program_sidecars
+                            .field_read_cache(module.identity.0, procedure, pc)
                             .and_then(|cache| cache.resolution_for(&receiver_type))
                         else {
                             break 'quickened None;
@@ -2390,7 +2381,11 @@ pub(crate) fn dispatch_instruction(
                             .declared_field_quickening
                             .invalidations
                             .saturating_add(1);
-                        if let Some(cache) = state.field_slot_cache.get_mut(&key) {
+                        if let Some(cache) = state.program_sidecars.field_read_cache(
+                            module.identity.0,
+                            procedure,
+                            pc,
+                        ) {
                             cache.forget(&receiver_type);
                         }
                         None
@@ -2417,7 +2412,7 @@ pub(crate) fn dispatch_instruction(
                     if let Some(value) = quickened_value {
                         value
                     } else if let Some(value) = ordinary_value {
-                        if let Some(key) = quickening_key {
+                        if let Some(pc) = quickening_pc {
                             state.declared_field_quickening.misses =
                                 state.declared_field_quickening.misses.saturating_add(1);
                             if value.is_ok()
@@ -2441,12 +2436,16 @@ pub(crate) fn dispatch_instruction(
                                 } else {
                                     None
                                 };
-                                if let Some(resolution) = resolution {
-                                    state
-                                        .field_slot_cache
-                                        .entry(key)
-                                        .or_default()
-                                        .remember(receiver_type, resolution);
+                                if let Some(resolution) = resolution
+                                    && let Some(cache) =
+                                        state.program_sidecars.field_read_cache_or_install(
+                                            module.identity.0,
+                                            procedure,
+                                            pc,
+                                            program.instructions.len(),
+                                        )
+                                {
+                                    cache.remember(receiver_type, resolution);
                                 }
                             }
                         }
