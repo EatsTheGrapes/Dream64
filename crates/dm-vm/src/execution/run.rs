@@ -257,6 +257,32 @@ fn run_frames_inner(
                         .then(|| frames[frame_index].numeric_jit_state())
                         .flatten()
                         .map(|state| state.stack[0]);
+                    // Milestone 5: a `CallSideExit` (always this trace's last
+                    // instruction) is the region's way of handing an
+                    // unconditionally-unsupported call/allocation to the
+                    // interpreter — its own arguments are exactly what's
+                    // sitting on the native operand stack (`validate` proved
+                    // nothing else is live there), in the same bottom-to-top
+                    // order `frame.stack` needs them in for the interpreter
+                    // to redo this instruction from scratch.
+                    let call_argument_count = match original {
+                        Some(Instruction::Call { argument_count, .. }) => Some(*argument_count),
+                        Some(
+                            Instruction::CallCurrent { argument_count }
+                            | Instruction::CallParent { argument_count, .. },
+                        ) => Some(argument_count.unwrap_or(0)),
+                        Some(Instruction::AllocateCurrentDatum { argument_count }) => {
+                            Some(*argument_count)
+                        }
+                        _ => None,
+                    };
+                    let call_arguments: Vec<f32> = call_argument_count
+                        .and_then(|count| {
+                            frames[frame_index]
+                                .numeric_jit_state()
+                                .map(|state| state.stack[..usize::from(count)].to_vec())
+                        })
+                        .unwrap_or_default();
                     // The interpreter also reads `frame.locals` directly from
                     // here on, and native execution never touched it either —
                     // any local a `StoreLocal` wrote since entry only exists
@@ -284,6 +310,9 @@ fn run_frames_inner(
                         frames[frame_index].stack.push(src);
                     }
                     if let Some(value) = stashed_value {
+                        frames[frame_index].stack.push(Value::number(value));
+                    }
+                    for value in call_arguments {
                         frames[frame_index].stack.push(Value::number(value));
                     }
                     for (index, value) in dirty_locals {

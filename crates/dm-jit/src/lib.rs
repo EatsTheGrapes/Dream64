@@ -88,6 +88,28 @@ pub enum NumericInstruction {
     JumpIfFalse(u32),
     /// Return the top stack value.
     Return,
+    /// Unconditionally ends the region's compiled prefix: the real bytecode
+    /// at this PC is a call or allocation, which this milestone always hands
+    /// to the interpreter rather than executing natively or resuming after.
+    /// Unlike a declined `*Dynamic` op, whether to exit here is not a
+    /// runtime decision — codegen never calls a callback for it, it just
+    /// packs the exit unconditionally. `argument_count` values (already
+    /// sitting on the native stack from prior instructions, exactly as an
+    /// interpreted `LoadLocal`/arithmetic sequence would have left them) are
+    /// left untouched for the VM to read directly out of
+    /// `NumericExecutionState.stack` and rematerialize onto `frame.stack`
+    /// before resuming the interpreter at this exact instruction, which then
+    /// runs the call for real. The translator only ever emits this as a
+    /// trace's last instruction, and only when nothing else is live on the
+    /// stack below these arguments (`validate` requires stack depth to be
+    /// exactly `argument_count` here) and every argument is a plain number
+    /// (`validate` rejects a `Src`-kind argument — passing `src` itself into
+    /// a call — the same way a general non-`src` field receiver is
+    /// rejected; both need real rooted-`Value` support this milestone
+    /// deliberately doesn't build).
+    CallSideExit {
+        argument_count: u16,
+    },
 }
 
 /// Failure to validate or compile a numeric trace.
@@ -122,6 +144,18 @@ pub enum CompileError {
     /// Two control-flow paths agree on operand-stack *depth* at a merge
     /// point but disagree about which slots hold `src` versus a number.
     InconsistentOperandKind(usize),
+    /// A side-exiting instruction's own operands (a `LoadFieldDynamic`
+    /// receiver placeholder, a `StoreGlobalDynamic` value, a
+    /// `CallSideExit`'s arguments, ...) aren't the only thing live on the
+    /// operand stack — something from an enclosing expression is still
+    /// pending underneath them. The VM's side-exit rematerialization (in
+    /// `dm-vm`) only ever reconstructs what the *specific* declining
+    /// instruction needs; anything else pending would be silently dropped —
+    /// discovered as a real, reachable bug (a `Constant` sitting under a
+    /// `LoadGlobalDynamic` that then declines) rather than a theoretical
+    /// one, so every side-exiting instruction requires stack isolation, not
+    /// just this milestone's new one.
+    DynamicOperandsNotIsolated(usize),
     /// Cranelift rejected the generated module.
     Backend(String),
 }
@@ -170,6 +204,10 @@ impl std::fmt::Display for CompileError {
             Self::InconsistentOperandKind(instruction) => write!(
                 formatter,
                 "numeric trace reaches instruction {instruction} with disagreeing operand kinds"
+            ),
+            Self::DynamicOperandsNotIsolated(instruction) => write!(
+                formatter,
+                "numeric trace instruction {instruction} has values live beneath a side-exiting instruction's own operands"
             ),
             Self::Backend(message) => write!(formatter, "Cranelift backend failed: {message}"),
         }
@@ -1314,6 +1352,23 @@ pub fn compile_numeric_field_trace(
                     function_builder.ins().return_(&[packed]);
                     continue;
                 }
+                NumericInstruction::CallSideExit { argument_count } => {
+                    // Unconditional, unlike every `*Dynamic` decline: whether
+                    // to exit here is a compile-time certainty, not a
+                    // callback's runtime answer, so there is nothing to call
+                    // and nothing to branch on. The native stack already
+                    // holds this call's arguments exactly as the prior
+                    // instructions left them (`validate` proved depth is
+                    // exactly `argument_count` here) — leave them in place
+                    // for the VM to read directly and just pack the exit,
+                    // using `steps` (not `next_steps`): like a declined
+                    // field/global op, this instruction is not counted as
+                    // retired, since the interpreter redoes it from scratch.
+                    debug_assert_eq!(depth, usize::from(argument_count));
+                    let side_exit = pack_side_exit(&mut function_builder, pc as u32, steps);
+                    function_builder.ins().return_(&[side_exit]);
+                    continue;
+                }
                 operation => {
                     let right = memory_pop(&mut function_builder, stack_pointer, &mut depth);
                     let left = memory_pop(&mut function_builder, stack_pointer, &mut depth);
@@ -1585,6 +1640,15 @@ fn validate(
                 if usize::from(field) >= dynamic_field_count {
                     return Err(CompileError::InvalidField(field));
                 }
+                // A decline here side-exits, and the VM only ever
+                // rematerializes this instruction's own receiver — anything
+                // else pending below it (a `Constant` from an enclosing
+                // expression, say) would be silently lost. Require the
+                // receiver placeholder to be the only thing on the stack, so
+                // a decline never has anything else to lose.
+                if stack.len() != 1 {
+                    return Err(CompileError::DynamicOperandsNotIsolated(pc));
+                }
                 // The popped placeholder is discarded unconditionally by
                 // codegen (the real receiver travels through the callback
                 // context, not this stack), so unlike `StoreFieldDynamic`
@@ -1601,6 +1665,12 @@ fn validate(
                 if usize::from(field) >= dynamic_field_count {
                     return Err(CompileError::InvalidField(field));
                 }
+                // Same isolation requirement as `LoadFieldDynamic` above, for
+                // the same reason: a decline only ever rematerializes the
+                // value and receiver, nothing pending beneath them.
+                if stack.len() != 2 {
+                    return Err(CompileError::DynamicOperandsNotIsolated(pc));
+                }
                 pop_number(pc, &mut stack)?;
                 pop_src(pc, &mut stack)?;
             }
@@ -1608,11 +1678,23 @@ fn validate(
                 if usize::from(global) >= dynamic_global_count {
                     return Err(CompileError::InvalidField(global));
                 }
+                // No receiver, but the same hazard applies to whatever an
+                // enclosing expression already pushed: a decline here would
+                // silently lose it.
+                if !stack.is_empty() {
+                    return Err(CompileError::DynamicOperandsNotIsolated(pc));
+                }
                 stack.push(StackKind::Number);
             }
             NumericInstruction::StoreGlobalDynamic(global) => {
                 if usize::from(global) >= dynamic_global_count {
                     return Err(CompileError::InvalidField(global));
+                }
+                // Same isolation requirement as the other three dynamic
+                // instructions: a decline here only ever rematerializes the
+                // value being stored, nothing pending beneath it.
+                if stack.len() != 1 {
+                    return Err(CompileError::DynamicOperandsNotIsolated(pc));
                 }
                 pop_number(pc, &mut stack)?;
             }
@@ -1647,6 +1729,16 @@ fn validate(
                 }
                 pop_number(pc, &mut stack)?;
                 max_depth = max_depth.max(1);
+                continue;
+            }
+            NumericInstruction::CallSideExit { argument_count } => {
+                if stack.len() != usize::from(argument_count) {
+                    return Err(CompileError::DynamicOperandsNotIsolated(pc));
+                }
+                for _ in 0..argument_count {
+                    pop_number(pc, &mut stack)?;
+                }
+                max_depth = max_depth.max(usize::from(argument_count));
                 continue;
             }
         }
@@ -2164,6 +2256,125 @@ mod tests {
             state.stack[0], 9.0,
             "the value that would have been written must be recoverable from stack slot 0"
         );
+    }
+
+    #[test]
+    fn call_side_exit_with_no_arguments_exits_unconditionally_after_the_prefix_runs() {
+        let trace = compile_numeric_trace(
+            &[
+                NumericInstruction::Constant(1.0),
+                NumericInstruction::StoreLocal(0),
+                NumericInstruction::CallSideExit { argument_count: 0 },
+            ],
+            1,
+        )
+        .expect("a straight-line prefix ending in a zero-argument call compiles");
+        let mut state = trace.initial_state(&[0.0]).unwrap();
+        let outcome = trace
+            .run_budgeted(&mut state, 10, &mut no_callbacks())
+            .unwrap();
+        assert_eq!(
+            outcome,
+            NumericRunOutcome::SideExit {
+                instruction: 2,
+                steps: 2,
+            },
+            "steps must not count the call itself, exactly like a declined field/global op"
+        );
+        assert_eq!(
+            state.locals[0], 1.0,
+            "the prefix's own local write must have actually run natively"
+        );
+        assert_eq!(
+            state.dirty_locals, 1,
+            "local 0 was written, must be flagged"
+        );
+    }
+
+    #[test]
+    fn call_side_exit_leaves_its_arguments_readable_on_the_native_stack_in_order() {
+        let trace = compile_numeric_trace(
+            &[
+                NumericInstruction::Constant(3.0),
+                NumericInstruction::Constant(4.0),
+                NumericInstruction::CallSideExit { argument_count: 2 },
+            ],
+            0,
+        )
+        .expect("a two-argument call compiles");
+        let mut state = trace.initial_state(&[]).unwrap();
+        let outcome = trace
+            .run_budgeted(&mut state, 10, &mut no_callbacks())
+            .unwrap();
+        assert_eq!(
+            outcome,
+            NumericRunOutcome::SideExit {
+                instruction: 2,
+                steps: 2,
+            }
+        );
+        // Index 0 is the first-pushed (bottom) argument, matching the order
+        // the interpreter's own `LoadLocal`/etc. sequence would have left on
+        // `frame.stack` — the VM rematerializes in this same order so the
+        // interpreter's re-executed `Call` pops them correctly.
+        assert_eq!(state.stack[0], 3.0);
+        assert_eq!(state.stack[1], 4.0);
+    }
+
+    #[test]
+    fn validate_rejects_a_call_with_something_live_beneath_its_arguments() {
+        assert!(matches!(
+            compile_numeric_trace(
+                &[
+                    NumericInstruction::Constant(99.0),
+                    NumericInstruction::Constant(3.0),
+                    NumericInstruction::CallSideExit { argument_count: 1 },
+                ],
+                0,
+            ),
+            Err(CompileError::DynamicOperandsNotIsolated(2))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_every_dynamic_op_with_something_live_beneath_its_own_operands() {
+        // A real, reachable bug (not a theoretical one): a decline only ever
+        // rematerializes the declining instruction's *own* operands — a
+        // `Constant` pushed earlier in the same expression, still pending
+        // below, would be silently dropped when the interpreter resumes.
+        // Every side-exiting instruction needs this same isolation, not just
+        // `CallSideExit`. `LoadGlobalDynamic` (zero popped operands) is the
+        // simplest case to prove: a value pending below it at all is already
+        // one too many.
+        assert!(matches!(
+            compile_numeric_field_trace(
+                &[
+                    NumericInstruction::Constant(6.0),
+                    NumericInstruction::LoadGlobalDynamic(0),
+                    NumericInstruction::Add,
+                    NumericInstruction::Return,
+                ],
+                0,
+                0,
+                0,
+                1,
+            ),
+            Err(CompileError::DynamicOperandsNotIsolated(1))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_passing_src_itself_as_a_call_argument() {
+        assert!(matches!(
+            compile_numeric_trace(
+                &[
+                    NumericInstruction::LoadSrc,
+                    NumericInstruction::CallSideExit { argument_count: 1 },
+                ],
+                0,
+            ),
+            Err(CompileError::InvalidOperandKind(1))
+        ));
     }
 
     #[test]
