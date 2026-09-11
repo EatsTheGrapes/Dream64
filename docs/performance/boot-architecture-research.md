@@ -158,6 +158,15 @@ Conclusion: Tier 1 must specialize the **general** field/list/call/branch
 families and compile Value-level regions, exactly as ranked below. Broadening
 the numeric JIT's procedure selection is not worth doing.
 
+**Update (2026-09-10).** The PC-local sidecar (#74) and its pointer-cache (#75)
+are built. Instruction-level quickening was then measured out: after field-read
+(#70) nothing incremental is worth more than ~3 s — field-write quickening
+thrashes (slots move during init), `is_subtype` is already O(1), globals are
+already slot-dense, and the `locate/spatial` category has no single O(n) scan
+to remove. The compiled-region tier below is the remaining lever. Its detailed
+design — operand model, slow-path ABI, safepoints, deopt, milestones — is in
+[`baseline-region-jit.md`](baseline-region-jit.md).
+
 The replacement should be tiered:
 
 1. Give each program a compact mutable execution form and a PC-local cache
