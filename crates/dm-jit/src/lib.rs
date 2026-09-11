@@ -21,6 +21,12 @@ pub enum NumericInstruction {
     LoadLocal(u16),
     /// Pop a value into a procedure local.
     StoreLocal(u16),
+    /// Push the region's implicit receiver marker. Runtime-inert (codegen
+    /// pushes an arbitrary placeholder f32, identically to `Constant`) — the
+    /// only thing that matters is that `validate` tracks this stack slot as
+    /// `StackKind::Src`, so it type-checks as a receiver for
+    /// `LoadFieldDynamic`/`StoreFieldDynamic` and nothing else.
+    LoadSrc,
     /// Push a VM-guarded, materialized binary32 field.
     LoadField(u16),
     /// Pop into a materialized field and mark it dirty for VM writeback.
@@ -32,6 +38,14 @@ pub enum NumericInstruction {
     /// call time, not the flat `fields` array. See the "Milestone 3" module
     /// doc below for why the receiver is always `src` and always implicit.
     LoadFieldDynamic(u16),
+    /// Pop a value and a receiver placeholder, then write the value to one
+    /// named field of the region's implicit `src` through the
+    /// `store_field_dynamic` slow-path callback. The receiver placeholder is
+    /// only ever `src` — proven at compile time by kind-tracking through
+    /// `validate`, not by adjacency the way `LoadFieldDynamic`'s translator
+    /// check is (a store's receiver sits under an arbitrary-length value
+    /// expression, not immediately below the store).
+    StoreFieldDynamic(u16),
     /// Set a VM-defined deferred action bit, committed after native exit.
     RaiseAction(u8),
     /// Duplicate the top operand.
@@ -90,6 +104,14 @@ pub enum CompileError {
         first: usize,
         second: usize,
     },
+    /// An instruction's operand is the wrong kind — for example, arithmetic
+    /// on the region's implicit `src` marker (produced only by a translated
+    /// `LoadSrc`, valid only as `LoadFieldDynamic`/`StoreFieldDynamic`'s
+    /// receiver) rather than a number.
+    InvalidOperandKind(usize),
+    /// Two control-flow paths agree on operand-stack *depth* at a merge
+    /// point but disagree about which slots hold `src` versus a number.
+    InconsistentOperandKind(usize),
     /// Cranelift rejected the generated module.
     Backend(String),
 }
@@ -127,6 +149,14 @@ impl std::fmt::Display for CompileError {
             } => write!(
                 formatter,
                 "numeric trace reaches instruction {instruction} with stack depths {first} and {second}",
+            ),
+            Self::InvalidOperandKind(instruction) => write!(
+                formatter,
+                "numeric trace instruction {instruction} has an operand of the wrong kind"
+            ),
+            Self::InconsistentOperandKind(instruction) => write!(
+                formatter,
+                "numeric trace reaches instruction {instruction} with disagreeing operand kinds"
             ),
             Self::Backend(message) => write!(formatter, "Cranelift backend failed: {message}"),
         }
@@ -461,7 +491,7 @@ impl CompiledNumericTrace {
         // exact `(pointer) -> f32` ABI. The module is retained by `self`, and
         // `locals` remains live and contains the validated number of elements.
         let mut state = self.initial_state(locals)?;
-        match self.run_budgeted(&mut state, u32::MAX, &mut |_| None)? {
+        match self.run_budgeted(&mut state, u32::MAX, &mut |_| None, &mut |_, _| false)? {
             NumericRunOutcome::Returned { value, .. } => Some(value),
             NumericRunOutcome::BudgetExhausted { .. } | NumericRunOutcome::SideExit { .. } => None,
         }
@@ -504,15 +534,21 @@ impl CompiledNumericTrace {
     ///
     /// `load_field` answers a `LoadFieldDynamic(field_index)` instruction with
     /// the current guarded numeric value of that field on the region's
-    /// implicit `src`, or `None` to side-exit (the interpreter re-runs this
-    /// instruction). Traces that never lower `LoadFieldDynamic` still take
-    /// this parameter — it is simply never called — so callers with nothing
-    /// to answer can pass `&mut |_| None`.
+    /// implicit `src`, or `None` to side-exit. `store_field` answers a
+    /// `StoreFieldDynamic(field_index, value)` instruction with whether the
+    /// guarded write succeeded; on `false` the trace also leaves the value
+    /// that would have been stored in `state.stack[0]` (the same slot
+    /// `Returned` uses), since the interpreter resuming this exact
+    /// `StoreField` needs it rematerialized — see `try_run_region_numeric_jit`.
+    /// Traces that never lower either instruction still take both
+    /// parameters — they are simply never called — so callers with nothing
+    /// to answer can pass `&mut |_| None` / `&mut |_, _| false`.
     pub fn run_budgeted(
         &self,
         state: &mut NumericExecutionState,
         max_steps: u32,
         load_field: &mut dyn FnMut(u32) -> Option<f32>,
+        store_field: &mut dyn FnMut(u32, f32) -> bool,
     ) -> Option<NumericRunOutcome> {
         let redzone_start = self.max_stack_depth.max(1);
         if state.locals.len() != self.local_count
@@ -526,12 +562,15 @@ impl CompiledNumericTrace {
         {
             return None;
         }
-        let mut dispatch = SafeFieldLoadDispatch { load_field };
+        let mut dispatch = SafeFieldDispatch {
+            load_field,
+            store_field,
+        };
         // SAFETY: `dispatch` outlives the call below (it is not returned or
-        // stored), and `safe_load_field_dynamic` — the only function this
-        // module's compiled code can call through `context_pointer` — casts
-        // it back to this exact type.
-        let context_pointer = (&mut dispatch as *mut SafeFieldLoadDispatch<'_>).cast();
+        // stored), and `safe_load_field_dynamic`/`safe_store_field_dynamic`
+        // — the only functions this module's compiled code can call through
+        // `context_pointer` — both cast it back to this exact type.
+        let context_pointer = (&mut dispatch as *mut SafeFieldDispatch<'_>).cast();
         let packed = unsafe {
             (self.entry)(
                 state.locals.as_mut_ptr(),
@@ -584,12 +623,17 @@ pub fn compile_numeric_trace(
     compile_numeric_field_trace(instructions, local_count, 0, 0)
 }
 
-/// Context wrapper for `run_budgeted`'s `load_field` closure. A thin,
-/// pointer-sized struct so the fat `&mut dyn FnMut` reference can cross the
-/// FFI boundary as a single `*mut c_void` — the same reason
-/// `SafeRootedDispatch` exists for `CompiledRootedBlock`.
-struct SafeFieldLoadDispatch<'a> {
+/// Context wrapper for `run_budgeted`'s `load_field`/`store_field` closures.
+/// A thin, pointer-sized struct so the fat `&mut dyn FnMut` references can
+/// cross the FFI boundary as a single `*mut c_void` — the same reason
+/// `SafeRootedDispatch` exists for `CompiledRootedBlock`. One combined
+/// struct, not two: both `dream64_load_field_dynamic` and
+/// `dream64_store_field_dynamic` are registered against the *same*
+/// `context_pointer` parameter of the compiled function (there is only one),
+/// so they must agree on what type is behind it.
+struct SafeFieldDispatch<'a> {
     load_field: &'a mut dyn FnMut(u32) -> Option<f32>,
+    store_field: &'a mut dyn FnMut(u32, f32) -> bool,
 }
 
 /// Trampoline registered as `dream64_load_field_dynamic` in every compiled
@@ -597,11 +641,25 @@ struct SafeFieldLoadDispatch<'a> {
 /// success (so the packed value is always `>= 2^32`) or `0` on a declined
 /// field (the trace side-exits and the interpreter resumes this instruction).
 unsafe extern "C" fn safe_load_field_dynamic(context: *mut c_void, field_index: u32) -> u64 {
-    let context = unsafe { &mut *context.cast::<SafeFieldLoadDispatch<'_>>() };
+    let context = unsafe { &mut *context.cast::<SafeFieldDispatch<'_>>() };
     match (context.load_field)(field_index) {
         Some(value) => 0x1_0000_0000_u64 | u64::from(value.to_bits()),
         None => 0,
     }
+}
+
+/// Trampoline registered as `dream64_store_field_dynamic`. Returns `1` on a
+/// guarded write, `0` on decline (the trace side-exits and the interpreter
+/// resumes this instruction, receiver and value both still to be
+/// materialized by the VM side — see `StoreFieldDynamic`'s codegen).
+unsafe extern "C" fn safe_store_field_dynamic(
+    context: *mut c_void,
+    field_index: u32,
+    value_bits: u32,
+) -> u64 {
+    let context = unsafe { &mut *context.cast::<SafeFieldDispatch<'_>>() };
+    let value = f32::from_bits(value_bits);
+    u64::from((context.store_field)(field_index, value))
 }
 
 /// Compiles a trace over guarded numeric field snapshots. The VM validates and
@@ -623,6 +681,10 @@ pub fn compile_numeric_field_trace(
         "dream64_load_field_dynamic",
         safe_load_field_dynamic as *const u8,
     );
+    builder.symbol(
+        "dream64_store_field_dynamic",
+        safe_store_field_dynamic as *const u8,
+    );
     let mut module = JITModule::new(builder);
     let mut load_field_dynamic_signature = module.make_signature();
     load_field_dynamic_signature
@@ -639,6 +701,20 @@ pub fn compile_numeric_field_trace(
             "dream64_load_field_dynamic",
             Linkage::Import,
             &load_field_dynamic_signature,
+        )
+        .map_err(|error| CompileError::Backend(error.to_string()))?;
+    let mut store_field_dynamic_signature = module.make_signature();
+    for ty in [types::I64, types::I32, types::I32] {
+        store_field_dynamic_signature.params.push(AbiParam::new(ty));
+    }
+    store_field_dynamic_signature
+        .returns
+        .push(AbiParam::new(types::I64));
+    let store_field_dynamic_id = module
+        .declare_function(
+            "dream64_store_field_dynamic",
+            Linkage::Import,
+            &store_field_dynamic_signature,
         )
         .map_err(|error| CompileError::Backend(error.to_string()))?;
     let mut context = module.make_context();
@@ -696,6 +772,8 @@ pub fn compile_numeric_field_trace(
         .map_err(|error| CompileError::Backend(error.to_string()))?;
     let load_field_dynamic_ref =
         module.declare_func_in_func(load_field_dynamic_id, &mut context.func);
+    let store_field_dynamic_ref =
+        module.declare_func_in_func(store_field_dynamic_id, &mut context.func);
 
     let mut frontend_context = FunctionBuilderContext::new();
     {
@@ -795,6 +873,15 @@ pub fn compile_numeric_field_trace(
                     let value = function_builder.ins().f32const(value);
                     memory_push(&mut function_builder, stack_pointer, &mut depth, value);
                 }
+                NumericInstruction::LoadSrc => {
+                    // Runtime-inert: only `validate`'s `StackKind::Src`
+                    // tracking gives this meaning. The bit pattern is never
+                    // read — `LoadFieldDynamic` discards it unconditionally
+                    // and `StoreFieldDynamic` only checks (at compile time)
+                    // that a slot popped here traces back to `LoadSrc`.
+                    let value = function_builder.ins().f32const(0.0);
+                    memory_push(&mut function_builder, stack_pointer, &mut depth, value);
+                }
                 NumericInstruction::LoadLocal(local) => {
                     let value =
                         memory_load(&mut function_builder, locals_pointer, usize::from(local));
@@ -881,6 +968,48 @@ pub fn compile_numeric_field_trace(
                         value_bits,
                     );
                     memory_push(&mut function_builder, stack_pointer, &mut depth, value);
+                }
+                NumericInstruction::StoreFieldDynamic(field) => {
+                    let value = memory_pop(&mut function_builder, stack_pointer, &mut depth);
+                    // Discard the receiver placeholder for the same reason
+                    // `LoadFieldDynamic` does: the real receiver is always
+                    // this region's implicit `src`, proven by `validate`'s
+                    // `StackKind` tracking, not carried through this slot.
+                    let _ = memory_pop(&mut function_builder, stack_pointer, &mut depth);
+                    let field_index = function_builder.ins().iconst(types::I32, i64::from(field));
+                    let value_bits = function_builder.ins().bitcast(
+                        types::I32,
+                        cranelift_codegen::ir::MemFlags::new(),
+                        value,
+                    );
+                    let call = function_builder.ins().call(
+                        store_field_dynamic_ref,
+                        &[context_pointer, field_index, value_bits],
+                    );
+                    let result = function_builder.inst_results(call)[0];
+                    let failed = function_builder.ins().icmp_imm(IntCC::Equal, result, 0);
+                    let declined = function_builder.create_block();
+                    let stored = function_builder.create_block();
+                    function_builder
+                        .ins()
+                        .brif(failed, declined, &[], stored, &[]);
+
+                    function_builder.switch_to_block(declined);
+                    function_builder.seal_block(declined);
+                    // Stash the value that would have been stored in stack
+                    // slot 0 — the VM side re-materializes it from
+                    // `state.stack[0]` onto `frame.stack` before letting the
+                    // interpreter redo this exact `StoreField`
+                    // (`try_run_region_numeric_jit`). Safe to clobber slot 0
+                    // unconditionally: the whole native operand stack is
+                    // abandoned the moment this trace side-exits, exactly
+                    // like `Return`'s use of the same slot below.
+                    memory_store(&mut function_builder, stack_pointer, 0, value);
+                    let side_exit = pack_side_exit(&mut function_builder, pc as u32, steps);
+                    function_builder.ins().return_(&[side_exit]);
+
+                    function_builder.switch_to_block(stored);
+                    function_builder.seal_block(stored);
                 }
                 NumericInstruction::RaiseAction(action) => {
                     let actions = function_builder.ins().load(
@@ -1122,6 +1251,36 @@ struct Validation {
     max_depth: usize,
 }
 
+/// Whether a tracked operand-stack slot holds a number or the region's
+/// implicit `src` marker (produced only by a translated `LoadSrc`; valid only
+/// as `LoadFieldDynamic`/`StoreFieldDynamic`'s receiver operand). This is
+/// deliberately the smallest possible slice of the design doc's
+/// `Unboxed | Rooted slot` operand model — the one non-numeric value
+/// field-touching procedures reliably need — tracked precisely enough that a
+/// non-`src` receiver is rejected by this type check, not silently treated
+/// as `src`. See the "Milestone 3" module doc below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StackKind {
+    Number,
+    Src,
+}
+
+fn pop_number(pc: usize, stack: &mut SmallVec<[StackKind; 8]>) -> Result<(), CompileError> {
+    match stack.pop() {
+        Some(StackKind::Number) => Ok(()),
+        Some(StackKind::Src) => Err(CompileError::InvalidOperandKind(pc)),
+        None => Err(CompileError::StackUnderflow),
+    }
+}
+
+fn pop_src(pc: usize, stack: &mut SmallVec<[StackKind; 8]>) -> Result<(), CompileError> {
+    match stack.pop() {
+        Some(StackKind::Src) => Ok(()),
+        Some(StackKind::Number) => Err(CompileError::InvalidOperandKind(pc)),
+        None => Err(CompileError::StackUnderflow),
+    }
+}
+
 fn validate(
     instructions: &[NumericInstruction],
     local_count: usize,
@@ -1132,43 +1291,40 @@ fn validate(
         return Err(CompileError::InvalidResultStack(0));
     }
     let mut depths = vec![None; instructions.len()];
+    let mut kinds: Vec<Option<SmallVec<[StackKind; 8]>>> = vec![None; instructions.len()];
     depths[0] = Some(0);
+    kinds[0] = Some(SmallVec::new());
     let mut work = vec![0usize];
     let mut max_depth = 0;
     while let Some(pc) = work.pop() {
-        let mut depth = depths[pc].expect("queued reachable instruction");
+        let mut stack = kinds[pc].clone().expect("queued reachable instruction");
         let instruction = instructions[pc];
         match instruction {
-            NumericInstruction::Constant(_) => depth += 1,
+            NumericInstruction::Constant(_) => stack.push(StackKind::Number),
+            NumericInstruction::LoadSrc => stack.push(StackKind::Src),
             NumericInstruction::LoadLocal(local) => {
                 if usize::from(local) >= local_count {
                     return Err(CompileError::InvalidLocal(local));
                 }
-                depth += 1;
+                stack.push(StackKind::Number);
             }
             NumericInstruction::StoreLocal(local) => {
                 if usize::from(local) >= local_count {
                     return Err(CompileError::InvalidLocal(local));
                 }
-                if depth < 1 {
-                    return Err(CompileError::StackUnderflow);
-                }
-                depth -= 1;
+                pop_number(pc, &mut stack)?;
             }
             NumericInstruction::LoadField(field) => {
                 if usize::from(field) >= field_count {
                     return Err(CompileError::InvalidField(field));
                 }
-                depth += 1;
+                stack.push(StackKind::Number);
             }
             NumericInstruction::StoreField(field) => {
                 if usize::from(field) >= field_count {
                     return Err(CompileError::InvalidField(field));
                 }
-                if depth < 1 {
-                    return Err(CompileError::StackUnderflow);
-                }
-                depth -= 1;
+                pop_number(pc, &mut stack)?;
             }
             NumericInstruction::RaiseAction(action) => {
                 if action >= 64 {
@@ -1176,29 +1332,40 @@ fn validate(
                 }
             }
             NumericInstruction::Duplicate => {
-                if depth < 1 {
-                    return Err(CompileError::StackUnderflow);
-                }
-                depth += 1;
+                let top = *stack.last().ok_or(CompileError::StackUnderflow)?;
+                stack.push(top);
             }
             NumericInstruction::Pop => {
-                if depth < 1 {
-                    return Err(CompileError::StackUnderflow);
-                }
-                depth -= 1;
-            }
-            NumericInstruction::Negate | NumericInstruction::Not => {
-                if depth < 1 {
+                if stack.pop().is_none() {
                     return Err(CompileError::StackUnderflow);
                 }
             }
+            NumericInstruction::Negate | NumericInstruction::Not => match stack.last() {
+                Some(StackKind::Number) => {}
+                Some(StackKind::Src) => return Err(CompileError::InvalidOperandKind(pc)),
+                None => return Err(CompileError::StackUnderflow),
+            },
             NumericInstruction::LoadFieldDynamic(field) => {
                 if usize::from(field) >= dynamic_field_count {
                     return Err(CompileError::InvalidField(field));
                 }
-                if depth < 1 {
+                // The popped placeholder is discarded unconditionally by
+                // codegen (the real receiver travels through the callback
+                // context, not this stack), so unlike `StoreFieldDynamic`
+                // below, its kind is never checked here — the VM-side
+                // translator's adjacency rule is the whole soundness
+                // argument for reads (see `numeric_trace_instructions`).
+                if stack.pop().is_none() {
                     return Err(CompileError::StackUnderflow);
                 }
+                stack.push(StackKind::Number);
+            }
+            NumericInstruction::StoreFieldDynamic(field) => {
+                if usize::from(field) >= dynamic_field_count {
+                    return Err(CompileError::InvalidField(field));
+                }
+                pop_number(pc, &mut stack)?;
+                pop_src(pc, &mut stack)?;
             }
             NumericInstruction::Add
             | NumericInstruction::Subtract
@@ -1212,38 +1379,38 @@ fn validate(
             | NumericInstruction::GreaterThanOrEqual
             | NumericInstruction::And
             | NumericInstruction::Or => {
-                if depth < 2 {
-                    return Err(CompileError::StackUnderflow);
-                }
-                depth -= 1;
+                pop_number(pc, &mut stack)?;
+                pop_number(pc, &mut stack)?;
+                stack.push(StackKind::Number);
             }
             NumericInstruction::Jump(target) => {
-                add_edge(target, depth, &mut depths, &mut work)?;
-                max_depth = max_depth.max(depth);
+                add_edge(target, &stack, &mut depths, &mut kinds, &mut work)?;
+                max_depth = max_depth.max(stack.len());
                 continue;
             }
             NumericInstruction::JumpIfFalse(target) => {
-                if depth < 1 {
-                    return Err(CompileError::StackUnderflow);
-                }
-                depth -= 1;
-                add_edge(target, depth, &mut depths, &mut work)?;
+                pop_number(pc, &mut stack)?;
+                add_edge(target, &stack, &mut depths, &mut kinds, &mut work)?;
             }
             NumericInstruction::Return => {
-                if depth != 1 {
-                    return Err(CompileError::InvalidResultStack(depth));
+                if stack.len() != 1 {
+                    return Err(CompileError::InvalidResultStack(stack.len()));
                 }
-                max_depth = max_depth.max(depth);
+                pop_number(pc, &mut stack)?;
+                max_depth = max_depth.max(1);
                 continue;
             }
         }
-        max_depth = max_depth.max(depth);
+        max_depth = max_depth.max(stack.len());
         if pc + 1 == instructions.len() {
-            if depth != 1 {
-                return Err(CompileError::InvalidResultStack(depth));
+            if stack.len() != 1 {
+                return Err(CompileError::InvalidResultStack(stack.len()));
+            }
+            if stack[0] != StackKind::Number {
+                return Err(CompileError::InvalidOperandKind(pc));
             }
         } else {
-            add_edge((pc + 1) as u32, depth, &mut depths, &mut work)?;
+            add_edge((pc + 1) as u32, &stack, &mut depths, &mut kinds, &mut work)?;
         }
     }
     Ok(Validation { depths, max_depth })
@@ -1251,17 +1418,20 @@ fn validate(
 
 fn add_edge(
     target: u32,
-    depth: usize,
+    stack: &SmallVec<[StackKind; 8]>,
     depths: &mut [Option<usize>],
+    kinds: &mut [Option<SmallVec<[StackKind; 8]>>],
     work: &mut Vec<usize>,
 ) -> Result<(), CompileError> {
     let target_usize = usize::try_from(target).map_err(|_| CompileError::InvalidTarget(target))?;
-    let Some(slot) = depths.get_mut(target_usize) else {
+    let Some(depth_slot) = depths.get_mut(target_usize) else {
         return Err(CompileError::InvalidTarget(target));
     };
-    match *slot {
+    let depth = stack.len();
+    match *depth_slot {
         None => {
-            *slot = Some(depth);
+            *depth_slot = Some(depth);
+            kinds[target_usize] = Some(stack.clone());
             work.push(target_usize);
         }
         Some(first) if first != depth => {
@@ -1271,7 +1441,14 @@ fn add_edge(
                 second: depth,
             });
         }
-        Some(_) => {}
+        Some(_) => {
+            if kinds[target_usize]
+                .as_ref()
+                .is_some_and(|existing| existing != stack)
+            {
+                return Err(CompileError::InconsistentOperandKind(target_usize));
+            }
+        }
     }
     Ok(())
 }
@@ -1390,10 +1567,15 @@ mod tests {
         .expect("dynamic field trace compiles");
         let mut state = trace.initial_state(&[]).unwrap();
         let outcome = trace
-            .run_budgeted(&mut state, 10, &mut |index| {
-                assert_eq!(index, 0, "only field-table index 0 was declared");
-                Some(42.0)
-            })
+            .run_budgeted(
+                &mut state,
+                10,
+                &mut |index| {
+                    assert_eq!(index, 0, "only field-table index 0 was declared");
+                    Some(42.0)
+                },
+                &mut |_, _| false,
+            )
             .unwrap();
         assert_eq!(
             outcome,
@@ -1418,7 +1600,9 @@ mod tests {
         )
         .expect("dynamic field trace compiles");
         let mut state = trace.initial_state(&[]).unwrap();
-        let outcome = trace.run_budgeted(&mut state, 10, &mut |_| None).unwrap();
+        let outcome = trace
+            .run_budgeted(&mut state, 10, &mut |_| None, &mut |_, _| false)
+            .unwrap();
         assert_eq!(
             outcome,
             NumericRunOutcome::SideExit {
@@ -1452,6 +1636,125 @@ mod tests {
     }
 
     #[test]
+    fn store_field_dynamic_writes_a_guarded_field_via_callback() {
+        let trace = compile_numeric_field_trace(
+            &[
+                NumericInstruction::LoadSrc,
+                NumericInstruction::LoadLocal(0),
+                NumericInstruction::StoreFieldDynamic(0),
+                NumericInstruction::Constant(1.0),
+                NumericInstruction::Return,
+            ],
+            1,
+            0,
+            1,
+        )
+        .expect("dynamic field store trace compiles");
+        let mut state = trace.initial_state(&[9.0]).unwrap();
+        let mut received = None;
+        let outcome = trace
+            .run_budgeted(&mut state, 10, &mut |_| None, &mut |index, value| {
+                received = Some((index, value));
+                true
+            })
+            .unwrap();
+        assert_eq!(received, Some((0, 9.0)));
+        assert_eq!(
+            outcome,
+            NumericRunOutcome::Returned {
+                value: 1.0,
+                steps: 5
+            }
+        );
+    }
+
+    #[test]
+    fn store_field_dynamic_side_exits_and_stashes_the_declined_value() {
+        let trace = compile_numeric_field_trace(
+            &[
+                NumericInstruction::LoadSrc,
+                NumericInstruction::LoadLocal(0),
+                NumericInstruction::StoreFieldDynamic(0),
+                NumericInstruction::Constant(1.0),
+                NumericInstruction::Return,
+            ],
+            1,
+            0,
+            1,
+        )
+        .expect("dynamic field store trace compiles");
+        let mut state = trace.initial_state(&[9.0]).unwrap();
+        let outcome = trace
+            .run_budgeted(&mut state, 10, &mut |_| None, &mut |_, _| false)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            NumericRunOutcome::SideExit {
+                instruction: 2,
+                steps: 2,
+            }
+        );
+        assert_eq!(
+            state.stack[0], 9.0,
+            "the value that would have been written must be recoverable from stack slot 0"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_src_flowing_into_arithmetic() {
+        assert!(matches!(
+            compile_numeric_trace(
+                &[
+                    NumericInstruction::LoadSrc,
+                    NumericInstruction::Constant(1.0),
+                    NumericInstruction::Add,
+                    NumericInstruction::Return,
+                ],
+                0,
+            ),
+            Err(CompileError::InvalidOperandKind(_))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_storing_src_into_a_local() {
+        assert!(matches!(
+            compile_numeric_trace(
+                &[
+                    NumericInstruction::LoadSrc,
+                    NumericInstruction::StoreLocal(0),
+                    NumericInstruction::Constant(0.0),
+                    NumericInstruction::Return,
+                ],
+                1,
+            ),
+            Err(CompileError::InvalidOperandKind(_))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_store_field_dynamic_with_swapped_operand_kinds() {
+        // Receiver and value in the wrong stack positions (a translator bug,
+        // not something the real translator ever emits) must still be caught
+        // by the type checker, not silently miscompiled.
+        assert!(matches!(
+            compile_numeric_field_trace(
+                &[
+                    NumericInstruction::Constant(5.0),
+                    NumericInstruction::LoadSrc,
+                    NumericInstruction::StoreFieldDynamic(0),
+                    NumericInstruction::Constant(0.0),
+                    NumericInstruction::Return,
+                ],
+                0,
+                0,
+                1,
+            ),
+            Err(CompileError::InvalidOperandKind(_))
+        ));
+    }
+
+    #[test]
     fn rejects_unsafe_trace_shapes_for_interpreter_fallback() {
         assert!(matches!(
             compile_numeric_trace(&[NumericInstruction::Add], 0),
@@ -1477,7 +1780,10 @@ mod tests {
         assert!(state.stack.spilled());
         let redzone = trace.max_stack_depth.max(1);
         state.stack[redzone] = 0.0;
-        assert_eq!(trace.run_budgeted(&mut state, 2, &mut |_| None), None);
+        assert_eq!(
+            trace.run_budgeted(&mut state, 2, &mut |_| None, &mut |_, _| false),
+            None
+        );
     }
 
     #[test]
@@ -1512,7 +1818,7 @@ mod tests {
 
         let mut state = trace.initial_state(&[5.0, 123.0]).unwrap();
         assert_eq!(
-            trace.run_budgeted(&mut state, 0, &mut |_| None),
+            trace.run_budgeted(&mut state, 0, &mut |_| None, &mut |_, _| false),
             Some(NumericRunOutcome::BudgetExhausted {
                 instruction: 0,
                 steps: 0
@@ -1520,7 +1826,10 @@ mod tests {
         );
         let mut total_steps = 0;
         loop {
-            match trace.run_budgeted(&mut state, 10, &mut |_| None).unwrap() {
+            match trace
+                .run_budgeted(&mut state, 10, &mut |_| None, &mut |_, _| false)
+                .unwrap()
+            {
                 NumericRunOutcome::BudgetExhausted { steps, .. } => {
                     assert_eq!(steps, 10);
                     total_steps += steps;
@@ -1576,7 +1885,9 @@ mod tests {
         );
         loop {
             if matches!(
-                trace.run_budgeted(&mut state, 7, &mut |_| None).unwrap(),
+                trace
+                    .run_budgeted(&mut state, 7, &mut |_| None, &mut |_, _| false)
+                    .unwrap(),
                 NumericRunOutcome::Returned { value: 17.0, .. }
             ) {
                 break;
@@ -1627,7 +1938,11 @@ mod tests {
         let mut native = trace.initial_state_with_fields(&[], &[0.0]).unwrap();
         let started = Instant::now();
         for _ in 0..CALLS {
-            black_box(trace.run_budgeted(&mut native, 6, &mut |_| None).unwrap());
+            black_box(
+                trace
+                    .run_budgeted(&mut native, 6, &mut |_| None, &mut |_, _| false)
+                    .unwrap(),
+            );
         }
         let native_elapsed = started.elapsed();
         let mut rust_field = 0.0_f32;
