@@ -231,7 +231,39 @@ number. Reject anything that regresses parity or the short gates.
    need the fuller mixed-kind rooted-slot operand model the original sketch
    above assumed, and remain deferred, likely alongside real rooted-slot
    support once calls/allocations (milestone 5) need it anyway.
-4. **Globals, list index/length, type predicates** through the ABI.
+4. **Guarded globals. Done** (globals only — list index/length and type
+   predicates narrowed out, see below). `LoadGlobalDynamic`/`StoreGlobalDynamic`
+   mirror the field-access callbacks but are structurally simpler: a global has
+   no receiver (`LoadGlobal`/`StoreGlobal` are pop0/pop1, never popping a
+   `src`), so there's no receiver-kind proof to build — just a dense
+   per-region `FieldName` table for globals alongside the existing one for
+   fields. The callback ABI was refactored ahead of this milestone: two more
+   closures would have pushed `run_budgeted` to six parameters on top of the
+   `RefCell` wrapping already needed for two closures to share
+   `&mut ExecutionState`. Replaced both with a single `RegionCallbacks` trait
+   (`load_field`/`store_field`/`load_global`/`store_global` as `&mut self`
+   methods on one object crossing the FFI boundary as one fat-pointer
+   context) — one implementor can answer every callback from the same
+   `&mut ExecutionState` because native code only ever calls one method at a
+   time, and the borrow checker accepts sequential `&mut self` calls without
+   needing `RefCell` to convince it. All pre-existing field-access tests
+   passed unchanged under the refactor before globals were added on top,
+   confirming it was behavior-preserving on its own.
+   List index/length and type predicates were dropped from this milestone's
+   scope: unlike a global (no receiver at all) or `src` (an implicit,
+   never-materialized receiver already known to the callback context), a list
+   receiver is an arbitrary `Value` that has to actually flow through the
+   region — as a local, a call result, or a nested expression — which needs
+   the mixed-kind rooted-slot operand model the field-write milestone already
+   flagged as out of scope for the same reason (see the M3 writeup above).
+   That's the same infrastructure milestone 5 needs for calls and
+   allocations, so list ops and type predicates are deferred to land
+   alongside it rather than being built twice. Parity: `exec_steps` delta
+   +0.0022% against the M3b baseline (998,258,700 → 998,280,937), both
+   `rc=0`, `field_quickening hit_pct=87.1` identical in both runs — the
+   tightest parity result of any milestone so far. `jit_guarded` telemetry
+   showed the expected signal: `numeric_compiled` up 4504→4640 (+3.0%, more
+   procedures touching globals now qualify for the region tier).
 5. **Calls and allocations as side-exits**, so a region spanning
    `atom/Initialize`'s straight-line body compiles and only stops at each
    `Initialize()` sub-call. This is where the InitAtom throughput (6.5 %) and
