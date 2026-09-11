@@ -1167,6 +1167,12 @@ pub(crate) fn dispatch_instruction(
                 ))));
         }
         Instruction::TypeInstances(target) => {
+            crate::value_ops::TYPE_INSTANCES_SCANS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::value_ops::TYPE_INSTANCES_SCAN_DATUMS.fetch_add(
+                state.heap.live_datum_count() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let matches = state
                 .heap
                 .datums()

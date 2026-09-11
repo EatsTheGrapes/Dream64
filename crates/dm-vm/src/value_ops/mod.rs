@@ -5,6 +5,7 @@
 
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::ExecutionState;
@@ -2123,6 +2124,45 @@ pub(crate) fn locate_in_container(
     Ok(Value::Null)
 }
 
+/// Diagnostic: whole-heap scans performed by unqualified `locate()`.
+/// `LOCATE_TYPE_SCAN_DATUMS` / `LOCATE_TAG_SCAN_DATUMS` accumulate the datums
+/// visited before a match (or the whole heap on a miss), which is what reveals
+/// an O(n) `locate(/type)` pattern that grows with the heap during atom init.
+pub(crate) static LOCATE_TYPE_SCANS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LOCATE_TYPE_SCAN_DATUMS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LOCATE_TAG_SCANS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LOCATE_TAG_SCAN_DATUMS: AtomicU64 = AtomicU64::new(0);
+/// Whole-heap scans by `Instruction::TypeInstances` (`X in world` filtered by
+/// type). `_DATUMS` accumulates `live_datum_count()` sampled at each scan.
+pub(crate) static TYPE_INSTANCES_SCANS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TYPE_INSTANCES_SCAN_DATUMS: AtomicU64 = AtomicU64::new(0);
+
+/// `(type_scans, type_scan_datums, tag_scans, tag_scan_datums,
+/// type_instances_scans, type_instances_scan_datums)` for whole-heap `locate()`
+/// / `TypeInstances` over the run.
+#[must_use]
+pub fn locate_scan_telemetry() -> (u64, u64, u64, u64, u64, u64) {
+    (
+        LOCATE_TYPE_SCANS.load(Ordering::Relaxed),
+        LOCATE_TYPE_SCAN_DATUMS.load(Ordering::Relaxed),
+        LOCATE_TAG_SCANS.load(Ordering::Relaxed),
+        LOCATE_TAG_SCAN_DATUMS.load(Ordering::Relaxed),
+        TYPE_INSTANCES_SCANS.load(Ordering::Relaxed),
+        TYPE_INSTANCES_SCAN_DATUMS.load(Ordering::Relaxed),
+    )
+}
+
+fn locate_first_of_type(state: &ExecutionState, target: &TypePath) -> Value {
+    LOCATE_TYPE_SCANS.fetch_add(1, Ordering::Relaxed);
+    let mut visited = 0_u64;
+    let found = state.heap().datums().find(|(_, datum)| {
+        visited += 1;
+        builtins::is_subtype(state, datum.type_path(), target)
+    });
+    LOCATE_TYPE_SCAN_DATUMS.fetch_add(visited, Ordering::Relaxed);
+    found.map_or(Value::Null, |(datum, _)| Value::Datum(datum))
+}
+
 pub(crate) fn locate_single(search: &Value, state: &ExecutionState) -> Value {
     match search {
         Value::Null => Value::Null,
@@ -2140,16 +2180,8 @@ pub(crate) fn locate_single(search: &Value, state: &ExecutionState) -> Value {
                 Value::Null
             }
         }
-        Value::TypePath(target) => state
-            .heap()
-            .datums()
-            .find(|(_, datum)| builtins::is_subtype(state, datum.type_path(), target))
-            .map_or(Value::Null, |(datum, _)| Value::Datum(datum)),
-        Value::ModifiedTypePath(target) => state
-            .heap()
-            .datums()
-            .find(|(_, datum)| builtins::is_subtype(state, datum.type_path(), target.base()))
-            .map_or(Value::Null, |(datum, _)| Value::Datum(datum)),
+        Value::TypePath(target) => locate_first_of_type(state, target),
+        Value::ModifiedTypePath(target) => locate_first_of_type(state, target.base()),
         Value::Text(text) => {
             if let Some(reference) = parse_heap_reference(text) {
                 return match reference {
@@ -2164,15 +2196,16 @@ pub(crate) fn locate_single(search: &Value, state: &ExecutionState) -> Value {
                 };
             }
             let tag = FieldName::parse("tag").expect("built-in datum tag field is valid");
-            state
-                .heap()
-                .datums()
-                .find(|(_, datum)| {
-                    datum
-                        .field(&tag)
-                        .is_ok_and(|candidate| candidate.semantic_eq(search))
-                })
-                .map_or(Value::Null, |(datum, _)| Value::Datum(datum))
+            LOCATE_TAG_SCANS.fetch_add(1, Ordering::Relaxed);
+            let mut visited = 0_u64;
+            let found = state.heap().datums().find(|(_, datum)| {
+                visited += 1;
+                datum
+                    .field(&tag)
+                    .is_ok_and(|candidate| candidate.semantic_eq(search))
+            });
+            LOCATE_TAG_SCAN_DATUMS.fetch_add(visited, Ordering::Relaxed);
+            found.map_or(Value::Null, |(datum, _)| Value::Datum(datum))
         }
         Value::Number(_) | Value::File(_) => Value::Null,
     }
