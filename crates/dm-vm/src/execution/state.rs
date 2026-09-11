@@ -696,6 +696,18 @@ impl ExecutionState {
         self.program_sidecars.widest_field_read_site()
     }
 
+    /// Whether a Milestone-1 region has been compiled and installed at
+    /// `procedure`'s entry PC for the given module identity.
+    #[cfg(test)]
+    pub(crate) fn region_installed_at_entry(
+        &self,
+        module_identity: u64,
+        procedure: ProcedureId,
+    ) -> bool {
+        self.program_sidecars
+            .region_installed(module_identity, procedure)
+    }
+
     /// Returns the earliest tick at which pending scheduler work is due.
     #[must_use]
     pub fn next_scheduled_tick(&self) -> Option<u64> {
