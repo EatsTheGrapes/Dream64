@@ -21,9 +21,9 @@
 
 use std::collections::HashMap;
 
+use crate::CompiledRegion;
 use crate::bytecode::{ProcedureId, Program};
 use crate::execution::state::FieldSlotCache;
-use dm_jit::CompiledNumericTrace;
 
 /// The specialization state for one bytecode instruction. Every non-`Cold`
 /// variant boxes its payload so an all-`Cold` procedure array stays at one
@@ -41,12 +41,12 @@ pub(crate) enum PcCache {
     /// toward a region-compile attempt. See
     /// `docs/performance/baseline-region-jit.md`.
     RegionCounting(u16),
-    /// A compiled region installed at this procedure's entry (PC 0).
-    /// Milestone 2 (numeric core): every region is currently a whole-procedure
-    /// binary32 trace — see the module doc comment in `dm-jit`'s
-    /// `baseline region JIT` section for why `CompiledNumericTrace` fills the
-    /// region role directly rather than through a separate wrapper type.
-    Region(Box<CompiledNumericTrace>),
+    /// A compiled region installed at this procedure's entry (PC 0). Since
+    /// Milestone 3, `CompiledRegion` bundles the whole-procedure binary32
+    /// trace with the dense `FieldName` table its `LoadFieldDynamic`
+    /// instructions index into (`dm-jit` never sees a `FieldName`, only
+    /// indices) — see `compile_region_trace`.
+    Region(Box<CompiledRegion>),
     /// A region-compile attempt at this site failed or the shape was
     /// unsupported; never retried.
     RegionRejected,
@@ -154,7 +154,7 @@ impl ProcedureSidecar {
     /// drive it exactly as the pre-region whole-procedure numeric JIT drove
     /// its own cached trace: build/resume a `NumericExecutionState` from the
     /// caller's frame and call `run_budgeted`.
-    pub(crate) fn region_at_entry(&self) -> Option<&CompiledNumericTrace> {
+    pub(crate) fn region_at_entry(&self) -> Option<&CompiledRegion> {
         match self.pcs.first()? {
             PcCache::Region(region) => Some(region),
             _ => None,
