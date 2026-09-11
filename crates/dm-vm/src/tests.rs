@@ -8925,14 +8925,14 @@ fn field_slot_cache_bounds_megamorphic_sites() {
 }
 
 #[test]
-fn region_jit_milestone1_installs_and_never_changes_computed_results() {
-    // Milestone 1's compiled region supports no bytecode and always deopts
-    // immediately at its own entry PC — see
-    // docs/performance/baseline-region-jit.md. This proves that on a hot
+fn region_jit_numeric_core_installs_and_computes_correctly() {
+    // Milestone 2's compiled region is a real binary32 numeric-core trace —
+    // see docs/performance/baseline-region-jit.md. This proves that on a hot
     // procedure (repeated calls at PC 0), a region gets compiled and
     // installed, AND that every single call before, during, and after that
-    // transition returns the exact interpreted result: the region's presence
-    // must never be observable.
+    // transition returns the correct result, whether served by the
+    // interpreter (pre-install) or the native region (post-install): which
+    // one ran must never be observable from the result alone.
     let source = parse(concat!("/proc/double(n)\n", "\treturn n * 2\n",)).unwrap();
     let module = compile_module(&source.definitions).unwrap();
     let entry = module.procedure_id("/proc/double").unwrap();
@@ -8969,7 +8969,7 @@ fn region_jit_milestone1_installs_and_never_changes_computed_results() {
 }
 
 #[test]
-fn region_jit_milestone1_is_independent_per_procedure() {
+fn region_jit_numeric_core_is_independent_per_procedure() {
     // Two hot procedures in the same module each warm up and compile their
     // own region independently; one installing must not affect the other's
     // correctness or its own (separate) warm-up state.
@@ -9011,6 +9011,101 @@ fn region_jit_milestone1_is_independent_per_procedure() {
         Ok(Value::number(42.0)),
         "double still computes correctly after triple's region installed"
     );
+}
+
+#[test]
+fn region_jit_numeric_core_supports_not() {
+    // `Not` (DM's `!` prefix) is new to the region tier's numeric core — the
+    // pre-region whole-procedure JIT had no lowering for it at all (see
+    // docs/performance/baseline-region-jit.md's Milestone 2 scope). `return
+    // !n` forces the negated value to be materialized (unlike `if(!n)`,
+    // whose condition a peephole pass could in principle invert without ever
+    // emitting `Not`), so this pins the real Cranelift lowering end to end.
+    let source = parse(concat!("/proc/logical_not(n)\n", "\treturn !n\n",)).unwrap();
+    let module = compile_module(&source.definitions).unwrap();
+    let entry = module.procedure_id("/proc/logical_not").unwrap();
+    let mut state = ExecutionState::new();
+
+    for round in 0..10 {
+        for n in [0.0, 1.0, -1.0, 2.5, -3.5, 100.0] {
+            assert_eq!(
+                execute_module_in_state(&module, entry, &[Value::number(n)], &mut state),
+                Ok(Value::number(f32::from(n == 0.0))),
+                "round {round} n={n}",
+            );
+        }
+    }
+    assert!(
+        state.region_installed_at_entry(module.identity.0, entry),
+        "a Not-using procedure entered this many times must compile natively"
+    );
+    for n in [0.0, 1.0, -1.0, 2.5, -3.5, 100.0] {
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::number(n)], &mut state),
+            Ok(Value::number(f32::from(n == 0.0))),
+            "post-installation n={n}",
+        );
+    }
+}
+
+#[test]
+fn region_jit_numeric_core_supports_and_or_via_switch() {
+    // DM's `&&`/`||` always short-circuit to Jump/JumpIfFalse (compile_expr.rs
+    // `emit_expression` for `Expression::Binary`); the eager
+    // `Instruction::And`/`Or` this region tier now lowers are only ever
+    // emitted by `switch`'s range (`to`) and multi-value alternatives (see
+    // compile_stmt.rs). This fixture's shape matches the existing
+    // `switch`/`if(a, b)`/`if(c to d)`/`else` coverage elsewhere in this file.
+    let source = parse(concat!(
+        "/proc/classify(n)\n",
+        "\tswitch(n)\n",
+        "\t\tif(1, 3)\n",
+        "\t\t\treturn 10\n",
+        "\t\tif(4 to 6)\n",
+        "\t\t\treturn 20\n",
+        "\t\telse\n",
+        "\t\t\treturn 30\n",
+    ))
+    .unwrap();
+    let module = compile_module(&source.definitions).unwrap();
+    let entry = module.procedure_id("/proc/classify").unwrap();
+    let mut state = ExecutionState::new();
+
+    let expected = |n: f32| -> f32 {
+        let n = n as i32;
+        if n == 1 || n == 3 {
+            10.0
+        } else if (4..=6).contains(&n) {
+            20.0
+        } else {
+            30.0
+        }
+    };
+
+    assert!(!state.region_installed_at_entry(module.identity.0, entry));
+
+    // Cycle through every branch each round so a wrong native lowering of
+    // And/Or would be caught immediately, before and after installation.
+    for round in 0..10 {
+        for n in [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, -2.0] {
+            assert_eq!(
+                execute_module_in_state(&module, entry, &[Value::number(n)], &mut state),
+                Ok(Value::number(expected(n))),
+                "round {round} n={n}",
+            );
+        }
+    }
+    assert!(
+        state.region_installed_at_entry(module.identity.0, entry),
+        "an And/Or-using procedure entered this many times must compile natively"
+    );
+    for n in [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, -2.0] {
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::number(n)], &mut state),
+            Ok(Value::number(expected(n))),
+            "post-installation n={n}",
+        );
+    }
 }
 
 #[test]
@@ -20683,43 +20778,6 @@ fn cached_jit_configuration_microbenchmark() {
 }
 
 #[test]
-#[ignore = "release-only negative numeric-JIT entry microbenchmark"]
-fn numeric_jit_negative_prefix_gate_release_microbenchmark() {
-    const ITERATIONS: usize = 10_000_000;
-    // Representative of mapping procedures: a cheap argument guard uses
-    // DM truthiness (`Not`), which the generic numeric tier cannot lower.
-    let program = manual_program(
-        vec![
-            Instruction::LoadLocal(1),
-            Instruction::Not,
-            Instruction::JumpIfFalse(4),
-            Instruction::Return,
-            Instruction::LoadField(field("members")),
-            Instruction::Return,
-        ],
-        2,
-    );
-    let key = (7_u64, crate::ProcedureId::from_index(42).unwrap());
-    let negative = HashMap::from([(key, None::<u8>)]);
-
-    let started = Instant::now();
-    for _ in 0..ITERATIONS {
-        std::hint::black_box(negative.get(&std::hint::black_box(key)));
-    }
-    let cached_negative = started.elapsed();
-    let started = Instant::now();
-    for _ in 0..ITERATIONS {
-        std::hint::black_box(super::numeric_jit_prefix_candidate(&program));
-    }
-    let prefix_gate = started.elapsed();
-    eprintln!(
-        "numeric-jit-negative iterations={ITERATIONS} cache_ms={} prefix_ms={}",
-        cached_negative.as_millis(),
-        prefix_gate.as_millis(),
-    );
-}
-
-#[test]
 fn numeric_jit_lowers_isolated_locals_and_cfg_conservatively() {
     let syntax = parse(
             "/proc/calculate(a, b)\n\tvar/result = a + b\n\tif(result > 10)\n\t\tresult = result * 2\n\treturn result",
@@ -20766,14 +20824,19 @@ fn numeric_jit_loop_resumes_at_budget_safepoints() {
     assert!(crate::numeric_trace_instructions(&module.procedures[entry.index()]).is_some());
 
     // Force an equivalent copy through the interpreter by appending an
-    // unreachable unsupported opcode after Return. This avoids changing
+    // unreachable disqualifying opcode after Return. This avoids changing
     // the process-wide JIT environment variable in a parallel test suite.
+    // `AddressLocal` specifically: `numeric_trace_instructions` rejects it
+    // unconditionally (its very first, non-reachability-gated check) rather
+    // than merely declining to translate it, so — unlike most unsupported
+    // opcodes — placing it after the procedure's own `Return` does not let
+    // reachability analysis tolerate it away as dead code.
     let syntax = parse(source).unwrap();
     let mut reference = compile_module(&syntax.definitions).unwrap();
     let reference_entry = reference.procedure_id("/proc/count").unwrap();
     Arc::make_mut(&mut reference.procedures[reference_entry.index()])
         .instructions
-        .push(Instruction::PushNull);
+        .push(Instruction::AddressLocal(0));
     assert!(
         crate::numeric_trace_instructions(&reference.procedures[reference_entry.index()]).is_none()
     );
@@ -20782,13 +20845,30 @@ fn numeric_jit_loop_resumes_at_budget_safepoints() {
         Ok(Value::number(25.0))
     );
 
+    let mut state = ExecutionState::new();
+    // The region tier only advances its warm-up counter on a fresh procedure
+    // entry (`instruction_index == 0`), not on each budget-exhausted resume
+    // within one still-running call — a single very-long call never grows
+    // it. Warm the region up first, past the sidecar's entry threshold,
+    // through small calls that each run to completion in one shot; only then
+    // does the budget=5 slow-motion call below have a region to resume.
+    for _ in 0..20 {
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::number(0.0)], &mut state),
+            Ok(Value::number(0.0)),
+        );
+    }
+    assert!(
+        state.region_installed_at_entry(module.identity.0, entry),
+        "20 complete calls must be enough to cross the warm-up threshold"
+    );
+
     let mut frames = vec![crate::make_frame(
         entry,
         &module.procedures[entry.index()],
         &[Value::number(25.0)],
         &ExecutionContext::default(),
     )];
-    let mut state = ExecutionState::new();
     let limits = ExecutionLimits {
         max_call_depth: 8,
         max_steps: 5,

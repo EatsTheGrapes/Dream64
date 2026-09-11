@@ -493,8 +493,6 @@ pub fn guarded_jit_telemetry() -> (u64, u64, u64, u64, u64, u64) {
 }
 
 thread_local! {
-    static NUMERIC_JIT_CACHE: RefCell<HashMap<(u64, ProcedureId), Option<CompiledNumericTrace>>> =
-        RefCell::new(HashMap::new());
     static LUMCOUNT_JIT_CACHE: RefCell<HashMap<(u64, ProcedureId), Option<LumcountTrace>>> =
         RefCell::new(HashMap::new());
     static ROOTED_LIST_JIT_CACHE: RefCell<HashMap<(u64, ProcedureId), Option<RootedListTrace>>> =
@@ -1124,15 +1122,14 @@ pub(crate) fn try_run_guarded_jit(
     remaining_steps: u64,
     state: &mut ExecutionState,
 ) -> Option<(NumericRunOutcome, bool)> {
-    // Keep the runtime kill switch authoritative for every native tier. This
-    // is also essential for trustworthy whole-server A/B diagnosis: the
-    // specialized field trace must not remain active in the "JIT disabled"
-    // process while the generic numeric tier is bypassed.
+    // Keep the runtime kill switch authoritative for every native tier.
     if jit_disabled() {
         return None;
     }
-    // Lumcount is an exact 48-instruction/four-local trace. Do not make every
-    // unrelated procedure pay a second thread-local negative-cache lookup.
+    // Lumcount is an exact 48-instruction/four-local trace. The generic
+    // numeric core (constants/locals/arithmetic/comparisons/branches) runs
+    // through the region tier instead — see `region_at_entry` in the sidecar
+    // and `try_run_region_numeric_jit` below.
     if program.instructions.len() == 48
         && program.local_count == 4
         && let Some(outcome) =
@@ -1146,42 +1143,7 @@ pub(crate) fn try_run_guarded_jit(
         GUARDED_JIT_STEPS.fetch_add(steps, Ordering::Relaxed);
         return Some((outcome, true));
     }
-    // Every generic numeric trace must lower every instruction. Most DM
-    // procedures expose a disqualifying heap/dynamic opcode immediately; a
-    // four-op necessary-condition gate avoids hashing into the thread-local
-    // negative cache on each of their millions of invocations. Returning true
-    // is deliberately conservative and leaves full validation to the compiler.
-    if !numeric_jit_prefix_candidate(program) {
-        return None;
-    }
-    try_run_numeric_jit(module, procedure, program, frame, remaining_steps)
-        .map(|outcome| (outcome, false))
-}
-
-pub(crate) fn numeric_jit_prefix_candidate(program: &Program) -> bool {
-    !program.instructions.is_empty()
-        && program.instructions.iter().take(4).all(|instruction| {
-            matches!(
-                instruction,
-                Instruction::PushNumber(_)
-                    | Instruction::LoadLocal(_)
-                    | Instruction::StoreLocal(_)
-                    | Instruction::Add
-                    | Instruction::Subtract
-                    | Instruction::Multiply
-                    | Instruction::Divide
-                    | Instruction::Negate
-                    | Instruction::Equal
-                    | Instruction::NotEqual
-                    | Instruction::Less
-                    | Instruction::LessEqual
-                    | Instruction::Greater
-                    | Instruction::GreaterEqual
-                    | Instruction::Jump(_)
-                    | Instruction::JumpIfFalse(_)
-                    | Instruction::Return
-            )
-        })
+    None
 }
 
 pub(crate) fn jit_disabled() -> bool {
@@ -1392,54 +1354,61 @@ pub(crate) fn compile_lumcount_trace(program: &Program) -> Option<LumcountTrace>
     })
 }
 
-fn try_run_numeric_jit(
-    module: &Module,
-    procedure: ProcedureId,
+/// Translates and compiles `program` for the region tier's numeric core, or
+/// declines. Called at most once per procedure — from
+/// `ProcedureSidecar::poll_region_at_entry`, once its PC-0 warm-up counter
+/// crosses the threshold — so, unlike the pre-region design, this pays a
+/// translation/compile attempt per *distinct* procedure that gets hot, not on
+/// every call.
+pub(crate) fn compile_region_trace(program: &Program) -> Option<CompiledNumericTrace> {
+    let compiled = numeric_trace_instructions(program)
+        .and_then(|instructions| compile_numeric_trace(&instructions, program.local_count).ok());
+    if compiled.is_some() {
+        GUARDED_JIT_NUMERIC_COMPILED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        GUARDED_JIT_NUMERIC_REJECTED.fetch_add(1, Ordering::Relaxed);
+    }
+    compiled
+}
+
+/// Drives a region installed by `compile_region_trace` for one call, exactly
+/// as the pre-region whole-procedure numeric JIT drove its own cached trace:
+/// guard every live local as a definite number (or a not-yet-read null),
+/// then resume or start `frame.numeric_jit_state` and run the budgeted trace.
+/// Declining here (a non-numeric-shaped local) is a per-*call* decision, not a
+/// procedure-wide one — the installed region stays available for the next
+/// call whose locals do qualify.
+pub(crate) fn try_run_region_numeric_jit(
+    trace: &CompiledNumericTrace,
     program: &Program,
     frame: &mut CallFrame,
     remaining_steps: u64,
 ) -> Option<NumericRunOutcome> {
-    let key = (module.identity.0, procedure);
-    NUMERIC_JIT_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let trace = cache.entry(key).or_insert_with(|| {
-            let compiled = numeric_trace_instructions(program).and_then(|instructions| {
-                compile_numeric_trace(&instructions, program.local_count).ok()
-            });
-            if compiled.is_some() {
-                GUARDED_JIT_NUMERIC_COMPILED.fetch_add(1, Ordering::Relaxed);
-            } else {
-                GUARDED_JIT_NUMERIC_REJECTED.fetch_add(1, Ordering::Relaxed);
+    if frame.numeric_jit_state().is_none() {
+        let mut numeric_locals = vec![0.0; program.local_count];
+        for (index, local) in frame.locals.iter().enumerate() {
+            if let Some(value) = local.as_number() {
+                numeric_locals[index] = value;
+            } else if !matches!(local, Value::Null)
+                || index < declared_argument_count(program)
+                || !local_is_definitely_initialized_before_load(program, index)
+            {
+                return None;
             }
-            compiled
-        });
-        let trace = trace.as_ref()?;
-        if frame.numeric_jit_state().is_none() {
-            let mut numeric_locals = vec![0.0; program.local_count];
-            for (index, local) in frame.locals.iter().enumerate() {
-                if let Some(value) = local.as_number() {
-                    numeric_locals[index] = value;
-                } else if !matches!(local, Value::Null)
-                    || index < declared_argument_count(program)
-                    || !local_is_definitely_initialized_before_load(program, index)
-                {
-                    return None;
-                }
-            }
-            frame.set_numeric_jit_state(trace.initial_state(&numeric_locals));
         }
-        let budget = u32::try_from(remaining_steps).unwrap_or(u32::MAX);
-        let outcome = trace.run_budgeted(frame.numeric_jit_state_mut()?, budget);
-        if let Some(outcome) = &outcome {
-            GUARDED_JIT_RUNS.fetch_add(1, Ordering::Relaxed);
-            let steps = match outcome {
-                NumericRunOutcome::Returned { steps, .. }
-                | NumericRunOutcome::BudgetExhausted { steps, .. } => u64::from(*steps),
-            };
-            GUARDED_JIT_STEPS.fetch_add(steps, Ordering::Relaxed);
-        }
-        outcome
-    })
+        frame.set_numeric_jit_state(trace.initial_state(&numeric_locals));
+    }
+    let budget = u32::try_from(remaining_steps).unwrap_or(u32::MAX);
+    let outcome = trace.run_budgeted(frame.numeric_jit_state_mut()?, budget);
+    if let Some(outcome) = &outcome {
+        GUARDED_JIT_RUNS.fetch_add(1, Ordering::Relaxed);
+        let steps = match outcome {
+            NumericRunOutcome::Returned { steps, .. }
+            | NumericRunOutcome::BudgetExhausted { steps, .. } => u64::from(*steps),
+        };
+        GUARDED_JIT_STEPS.fetch_add(steps, Ordering::Relaxed);
+    }
+    outcome
 }
 
 fn local_is_definitely_initialized_before_load(program: &Program, local: usize) -> bool {
@@ -1462,6 +1431,39 @@ fn local_is_definitely_initialized_before_load(program: &Program, local: usize) 
         })
 }
 
+/// Every instruction reachable from PC 0, by DM bytecode's own control-flow
+/// edges (`Jump`/`JumpIfFalse`/`JumpIfNull`/`LoadStaticLocalOrJump`/
+/// `JumpIfArgumentSupplied`/`Return`; every other instruction falls through).
+/// A DM procedure whose every real path already returns still gets a
+/// compiler-appended trailing `LoadResult; Return` for the implicit
+/// fall-off-the-end case — dead code, but common enough (any exhaustive
+/// `if`/`else` or `switch` produces it) that `numeric_trace_instructions`
+/// tolerates an unsupported opcode there instead of rejecting the whole
+/// procedure over code that can never execute.
+fn reachable_from_entry(instructions: &[Instruction]) -> Vec<bool> {
+    let mut reachable = vec![false; instructions.len()];
+    let mut stack = vec![0_usize];
+    while let Some(pc) = stack.pop() {
+        if reachable.get(pc).copied().unwrap_or(true) {
+            continue;
+        }
+        reachable[pc] = true;
+        match &instructions[pc] {
+            Instruction::Jump(target) => stack.push(*target),
+            Instruction::Return => {}
+            Instruction::JumpIfFalse(target)
+            | Instruction::JumpIfNull(target)
+            | Instruction::LoadStaticLocalOrJump { target, .. }
+            | Instruction::JumpIfArgumentSupplied { target, .. } => {
+                stack.push(*target);
+                stack.push(pc + 1);
+            }
+            _ => stack.push(pc + 1),
+        }
+    }
+    reachable
+}
+
 pub(crate) fn numeric_trace_instructions(program: &Program) -> Option<Vec<NumericInstruction>> {
     if program.instructions.is_empty()
         || program.instructions.iter().any(|instruction| {
@@ -1474,10 +1476,12 @@ pub(crate) fn numeric_trace_instructions(program: &Program) -> Option<Vec<Numeri
         return None;
     }
     let declared_arguments = declared_argument_count(program);
+    let reachable = reachable_from_entry(&program.instructions);
     program
         .instructions
         .iter()
-        .map(|instruction| match instruction {
+        .enumerate()
+        .map(|(pc, instruction)| match instruction {
             Instruction::PushNumber(number) => Some(NumericInstruction::Constant(number.to_f32())),
             Instruction::LoadLocal(slot) => Some(NumericInstruction::LoadLocal(*slot)),
             // Writing a declared argument is observable through the live args
@@ -1491,6 +1495,9 @@ pub(crate) fn numeric_trace_instructions(program: &Program) -> Option<Vec<Numeri
             Instruction::Multiply => Some(NumericInstruction::Multiply),
             Instruction::Divide => Some(NumericInstruction::Divide),
             Instruction::Negate => Some(NumericInstruction::Negate),
+            Instruction::Not => Some(NumericInstruction::Not),
+            Instruction::And => Some(NumericInstruction::And),
+            Instruction::Or => Some(NumericInstruction::Or),
             Instruction::Equal => Some(NumericInstruction::Equal),
             Instruction::NotEqual => Some(NumericInstruction::NotEqual),
             Instruction::Less => Some(NumericInstruction::LessThan),
@@ -1502,6 +1509,7 @@ pub(crate) fn numeric_trace_instructions(program: &Program) -> Option<Vec<Numeri
                 .ok()
                 .map(NumericInstruction::JumpIfFalse),
             Instruction::Return => Some(NumericInstruction::Return),
+            _ if !reachable[pc] => Some(NumericInstruction::Return),
             _ => None,
         })
         .collect()
