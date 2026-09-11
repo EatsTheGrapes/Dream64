@@ -192,10 +192,33 @@ number. Reject anything that regresses parity or the short gates.
    Resumption across a budget boundary reuses the pre-existing per-`CallFrame`
    `numeric_jit_state` slot exactly as the old JIT did (same safe, already
    continuation-tested mechanism — deliberately not reinvented).
-3. **Guarded field r/w.** `load_field`/`store_field` via the integer shape
-   guard + slot read, numeric fields stay unboxed. Target: `update_lumcount`
-   (~1.8 % of boot, 48 instrs, its bespoke JIT never matches Monke) and the
-   `light_source/update_corners` numeric prologue.
+3. **Guarded field reads. Done (reads only — writes are the immediate
+   follow-up, not yet started).** `LoadFieldDynamic` calls a slow-path
+   callback (`dm-jit`'s first mid-region call, not just a whole-body
+   dispatcher) that runs the existing #70-shaped lookup and hands back a
+   plain `f32` — no rooted slot needed, since scope stayed numeric-fields-only
+   (see the "Dense IDs" revision above for why there's no shape/version guard,
+   just the callback re-deriving the value live every time). Receiver is
+   always the region's implicit `src` (proven by the translator only ever
+   accepting a
+   `LoadField` immediately preceded by `LoadSrc`, never a general expression)
+   — general (non-`src`) receivers need the mixed-kind operand stack the
+   original sketch above assumed and are deferred, likely alongside real
+   rooted-slot support once calls/allocations (milestone 5) need it anyway.
+   `numeric_trace_instructions` also grew a per-region `FieldName` table.
+   A side-exit here (field declined) is a **distinct outcome from budget
+   exhaustion** (`NumericRunOutcome::SideExit`, not `BudgetExhausted`) —
+   retrying a declined field natively would decline forever, so the VM must
+   know to hand off to the interpreter rather than resume native execution;
+   getting this outcome distinction right (and rematerializing `src` onto
+   `frame.stack` before the interpreter resumes — the ONE bug this milestone's
+   testing caught, never shipped) is the real substance of this milestone.
+   Target: `update_lumcount` (~1.8 % of boot, 48 instrs, its bespoke JIT never
+   matches Monke) and the `light_source/update_corners` numeric prologue —
+   still not directly hit (both have shapes outside this milestone's narrow
+   scope), but `jit_guarded` telemetry shows real broader effect already:
+   steps served natively +19.9% in the parity boot, from other `src.field`-
+   reading procedures the translator previously rejected outright.
 4. **Globals, list index/length, type predicates** through the ABI.
 5. **Calls and allocations as side-exits**, so a region spanning
    `atom/Initialize`'s straight-line body compiles and only stops at each
