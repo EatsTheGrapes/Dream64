@@ -46,10 +46,19 @@ type/shape pass:
    operand is provably a number (constant, arithmetic result, a field guarded
    as numeric). The overwhelmingly common case in hot init math.
 2. **Rooted slot** — a `u32` index into a VM-owned `SmallVec<Value>` scratch
-   array passed to the region (the same mechanism as
-   `dm_jit::CompiledRootedBlock`: the slot array *is* a GC root set, so a
-   `Value` parked in a slot across a slow-path call stays traced). Used for
-   any non-number operand and for numbers about to cross the slow-path ABI.
+   array passed to the region. **Revised after reading the real code ahead of
+   M5:** `dm_jit::CompiledRootedBlock` is not the ready-made version of this —
+   its own scratch array (`try_run_rooted_list_jit`'s local `SmallVec<Value>`,
+   `fastpath_jit.rs`) is never added to `heap_gc.rs`'s root scan at all; its
+   safety comes from atomicity instead (nothing that can trigger a collection
+   is reachable from inside `CompiledRootedBlock::run_with`, so the window
+   just never opens). That guarantee doesn't extend to a region that side-exits
+   to run an arbitrary DM proc call, which very much can allocate/collect. A
+   real rooted-slot array for this milestone means a new side-array actually
+   wired into `heap_gc.rs`'s scan (owned by `ExecutionState` or the
+   `CallFrame`, analogous to how `locals`/`stack` are already scanned) — net
+   new work, not reuse. Used for any non-number operand and for numbers about
+   to cross the slow-path ABI, once built.
 
 Locals mirror this: a `locals_kind: [Unboxed|Slot; local_count]` plan. A local
 that is only ever a number lives in an `f64` stack slot; anything else is a
@@ -81,9 +90,32 @@ Initial ABI surface (each maps to an existing `value_ops` / interpreter helper):
 
 `field_id` / `global_id` / `type_id` / `proc_id` are dense indices resolved
 once at compile time (see "Dense IDs" below). Calls and allocations always
-side-exit in v1 — the region stops, the interpreter runs the callee/constructor
-and re-enters the region at the return PC if it is still hot. v2 can inline
-leaf calls.
+side-exit in v1 — the region stops, the interpreter runs the
+callee/constructor. **Revised after reading the real code ahead of M5:**
+automatic re-entry "at the return PC if it is still hot" is NOT v1 — it needs
+two things that don't exist yet and aren't free: (a) region lookup indexed by
+an arbitrary PC, not just PC 0 (the sidecar's per-instruction `PcCache` array
+already supports this structurally — `field_read_cache_or_install` proves
+it — so this part is a small, mechanical change when it's actually needed);
+(b) a way to cold-start `NumericExecutionState` from a live interpreter frame
+mid-procedure, which today only exists for PC 0 (fresh locals, empty stack).
+(b) is the real gap: a resume point right after a call has the call's return
+value sitting on `frame.stack`, not just fresh locals, and there's no
+reconstruction logic for that. v1 (M5, this session) is simpler and needs
+neither: a region compiles its procedure's straight-line **prefix**, up to
+the *first* call/alloc/dynamic-dispatch instruction, and permanently
+side-exits there — same mechanism every field/global decline already uses
+(rematerialize what the interpreter needs onto `frame.stack`, resume at that
+exact instruction, never return to native code for the rest of that call).
+Arguments and receivers are accepted only when `validate()`'s existing
+`Number|Src` kind-tracking (built for M3b) proves them plain numbers — a
+`Src`-kind argument (passing `src` itself into a call) is out of scope here
+for the same reason general non-`src` field receivers were: it needs the
+rooted-slot work above. A later milestone can add true resume-after-call
+(needs (a)+(b)) and leaf-call inlining (M6, doesn't need either — a callee
+that's *also* a compiled numeric region can be invoked through a callback
+exactly like `RegionCallbacks` today, no side-exit required, as long as its
+arguments and return are numeric).
 
 ## Safepoints, budget, deopt
 
@@ -256,30 +288,75 @@ number. Reject anything that regresses parity or the short gates.
    region — as a local, a call result, or a nested expression — which needs
    the mixed-kind rooted-slot operand model the field-write milestone already
    flagged as out of scope for the same reason (see the M3 writeup above).
-   That's the same infrastructure milestone 5 needs for calls and
-   allocations, so list ops and type predicates are deferred to land
-   alongside it rather than being built twice. Parity: `exec_steps` delta
+   **Correction, written alongside milestone 5's scoping below:** that
+   infrastructure turned out NOT to be milestone 5's either — milestone 5's
+   real (narrower) scope needs no rooted `Value` support at all, so list ops
+   and type predicates are deferred further, to whichever later milestone
+   actually builds true resume-after-call (see milestone 5's writeup).
+   Parity: `exec_steps` delta
    +0.0022% against the M3b baseline (998,258,700 → 998,280,937), both
    `rc=0`, `field_quickening hit_pct=87.1` identical in both runs — the
    tightest parity result of any milestone so far. `jit_guarded` telemetry
    showed the expected signal: `numeric_compiled` up 4504→4640 (+3.0%, more
    procedures touching globals now qualify for the region tier).
-5. **Calls and allocations as side-exits**, so a region spanning
-   `atom/Initialize`'s straight-line body compiles and only stops at each
-   `Initialize()` sub-call. This is where the InitAtom throughput (6.5 %) and
-   `update_corners` (10 %) start to move.
-6. **Leaf-call inlining** for already-compiled numeric callees.
+5. **Calls and allocations as a prefix-ending side-exit.** Narrowed after
+   reading the real call/alloc/GC code (see the "Operand model" and slow-path
+   ABI corrections above) — the original "stops at *each* sub-call and
+   re-enters after" vision needs true mid-procedure region re-entry and a
+   real rooted-`Value` side-array wired into `heap_gc.rs`, neither of which
+   exists yet, and the mechanism it was modeled on
+   (`dm_jit::CompiledRootedBlock`) turns out not to provide the second one
+   either. **v1 scope:** a region compiles a procedure's straight-line
+   *prefix* — constants/locals/arithmetic/guarded field+global access, same
+   as milestones 2-4 — up to the *first* `Call`/`CallCurrent`/`CallParent`/
+   `AllocateDatum`/`AllocateCurrentDatum` instruction, and permanently
+   side-exits there, reusing the exact mechanism every field/global decline
+   already uses: rematerialize what the interpreter needs onto `frame.stack`
+   (here, the call's own popped arguments — `validate()`'s existing
+   `Number|Src` kind tracking from M3b proves each argument slot's kind, so a
+   `Src`-kind argument, e.g. passing `src` itself into a call, is rejected
+   for now the same way a general non-`src` field receiver was), resume the
+   interpreter AT that instruction, and never return to native code for the
+   rest of that call. `CallDynamic` (runtime-selected callee) is out of scope
+   for v1 — only the statically-resolvable call shapes. No new GC work, no
+   PC-indexed region re-entry, no rooted slots: this is a straight
+   generalization of the side-exit machinery M3-M4 already proved out, with
+   compile-time-certain unconditional exits (no callback/FFI call needed at
+   the call site itself, since whether to exit isn't a runtime decision).
+   This buys the straight-line prologue of hot procedures like
+   `atom/Initialize()` — real but smaller than the full vision, since
+   anything from the first call onward (often most of the procedure) still
+   runs interpreted.
+6. **Leaf-call inlining** for already-compiled numeric callees whose
+   arguments and return are provably numeric — invoked through a callback
+   exactly like `RegionCallbacks` today (a real Cranelift `call` to a Rust
+   trampoline that runs the callee's own `CompiledNumericTrace` and hands
+   back a plain `f32`), no side-exit, no rooted slots needed either, since
+   scope stays numeric-in-numeric-out by construction.
 
-Expected by milestone 5: a first double-digit-percent boot improvement.
-Milestone 6 and beyond is where the 2–4x in VM-heavy regions is plausible.
+True resume-after-call and rooted-`Value` support (the InitAtom-throughput
+and `update_corners`-class wins the original milestone 5 targeted) are now a
+later milestone, once (a) PC-indexed region re-entry and (b) a real
+GC-scanned rooted side-array both exist — (a) is structurally cheap (the
+sidecar's per-instruction cache array already supports arbitrary-PC entries),
+(b) is the real work. Milestone 6 and beyond is where the 2–4x in VM-heavy
+regions is plausible, once that lands.
 
 ## Risks
 
 - Cranelift compile latency on a cold boot. Mitigate by compiling on workers
   and only after an entry-count threshold, and by caching compiled regions in
   the ready-world image keyed by the engine-semantics fingerprint.
-- GC safety of parked `Value`s. The rooted-slot array is the whole answer and
-  it already exists (`CompiledRootedBlock`); the discipline is "every `Value`
-  that outlives a slow-path call lives in a slot, never a register".
+- GC safety of parked `Value`s. **Revised ahead of milestone 5** (see the
+  "Operand model" correction above): no ready-made root-scanned rooted-slot
+  array exists yet — `CompiledRootedBlock`'s scratch array is real but is
+  never added to `heap_gc.rs`'s scan; its safety today comes from atomicity
+  (nothing GC-triggering runs while it's live), a guarantee side-exiting into
+  an arbitrary DM proc call doesn't have. Building one is real, net-new work:
+  a side-array actually wired into the root scan, owned by `ExecutionState`
+  or `CallFrame`. Milestones 2-5 sidestep this entirely by staying
+  numeric-only and side-exiting (never rooting) anything that isn't a plain
+  number; the discipline once the rooted array exists is still "every `Value`
+  that outlives a slow-path call lives in a slot, never a register."
 - Parity drift. The interpreter stays authoritative; regions are gated on
   byte-exact `field_quickening` / instruction-count parity every step.
