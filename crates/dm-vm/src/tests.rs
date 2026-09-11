@@ -9235,6 +9235,100 @@ fn region_jit_field_read_side_exits_to_the_interpreter_for_a_non_numeric_field()
 }
 
 #[test]
+fn region_jit_side_exit_preserves_a_local_written_before_the_decline() {
+    // A local assigned by native `StoreLocal` only exists in
+    // `NumericExecutionState.locals` until the VM writes it back into
+    // `frame.locals` — the interpreter never reads native's own copy. If a
+    // side-exit (here, a declining `LoadFieldDynamic`) forgets to write back
+    // a local assigned *before* the decline point, the interpreter resumes
+    // with that local at its stale pre-entry value instead of what native
+    // code actually computed. The field is deliberately set to a *datum*
+    // (not left unset) so the decline is graceful — the callback declines
+    // because a datum reference isn't a number, but the underlying read
+    // still succeeds, letting execution continue past the decline point to
+    // `return x + 1`, which is what actually exercises the bug. An unset
+    // field raises a hard "field is absent" error at the read itself and
+    // never reaches that `return` at all.
+    let source = parse(concat!(
+        "/datum/proc/local_survives_field_decline()\n",
+        "\tvar/x = 41\n",
+        "\tvar/y = value\n",
+        "\treturn x + 1\n",
+    ))
+    .unwrap();
+    let module = compile_module_specs(&[ProcedureSpec {
+        path: "/datum/proc/local_survives_field_decline".to_owned(),
+        definition: &source.definitions[0],
+        parent: None,
+        static_calls: BTreeMap::new(),
+        src_fields: BTreeMap::from([("value".to_owned(), field("value"))]),
+        global_fields: BTreeMap::new(),
+    }])
+    .unwrap();
+    let entry = module
+        .procedure_id("/datum/proc/local_survives_field_decline")
+        .unwrap();
+
+    let non_numeric_result = |state: &mut ExecutionState| {
+        let other = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/region_local_side_exit_fixture").unwrap());
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/region_local_side_exit_fixture").unwrap());
+        // `value` is a real, set field — just not a number — so the callback
+        // declines (`as_number()` fails) without the underlying read itself
+        // erroring, and the region must hand off to the interpreter mid-procedure.
+        state
+            .heap_mut()
+            .set_datum_field(datum, field("value"), Value::Datum(other))
+            .unwrap();
+        execute_module_in_context(
+            &module,
+            entry,
+            &[],
+            state,
+            &ExecutionContext::new(Value::Datum(datum), Value::Null),
+        )
+    };
+
+    // Baseline: what the pure interpreter computes, before any region exists.
+    let mut baseline_state = ExecutionState::new();
+    let baseline = non_numeric_result(&mut baseline_state);
+    assert_eq!(baseline, Ok(Value::number(42.0)), "41 + 1, interpreted");
+    assert!(
+        !baseline_state.region_installed_at_entry(module.identity.0, entry),
+        "no calls happened yet"
+    );
+
+    // Warm the region up on NUMERIC calls only, then confirm a subsequent
+    // non-numeric-valued call still matches the pure-interpreter baseline
+    // exactly — `x`'s value, assigned natively before the decline, must
+    // survive the hand-off exactly as it would have in the pure interpreter.
+    let mut state = ExecutionState::new();
+    for round in 0..20 {
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/region_local_side_exit_fixture").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(datum, field("value"), Value::number(round as f32))
+            .unwrap();
+        execute_module_in_context(
+            &module,
+            entry,
+            &[],
+            &mut state,
+            &ExecutionContext::new(Value::Datum(datum), Value::Null),
+        )
+        .unwrap();
+    }
+    assert!(state.region_installed_at_entry(module.identity.0, entry));
+
+    assert_eq!(non_numeric_result(&mut state), baseline);
+}
+
+#[test]
 fn region_jit_numeric_core_supports_field_writes_to_src() {
     // Milestone 3b: `StoreFieldDynamic` writes a field of the region's
     // implicit `src` through a live slow-path callback. Verifies both the

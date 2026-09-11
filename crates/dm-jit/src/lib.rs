@@ -99,6 +99,8 @@ pub enum CompileError {
     InvalidField(u16),
     /// Dirty writeback currently uses one native mask.
     TooManyFields(usize),
+    /// Local writeback-on-side-exit currently uses one native mask.
+    TooManyLocals(usize),
     InvalidAction(u8),
     /// A branch points outside the procedure.
     InvalidTarget(u32),
@@ -135,6 +137,9 @@ impl std::fmt::Display for CompileError {
             }
             Self::TooManyFields(count) => {
                 write!(formatter, "numeric trace has {count} fields, maximum is 64")
+            }
+            Self::TooManyLocals(count) => {
+                write!(formatter, "numeric trace has {count} locals, maximum is 64")
             }
             Self::InvalidAction(action) => {
                 write!(formatter, "numeric trace uses invalid action bit {action}")
@@ -182,6 +187,7 @@ type NumericEntry = unsafe extern "C" fn(
     u32,
     u64,
     *mut c_void,
+    *mut u64,
 ) -> u64;
 
 // Native stack stores deliberately land in a heap allocation with a checked
@@ -214,6 +220,15 @@ pub struct NumericExecutionState {
     pub fields: SmallVec<[f32; 8]>,
     /// Fields stored by native execution and requiring VM writeback at the exit.
     pub dirty_fields: u64,
+    /// Locals stored by native execution since entry. On a side-exit the VM
+    /// must write each flagged local back into the interpreter's own
+    /// `frame.locals` before resuming there — native execution never touches
+    /// `frame.locals` directly, so a local a trace assigns via `StoreLocal`
+    /// only exists here until this mask says otherwise. A local an entry
+    /// snapshot seeded as still-`Null` (and this trace never wrote) must NOT
+    /// be written back as a number, which is exactly what this mask, rather
+    /// than just re-checking the f32 value, distinguishes.
+    pub dirty_locals: u64,
     /// VM-defined deferred work requested by the trace (for example enqueueing an update).
     pub action_bits: u64,
     pub instruction: u32,
@@ -512,6 +527,7 @@ impl CompiledNumericTrace {
             stack: numeric_stack_storage(self.max_stack_depth),
             fields: SmallVec::new(),
             dirty_fields: 0,
+            dirty_locals: 0,
             action_bits: 0,
             instruction: 0,
         })
@@ -531,6 +547,7 @@ impl CompiledNumericTrace {
                 stack: numeric_stack_storage(self.max_stack_depth),
                 fields: fields.iter().copied().collect(),
                 dirty_fields: 0,
+                dirty_locals: 0,
                 action_bits: 0,
                 instruction: 0,
             }
@@ -579,6 +596,7 @@ impl CompiledNumericTrace {
                 state.instruction,
                 u64::from(max_steps),
                 context_pointer,
+                &mut state.dirty_locals,
             )
         };
         if state.stack[redzone_start..]
@@ -744,6 +762,9 @@ pub fn compile_numeric_field_trace(
     if field_count > 64 {
         return Err(CompileError::TooManyFields(field_count));
     }
+    if local_count > 64 {
+        return Err(CompileError::TooManyLocals(local_count));
+    }
     let validation = validate(
         instructions,
         local_count,
@@ -879,6 +900,11 @@ pub fn compile_numeric_field_trace(
     context
         .func
         .signature
+        .params
+        .push(AbiParam::new(types::I64));
+    context
+        .func
+        .signature
         .returns
         .push(AbiParam::new(types::I64));
     let function = module
@@ -911,6 +937,7 @@ pub fn compile_numeric_field_trace(
         let resume_pc = params[5];
         let budget = params[6];
         let context_pointer = params[7];
+        let dirty_locals_pointer = params[8];
         let checks: Vec<_> = instructions
             .iter()
             .map(|_| function_builder.create_block())
@@ -1016,6 +1043,27 @@ pub fn compile_numeric_field_trace(
                         locals_pointer,
                         usize::from(local),
                         value,
+                    );
+                    // A side-exit hands the rest of this call to the
+                    // interpreter, which reads `frame.locals` directly and
+                    // never sees this native write otherwise (see
+                    // `NumericExecutionState::dirty_locals`'s doc comment).
+                    // Flag it so the VM knows to write it back.
+                    let dirty = function_builder.ins().load(
+                        types::I64,
+                        cranelift_codegen::ir::MemFlags::trusted(),
+                        dirty_locals_pointer,
+                        0,
+                    );
+                    let mask = function_builder
+                        .ins()
+                        .iconst(types::I64, (1_u64 << local) as i64);
+                    let dirty = function_builder.ins().bor(dirty, mask);
+                    function_builder.ins().store(
+                        cranelift_codegen::ir::MemFlags::trusted(),
+                        dirty,
+                        dirty_locals_pointer,
+                        0,
                     );
                 }
                 NumericInstruction::LoadField(field) => {
@@ -2313,6 +2361,48 @@ mod tests {
         assert_eq!(state.fields.as_slice(), &[17.0]);
         assert_eq!(state.dirty_fields, 1);
         assert_eq!(state.action_bits, 1 << 2);
+    }
+
+    #[test]
+    fn store_local_marks_the_dirty_locals_bit() {
+        let trace = compile_numeric_trace(
+            &[
+                NumericInstruction::Constant(5.0),
+                NumericInstruction::StoreLocal(1),
+                NumericInstruction::LoadLocal(0),
+                NumericInstruction::Return,
+            ],
+            2,
+        )
+        .expect("trace with an unread local 0 and a written local 1 compiles");
+        let mut state = trace.initial_state(&[9.0, 0.0]).unwrap();
+        assert_eq!(state.dirty_locals, 0, "nothing written yet");
+        assert_eq!(
+            trace.run_budgeted(&mut state, 10, &mut no_callbacks()),
+            Some(NumericRunOutcome::Returned {
+                value: 9.0,
+                steps: 4
+            })
+        );
+        // Local 1 was written (bit 1 set); local 0 was only ever read, so its
+        // bit must stay clear — a side-exit must not overwrite an untouched
+        // local's real interpreter-side value with a reconstructed one.
+        assert_eq!(state.dirty_locals, 0b10);
+        assert_eq!(state.locals.as_slice(), &[9.0, 5.0]);
+    }
+
+    #[test]
+    fn compile_numeric_field_trace_rejects_too_many_locals() {
+        assert!(matches!(
+            compile_numeric_trace(
+                &[
+                    NumericInstruction::Constant(0.0),
+                    NumericInstruction::Return
+                ],
+                65
+            ),
+            Err(CompileError::TooManyLocals(65))
+        ));
     }
 
     #[test]
