@@ -1226,9 +1226,10 @@ fn try_run_lumcount_jit(
             );
         }
         let budget = u32::try_from(remaining_steps).unwrap_or(u32::MAX);
-        let outcome = trace
-            .compiled
-            .run_budgeted(frame.numeric_jit_state_mut()?, budget, &mut |_| None)?;
+        let outcome =
+            trace
+                .compiled
+                .run_budgeted(frame.numeric_jit_state_mut()?, budget, &mut |_| None)?;
         let native = frame.numeric_jit_state_mut()?;
         for (index, field) in trace.fields.iter().enumerate() {
             if native.dirty_fields & (1_u64 << index) != 0 {
@@ -1578,7 +1579,9 @@ pub(crate) fn numeric_trace_instructions(
                         field_names.push(name.clone());
                         field_names.len() - 1
                     });
-                u16::try_from(index).ok().map(NumericInstruction::LoadFieldDynamic)
+                u16::try_from(index)
+                    .ok()
+                    .map(NumericInstruction::LoadFieldDynamic)
             }
             _ if !reachable[pc] => Some(NumericInstruction::Return),
             _ => None,

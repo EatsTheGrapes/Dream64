@@ -192,11 +192,17 @@ impl NumericExecutionState {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NumericRunOutcome {
-    Returned { value: f32, steps: u32 },
+    Returned {
+        value: f32,
+        steps: u32,
+    },
     /// The trace ran out of its step budget mid-execution. Resuming with the
     /// same state (more budget) continues this same native run — the trace's
     /// own control-flow position is exactly what it was.
-    BudgetExhausted { instruction: u32, steps: u32 },
+    BudgetExhausted {
+        instruction: u32,
+        steps: u32,
+    },
     /// A `LoadFieldDynamic` callback declined (the field isn't a guarded
     /// number, or any other reason the VM needs the interpreter for). Unlike
     /// `BudgetExhausted`, retrying `run_budgeted` from this same `state` is
@@ -204,7 +210,10 @@ pub enum NumericRunOutcome {
     /// rest of this call to the interpreter rather than resume native
     /// execution. `instruction` is exactly where the interpreter must
     /// continue.
-    SideExit { instruction: u32, steps: u32 },
+    SideExit {
+        instruction: u32,
+        steps: u32,
+    },
 }
 
 /// One VM-owned rooted-value block dispatcher. Native code never interprets
@@ -685,7 +694,8 @@ pub fn compile_numeric_field_trace(
             &context.func.signature,
         )
         .map_err(|error| CompileError::Backend(error.to_string()))?;
-    let load_field_dynamic_ref = module.declare_func_in_func(load_field_dynamic_id, &mut context.func);
+    let load_field_dynamic_ref =
+        module.declare_func_in_func(load_field_dynamic_id, &mut context.func);
 
     let mut frontend_context = FunctionBuilderContext::new();
     {

@@ -9147,7 +9147,11 @@ fn region_jit_numeric_core_supports_field_reads_of_src() {
     assert!(!state.region_installed_at_entry(module.identity.0, entry));
     for round in 0..20 {
         let n = round as f32;
-        assert_eq!(call(&mut state, n), Ok(Value::number(n * 2.0)), "round {round}");
+        assert_eq!(
+            call(&mut state, n),
+            Ok(Value::number(n * 2.0)),
+            "round {round}"
+        );
     }
     assert!(
         state.region_installed_at_entry(module.identity.0, entry),
