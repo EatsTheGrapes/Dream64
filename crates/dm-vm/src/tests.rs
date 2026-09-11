@@ -8925,6 +8925,95 @@ fn field_slot_cache_bounds_megamorphic_sites() {
 }
 
 #[test]
+fn region_jit_milestone1_installs_and_never_changes_computed_results() {
+    // Milestone 1's compiled region supports no bytecode and always deopts
+    // immediately at its own entry PC — see
+    // docs/performance/baseline-region-jit.md. This proves that on a hot
+    // procedure (repeated calls at PC 0), a region gets compiled and
+    // installed, AND that every single call before, during, and after that
+    // transition returns the exact interpreted result: the region's presence
+    // must never be observable.
+    let source = parse(concat!("/proc/double(n)\n", "\treturn n * 2\n",)).unwrap();
+    let module = compile_module(&source.definitions).unwrap();
+    let entry = module.procedure_id("/proc/double").unwrap();
+    let mut state = ExecutionState::new();
+
+    assert!(
+        !state.region_installed_at_entry(module.identity.0, entry),
+        "no region before the procedure has ever run"
+    );
+
+    // Comfortably past any reasonable warm-up threshold, with a different
+    // argument each call so a cached/stale result would be caught immediately.
+    for n in 0..40 {
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::number(n as f32)], &mut state),
+            Ok(Value::number((n * 2) as f32)),
+            "call {n} must compute correctly regardless of region state",
+        );
+    }
+    assert!(
+        state.region_installed_at_entry(module.identity.0, entry),
+        "a procedure entered this many times must have compiled a region"
+    );
+
+    // Keep calling well past installation: the deopt path must stay correct
+    // indefinitely, not just for the one call that triggered compilation.
+    for n in 40..60 {
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::number(n as f32)], &mut state),
+            Ok(Value::number((n * 2) as f32)),
+            "call {n} (post-installation) must still compute correctly",
+        );
+    }
+}
+
+#[test]
+fn region_jit_milestone1_is_independent_per_procedure() {
+    // Two hot procedures in the same module each warm up and compile their
+    // own region independently; one installing must not affect the other's
+    // correctness or its own (separate) warm-up state.
+    let source = parse(concat!(
+        "/proc/double(n)\n",
+        "\treturn n * 2\n",
+        "/proc/triple(n)\n",
+        "\treturn n * 3\n",
+    ))
+    .unwrap();
+    let module = compile_module(&source.definitions).unwrap();
+    let double = module.procedure_id("/proc/double").unwrap();
+    let triple = module.procedure_id("/proc/triple").unwrap();
+    let mut state = ExecutionState::new();
+
+    // Warm up `double` only.
+    for n in 0..40 {
+        assert_eq!(
+            execute_module_in_state(&module, double, &[Value::number(n as f32)], &mut state),
+            Ok(Value::number((n * 2) as f32)),
+        );
+    }
+    assert!(state.region_installed_at_entry(module.identity.0, double));
+    assert!(
+        !state.region_installed_at_entry(module.identity.0, triple),
+        "an unrelated procedure's warm-up is independent"
+    );
+
+    // Now warm up `triple`; `double` must remain correct and installed.
+    for n in 0..40 {
+        assert_eq!(
+            execute_module_in_state(&module, triple, &[Value::number(n as f32)], &mut state),
+            Ok(Value::number((n * 3) as f32)),
+        );
+    }
+    assert!(state.region_installed_at_entry(module.identity.0, triple));
+    assert_eq!(
+        execute_module_in_state(&module, double, &[Value::number(21.0)], &mut state),
+        Ok(Value::number(42.0)),
+        "double still computes correctly after triple's region installed"
+    );
+}
+
+#[test]
 fn field_slot_cache_routes_unmaterialized_reads_through_initial_value() {
     let source = parse(concat!(
         "/proc/read_default(target)\n",

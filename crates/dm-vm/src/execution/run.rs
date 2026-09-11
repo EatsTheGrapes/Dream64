@@ -170,6 +170,28 @@ fn run_frames_inner(
                 &mut *active_sidecar.insert((procedure, resolved)).1
             }
         };
+        // Baseline region JIT, Milestone 1 (docs/performance/baseline-region-jit.md):
+        // warm up and, once hot enough, compile a region at the procedure's
+        // entry. No milestone-1 region supports any bytecode — every call
+        // immediately deopts back to this same instruction having retired zero
+        // steps — so this block is inert on today's boot and only proves the
+        // compile/call/decode/account round trip on real traffic. Checked only
+        // at instruction 0 (not every instruction) to keep that inertness cheap.
+        if instruction_index == 0 {
+            sidecar.poll_region_at_entry();
+            if let Some(dm_jit::RegionOutcome::Deopt { resume_pc, steps }) =
+                sidecar.run_region_at_entry(0, u32::try_from(remaining_steps).unwrap_or(u32::MAX))
+            {
+                let steps = u64::from(steps);
+                let scheduler_batches_before = executed_steps / 4_096;
+                remaining_steps = remaining_steps.saturating_sub(steps);
+                executed_steps += steps;
+                for _ in scheduler_batches_before..(executed_steps / 4_096) {
+                    account_scheduler_tick_usage(state);
+                }
+                frames[frame_index].instruction = resume_pc as usize;
+            }
+        }
         // A packed numeric dispatch block that exhausts its step budget stashes
         // the live operand stack / locals / result in cold frame state instead
         // of materializing them, expecting the next loop iteration to resume the

@@ -1064,12 +1064,195 @@ fn add_edge(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Baseline region JIT (docs/performance/baseline-region-jit.md)
+// ---------------------------------------------------------------------------
+//
+// A "region" compiles a run of DM bytecode starting at a hot entry PC to
+// native code, calling back into a Rust slow path for anything it cannot do
+// inline. This is Milestone 1: the Cranelift compile/call/outcome-decode round
+// trip, with **zero bytecode instructions supported**. Every compiled region
+// immediately deopts at its own entry PC having retired zero steps — behaving
+// exactly as if it were never called. The point is to prove the calling
+// convention and the `dm-vm` integration (sidecar installation, step
+// accounting, the interpreter fallback) are live and inert on real boot
+// traffic before any milestone teaches a region to actually execute anything.
+// Later milestones extend `compile_trivial_region`'s function body and the
+// `RegionEntry` signature; `dm-vm` call sites are not expected to change shape.
+
+/// Outcome of one region-entry call, decoded from the packed `u64` every
+/// region ABI function returns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegionOutcome {
+    /// The region retired `steps` bytecodes and then gave up — either because
+    /// it hit an unsupported instruction, a guard failed, or (Milestone 1)
+    /// because it supports nothing at all. `resume_pc` is the exact bytecode
+    /// index the interpreter must continue from; it is always within the
+    /// procedure the region was compiled for.
+    Deopt { resume_pc: u32, steps: u32 },
+}
+
+fn unpack_region_outcome(packed: u64) -> RegionOutcome {
+    RegionOutcome::Deopt {
+        resume_pc: packed as u32,
+        steps: (packed >> 32) as u32,
+    }
+}
+
+type RegionEntry = unsafe extern "C" fn(entry_pc: u32, budget: u32) -> u64;
+
+/// Executable native code for one compiled region.
+///
+/// Not `Clone`: the owning module keeps the finalized function's code pages
+/// alive, and a region is only ever reached through the `PcCache` slot that
+/// owns it.
+pub struct CompiledRegion {
+    _module: JITModule,
+    entry: RegionEntry,
+}
+
+impl CompiledRegion {
+    /// Runs the region starting at `entry_pc` with `budget` logical bytecode
+    /// steps available. Milestone 1's compiled body reads no memory and calls
+    /// nothing else — it unconditionally returns `Deopt { resume_pc: entry_pc,
+    /// steps: 0 }` — so this is safe to expose without an `unsafe` marker at
+    /// the `dm-vm` call site (which cannot use `unsafe` at all; see the module
+    /// doc comment above).
+    #[must_use]
+    pub fn run(&self, entry_pc: u32, budget: u32) -> RegionOutcome {
+        // SAFETY: `entry` is a pointer into `_module`'s finalized code, kept
+        // alive for exactly as long as `self` is, produced by Cranelift from
+        // the signature declared in `compile_trivial_region` below and called
+        // with that exact signature here. The compiled body touches no memory
+        // beyond its own two integer parameters.
+        let packed = unsafe { (self.entry)(entry_pc, budget) };
+        unpack_region_outcome(packed)
+    }
+}
+
+/// Compiles a region that supports no bytecode: calling it always returns
+/// `Deopt` at its own entry PC having retired zero steps. See the module doc
+/// comment above — this is Milestone 1 of the baseline region JIT, proving the
+/// Cranelift build/call/decode path before any milestone teaches it real ops.
+///
+/// # Errors
+///
+/// Returns [`CompileError::Backend`] if Cranelift rejects the generated
+/// module. The caller's correct response is the same as any other rejected
+/// region: keep interpreting that procedure, never retry.
+pub fn compile_trivial_region() -> Result<CompiledRegion, CompileError> {
+    let builder = JITBuilder::new(cranelift_module::default_libcall_names())
+        .map_err(|error| CompileError::Backend(error.to_string()))?;
+    let mut module = JITModule::new(builder);
+    let mut context = module.make_context();
+    context
+        .func
+        .signature
+        .params
+        .push(AbiParam::new(types::I32));
+    context
+        .func
+        .signature
+        .params
+        .push(AbiParam::new(types::I32));
+    context
+        .func
+        .signature
+        .returns
+        .push(AbiParam::new(types::I64));
+    let function = module
+        .declare_function(
+            "dream64_region_entry",
+            Linkage::Local,
+            &context.func.signature,
+        )
+        .map_err(|error| CompileError::Backend(error.to_string()))?;
+    let mut frontend_context = FunctionBuilderContext::new();
+    {
+        let mut function_builder = FunctionBuilder::new(&mut context.func, &mut frontend_context);
+        let entry_block = function_builder.create_block();
+        function_builder.append_block_params_for_function_params(entry_block);
+        function_builder.switch_to_block(entry_block);
+        let entry_pc = function_builder.block_params(entry_block)[0];
+        // Pack { steps: 0, resume_pc: entry_pc } exactly as `unpack_region_outcome`
+        // reads it: resume_pc in the low 32 bits, steps in the high 32 bits.
+        let packed = function_builder.ins().uextend(types::I64, entry_pc);
+        function_builder.ins().return_(&[packed]);
+        function_builder.seal_all_blocks();
+        function_builder.finalize();
+    }
+    module
+        .define_function(function, &mut context)
+        .map_err(|error| CompileError::Backend(format!("{error:?}\n{}", context.func.display())))?;
+    module.clear_context(&mut context);
+    module
+        .finalize_definitions()
+        .map_err(|error| CompileError::Backend(error.to_string()))?;
+    let pointer = module.get_finalized_function(function);
+    // SAFETY: Cranelift finalized `function` with the two-`i32`-params,
+    // one-`i64`-return signature declared above, matching `RegionEntry` exactly.
+    let entry: RegionEntry = unsafe { std::mem::transmute(pointer) };
+    Ok(CompiledRegion {
+        _module: module,
+        entry,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CompileError, NumericInstruction, NumericRunOutcome, compile_numeric_field_trace,
-        compile_numeric_trace,
+        CompileError, NumericInstruction, NumericRunOutcome, RegionOutcome,
+        compile_numeric_field_trace, compile_numeric_trace, compile_trivial_region,
     };
+
+    #[test]
+    fn trivial_region_always_deopts_at_its_own_entry_pc_with_no_steps_retired() {
+        let region = compile_trivial_region().expect("trivial region compiles");
+        for entry_pc in [0, 1, 5, 138, u32::MAX] {
+            for budget in [0, 1, 4_096, u32::MAX] {
+                assert_eq!(
+                    region.run(entry_pc, budget),
+                    RegionOutcome::Deopt {
+                        resume_pc: entry_pc,
+                        steps: 0
+                    },
+                    "entry_pc={entry_pc} budget={budget}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trivial_region_compiles_repeatedly_and_independently() {
+        // Each call site (each PC-0 slot) gets its own compiled module; two
+        // independently compiled trivial regions must behave identically and
+        // neither's lifetime affects the other's.
+        let first = compile_trivial_region().unwrap();
+        let second = compile_trivial_region().unwrap();
+        assert_eq!(
+            first.run(7, 100),
+            RegionOutcome::Deopt {
+                resume_pc: 7,
+                steps: 0
+            }
+        );
+        assert_eq!(
+            second.run(9, 100),
+            RegionOutcome::Deopt {
+                resume_pc: 9,
+                steps: 0
+            }
+        );
+        // The first region is still independently callable after the second
+        // compiled (no shared/overwritten code pages).
+        assert_eq!(
+            first.run(7, 100),
+            RegionOutcome::Deopt {
+                resume_pc: 7,
+                steps: 0
+            }
+        );
+    }
 
     #[test]
     fn compiles_binary32_arithmetic() {
