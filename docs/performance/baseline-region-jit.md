@@ -98,17 +98,47 @@ leaf calls.
   and returns the error to `run_frames`, which raises it exactly as an
   interpreted op would (same `execution_error` path, same source span).
 
-## Dense IDs
+## Dense IDs — revised after reading the real field-storage code (M3)
 
-Regions need `FieldId`, `GlobalId`, `ProcId`, `TypeId` as `u32` array indices,
-not `FieldName` hashes. `GlobalStore` is already slot-dense internally;
-`Module::procedures` is `Vec`-indexed; type intervals are dense. The missing
-piece is a per-module `FieldName -> FieldId` table and a `TypePath -> TypeId`
-table, both built at module load, immutable thereafter. A datum shape maps
-`FieldId -> value slot`; the region's `load_field` fast path is one shape/version
-compare then a slot read (this is the #70 cache, re-expressed as an integer
-guard). Dynamic `vars[...]`, additions, deletions stay on the generic path and
-bump the shape version.
+The paragraph below this heading was the pre-M3 plan; it assumed a per-`Datum`
+shape/version stamp that **does not exist** and was never built for #70.
+Corrected understanding, from reading `Datum`/`FieldSlotCache` directly
+(`dm-value/src/lib.rs`, `dm-vm/src/execution/state.rs`):
+
+- A datum's fields are a per-instance `Vec<(FieldName, Value)>`
+  (`DatumFields::Owned`/`Shared`); a "slot" is a position in *that specific
+  datum's* vector, not a compiler-assignable struct offset. Two datums of the
+  same `TypePath` are not guaranteed the same slot layout — `delete_field`
+  physically shifts later slots, and `DatumLayoutCache` tracks up to 8
+  distinct layouts per type. There is no shape/version counter anywhere.
+- #70's actual guard is therefore **not** an integer compare: it's `(receiver
+  TypePath → cached slot)` in a small per-callsite MRU list, then on *every*
+  hit `Datum::field_at_validated_slot` re-reads the `FieldName` stored at that
+  position and compares it (by `Arc` string) to the name baked into the
+  bytecode. A slot shift is caught here, not by a version bump.
+- `datum_field_or_shared`/`assign_datum_or_shared_field` (the two helpers this
+  doc already named as the read/write targets) take a `FieldName`, full stop
+  — no integer-indexed overload exists, and building a per-module dense
+  `FieldName -> FieldId` table would only let native code skip *looking up*
+  which `FieldName` to ask for; it does nothing to avoid the per-hit name
+  recheck above, which is where the real safety lives.
+
+Given that, `load_field`/`store_field` are not going to be an inlined
+"shape-guard then struct-offset read" the way a compiled struct access would
+be in a language with fixed layouts — they were already specified as
+**slow-path callbacks** in the ABI table above (`unsafe extern "C" fn(ctx,
+...)`), and M3 keeps them exactly that: a call out to Rust that runs the
+existing #70-shaped lookup (MRU by type, validate by name at the slot) and
+hands back a rooted slot index (or a side-exit if the field isn't a number).
+No new dense-id table, no new `Datum` version field — M3 is ABI plumbing
+(`RegionVm` context, the rooted-slot array as a GC root, the packed
+`{status, resume_pc, steps}` outcome, one `unsafe extern "C"` trampoline per
+callback, mirroring `CompiledRootedBlock`'s existing safe-closure pattern
+exactly) plus wiring the Cranelift side to *call* `load_field`/`store_field`
+rather than to inline a guard. `TypeId`/`ProcId`/`GlobalId` dense tables
+remain future work for M4/M5, where the underlying stores (`GlobalStore`,
+`Module::procedures`, type intervals) really are already dense and this
+concern doesn't apply.
 
 ## `PcCache` integration
 
