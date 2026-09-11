@@ -299,27 +299,34 @@ number. Reject anything that regresses parity or the short gates.
    tightest parity result of any milestone so far. `jit_guarded` telemetry
    showed the expected signal: `numeric_compiled` up 4504→4640 (+3.0%, more
    procedures touching globals now qualify for the region tier).
-5. **Calls and allocations as a prefix-ending side-exit.** Narrowed after
-   reading the real call/alloc/GC code (see the "Operand model" and slow-path
-   ABI corrections above) — the original "stops at *each* sub-call and
-   re-enters after" vision needs true mid-procedure region re-entry and a
+5. **Calls and allocations as a prefix-ending side-exit. Done.** Narrowed
+   after reading the real call/alloc/GC code (see the "Operand model" and
+   slow-path ABI corrections above) — the original "stops at *each* sub-call
+   and re-enters after" vision needs true mid-procedure region re-entry and a
    real rooted-`Value` side-array wired into `heap_gc.rs`, neither of which
    exists yet, and the mechanism it was modeled on
    (`dm_jit::CompiledRootedBlock`) turns out not to provide the second one
-   either. **v1 scope:** a region compiles a procedure's straight-line
+   either. **Shipped scope:** a region compiles a procedure's straight-line
    *prefix* — constants/locals/arithmetic/guarded field+global access, same
    as milestones 2-4 — up to the *first* `Call`/`CallCurrent`/`CallParent`/
-   `AllocateDatum`/`AllocateCurrentDatum` instruction, and permanently
-   side-exits there, reusing the exact mechanism every field/global decline
-   already uses: rematerialize what the interpreter needs onto `frame.stack`
-   (here, the call's own popped arguments — `validate()`'s existing
-   `Number|Src` kind tracking from M3b proves each argument slot's kind, so a
-   `Src`-kind argument, e.g. passing `src` itself into a call, is rejected
-   for now the same way a general non-`src` field receiver was), resume the
-   interpreter AT that instruction, and never return to native code for the
-   rest of that call. `CallDynamic` (runtime-selected callee) is out of scope
-   for v1 — only the statically-resolvable call shapes. No new GC work, no
-   PC-indexed region re-entry, no rooted slots: this is a straight
+   `AllocateCurrentDatum` instruction, and permanently side-exits there,
+   reusing the exact mechanism every field/global decline already uses:
+   rematerialize what the interpreter needs onto `frame.stack` (here, the
+   call's own popped arguments — `validate()`'s existing `Number|Src` kind
+   tracking from M3b proves each argument slot's kind, so a `Src`-kind
+   argument, e.g. passing `src` itself into a call, substitutes the region's
+   implicit receiver on rematerialization, the same way a field receiver
+   already does), resume the interpreter AT that instruction, and never
+   return to native code for the rest of that call. `CallDynamic`
+   (runtime-selected callee) and `AllocateDatum` (its popped type-path
+   operand isn't representable in the numeric-only operand model — no
+   `TypePath`-kind tracking exists) are out of scope. The call must also be
+   reached by a **pure straight line from procedure entry** — no branch
+   anywhere before it — because bytecode *array* order isn't execution
+   order once a branch exists; accepting a call reachable only through one
+   path while other array positions belong to paths that never reach it
+   at all risks silently truncating a still-reachable branch. No new GC
+   work, no PC-indexed region re-entry, no rooted slots: this is a straight
    generalization of the side-exit machinery M3-M4 already proved out, with
    compile-time-certain unconditional exits (no callback/FFI call needed at
    the call site itself, since whether to exit isn't a runtime decision).
@@ -327,6 +334,30 @@ number. Reject anything that regresses parity or the short gates.
    `atom/Initialize()` — real but smaller than the full vision, since
    anything from the first call onward (often most of the procedure) still
    runs interpreted.
+   - **A real, general bug found via this milestone's own boot-testing,
+     predating it.** Every side-exiting instruction's rematerialization —
+     including the 4 already-merged from M3/M3b/M4 — only ever reconstructed
+     what the *specific declining instruction* needed (a receiver, a stashed
+     value); nothing accounted for a value pushed *earlier in the same
+     expression* and still pending underneath. `return 2 * value` (constant
+     first, then a field read) was already a latently-reachable shape on
+     `main`, unrelated to this milestone — it simply had never been
+     exercised by a boot before. This milestone made the shape concretely
+     common (constant, then a declining dynamic op, then a call), and a real
+     Monkestation procedure hit it on the first boot-parity attempt:
+     `/proc/random_color()` (`return random_string(6, hex_characters)` — a
+     constant, a non-numeric global read, then a call) crashed with
+     `bytecode stack underflow at instruction 2`, because the declining
+     global read's rematerialization lost the already-computed `6`. Fixed
+     by requiring, in `validate()`, that every side-exiting instruction's
+     own operands are the *only* thing on the operand stack — nothing
+     pending beneath them — for all five side-exiting instructions
+     (`LoadFieldDynamic`/`StoreFieldDynamic`/`LoadGlobalDynamic`/
+     `StoreGlobalDynamic`/`CallSideExit`), not just the new one. Confirmed
+     this doesn't regress any of M3/M3b/M4's existing coverage: every
+     pre-existing test already (accidentally) satisfied this requirement,
+     since each one happened to put its declining instruction first in its
+     own expression.
 6. **Leaf-call inlining** for already-compiled numeric callees whose
    arguments and return are provably numeric — invoked through a callback
    exactly like `RegionCallbacks` today (a real Cranelift `call` to a Rust
