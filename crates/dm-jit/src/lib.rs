@@ -25,6 +25,13 @@ pub enum NumericInstruction {
     LoadField(u16),
     /// Pop into a materialized field and mark it dirty for VM writeback.
     StoreField(u16),
+    /// Pop and discard a receiver placeholder, then push one named field of
+    /// the region's implicit `src`, read live through the `load_field_dynamic`
+    /// slow-path callback. Unlike `LoadField`, the field is not pre-fetched:
+    /// the index addresses a per-region field-name table the VM resolves at
+    /// call time, not the flat `fields` array. See the "Milestone 3" module
+    /// doc below for why the receiver is always `src` and always implicit.
+    LoadFieldDynamic(u16),
     /// Set a VM-defined deferred action bit, committed after native exit.
     RaiseAction(u8),
     /// Duplicate the top operand.
@@ -128,8 +135,16 @@ impl std::fmt::Display for CompileError {
 
 impl std::error::Error for CompileError {}
 
-type NumericEntry =
-    unsafe extern "C" fn(*mut f32, *mut f32, *mut f32, *mut u64, *mut u64, u32, u64) -> u64;
+type NumericEntry = unsafe extern "C" fn(
+    *mut f32,
+    *mut f32,
+    *mut f32,
+    *mut u64,
+    *mut u64,
+    u32,
+    u64,
+    *mut c_void,
+) -> u64;
 
 // Native stack stores deliberately land in a heap allocation with a checked
 // redzone.  Keeping this buffer inline would place an unchecked Cranelift store
@@ -178,7 +193,18 @@ impl NumericExecutionState {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NumericRunOutcome {
     Returned { value: f32, steps: u32 },
+    /// The trace ran out of its step budget mid-execution. Resuming with the
+    /// same state (more budget) continues this same native run — the trace's
+    /// own control-flow position is exactly what it was.
     BudgetExhausted { instruction: u32, steps: u32 },
+    /// A `LoadFieldDynamic` callback declined (the field isn't a guarded
+    /// number, or any other reason the VM needs the interpreter for). Unlike
+    /// `BudgetExhausted`, retrying `run_budgeted` from this same `state` is
+    /// not expected to make different progress — the caller should hand the
+    /// rest of this call to the interpreter rather than resume native
+    /// execution. `instruction` is exactly where the interpreter must
+    /// continue.
+    SideExit { instruction: u32, steps: u32 },
 }
 
 /// One VM-owned rooted-value block dispatcher. Native code never interprets
@@ -426,9 +452,9 @@ impl CompiledNumericTrace {
         // exact `(pointer) -> f32` ABI. The module is retained by `self`, and
         // `locals` remains live and contains the validated number of elements.
         let mut state = self.initial_state(locals)?;
-        match self.run_budgeted(&mut state, u32::MAX)? {
+        match self.run_budgeted(&mut state, u32::MAX, &mut |_| None)? {
             NumericRunOutcome::Returned { value, .. } => Some(value),
-            NumericRunOutcome::BudgetExhausted { .. } => None,
+            NumericRunOutcome::BudgetExhausted { .. } | NumericRunOutcome::SideExit { .. } => None,
         }
     }
 
@@ -466,10 +492,18 @@ impl CompiledNumericTrace {
 
     /// Runs at most `max_steps` bytecode instructions and leaves locals, operand
     /// stack, and the exact resume PC materialized in `state` on budget exit.
+    ///
+    /// `load_field` answers a `LoadFieldDynamic(field_index)` instruction with
+    /// the current guarded numeric value of that field on the region's
+    /// implicit `src`, or `None` to side-exit (the interpreter re-runs this
+    /// instruction). Traces that never lower `LoadFieldDynamic` still take
+    /// this parameter — it is simply never called — so callers with nothing
+    /// to answer can pass `&mut |_| None`.
     pub fn run_budgeted(
         &self,
         state: &mut NumericExecutionState,
         max_steps: u32,
+        load_field: &mut dyn FnMut(u32) -> Option<f32>,
     ) -> Option<NumericRunOutcome> {
         let redzone_start = self.max_stack_depth.max(1);
         if state.locals.len() != self.local_count
@@ -483,6 +517,12 @@ impl CompiledNumericTrace {
         {
             return None;
         }
+        let mut dispatch = SafeFieldLoadDispatch { load_field };
+        // SAFETY: `dispatch` outlives the call below (it is not returned or
+        // stored), and `safe_load_field_dynamic` — the only function this
+        // module's compiled code can call through `context_pointer` — casts
+        // it back to this exact type.
+        let context_pointer = (&mut dispatch as *mut SafeFieldLoadDispatch<'_>).cast();
         let packed = unsafe {
             (self.entry)(
                 state.locals.as_mut_ptr(),
@@ -492,6 +532,7 @@ impl CompiledNumericTrace {
                 &mut state.action_bits,
                 state.instruction,
                 u64::from(max_steps),
+                context_pointer,
             )
         };
         if state.stack[redzone_start..]
@@ -502,16 +543,23 @@ impl CompiledNumericTrace {
             // stack. The allocation boundary kept the VM frame untouched.
             return None;
         }
-        let instruction = packed as u32;
+        let raw_instruction = packed as u32;
         let steps = (packed >> 32) as u32;
-        if instruction == u32::MAX {
+        if raw_instruction == u32::MAX {
             Some(NumericRunOutcome::Returned {
                 value: state.stack[0],
                 steps,
             })
-        } else {
+        } else if raw_instruction & 0x8000_0000 != 0 {
+            let instruction = raw_instruction & 0x7fff_ffff;
             state.instruction = instruction;
-            Some(NumericRunOutcome::BudgetExhausted { instruction, steps })
+            Some(NumericRunOutcome::SideExit { instruction, steps })
+        } else {
+            state.instruction = raw_instruction;
+            Some(NumericRunOutcome::BudgetExhausted {
+                instruction: raw_instruction,
+                steps,
+            })
         }
     }
 }
@@ -524,7 +572,27 @@ pub fn compile_numeric_trace(
     instructions: &[NumericInstruction],
     local_count: usize,
 ) -> Result<CompiledNumericTrace, CompileError> {
-    compile_numeric_field_trace(instructions, local_count, 0)
+    compile_numeric_field_trace(instructions, local_count, 0, 0)
+}
+
+/// Context wrapper for `run_budgeted`'s `load_field` closure. A thin,
+/// pointer-sized struct so the fat `&mut dyn FnMut` reference can cross the
+/// FFI boundary as a single `*mut c_void` — the same reason
+/// `SafeRootedDispatch` exists for `CompiledRootedBlock`.
+struct SafeFieldLoadDispatch<'a> {
+    load_field: &'a mut dyn FnMut(u32) -> Option<f32>,
+}
+
+/// Trampoline registered as `dream64_load_field_dynamic` in every compiled
+/// numeric-field trace. Packs the answer as `(1 << 32) | value.to_bits()` on
+/// success (so the packed value is always `>= 2^32`) or `0` on a declined
+/// field (the trace side-exits and the interpreter resumes this instruction).
+unsafe extern "C" fn safe_load_field_dynamic(context: *mut c_void, field_index: u32) -> u64 {
+    let context = unsafe { &mut *context.cast::<SafeFieldLoadDispatch<'_>>() };
+    match (context.load_field)(field_index) {
+        Some(value) => 0x1_0000_0000_u64 | u64::from(value.to_bits()),
+        None => 0,
+    }
 }
 
 /// Compiles a trace over guarded numeric field snapshots. The VM validates and
@@ -533,15 +601,37 @@ pub fn compile_numeric_field_trace(
     instructions: &[NumericInstruction],
     local_count: usize,
     field_count: usize,
+    dynamic_field_count: usize,
 ) -> Result<CompiledNumericTrace, CompileError> {
     if field_count > 64 {
         return Err(CompileError::TooManyFields(field_count));
     }
-    let validation = validate(instructions, local_count, field_count)?;
+    let validation = validate(instructions, local_count, field_count, dynamic_field_count)?;
 
-    let builder = JITBuilder::new(cranelift_module::default_libcall_names())
+    let mut builder = JITBuilder::new(cranelift_module::default_libcall_names())
         .map_err(|error| CompileError::Backend(error.to_string()))?;
+    builder.symbol(
+        "dream64_load_field_dynamic",
+        safe_load_field_dynamic as *const u8,
+    );
     let mut module = JITModule::new(builder);
+    let mut load_field_dynamic_signature = module.make_signature();
+    load_field_dynamic_signature
+        .params
+        .push(AbiParam::new(types::I64));
+    load_field_dynamic_signature
+        .params
+        .push(AbiParam::new(types::I32));
+    load_field_dynamic_signature
+        .returns
+        .push(AbiParam::new(types::I64));
+    let load_field_dynamic_id = module
+        .declare_function(
+            "dream64_load_field_dynamic",
+            Linkage::Import,
+            &load_field_dynamic_signature,
+        )
+        .map_err(|error| CompileError::Backend(error.to_string()))?;
     let mut context = module.make_context();
     context
         .func
@@ -581,6 +671,11 @@ pub fn compile_numeric_field_trace(
     context
         .func
         .signature
+        .params
+        .push(AbiParam::new(types::I64));
+    context
+        .func
+        .signature
         .returns
         .push(AbiParam::new(types::I64));
     let function = module
@@ -590,6 +685,7 @@ pub fn compile_numeric_field_trace(
             &context.func.signature,
         )
         .map_err(|error| CompileError::Backend(error.to_string()))?;
+    let load_field_dynamic_ref = module.declare_func_in_func(load_field_dynamic_id, &mut context.func);
 
     let mut frontend_context = FunctionBuilderContext::new();
     {
@@ -604,6 +700,7 @@ pub fn compile_numeric_field_trace(
         let action_pointer = params[4];
         let resume_pc = params[5];
         let budget = params[6];
+        let context_pointer = params[7];
         let checks: Vec<_> = instructions
             .iter()
             .map(|_| function_builder.create_block())
@@ -731,6 +828,49 @@ pub fn compile_numeric_field_trace(
                         dirty_pointer,
                         0,
                     );
+                }
+                NumericInstruction::LoadFieldDynamic(field) => {
+                    // The popped value is a placeholder the VM-side translator
+                    // pushed in place of the bytecode's `LoadSrc` (see
+                    // `numeric_trace_instructions`); the actual receiver is
+                    // always this region's implicit `src`, threaded through
+                    // `context_pointer` rather than the operand stack. See the
+                    // "Milestone 3" module doc below for why this is sound.
+                    let _ = memory_pop(&mut function_builder, stack_pointer, &mut depth);
+                    let field_index = function_builder.ins().iconst(types::I32, i64::from(field));
+                    let call = function_builder
+                        .ins()
+                        .call(load_field_dynamic_ref, &[context_pointer, field_index]);
+                    let packed = function_builder.inst_results(call)[0];
+                    // Packing convention (`safe_load_field_dynamic`): success
+                    // sets bit 32 and carries the f32 bits in the low 32 bits,
+                    // so the packed value is >= 2^32 iff the callback found a
+                    // guarded numeric field; failure is exactly 0.
+                    let failed = function_builder.ins().icmp_imm(
+                        IntCC::UnsignedLessThan,
+                        packed,
+                        0x1_0000_0000_i64,
+                    );
+                    let declined = function_builder.create_block();
+                    let loaded = function_builder.create_block();
+                    function_builder
+                        .ins()
+                        .brif(failed, declined, &[], loaded, &[]);
+
+                    function_builder.switch_to_block(declined);
+                    function_builder.seal_block(declined);
+                    let side_exit = pack_side_exit(&mut function_builder, pc as u32, steps);
+                    function_builder.ins().return_(&[side_exit]);
+
+                    function_builder.switch_to_block(loaded);
+                    function_builder.seal_block(loaded);
+                    let value_bits = function_builder.ins().ireduce(types::I32, packed);
+                    let value = function_builder.ins().bitcast(
+                        types::F32,
+                        cranelift_codegen::ir::MemFlags::new(),
+                        value_bits,
+                    );
+                    memory_push(&mut function_builder, stack_pointer, &mut depth, value);
                 }
                 NumericInstruction::RaiseAction(action) => {
                     let actions = function_builder.ins().load(
@@ -950,6 +1090,23 @@ fn pack_exit(
     builder.ins().bor(shifted, pc)
 }
 
+/// Packs a `LoadFieldDynamic` decline exactly like `pack_exit`, but with the
+/// low field's top bit set so `run_budgeted` reports `SideExit` rather than
+/// `BudgetExhausted` — real instruction indices never set that bit (no
+/// procedure has anywhere near `2^31` instructions), and `u32::MAX` (all
+/// bits set, `Returned`'s sentinel) is unambiguous either way.
+fn pack_side_exit(
+    builder: &mut FunctionBuilder<'_>,
+    instruction: u32,
+    steps: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    let shifted = builder.ins().ishl_imm(steps, 32);
+    let pc = builder
+        .ins()
+        .iconst(types::I64, i64::from(instruction | 0x8000_0000));
+    builder.ins().bor(shifted, pc)
+}
+
 struct Validation {
     depths: Vec<Option<usize>>,
     max_depth: usize,
@@ -959,6 +1116,7 @@ fn validate(
     instructions: &[NumericInstruction],
     local_count: usize,
     field_count: usize,
+    dynamic_field_count: usize,
 ) -> Result<Validation, CompileError> {
     if instructions.is_empty() {
         return Err(CompileError::InvalidResultStack(0));
@@ -1020,6 +1178,14 @@ fn validate(
                 depth -= 1;
             }
             NumericInstruction::Negate | NumericInstruction::Not => {
+                if depth < 1 {
+                    return Err(CompileError::StackUnderflow);
+                }
+            }
+            NumericInstruction::LoadFieldDynamic(field) => {
+                if usize::from(field) >= dynamic_field_count {
+                    return Err(CompileError::InvalidField(field));
+                }
                 if depth < 1 {
                     return Err(CompileError::StackUnderflow);
                 }
@@ -1195,6 +1361,87 @@ mod tests {
     }
 
     #[test]
+    fn load_field_dynamic_reads_a_guarded_field_via_callback() {
+        // The VM-side translator emits `Constant(0.0)` in place of the
+        // bytecode's `LoadSrc` -- `LoadFieldDynamic` pops and discards that
+        // placeholder; the real receiver is always this region's implicit
+        // `src`, supplied to the callback out of band, never through the
+        // operand stack (see the "Milestone 3" module doc below).
+        let trace = compile_numeric_field_trace(
+            &[
+                NumericInstruction::Constant(0.0),
+                NumericInstruction::LoadFieldDynamic(0),
+                NumericInstruction::Return,
+            ],
+            0,
+            0,
+            1,
+        )
+        .expect("dynamic field trace compiles");
+        let mut state = trace.initial_state(&[]).unwrap();
+        let outcome = trace
+            .run_budgeted(&mut state, 10, &mut |index| {
+                assert_eq!(index, 0, "only field-table index 0 was declared");
+                Some(42.0)
+            })
+            .unwrap();
+        assert_eq!(
+            outcome,
+            NumericRunOutcome::Returned {
+                value: 42.0,
+                steps: 3
+            }
+        );
+    }
+
+    #[test]
+    fn load_field_dynamic_side_exits_when_the_callback_declines() {
+        let trace = compile_numeric_field_trace(
+            &[
+                NumericInstruction::Constant(0.0),
+                NumericInstruction::LoadFieldDynamic(0),
+                NumericInstruction::Return,
+            ],
+            0,
+            0,
+            1,
+        )
+        .expect("dynamic field trace compiles");
+        let mut state = trace.initial_state(&[]).unwrap();
+        let outcome = trace.run_budgeted(&mut state, 10, &mut |_| None).unwrap();
+        assert_eq!(
+            outcome,
+            NumericRunOutcome::SideExit {
+                instruction: 1,
+                steps: 1,
+            },
+            "declining must resume at the LoadFieldDynamic instruction itself, \
+             having retired no steps for it"
+        );
+        // A SideExit is not "retry this same state and expect progress" the
+        // way BudgetExhausted is, but `state.instruction` must still name the
+        // exact bytecode a caller that does inspect it should continue from.
+        assert_eq!(state.instruction, 1);
+    }
+
+    #[test]
+    fn load_field_dynamic_rejects_an_out_of_range_field_index() {
+        assert!(matches!(
+            compile_numeric_field_trace(
+                &[
+                    NumericInstruction::Constant(0.0),
+                    NumericInstruction::LoadFieldDynamic(1),
+                    NumericInstruction::Return,
+                ],
+                0,
+                0,
+                1,
+            ),
+            Err(CompileError::InvalidField(1))
+        ));
+    }
+
+    #[test]
     fn rejects_unsafe_trace_shapes_for_interpreter_fallback() {
         assert!(matches!(
             compile_numeric_trace(&[NumericInstruction::Add], 0),
@@ -1220,7 +1467,7 @@ mod tests {
         assert!(state.stack.spilled());
         let redzone = trace.max_stack_depth.max(1);
         state.stack[redzone] = 0.0;
-        assert_eq!(trace.run_budgeted(&mut state, 2), None);
+        assert_eq!(trace.run_budgeted(&mut state, 2, &mut |_| None), None);
     }
 
     #[test]
@@ -1255,7 +1502,7 @@ mod tests {
 
         let mut state = trace.initial_state(&[5.0, 123.0]).unwrap();
         assert_eq!(
-            trace.run_budgeted(&mut state, 0),
+            trace.run_budgeted(&mut state, 0, &mut |_| None),
             Some(NumericRunOutcome::BudgetExhausted {
                 instruction: 0,
                 steps: 0
@@ -1263,7 +1510,7 @@ mod tests {
         );
         let mut total_steps = 0;
         loop {
-            match trace.run_budgeted(&mut state, 10).unwrap() {
+            match trace.run_budgeted(&mut state, 10, &mut |_| None).unwrap() {
                 NumericRunOutcome::BudgetExhausted { steps, .. } => {
                     assert_eq!(steps, 10);
                     total_steps += steps;
@@ -1272,6 +1519,9 @@ mod tests {
                     total_steps += steps;
                     assert_eq!(value, 15.0);
                     break;
+                }
+                NumericRunOutcome::SideExit { .. } => {
+                    panic!("a trace with no LoadFieldDynamic cannot side-exit")
                 }
             }
         }
@@ -1304,6 +1554,7 @@ mod tests {
             ],
             2,
             1,
+            0,
         )
         .expect("guarded field loop compiles");
         let mut state = trace
@@ -1315,7 +1566,7 @@ mod tests {
         );
         loop {
             if matches!(
-                trace.run_budgeted(&mut state, 7).unwrap(),
+                trace.run_budgeted(&mut state, 7, &mut |_| None).unwrap(),
                 NumericRunOutcome::Returned { value: 17.0, .. }
             ) {
                 break;
@@ -1360,12 +1611,13 @@ mod tests {
             ],
             0,
             1,
+            0,
         )
         .unwrap();
         let mut native = trace.initial_state_with_fields(&[], &[0.0]).unwrap();
         let started = Instant::now();
         for _ in 0..CALLS {
-            black_box(trace.run_budgeted(&mut native, 6).unwrap());
+            black_box(trace.run_budgeted(&mut native, 6, &mut |_| None).unwrap());
         }
         let native_elapsed = started.elapsed();
         let mut rust_field = 0.0_f32;

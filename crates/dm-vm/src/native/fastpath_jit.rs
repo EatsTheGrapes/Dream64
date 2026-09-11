@@ -14,8 +14,7 @@ use crate::value_ops::{
 use crate::{CallFrame, ExecutionState, declared_argument_count};
 use dm_jit::{
     CompiledNumericTrace, CompiledRootedBlock, NumericInstruction, NumericRunOutcome,
-    RootedBlockOutcome, compile_numeric_field_trace, compile_numeric_trace,
-    compile_safe_rooted_block,
+    RootedBlockOutcome, compile_numeric_field_trace, compile_safe_rooted_block,
 };
 use dm_value::{DatumId, FieldName, ListId, TypePath, Value, ValueError};
 use smallvec::SmallVec;
@@ -1138,7 +1137,8 @@ pub(crate) fn try_run_guarded_jit(
         GUARDED_JIT_RUNS.fetch_add(1, Ordering::Relaxed);
         let steps = match outcome {
             NumericRunOutcome::Returned { steps, .. }
-            | NumericRunOutcome::BudgetExhausted { steps, .. } => u64::from(steps),
+            | NumericRunOutcome::BudgetExhausted { steps, .. }
+            | NumericRunOutcome::SideExit { steps, .. } => u64::from(steps),
         };
         GUARDED_JIT_STEPS.fetch_add(steps, Ordering::Relaxed);
         return Some((outcome, true));
@@ -1228,7 +1228,7 @@ fn try_run_lumcount_jit(
         let budget = u32::try_from(remaining_steps).unwrap_or(u32::MAX);
         let outcome = trace
             .compiled
-            .run_budgeted(frame.numeric_jit_state_mut()?, budget)?;
+            .run_budgeted(frame.numeric_jit_state_mut()?, budget, &mut |_| None)?;
         let native = frame.numeric_jit_state_mut()?;
         for (index, field) in trace.fields.iter().enumerate() {
             if native.dirty_fields & (1_u64 << index) != 0 {
@@ -1343,7 +1343,7 @@ pub(crate) fn compile_lumcount_trace(program: &Program) -> Option<LumcountTrace>
         NumericInstruction::Constant(0.0),
         NumericInstruction::Return,
     ];
-    let compiled = compile_numeric_field_trace(&native, program.local_count, 4)
+    let compiled = compile_numeric_field_trace(&native, program.local_count, 4, 0)
         .inspect_err(|error| eprintln!("lumcount JIT compile rejected: {error}"))
         .ok()?;
     Some(LumcountTrace {
@@ -1360,9 +1360,22 @@ pub(crate) fn compile_lumcount_trace(program: &Program) -> Option<LumcountTrace>
 /// crosses the threshold — so, unlike the pre-region design, this pays a
 /// translation/compile attempt per *distinct* procedure that gets hot, not on
 /// every call.
-pub(crate) fn compile_region_trace(program: &Program) -> Option<CompiledNumericTrace> {
-    let compiled = numeric_trace_instructions(program)
-        .and_then(|instructions| compile_numeric_trace(&instructions, program.local_count).ok());
+/// A compiled region plus the field-name table its `LoadFieldDynamic`
+/// instructions index into. `dm-jit` only ever sees dense `u16` indices —
+/// resolving one back to a `FieldName` is entirely a `dm-vm` concern, so this
+/// wrapper (not `CompiledNumericTrace` alone) is what `PcCache::Region`
+/// stores from Milestone 3 on.
+pub(crate) struct CompiledRegion {
+    pub(crate) trace: CompiledNumericTrace,
+    pub(crate) field_names: Vec<FieldName>,
+}
+
+pub(crate) fn compile_region_trace(program: &Program) -> Option<CompiledRegion> {
+    let compiled = numeric_trace_instructions(program).and_then(|(instructions, field_names)| {
+        compile_numeric_field_trace(&instructions, program.local_count, 0, field_names.len())
+            .ok()
+            .map(|trace| CompiledRegion { trace, field_names })
+    });
     if compiled.is_some() {
         GUARDED_JIT_NUMERIC_COMPILED.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -1379,10 +1392,11 @@ pub(crate) fn compile_region_trace(program: &Program) -> Option<CompiledNumericT
 /// procedure-wide one — the installed region stays available for the next
 /// call whose locals do qualify.
 pub(crate) fn try_run_region_numeric_jit(
-    trace: &CompiledNumericTrace,
+    region: &CompiledRegion,
     program: &Program,
     frame: &mut CallFrame,
     remaining_steps: u64,
+    state: &ExecutionState,
 ) -> Option<NumericRunOutcome> {
     if frame.numeric_jit_state().is_none() {
         let mut numeric_locals = vec![0.0; program.local_count];
@@ -1396,15 +1410,31 @@ pub(crate) fn try_run_region_numeric_jit(
                 return None;
             }
         }
-        frame.set_numeric_jit_state(trace.initial_state(&numeric_locals));
+        frame.set_numeric_jit_state(region.trace.initial_state(&numeric_locals));
     }
     let budget = u32::try_from(remaining_steps).unwrap_or(u32::MAX);
-    let outcome = trace.run_budgeted(frame.numeric_jit_state_mut()?, budget);
+    // `src` is captured by value (a `DatumId` is `Copy`) before the
+    // `numeric_jit_state_mut()` borrow below, exactly like `try_run_lumcount_jit`
+    // reads it once up front rather than holding a live borrow of `frame`.
+    let src = match frame.src {
+        Value::Datum(id) => Some(id),
+        _ => None,
+    };
+    let field_names = &region.field_names;
+    let mut load_field = |field_index: u32| -> Option<f32> {
+        let name = field_names.get(usize::try_from(field_index).ok()?)?;
+        datum_field_or_shared(state, src?, name).ok()?.as_number()
+    };
+    let outcome =
+        region
+            .trace
+            .run_budgeted(frame.numeric_jit_state_mut()?, budget, &mut load_field);
     if let Some(outcome) = &outcome {
         GUARDED_JIT_RUNS.fetch_add(1, Ordering::Relaxed);
         let steps = match outcome {
             NumericRunOutcome::Returned { steps, .. }
-            | NumericRunOutcome::BudgetExhausted { steps, .. } => u64::from(*steps),
+            | NumericRunOutcome::BudgetExhausted { steps, .. }
+            | NumericRunOutcome::SideExit { steps, .. } => u64::from(*steps),
         };
         GUARDED_JIT_STEPS.fetch_add(steps, Ordering::Relaxed);
     }
@@ -1464,7 +1494,26 @@ fn reachable_from_entry(instructions: &[Instruction]) -> Vec<bool> {
     reachable
 }
 
-pub(crate) fn numeric_trace_instructions(program: &Program) -> Option<Vec<NumericInstruction>> {
+/// Translates one procedure's bytecode into the region tier's closed numeric
+/// IR, alongside the distinct field names it references dynamically (the
+/// `LoadFieldDynamic` table `compile_region_trace` hands to `dm-jit`).
+///
+/// A `LoadField(name)` only translates when the instruction immediately
+/// before it is exactly `LoadSrc` — the receiver is always this region's
+/// implicit `src`, never a general expression (see the "Milestone 3" note in
+/// `docs/performance/baseline-region-jit.md`). That `LoadSrc` itself
+/// translates to an inert `Constant(0.0)` placeholder: `LoadFieldDynamic`
+/// pops and discards it (the real receiver travels out of band through the
+/// callback context, not the operand stack), so the placeholder only exists
+/// to keep every jump target's absolute instruction index unchanged. Any
+/// other appearance of `LoadSrc` or `LoadField` — not immediately adjacent,
+/// or `LoadField` with nothing before it — is conservatively left untranslated
+/// and falls through to the ordinary rejection path below (matching a
+/// non-`src` receiver would require tracking operand *kinds*, deferred to a
+/// later milestone; see the module's doc comment history).
+pub(crate) fn numeric_trace_instructions(
+    program: &Program,
+) -> Option<(Vec<NumericInstruction>, Vec<FieldName>)> {
     if program.instructions.is_empty()
         || program.instructions.iter().any(|instruction| {
             matches!(
@@ -1477,7 +1526,14 @@ pub(crate) fn numeric_trace_instructions(program: &Program) -> Option<Vec<Numeri
     }
     let declared_arguments = declared_argument_count(program);
     let reachable = reachable_from_entry(&program.instructions);
-    program
+    let is_src_for_field_read = |pc: usize| {
+        matches!(
+            program.instructions.get(pc + 1),
+            Some(Instruction::LoadField(_))
+        )
+    };
+    let mut field_names: Vec<FieldName> = Vec::new();
+    let instructions = program
         .instructions
         .iter()
         .enumerate()
@@ -1509,8 +1565,24 @@ pub(crate) fn numeric_trace_instructions(program: &Program) -> Option<Vec<Numeri
                 .ok()
                 .map(NumericInstruction::JumpIfFalse),
             Instruction::Return => Some(NumericInstruction::Return),
+            Instruction::LoadSrc if is_src_for_field_read(pc) => {
+                Some(NumericInstruction::Constant(0.0))
+            }
+            Instruction::LoadField(name)
+                if pc >= 1 && matches!(program.instructions[pc - 1], Instruction::LoadSrc) =>
+            {
+                let index = field_names
+                    .iter()
+                    .position(|existing| existing == name)
+                    .unwrap_or_else(|| {
+                        field_names.push(name.clone());
+                        field_names.len() - 1
+                    });
+                u16::try_from(index).ok().map(NumericInstruction::LoadFieldDynamic)
+            }
             _ if !reachable[pc] => Some(NumericInstruction::Return),
             _ => None,
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()?;
+    Some((instructions, field_names))
 }

@@ -9109,6 +9109,128 @@ fn region_jit_numeric_core_supports_and_or_via_switch() {
 }
 
 #[test]
+fn region_jit_numeric_core_supports_field_reads_of_src() {
+    // Milestone 3: `LoadFieldDynamic` reads a field of the region's implicit
+    // `src` through a slow-path callback (docs/performance/baseline-region-jit.md).
+    // A fresh datum every call (not the same one reused) so a stale-slot or
+    // shared-receiver bug would show up immediately as a wrong result.
+    let source = parse(concat!("/datum/proc/doubled()\n", "\treturn value * 2\n",)).unwrap();
+    let module = compile_module_specs(&[ProcedureSpec {
+        path: "/datum/proc/doubled".to_owned(),
+        definition: &source.definitions[0],
+        parent: None,
+        static_calls: BTreeMap::new(),
+        src_fields: BTreeMap::from([("value".to_owned(), field("value"))]),
+        global_fields: BTreeMap::new(),
+    }])
+    .unwrap();
+    let entry = module.procedure_id("/datum/proc/doubled").unwrap();
+    let mut state = ExecutionState::new();
+
+    let call = |state: &mut ExecutionState, n: f32| {
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/region_field_read_fixture").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(datum, field("value"), Value::number(n))
+            .unwrap();
+        execute_module_in_context(
+            &module,
+            entry,
+            &[],
+            state,
+            &ExecutionContext::new(Value::Datum(datum), Value::Null),
+        )
+    };
+
+    assert!(!state.region_installed_at_entry(module.identity.0, entry));
+    for round in 0..20 {
+        let n = round as f32;
+        assert_eq!(call(&mut state, n), Ok(Value::number(n * 2.0)), "round {round}");
+    }
+    assert!(
+        state.region_installed_at_entry(module.identity.0, entry),
+        "a field-reading procedure entered this many times must compile natively"
+    );
+    for round in 20..40 {
+        let n = round as f32;
+        assert_eq!(
+            call(&mut state, n),
+            Ok(Value::number(n * 2.0)),
+            "post-installation round {round}"
+        );
+    }
+}
+
+#[test]
+fn region_jit_field_read_side_exits_to_the_interpreter_for_a_non_numeric_field() {
+    // A `LoadFieldDynamic` callback declines (steps: `NumericRunOutcome::SideExit`,
+    // not `Returned`/`BudgetExhausted`) whenever the field isn't a guarded
+    // number — here, a `null` value. The interpreter must then finish this
+    // exact call, computing the same result it always would have; the
+    // region's presence must stay completely unobservable.
+    let source = parse(concat!("/datum/proc/doubled()\n", "\treturn value * 2\n",)).unwrap();
+    let module = compile_module_specs(&[ProcedureSpec {
+        path: "/datum/proc/doubled".to_owned(),
+        definition: &source.definitions[0],
+        parent: None,
+        static_calls: BTreeMap::new(),
+        src_fields: BTreeMap::from([("value".to_owned(), field("value"))]),
+        global_fields: BTreeMap::new(),
+    }])
+    .unwrap();
+    let entry = module.procedure_id("/datum/proc/doubled").unwrap();
+
+    let null_valued_result = |state: &mut ExecutionState| {
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/region_field_side_exit_fixture").unwrap());
+        // `value` stays unset -> reads as null, not a number.
+        execute_module_in_context(
+            &module,
+            entry,
+            &[],
+            state,
+            &ExecutionContext::new(Value::Datum(datum), Value::Null),
+        )
+    };
+
+    // Baseline: what the pure interpreter computes, before any region exists.
+    let mut baseline_state = ExecutionState::new();
+    let baseline = null_valued_result(&mut baseline_state);
+    assert!(
+        !baseline_state.region_installed_at_entry(module.identity.0, entry),
+        "no calls happened yet"
+    );
+
+    // Warm the region up on NUMERIC calls only, then confirm a subsequent
+    // null-valued call still matches the pure-interpreter baseline exactly —
+    // the side-exit must hand off, not silently miscompute.
+    let mut state = ExecutionState::new();
+    for round in 0..20 {
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/region_field_side_exit_fixture").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(datum, field("value"), Value::number(round as f32))
+            .unwrap();
+        execute_module_in_context(
+            &module,
+            entry,
+            &[],
+            &mut state,
+            &ExecutionContext::new(Value::Datum(datum), Value::Null),
+        )
+        .unwrap();
+    }
+    assert!(state.region_installed_at_entry(module.identity.0, entry));
+
+    assert_eq!(null_valued_result(&mut state), baseline);
+}
+
+#[test]
 fn field_slot_cache_routes_unmaterialized_reads_through_initial_value() {
     let source = parse(concat!(
         "/proc/read_default(target)\n",
@@ -20786,7 +20908,9 @@ fn numeric_jit_lowers_isolated_locals_and_cfg_conservatively() {
     let module = compile_module(&syntax.definitions).expect("numeric CFG fixture compiles");
     let entry = module.procedure_id("/proc/calculate").unwrap();
     let program = &module.procedures[entry.index()];
-    let lowered = crate::numeric_trace_instructions(program).expect("safe numeric CFG lowers");
+    let (lowered, field_names) =
+        crate::numeric_trace_instructions(program).expect("safe numeric CFG lowers");
+    assert!(field_names.is_empty(), "this fixture reads no fields");
     assert!(
         lowered
             .iter()

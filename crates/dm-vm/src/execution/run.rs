@@ -190,17 +190,33 @@ fn run_frames_inner(
                 program,
                 &mut frames[frame_index],
                 remaining_steps,
+                state,
             )
         {
-            let (accounted_steps, result) = match outcome {
-                NumericRunOutcome::Returned { value, steps } => {
-                    // Native Return has no VM-visible side effect. Replay that
-                    // final instruction through the ordinary arm below so call
-                    // unwinding, tracing, and scheduler behavior stay unified —
-                    // mirrors `try_run_guarded_jit`'s call site below exactly.
-                    (u64::from(steps.saturating_sub(1)), Some(value))
+            // What the frame needs after accounting, beyond `Continue`
+            // (nothing — the ordinary loop resumes at `instruction_index`,
+            // matching `BudgetExhausted`'s existing contract): a completed
+            // native `Return` replays through the ordinary arm below exactly
+            // as `try_run_guarded_jit`'s call site does; a `LoadFieldDynamic`
+            // decline is NOT a "try native again next time" signal like
+            // budget exhaustion — it hands the rest of this call to the
+            // interpreter at the exact bytecode the native run stopped at.
+            enum RegionCompletion {
+                Continue,
+                Returned(f32),
+                SideExit(u32),
+            }
+            let (accounted_steps, completion) = match outcome {
+                NumericRunOutcome::Returned { value, steps } => (
+                    u64::from(steps.saturating_sub(1)),
+                    RegionCompletion::Returned(value),
+                ),
+                NumericRunOutcome::BudgetExhausted { steps, .. } => {
+                    (u64::from(steps), RegionCompletion::Continue)
                 }
-                NumericRunOutcome::BudgetExhausted { steps, .. } => (u64::from(steps), None),
+                NumericRunOutcome::SideExit { instruction, steps } => {
+                    (u64::from(steps), RegionCompletion::SideExit(instruction))
+                }
             };
             let scheduler_batches_before = executed_steps / 4_096;
             remaining_steps = remaining_steps.saturating_sub(accounted_steps);
@@ -212,10 +228,26 @@ fn run_frames_inner(
                 profile.total_instructions =
                     profile.total_instructions.saturating_add(accounted_steps);
             }
-            if let Some(value) = result {
-                frames[frame_index].set_numeric_jit_state(None);
-                frames[frame_index].stack.push(Value::number(value));
-                frames[frame_index].instruction = program.instructions.len() - 1;
+            match completion {
+                RegionCompletion::Continue => {}
+                RegionCompletion::SideExit(instruction) => {
+                    frames[frame_index].set_numeric_jit_state(None);
+                    // Native execution never touches the real `frame.stack` —
+                    // only its own internal f32 array — so the interpreter,
+                    // resuming at the original `LoadField` this instruction
+                    // was translated from, must find the receiver it expects
+                    // to pop rematerialized here first. Every
+                    // `LoadFieldDynamic` translates only a `LoadSrc`-adjacent
+                    // `LoadField`, so the receiver is always exactly `src`.
+                    let src = frames[frame_index].src.clone();
+                    frames[frame_index].stack.push(src);
+                    frames[frame_index].instruction = instruction as usize;
+                }
+                RegionCompletion::Returned(value) => {
+                    frames[frame_index].set_numeric_jit_state(None);
+                    frames[frame_index].stack.push(Value::number(value));
+                    frames[frame_index].instruction = program.instructions.len() - 1;
+                }
             }
         }
         // A packed numeric dispatch block that exhausts its step budget stashes
@@ -579,7 +611,13 @@ fn run_frames_inner(
                     // unwinding, tracing, and scheduler behavior stay unified.
                     (u64::from(steps.saturating_sub(1)), Some(value))
                 }
-                NumericRunOutcome::BudgetExhausted { steps, .. } => (u64::from(steps), None),
+                // Lumcount's compiled trace has no `LoadFieldDynamic`
+                // instruction (it always guards its fixed field set through
+                // the flat pre-fetched array instead), so this never actually
+                // fires; handled the same as budget exhaustion regardless —
+                // resuming is always safe, never a correctness event.
+                NumericRunOutcome::BudgetExhausted { steps, .. }
+                | NumericRunOutcome::SideExit { steps, .. } => (u64::from(steps), None),
             };
             let scheduler_batches_before = executed_steps / 4_096;
             remaining_steps = remaining_steps.saturating_sub(accounted_steps);
