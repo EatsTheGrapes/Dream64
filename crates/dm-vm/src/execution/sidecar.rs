@@ -13,6 +13,11 @@
 //! its PC; every hit still revalidates against live heap/catalog state, so the
 //! cache only ever affects hit rate, never semantics. Cold slots are one
 //! pointer-sized niche and never allocate.
+//!
+//! The run loop resolves a procedure's sidecar **once per procedure switch**
+//! (alongside the immutable [`Program`](crate::bytecode::Program)) and threads
+//! `&mut ProcedureSidecar` through `dispatch_instruction`, so a per-PC cache
+//! access is a plain array index — never a map lookup on the hot path.
 
 use std::collections::HashMap;
 
@@ -49,10 +54,33 @@ impl ProcedureSidecar {
         }
     }
 
-    /// The cache slot for one instruction index, or `None` if the index is out
-    /// of range (a fused/synthetic instruction with no source PC).
-    pub(crate) fn slot_mut(&mut self, instruction_index: usize) -> Option<&mut PcCache> {
-        self.pcs.get_mut(instruction_index)
+    /// The field-read inline cache at one PC, or `None` if nothing has been
+    /// installed there yet (or the index is out of range). The hit and
+    /// invalidation paths use this.
+    pub(crate) fn field_read_cache(
+        &mut self,
+        instruction_index: usize,
+    ) -> Option<&mut FieldSlotCache> {
+        match self.pcs.get_mut(instruction_index)? {
+            PcCache::FieldRead(cache) => Some(cache),
+            PcCache::Cold => None,
+        }
+    }
+
+    /// The field-read inline cache at one PC, promoting the slot on first use.
+    /// The miss path installs a resolution through this.
+    pub(crate) fn field_read_cache_or_install(
+        &mut self,
+        instruction_index: usize,
+    ) -> Option<&mut FieldSlotCache> {
+        let slot = self.pcs.get_mut(instruction_index)?;
+        if matches!(slot, PcCache::Cold) {
+            *slot = PcCache::FieldRead(Box::default());
+        }
+        match slot {
+            PcCache::FieldRead(cache) => Some(cache),
+            PcCache::Cold => unreachable!("slot was just promoted to FieldRead"),
+        }
     }
 
     /// Every installed field-read inline cache in this procedure.
@@ -66,61 +94,36 @@ impl ProcedureSidecar {
 }
 
 /// All procedure sidecars for one runtime world, keyed by
-/// `(module identity, procedure)`. A newtype so its accessors are a disjoint
-/// field borrow of `ExecutionState`, leaving the heap borrowable alongside.
+/// `(module identity, procedure)`. `run_frames` lends the whole map out as a
+/// value disjoint from `ExecutionState` for one run, then holds `&mut` to the
+/// active procedure's entry across that procedure's instructions, re-resolving
+/// only on a procedure switch.
 #[derive(Default)]
 pub(crate) struct ProgramSidecars {
     by_procedure: HashMap<(u64, ProcedureId), ProcedureSidecar>,
 }
 
 impl ProgramSidecars {
-    /// Drops every cache. Called when the type / shared-var / initial-value
-    /// catalogs are replaced, or on ready-world snapshot restore.
+    /// Drops every cache. Called *between* `run_frames` invocations only —
+    /// when the type / shared-var / initial-value catalogs are replaced, or on
+    /// ready-world snapshot restore. Never reachable from `dispatch_instruction`.
     pub(crate) fn clear(&mut self) {
         self.by_procedure.clear();
     }
 
-    /// The field-read inline cache installed at one `(module, procedure, PC)`
-    /// call site, or `None` if the site has never resolved a datum field read.
-    /// Non-creating — the hit and invalidation paths use this.
-    pub(crate) fn field_read_cache(
+    /// The sidecar for one `(module, procedure)`, allocating an all-`Cold` array
+    /// of `instruction_count` slots on first use. The run loop calls this only
+    /// when the executing procedure changes and holds the borrow across that
+    /// procedure's instructions.
+    pub(crate) fn resolve(
         &mut self,
         module_identity: u64,
         procedure: ProcedureId,
-        instruction_index: usize,
-    ) -> Option<&mut FieldSlotCache> {
-        match self
-            .by_procedure
-            .get_mut(&(module_identity, procedure))?
-            .slot_mut(instruction_index)?
-        {
-            PcCache::FieldRead(cache) => Some(cache),
-            PcCache::Cold => None,
-        }
-    }
-
-    /// The field-read inline cache at a call site, allocating the procedure's
-    /// sidecar array and promoting the PC's slot on first use. The miss path
-    /// installs a resolution through this.
-    pub(crate) fn field_read_cache_or_install(
-        &mut self,
-        module_identity: u64,
-        procedure: ProcedureId,
-        instruction_index: usize,
         instruction_count: usize,
-    ) -> Option<&mut FieldSlotCache> {
-        let slot = self
-            .by_procedure
+    ) -> &mut ProcedureSidecar {
+        self.by_procedure
             .entry((module_identity, procedure))
             .or_insert_with(|| ProcedureSidecar::new(instruction_count))
-            .slot_mut(instruction_index)?;
-        if matches!(slot, PcCache::Cold) {
-            *slot = PcCache::FieldRead(Box::default());
-        }
-        match slot {
-            PcCache::FieldRead(cache) => Some(cache),
-            PcCache::Cold => unreachable!("slot was just promoted to FieldRead"),
-        }
     }
 
     /// The most receiver types any single field-read call site is tracking.
@@ -128,7 +131,7 @@ impl ProgramSidecars {
     pub(crate) fn widest_field_read_site(&self) -> usize {
         self.by_procedure
             .values()
-            .flat_map(ProcedureSidecar::field_read_caches)
+            .flat_map(|sidecar| sidecar.field_read_caches())
             .map(FieldSlotCache::tracked_type_count)
             .max()
             .unwrap_or(0)

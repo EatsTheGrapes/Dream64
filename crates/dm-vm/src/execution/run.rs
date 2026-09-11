@@ -33,15 +33,47 @@ use crate::execution::frame::StepBudgetBehavior;
 use crate::execution::interpreter::{DispatchFlow, dispatch_instruction};
 use crate::execution::run_support::execution_error;
 use crate::execution::scheduler::account_scheduler_tick_usage;
+use crate::execution::sidecar::{ProcedureSidecar, ProgramSidecars};
 use crate::execution::state::ExecutionState;
 use crate::value_ops::pop;
 
 pub(crate) fn run_frames(
     module: &Module,
+    frames: Vec<CallFrame>,
+    limits: ExecutionLimits,
+    step_budget_behavior: StepBudgetBehavior,
+    state: &mut ExecutionState,
+) -> Result<FrameRunOutcome, RuntimeError> {
+    // Lend the PC-cache sidecars out as a value disjoint from `state` for the
+    // whole run, so the loop can hold `&mut ProcedureSidecar` for the active
+    // procedure across `dispatch_instruction` without a per-instruction map
+    // lookup. `state.program_sidecars` is only ever touched by this loop and by
+    // host catalog/snapshot APIs between runs, so the take/restore window is
+    // exclusive. (A panic mid-loop aborts the boot, so the restore is not
+    // guarded.)
+    let mut sidecars = std::mem::take(&mut state.program_sidecars);
+    let outcome = run_frames_inner(
+        module,
+        frames,
+        limits,
+        step_budget_behavior,
+        state,
+        &mut sidecars,
+    );
+    state.program_sidecars = sidecars;
+    outcome
+}
+
+// The interpreter loop keeps its instruction handling inline; splitting it would
+// only move the hot dispatch behind another call boundary.
+#[allow(clippy::too_many_lines)]
+fn run_frames_inner(
+    module: &Module,
     mut frames: Vec<CallFrame>,
     limits: ExecutionLimits,
     step_budget_behavior: StepBudgetBehavior,
     state: &mut ExecutionState,
+    sidecars: &mut ProgramSidecars,
 ) -> Result<FrameRunOutcome, RuntimeError> {
     // Observability flags are process-global and immutable after their first
     // read. Cache them once per dispatch instead of paying a OnceLock atomic
@@ -81,6 +113,10 @@ pub(crate) fn run_frames(
     // identity within one dispatch, resolving again only after a call/return switches
     // procedures or when a continuation starts a new dispatch.
     let mut active_program: Option<(ProcedureId, &Program)> = None;
+    // The active procedure's PC-cache sidecar, borrowed from `sidecars` and
+    // re-used across the procedure's instructions — resolved from the map only
+    // when the executing procedure changes, never per instruction.
+    let mut active_sidecar: Option<(ProcedureId, &mut ProcedureSidecar)> = None;
     loop {
         if let Some(budget) = wall_clock_budget
             && executed_steps >= next_wall_clock_poll
@@ -120,7 +156,18 @@ pub(crate) fn run_frames(
                     .resolve_procedure(procedure)
                     .map_err(|message| execution_error(module, &frames, message))?;
                 active_program = Some((procedure, program));
+                active_sidecar = None;
                 program
+            }
+        };
+        let sidecar: &mut ProcedureSidecar = match &mut active_sidecar {
+            Some((cached, sidecar)) if *cached == procedure => &mut **sidecar,
+            _ => {
+                // Release any previous procedure's borrow before re-borrowing.
+                active_sidecar = None;
+                let resolved =
+                    sidecars.resolve(module.identity.0, procedure, program.instructions.len());
+                &mut *active_sidecar.insert((procedure, resolved)).1
             }
         };
         // A packed numeric dispatch block that exhausts its step budget stashes
@@ -877,6 +924,7 @@ pub(crate) fn run_frames(
         let dispatch_flow = dispatch_instruction(
             module,
             state,
+            sidecar,
             &mut frames,
             frame_index,
             procedure,
