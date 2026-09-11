@@ -192,8 +192,8 @@ number. Reject anything that regresses parity or the short gates.
    Resumption across a budget boundary reuses the pre-existing per-`CallFrame`
    `numeric_jit_state` slot exactly as the old JIT did (same safe, already
    continuation-tested mechanism — deliberately not reinvented).
-3. **Guarded field reads. Done (reads only — writes are the immediate
-   follow-up, not yet started).** `LoadFieldDynamic` calls a slow-path
+3. **Guarded field read/write for the `src` receiver. Done.**
+   `LoadFieldDynamic` calls a slow-path
    callback (`dm-jit`'s first mid-region call, not just a whole-body
    dispatcher) that runs the existing #70-shaped lookup and hands back a
    plain `f32` — no rooted slot needed, since scope stayed numeric-fields-only
@@ -217,8 +217,20 @@ number. Reject anything that regresses parity or the short gates.
    matches Monke) and the `light_source/update_corners` numeric prologue —
    still not directly hit (both have shapes outside this milestone's narrow
    scope), but `jit_guarded` telemetry shows real broader effect already:
-   steps served natively +19.9% in the parity boot, from other `src.field`-
-   reading procedures the translator previously rejected outright.
+   steps served natively +19.9% in the read-support parity boot, from other
+   `src.field`-reading procedures the translator previously rejected
+   outright (a smaller, still-positive bump from write support landing
+   after). **Writes** (`StoreFieldDynamic`) needed more than the read side's
+   adjacency check: a store's receiver sits under an arbitrary-length value
+   expression, not immediately below the store, so `dm-jit`'s `validate`
+   grew real operand-*kind* tracking (`Number | Src`, mirroring its existing
+   per-PC depth tracking) as the soundness proof instead — which then let the
+   VM-side translator drop its adjacency heuristic for reads too and lower
+   `LoadSrc`/`LoadField`/`StoreField` unconditionally, `validate` alone
+   carrying the whole proof for both. General (non-`src`) receivers still
+   need the fuller mixed-kind rooted-slot operand model the original sketch
+   above assumed, and remain deferred, likely alongside real rooted-slot
+   support once calls/allocations (milestone 5) need it anyway.
 4. **Globals, list index/length, type predicates** through the ABI.
 5. **Calls and allocations as side-exits**, so a region spanning
    `atom/Initialize`'s straight-line body compiles and only stops at each
