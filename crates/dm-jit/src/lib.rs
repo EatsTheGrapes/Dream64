@@ -542,6 +542,15 @@ pub struct CompiledNumericTrace {
 }
 
 impl CompiledNumericTrace {
+    /// The exact local-vector length this trace was compiled for — may
+    /// exceed the source procedure's own declared local count when the
+    /// region inlined a leaf call's body into fresh, renumbered slots past
+    /// the procedure's own.
+    #[must_use]
+    pub fn local_count(&self) -> usize {
+        self.local_count
+    }
+
     /// Executes the trace for exactly the local vector shape used at compilation.
     #[must_use]
     pub fn run(&self, locals: &[f32]) -> Option<f32> {

@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use crate::CompiledRegion;
-use crate::bytecode::{ProcedureId, Program};
+use crate::bytecode::{Module, ProcedureId, Program};
 use crate::execution::state::FieldSlotCache;
 
 /// The specialization state for one bytecode instruction. Every non-`Cold`
@@ -130,7 +130,7 @@ impl ProcedureSidecar {
     /// the PC-0 slot toward a region-compile attempt; a no-op once the slot
     /// holds anything else (a region, a rejection, or — rare, but possible for
     /// a one-instruction procedure — an installed field-read cache).
-    pub(crate) fn poll_region_at_entry(&mut self, program: &Program) {
+    pub(crate) fn poll_region_at_entry(&mut self, module: &Module, program: &Program) {
         let Some(slot) = self.pcs.first_mut() else {
             return;
         };
@@ -138,7 +138,7 @@ impl ProcedureSidecar {
             PcCache::Cold => *slot = PcCache::RegionCounting(1),
             PcCache::RegionCounting(count) => {
                 if *count + 1 >= Self::REGION_ENTRY_THRESHOLD {
-                    *slot = match crate::compile_region_trace(program) {
+                    *slot = match crate::compile_region_trace(module, program) {
                         Some(region) => PcCache::Region(Box::new(region)),
                         None => PcCache::RegionRejected,
                     };

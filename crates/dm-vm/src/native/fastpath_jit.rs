@@ -1373,12 +1373,12 @@ pub(crate) struct CompiledRegion {
     pub(crate) global_names: Vec<FieldName>,
 }
 
-pub(crate) fn compile_region_trace(program: &Program) -> Option<CompiledRegion> {
-    let compiled = numeric_trace_instructions(program).and_then(
-        |(instructions, field_names, global_names)| {
+pub(crate) fn compile_region_trace(module: &Module, program: &Program) -> Option<CompiledRegion> {
+    let compiled = numeric_trace_instructions(module, program).and_then(
+        |(instructions, field_names, global_names, local_count)| {
             compile_numeric_field_trace(
                 &instructions,
-                program.local_count,
+                local_count,
                 0,
                 field_names.len(),
                 global_names.len(),
@@ -1487,7 +1487,13 @@ pub(crate) fn try_run_region_numeric_jit(
     state: &mut ExecutionState,
 ) -> Option<NumericRunOutcome> {
     if frame.numeric_jit_state().is_none() {
-        let mut numeric_locals = vec![0.0; program.local_count];
+        // May exceed `program.local_count`: an inlined leaf call's own
+        // (renumbered) locals live past the procedure's own declared ones,
+        // and always get written by that inline's argument-binding
+        // `StoreLocal`s before ever being read — 0.0 is a safe placeholder
+        // for those slots until then, the same way an uninitialized-but-safe
+        // real local already defaults to 0.0 below.
+        let mut numeric_locals = vec![0.0; region.trace.local_count()];
         for (index, local) in frame.locals.iter().enumerate() {
             if let Some(value) = local.as_number() {
                 numeric_locals[index] = value;
@@ -1616,9 +1622,27 @@ fn resolve_name_index(names: &mut Vec<FieldName>, name: &FieldName) -> Option<u1
 /// condition, returning it directly) fails validation there and this whole
 /// function's caller falls back to the interpreter, exactly as it always has
 /// for any other unsupported shape.
+/// A lowered trace: its instructions, the field/global name tables its
+/// `*Dynamic` instructions index into, and the total local-slot count it
+/// needs (which can exceed `program.local_count` — see milestone 6's
+/// `try_inline_leaf_call`, whose spliced-in callee locals live past the
+/// source procedure's own).
+type NumericTraceLowering = (
+    Vec<NumericInstruction>,
+    Vec<FieldName>,
+    Vec<FieldName>,
+    usize,
+);
+
+// The per-instruction-kind dispatch is one large match by design — the same
+// reasoning `run_frames_inner`'s own `#[allow(clippy::too_many_lines)]`
+// gives: splitting it would only move each arm behind another call boundary
+// without making any single arm simpler.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn numeric_trace_instructions(
+    module: &Module,
     program: &Program,
-) -> Option<(Vec<NumericInstruction>, Vec<FieldName>, Vec<FieldName>)> {
+) -> Option<NumericTraceLowering> {
     if program.instructions.is_empty()
         || program.instructions.iter().any(|instruction| {
             matches!(
@@ -1634,6 +1658,7 @@ pub(crate) fn numeric_trace_instructions(
     let mut field_names: Vec<FieldName> = Vec::new();
     let mut global_names: Vec<FieldName> = Vec::new();
     let mut instructions = Vec::with_capacity(program.instructions.len());
+    let mut local_count = program.local_count;
     // Milestone 5: a call/allocation ends the compiled prefix instead of
     // rejecting the whole procedure, but only when it's reached by a pure
     // straight line from entry — no branch anywhere before it. Bytecode
@@ -1643,6 +1668,25 @@ pub(crate) fn numeric_trace_instructions(
     // a reachable path rather than just being conservative. `seen_branch`
     // keeps this truncation to the one shape it's actually proven for.
     let mut seen_branch = false;
+    // Milestone 6: inlining a leaf call (see `try_inline_leaf_call`) needs
+    // fresh local slots for the callee's own locals, renumbered past
+    // whatever the caller and any earlier inline already used — which only
+    // stays sound if nothing in the *caller* can jump into the middle of a
+    // splice. `seen_branch` above only guards what's *before* a call site
+    // (sufficient for M5's truncation, which never looks past that point
+    // anyway); inlining instead continues translating everything after the
+    // splice, so a branch *anywhere* in the caller — including after the
+    // call — is disqualifying: dm-jit instruction positions are only valid
+    // resume PCs for later side-exits as long as they stay 1:1 with real
+    // bytecode positions, and a splice breaks that identity for everything
+    // after it. Requiring the whole caller branch-free sidesteps rewriting
+    // jump targets entirely, rather than risking getting that math wrong.
+    let caller_is_branch_free = !program.instructions.iter().any(|instruction| {
+        matches!(
+            instruction,
+            Instruction::Jump(_) | Instruction::JumpIfFalse(_)
+        )
+    });
     for (pc, instruction) in program.instructions.iter().enumerate() {
         let translated = match instruction {
             Instruction::PushNumber(number) => Some(NumericInstruction::Constant(number.to_f32())),
@@ -1688,7 +1732,19 @@ pub(crate) fn numeric_trace_instructions(
                 .map(NumericInstruction::LoadGlobalDynamic),
             Instruction::StoreGlobal(name) => resolve_name_index(&mut global_names, name)
                 .map(NumericInstruction::StoreGlobalDynamic),
-            Instruction::Call { argument_count, .. } if !seen_branch && reachable[pc] => {
+            Instruction::Call {
+                procedure,
+                argument_count,
+                ..
+            } if !seen_branch && reachable[pc] => {
+                if caller_is_branch_free
+                    && let Some((inlined, locals_used)) =
+                        try_inline_leaf_call(module, *procedure, *argument_count, local_count)
+                {
+                    local_count += locals_used;
+                    instructions.extend(inlined);
+                    continue;
+                }
                 instructions.push(NumericInstruction::CallSideExit {
                     argument_count: *argument_count,
                 });
@@ -1716,5 +1772,124 @@ pub(crate) fn numeric_trace_instructions(
         };
         instructions.push(translated?);
     }
-    Some((instructions, field_names, global_names))
+    Some((instructions, field_names, global_names, local_count))
+}
+
+/// Milestone 6: attempts to splice `procedure`'s own body directly into the
+/// caller's trace in place of a `Call`, at compile time, instead of M5's
+/// unconditional `CallSideExit`. Scoped narrowly, matching every other
+/// milestone's own narrowing: the callee must translate to a *pure*,
+/// branch-free arithmetic sequence (no field/global access, no calls or
+/// allocations of its own — bounding this to exactly one level of inlining
+/// by construction, since the recursive `numeric_trace_instructions` call
+/// below can then never itself encounter a `Call` to attempt inlining
+/// again) ending in exactly one `Return` as its last instruction, with its
+/// declared parameter count exactly equal to its total local count (no
+/// extra temp locals to reason about defaulting). The caller itself must
+/// ALSO be entirely branch-free (checked by the caller of this function,
+/// `caller_is_branch_free`) for the reason explained there.
+///
+/// A qualifying callee's `Return` is simply dropped: the value it would
+/// have popped already sits on the native operand stack — since native
+/// execution never actually "returns" anywhere, it only ever pushes and
+/// pops the one shared stack — so leaving it there is exactly equivalent to
+/// the call having returned it, for the caller's own following
+/// instructions to keep consuming normally.
+fn try_inline_leaf_call(
+    module: &Module,
+    procedure: ProcedureId,
+    argument_count: u16,
+    local_offset: usize,
+) -> Option<(Vec<NumericInstruction>, usize)> {
+    let callee_program = module.resolve_procedure(procedure).ok()?;
+    // `local_count` almost always exceeds the declared parameter count — DM
+    // reserves extra compiler-internal slots (the implicit `.` variable
+    // among them) regardless of whether a given procedure body ever
+    // touches them. The call site's own argument count only ever supplies
+    // the *declared* parameters, so that's what has to match here, not the
+    // total.
+    if usize::from(argument_count) != declared_argument_count(callee_program) {
+        return None;
+    }
+    // Every local beyond the declared parameters starts at this splice's
+    // default (0.0, from `try_run_region_numeric_jit`'s entry seeding) —
+    // safe only if the callee provably never reads one before writing it
+    // first (the same check, and the same reasoning, `try_run_region_numeric_jit`
+    // already applies to a region's own top-level entry locals). A local
+    // read before any write — most plausibly DM's implicit `.` — would
+    // otherwise silently read this splice's 0.0 instead of `.`'s real
+    // default of `null`.
+    if (declared_argument_count(callee_program)..callee_program.local_count)
+        .any(|local| !local_is_definitely_initialized_before_load(callee_program, local))
+    {
+        return None;
+    }
+    // A branch's jump target is an absolute index into the *callee's own*
+    // instruction array, which this splice never rewrites (only
+    // `LoadLocal`/`StoreLocal` indices get renumbered below) — so any
+    // internal jump would land on the wrong instruction once spliced into a
+    // new position in the caller's sequence. A call/allocation of its own
+    // would need this same inlining logic recursively, with its own
+    // local-offset bookkeeping layered on top of this splice's — not worth
+    // the complexity for a first cut, so it's rejected outright rather than
+    // attempted.
+    if callee_program.instructions.iter().any(|instruction| {
+        matches!(
+            instruction,
+            Instruction::Jump(_)
+                | Instruction::JumpIfFalse(_)
+                | Instruction::Call { .. }
+                | Instruction::CallCurrent { .. }
+                | Instruction::CallParent { .. }
+                | Instruction::CallDynamic { .. }
+                | Instruction::AllocateDatum { .. }
+                | Instruction::AllocateCurrentDatum { .. }
+        )
+    }) {
+        return None;
+    }
+    let (callee_instructions, callee_fields, callee_globals, _) =
+        numeric_trace_instructions(module, callee_program)?;
+    if !callee_fields.is_empty() || !callee_globals.is_empty() {
+        return None;
+    }
+    // Dead code after an early `return` (valid, if unusual, DM source) can
+    // still translate to more than one `Return`, or to a non-`Return`
+    // instruction trailing the real one — either way, only a *single*
+    // `Return` as the *last* instruction is safe to drop and splice.
+    if callee_instructions
+        .iter()
+        .filter(|instruction| matches!(instruction, NumericInstruction::Return))
+        .count()
+        != 1
+        || !matches!(callee_instructions.last(), Some(NumericInstruction::Return))
+    {
+        return None;
+    }
+    let local_offset = u16::try_from(local_offset).ok()?;
+    let mut spliced = Vec::with_capacity(callee_instructions.len() + usize::from(argument_count));
+    // Arguments already sit on the caller's native operand stack in push
+    // order (bottom-to-top = first-to-last, per `CallSideExit`'s own
+    // rematerialization in `run.rs`); bind them into the callee's own
+    // (renumbered) parameter slots by popping in reverse, exactly like an
+    // ordinary interpreted call would.
+    for callee_local in (0..argument_count).rev() {
+        spliced.push(NumericInstruction::StoreLocal(local_offset + callee_local));
+    }
+    for instruction in &callee_instructions[..callee_instructions.len() - 1] {
+        spliced.push(renumber_local(*instruction, local_offset));
+    }
+    // The full local range this inline claims, including the unused-but-
+    // reserved extras beyond the declared parameters — not just
+    // `argument_count` — so a later inline in the same caller starts its
+    // own renumbering past all of them, not just the bound ones.
+    Some((spliced, callee_program.local_count))
+}
+
+fn renumber_local(instruction: NumericInstruction, offset: u16) -> NumericInstruction {
+    match instruction {
+        NumericInstruction::LoadLocal(local) => NumericInstruction::LoadLocal(local + offset),
+        NumericInstruction::StoreLocal(local) => NumericInstruction::StoreLocal(local + offset),
+        other => other,
+    }
 }

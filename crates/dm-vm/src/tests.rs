@@ -21238,8 +21238,8 @@ fn numeric_jit_lowers_isolated_locals_and_cfg_conservatively() {
     let module = compile_module(&syntax.definitions).expect("numeric CFG fixture compiles");
     let entry = module.procedure_id("/proc/calculate").unwrap();
     let program = &module.procedures[entry.index()];
-    let (lowered, field_names, global_names) =
-        crate::numeric_trace_instructions(program).expect("safe numeric CFG lowers");
+    let (lowered, field_names, global_names, _local_count) =
+        crate::numeric_trace_instructions(&module, program).expect("safe numeric CFG lowers");
     assert!(field_names.is_empty(), "this fixture reads no fields");
     assert!(global_names.is_empty(), "this fixture reads no globals");
     assert!(
@@ -21267,7 +21267,9 @@ fn numeric_jit_lowers_isolated_locals_and_cfg_conservatively() {
     let syntax = parse("/proc/update(a)\n\ta = a + 1\n\treturn a").unwrap();
     let module = compile_module(&syntax.definitions).unwrap();
     let entry = module.procedure_id("/proc/update").unwrap();
-    assert!(crate::numeric_trace_instructions(&module.procedures[entry.index()]).is_none());
+    assert!(
+        crate::numeric_trace_instructions(&module, &module.procedures[entry.index()]).is_none()
+    );
 }
 
 #[test]
@@ -21275,9 +21277,16 @@ fn numeric_trace_instructions_ends_the_prefix_at_a_straight_line_call() {
     // Milestone 5: a call no longer rejects the whole procedure outright —
     // the straight-line prefix before it (here, `var/x = 5`) still lowers,
     // ending in a `CallSideExit` that carries the call's own argument count.
+    // The callee has its own branch specifically so milestone 6's inlining
+    // (added later, which would otherwise splice a shape this trivial in
+    // directly) never qualifies it — this test is about milestone 5's own
+    // truncation mechanism specifically, not whether this particular callee
+    // happens to also be inlinable.
     let syntax = parse(concat!(
         "/proc/prefix_then_call_helper(n)\n",
-        "\treturn n\n",
+        "\tif(n > 0)\n",
+        "\t\treturn n\n",
+        "\treturn -n\n",
         "/proc/prefix_then_call()\n",
         "\tvar/x = 5\n",
         "\treturn prefix_then_call_helper(x)\n",
@@ -21286,8 +21295,9 @@ fn numeric_trace_instructions_ends_the_prefix_at_a_straight_line_call() {
     let module = compile_module(&syntax.definitions).unwrap();
     let entry = module.procedure_id("/proc/prefix_then_call").unwrap();
     let program = &module.procedures[entry.index()];
-    let (lowered, field_names, global_names) =
-        crate::numeric_trace_instructions(program).expect("straight-line prefix-then-call lowers");
+    let (lowered, field_names, global_names, _local_count) =
+        crate::numeric_trace_instructions(&module, program)
+            .expect("straight-line prefix-then-call lowers");
     assert!(field_names.is_empty());
     assert!(global_names.is_empty());
     assert!(
@@ -21323,7 +21333,7 @@ fn numeric_trace_instructions_rejects_a_call_reached_only_after_a_branch() {
     let module = compile_module(&syntax.definitions).unwrap();
     let entry = module.procedure_id("/proc/branch_then_call").unwrap();
     let program = &module.procedures[entry.index()];
-    assert!(crate::numeric_trace_instructions(program).is_none());
+    assert!(crate::numeric_trace_instructions(&module, program).is_none());
 }
 
 #[test]
@@ -21391,10 +21401,15 @@ fn region_jit_declines_a_prefix_where_a_constant_sits_beneath_a_dynamic_global_r
 
 #[test]
 fn region_jit_prefix_ending_call_runs_the_call_correctly_after_warm_up() {
-    // End-to-end: the region compiles `var/x = 5` natively, side-exits at
-    // the call to `region_call_helper`, and the interpreter must run that
-    // call — and read back its result — exactly as it would with no region
-    // involved at all.
+    // End-to-end: the region compiles `var/x = 5` natively and must produce
+    // the correct final result for the call to `region_call_helper` —
+    // exactly as it would with no region involved at all. This shape
+    // happens to also qualify for milestone 6's leaf-call inlining
+    // (`region_call_helper` is branch-free, field/global-free, and its one
+    // declared parameter exactly matches its own local count), so this now
+    // exercises the inlined path rather than milestone 5's side-exit — see
+    // `region_jit_prefix_ending_call_side_exits_when_the_callee_has_a_branch`
+    // below for a shape that still exercises the side-exit fallback.
     let syntax = parse(concat!(
         "/proc/region_call_helper(n)\n",
         "\treturn n * 10\n",
@@ -21430,12 +21445,311 @@ fn region_jit_prefix_ending_call_runs_the_call_correctly_after_warm_up() {
 }
 
 #[test]
+fn numeric_trace_instructions_inlines_a_qualifying_leaf_call() {
+    // Milestone 6: `inline_helper`'s body (branch-free, field/global-free,
+    // one `Return` at the end, declared-parameter count exactly matching
+    // the call site's own argument count) qualifies for a compile-time
+    // splice instead of milestone 5's `CallSideExit`. Neither procedure's
+    // real `local_count` equals its declared parameter/`var` count — DM
+    // reserves extra compiler-internal slots (the implicit `.` variable
+    // among them) regardless of whether a body ever uses them — so the
+    // callee's own locals get renumbered starting at whatever the caller's
+    // *real* `local_count` already is, read here rather than assumed, to
+    // keep this test correct regardless of exactly how many hidden slots
+    // DM's compiler happens to reserve.
+    let syntax = parse(concat!(
+        "/proc/inline_helper(a, b)\n",
+        "\treturn a + b\n",
+        "/proc/inline_caller()\n",
+        "\treturn inline_helper(3, 4)\n",
+    ))
+    .unwrap();
+    let module = compile_module(&syntax.definitions).unwrap();
+    let helper_entry = module.procedure_id("/proc/inline_helper").unwrap();
+    let helper_local_count = module.procedures[helper_entry.index()].local_count;
+    let entry = module.procedure_id("/proc/inline_caller").unwrap();
+    let program = &module.procedures[entry.index()];
+    let caller_local_count = program.local_count;
+    let (lowered, field_names, global_names, local_count) =
+        crate::numeric_trace_instructions(&module, program).expect("inlining candidate lowers");
+    assert!(field_names.is_empty());
+    assert!(global_names.is_empty());
+    assert!(
+        !lowered.iter().any(|instruction| matches!(
+            instruction,
+            dm_jit::NumericInstruction::CallSideExit { .. }
+        )),
+        "a qualifying leaf call must be spliced in, not side-exited: {lowered:?}"
+    );
+    assert_eq!(local_count, caller_local_count + helper_local_count);
+    let a = u16::try_from(caller_local_count).unwrap();
+    let b = a + 1;
+    assert_eq!(
+        lowered,
+        vec![
+            dm_jit::NumericInstruction::Constant(3.0),
+            dm_jit::NumericInstruction::Constant(4.0),
+            // Bind in reverse pop order: `b` (top of stack) first, `a` second.
+            dm_jit::NumericInstruction::StoreLocal(b),
+            dm_jit::NumericInstruction::StoreLocal(a),
+            // The callee's own `a + b`, renumbered, with its `Return` dropped.
+            dm_jit::NumericInstruction::LoadLocal(a),
+            dm_jit::NumericInstruction::LoadLocal(b),
+            dm_jit::NumericInstruction::Add,
+            // The caller's own real `return`.
+            dm_jit::NumericInstruction::Return,
+        ]
+    );
+}
+
+#[test]
+fn numeric_trace_instructions_does_not_inline_a_callee_with_its_own_branch() {
+    // A callee's internal jump target is an absolute index into the
+    // callee's own instruction array; splicing without rewriting it would
+    // land on the wrong instruction. Must fall back to `CallSideExit`
+    // instead of attempting (and mis-translating) a splice.
+    let syntax = parse(concat!(
+        "/proc/inline_branchy_helper(a)\n",
+        "\tif(a > 0)\n",
+        "\t\treturn 1\n",
+        "\treturn -1\n",
+        "/proc/inline_branchy_caller()\n",
+        "\treturn inline_branchy_helper(5)\n",
+    ))
+    .unwrap();
+    let module = compile_module(&syntax.definitions).unwrap();
+    let entry = module.procedure_id("/proc/inline_branchy_caller").unwrap();
+    let program = &module.procedures[entry.index()];
+    let (lowered, ..) =
+        crate::numeric_trace_instructions(&module, program).expect("still lowers via CallSideExit");
+    assert!(matches!(
+        lowered.last(),
+        Some(dm_jit::NumericInstruction::CallSideExit { argument_count: 1 })
+    ));
+}
+
+#[test]
+fn numeric_trace_instructions_does_not_inline_when_the_caller_itself_branches() {
+    // Even when the callee alone would qualify, a branch anywhere in the
+    // CALLER — before or after the call site — disqualifies inlining for
+    // every call in that procedure: bytecode array order isn't execution
+    // order once a jump exists, so nothing after a splice point can be
+    // trusted to still be at the position any later side-exit (or the
+    // caller's own jump target) expects.
+    let syntax = parse(concat!(
+        "/proc/inline_helper3(a)\n",
+        "\treturn a * 2\n",
+        "/proc/inline_caller_with_branch(flag)\n",
+        "\tif(flag)\n",
+        "\t\treturn inline_helper3(1)\n",
+        "\treturn inline_helper3(2)\n",
+    ))
+    .unwrap();
+    let module = compile_module(&syntax.definitions).unwrap();
+    let entry = module
+        .procedure_id("/proc/inline_caller_with_branch")
+        .unwrap();
+    let program = &module.procedures[entry.index()];
+    // Both calls are reached only after (or as part of) a branch, so
+    // milestone 5's own `seen_branch` gate already rejects them from
+    // qualifying for a region at all here — this asserts that stays true
+    // now that milestone 6 adds a second reason a call might otherwise
+    // have looked inlinable.
+    assert!(crate::numeric_trace_instructions(&module, program).is_none());
+}
+
+#[test]
+fn numeric_trace_instructions_inlines_a_callee_with_a_safely_initialized_temp_local() {
+    // A callee's `local_count` almost always exceeds its declared parameter
+    // count — DM reserves extra compiler-internal slots (the implicit `.`
+    // variable among them) regardless of whether a body uses them, and an
+    // explicit `var/` declares more. `temp` here is genuinely written
+    // before ever being read, so leaving its slot at this splice's default
+    // (0.0) until that write happens is exactly as safe as leaving any
+    // other never-yet-loaded local at its default — the same reasoning
+    // `try_run_region_numeric_jit` already relies on for a region's own
+    // top-level locals, reused here via the same
+    // `local_is_definitely_initialized_before_load` check.
+    let syntax = parse(concat!(
+        "/proc/inline_extra_local_helper(a)\n",
+        "\tvar/temp = a + 1\n",
+        "\treturn temp\n",
+        "/proc/inline_extra_local_caller()\n",
+        "\treturn inline_extra_local_helper(5)\n",
+    ))
+    .unwrap();
+    let module = compile_module(&syntax.definitions).unwrap();
+    let entry = module
+        .procedure_id("/proc/inline_extra_local_caller")
+        .unwrap();
+    let program = &module.procedures[entry.index()];
+    let (lowered, ..) =
+        crate::numeric_trace_instructions(&module, program).expect("inlining candidate lowers");
+    assert!(
+        !lowered.iter().any(|instruction| matches!(
+            instruction,
+            dm_jit::NumericInstruction::CallSideExit { .. }
+        )),
+        "a safely-initialized temp local must not block inlining: {lowered:?}"
+    );
+
+    let baseline = execute_module(&module, entry, &[]);
+    assert_eq!(baseline, Ok(Value::number(6.0)), "5 + 1");
+    let mut state = ExecutionState::new();
+    for _ in 0..20 {
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::number(6.0)),
+        );
+    }
+    assert!(state.region_installed_at_entry(module.identity.0, entry));
+    assert_eq!(
+        execute_module_in_state(&module, entry, &[], &mut state),
+        Ok(Value::number(6.0)),
+    );
+}
+
+#[test]
+fn numeric_trace_instructions_does_not_inline_a_callee_with_field_access() {
+    // A callee touching `src`'s fields can't be a numeric-in-numeric-out
+    // leaf by this milestone's own definition — falls back to
+    // `CallSideExit`, matching every other non-qualifying shape.
+    let source = parse(concat!(
+        "/datum/proc/inline_field_helper()\n",
+        "\treturn value\n",
+        "/datum/proc/inline_field_caller()\n",
+        "\treturn inline_field_helper()\n",
+    ))
+    .unwrap();
+    let module = compile_module_specs(&[
+        ProcedureSpec {
+            path: "/datum/proc/inline_field_helper".to_owned(),
+            definition: &source.definitions[0],
+            parent: None,
+            static_calls: BTreeMap::new(),
+            src_fields: BTreeMap::from([("value".to_owned(), field("value"))]),
+            global_fields: BTreeMap::new(),
+        },
+        ProcedureSpec {
+            path: "/datum/proc/inline_field_caller".to_owned(),
+            definition: &source.definitions[1],
+            parent: None,
+            static_calls: BTreeMap::from([("inline_field_helper".to_owned(), 0)]),
+            src_fields: BTreeMap::new(),
+            global_fields: BTreeMap::new(),
+        },
+    ])
+    .unwrap();
+    let entry = module
+        .procedure_id("/datum/proc/inline_field_caller")
+        .unwrap();
+    let program = &module.procedures[entry.index()];
+    let (lowered, ..) =
+        crate::numeric_trace_instructions(&module, program).expect("still lowers via CallSideExit");
+    assert!(matches!(
+        lowered.last(),
+        Some(dm_jit::NumericInstruction::CallSideExit { argument_count: 0 })
+    ));
+}
+
+#[test]
+fn region_jit_inlines_a_leaf_call_without_colliding_with_the_callers_own_local() {
+    // End-to-end: the caller's own local (`x`) is used both as the inlined
+    // call's argument AND again afterward — proving the callee's
+    // renumbered locals land in genuinely fresh slots, not aliasing the
+    // caller's, and that the caller's own local survives the splice intact.
+    let syntax = parse(concat!(
+        "/proc/inline_square(a)\n",
+        "\treturn a * a\n",
+        "/proc/inline_caller_reuses_local()\n",
+        "\tvar/x = 7\n",
+        "\treturn inline_square(x) + x\n",
+    ))
+    .unwrap();
+    let module = compile_module(&syntax.definitions).unwrap();
+    let entry = module
+        .procedure_id("/proc/inline_caller_reuses_local")
+        .unwrap();
+    let program = &module.procedures[entry.index()];
+    let (lowered, ..) =
+        crate::numeric_trace_instructions(&module, program).expect("inlining candidate lowers");
+    assert!(
+        !lowered.iter().any(|instruction| matches!(
+            instruction,
+            dm_jit::NumericInstruction::CallSideExit { .. }
+        )),
+        "this shape must actually inline, not silently fall back to a side-exit \
+         that happens to produce the same correct result: {lowered:?}"
+    );
+
+    let baseline = execute_module(&module, entry, &[]);
+    assert_eq!(baseline, Ok(Value::number(56.0)), "7*7 + 7");
+
+    let mut state = ExecutionState::new();
+    for _ in 0..20 {
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::number(56.0)),
+        );
+    }
+    assert!(
+        state.region_installed_at_entry(module.identity.0, entry),
+        "20 complete calls must be enough to cross the warm-up threshold"
+    );
+    assert_eq!(
+        execute_module_in_state(&module, entry, &[], &mut state),
+        Ok(Value::number(56.0)),
+        "the warmed-up, fully-inlined region must match the pure-interpreter baseline"
+    );
+}
+
+#[test]
+fn region_jit_prefix_ending_call_side_exits_when_the_callee_has_a_branch() {
+    // End-to-end proof that milestone 5's side-exit fallback still works
+    // correctly once milestone 6 exists alongside it: a callee with its own
+    // branch can never qualify for inlining, so this must still produce the
+    // correct result via the interpreter handling the call, exactly as
+    // milestone 5 alone would have.
+    let syntax = parse(concat!(
+        "/proc/side_exit_branchy_helper(a)\n",
+        "\tif(a > 0)\n",
+        "\t\treturn a\n",
+        "\treturn -a\n",
+        "/proc/side_exit_branchy_caller()\n",
+        "\treturn side_exit_branchy_helper(-9)\n",
+    ))
+    .unwrap();
+    let module = compile_module(&syntax.definitions).unwrap();
+    let entry = module
+        .procedure_id("/proc/side_exit_branchy_caller")
+        .unwrap();
+
+    let baseline = execute_module(&module, entry, &[]);
+    assert_eq!(baseline, Ok(Value::number(9.0)));
+
+    let mut state = ExecutionState::new();
+    for _ in 0..20 {
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::number(9.0)),
+        );
+    }
+    assert!(state.region_installed_at_entry(module.identity.0, entry));
+    assert_eq!(
+        execute_module_in_state(&module, entry, &[], &mut state),
+        Ok(Value::number(9.0)),
+    );
+}
+
+#[test]
 fn numeric_jit_loop_resumes_at_budget_safepoints() {
     let source = "/proc/count(limit)\n\tvar/i = 0\n\twhile(i < limit)\n\t\ti = i + 1\n\treturn i";
     let syntax = parse(source).unwrap();
     let module = compile_module(&syntax.definitions).unwrap();
     let entry = module.procedure_id("/proc/count").unwrap();
-    assert!(crate::numeric_trace_instructions(&module.procedures[entry.index()]).is_some());
+    assert!(
+        crate::numeric_trace_instructions(&module, &module.procedures[entry.index()]).is_some()
+    );
 
     // Force an equivalent copy through the interpreter by appending an
     // unreachable disqualifying opcode after Return. This avoids changing
@@ -21452,7 +21766,11 @@ fn numeric_jit_loop_resumes_at_budget_safepoints() {
         .instructions
         .push(Instruction::AddressLocal(0));
     assert!(
-        crate::numeric_trace_instructions(&reference.procedures[reference_entry.index()]).is_none()
+        crate::numeric_trace_instructions(
+            &reference,
+            &reference.procedures[reference_entry.index()]
+        )
+        .is_none()
     );
     assert_eq!(
         execute_module(&reference, reference_entry, &[Value::number(25.0)]),

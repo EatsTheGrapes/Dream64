@@ -180,7 +180,7 @@ fn run_frames_inner(
         // region only ever installs at, and runs from, a procedure's own
         // entry.
         if instruction_index == 0 {
-            sidecar.poll_region_at_entry(program);
+            sidecar.poll_region_at_entry(module, program);
         }
         if instruction_index == 0
             && remaining_steps > 0
