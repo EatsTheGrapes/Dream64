@@ -21271,6 +21271,165 @@ fn numeric_jit_lowers_isolated_locals_and_cfg_conservatively() {
 }
 
 #[test]
+fn numeric_trace_instructions_ends_the_prefix_at_a_straight_line_call() {
+    // Milestone 5: a call no longer rejects the whole procedure outright —
+    // the straight-line prefix before it (here, `var/x = 5`) still lowers,
+    // ending in a `CallSideExit` that carries the call's own argument count.
+    let syntax = parse(concat!(
+        "/proc/prefix_then_call_helper(n)\n",
+        "\treturn n\n",
+        "/proc/prefix_then_call()\n",
+        "\tvar/x = 5\n",
+        "\treturn prefix_then_call_helper(x)\n",
+    ))
+    .unwrap();
+    let module = compile_module(&syntax.definitions).unwrap();
+    let entry = module.procedure_id("/proc/prefix_then_call").unwrap();
+    let program = &module.procedures[entry.index()];
+    let (lowered, field_names, global_names) =
+        crate::numeric_trace_instructions(program).expect("straight-line prefix-then-call lowers");
+    assert!(field_names.is_empty());
+    assert!(global_names.is_empty());
+    assert!(
+        lowered
+            .iter()
+            .any(|instruction| matches!(instruction, dm_jit::NumericInstruction::StoreLocal(_))),
+        "the prefix's own local write must still be part of the trace"
+    );
+    assert!(matches!(
+        lowered.last(),
+        Some(dm_jit::NumericInstruction::CallSideExit { argument_count: 1 })
+    ));
+}
+
+#[test]
+fn numeric_trace_instructions_rejects_a_call_reached_only_after_a_branch() {
+    // Array order isn't execution order once a branch exists — a call
+    // reachable only through a conditional must not truncate the trace,
+    // since bytecode positions *after* the call in array order could
+    // actually be reached by a path that never goes through it at all. This
+    // procedure must fall back to full rejection, exactly as it would have
+    // before milestone 5 (there is no other unsupported instruction here —
+    // the branch is what disqualifies it).
+    let syntax = parse(concat!(
+        "/proc/branch_then_call_helper(n)\n",
+        "\treturn n\n",
+        "/proc/branch_then_call(flag)\n",
+        "\tif(flag)\n",
+        "\t\tvar/x = 1\n",
+        "\treturn branch_then_call_helper(2)\n",
+    ))
+    .unwrap();
+    let module = compile_module(&syntax.definitions).unwrap();
+    let entry = module.procedure_id("/proc/branch_then_call").unwrap();
+    let program = &module.procedures[entry.index()];
+    assert!(crate::numeric_trace_instructions(program).is_none());
+}
+
+#[test]
+fn region_jit_declines_a_prefix_where_a_constant_sits_beneath_a_dynamic_global_read() {
+    // Reproduces a real boot crash found while parity-testing milestone 5
+    // (`/proc/random_color`, which does `return random_string(6,
+    // hex_characters)` — a constant, then a non-numeric global read, then a
+    // call): a `Constant` pushed before a `LoadGlobalDynamic` only ever
+    // exists in `NumericExecutionState.stack`. If that global read declines,
+    // the VM's rematerialization only knew how to reconstruct what
+    // `LoadGlobalDynamic` itself needs (nothing — it has no receiver), so
+    // the constant was silently dropped and the interpreter's `Call`
+    // underflowed trying to pop it. `validate`'s isolation check now rejects
+    // this shape at compile time instead, so it never installs a region and
+    // just runs interpreted — correctly, every time.
+    let source = parse(concat!(
+        "/proc/global_read_helper(count, thing)\n",
+        "\treturn count\n",
+        "/proc/global_read_prefix()\n",
+        "\treturn global_read_helper(6, non_numeric_global)\n",
+    ))
+    .unwrap();
+    let module = compile_module_specs(&[
+        ProcedureSpec {
+            path: "/proc/global_read_helper".to_owned(),
+            definition: &source.definitions[0],
+            parent: None,
+            static_calls: BTreeMap::new(),
+            src_fields: BTreeMap::new(),
+            global_fields: BTreeMap::new(),
+        },
+        ProcedureSpec {
+            path: "/proc/global_read_prefix".to_owned(),
+            definition: &source.definitions[1],
+            parent: None,
+            static_calls: BTreeMap::from([("global_read_helper".to_owned(), 0)]),
+            src_fields: BTreeMap::new(),
+            global_fields: BTreeMap::from([(
+                "non_numeric_global".to_owned(),
+                field("non_numeric_global"),
+            )]),
+        },
+    ])
+    .unwrap();
+    let entry = module.procedure_id("/proc/global_read_prefix").unwrap();
+
+    let mut state = ExecutionState::new();
+    let non_numeric = state
+        .heap_mut()
+        .allocate_datum(TypePath::parse("/datum").unwrap());
+    state.set_global(field("non_numeric_global"), Value::Datum(non_numeric));
+
+    for round in 0..25 {
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::number(6.0)),
+            "round {round}"
+        );
+    }
+    assert!(
+        !state.region_installed_at_entry(module.identity.0, entry),
+        "this shape must never qualify for the region tier at all"
+    );
+}
+
+#[test]
+fn region_jit_prefix_ending_call_runs_the_call_correctly_after_warm_up() {
+    // End-to-end: the region compiles `var/x = 5` natively, side-exits at
+    // the call to `region_call_helper`, and the interpreter must run that
+    // call — and read back its result — exactly as it would with no region
+    // involved at all.
+    let syntax = parse(concat!(
+        "/proc/region_call_helper(n)\n",
+        "\treturn n * 10\n",
+        "/proc/region_call_prefix()\n",
+        "\tvar/x = 5\n",
+        "\treturn region_call_helper(x)\n",
+    ))
+    .unwrap();
+    let module = compile_module(&syntax.definitions).unwrap();
+    let entry = module.procedure_id("/proc/region_call_prefix").unwrap();
+
+    let baseline = execute_module(&module, entry, &[]);
+    assert_eq!(baseline, Ok(Value::number(50.0)));
+
+    let mut state = ExecutionState::new();
+    for _ in 0..20 {
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::number(50.0)),
+        );
+    }
+    assert!(
+        state.region_installed_at_entry(module.identity.0, entry),
+        "20 complete calls must be enough to cross the warm-up threshold"
+    );
+
+    assert_eq!(
+        execute_module_in_state(&module, entry, &[], &mut state),
+        Ok(Value::number(50.0)),
+        "the warmed-up region's prefix plus the interpreter's call hand-off \
+         must match the pure-interpreter baseline exactly"
+    );
+}
+
+#[test]
 fn numeric_jit_loop_resumes_at_budget_safepoints() {
     let source = "/proc/count(limit)\n\tvar/i = 0\n\twhile(i < limit)\n\t\ti = i + 1\n\treturn i";
     let syntax = parse(source).unwrap();

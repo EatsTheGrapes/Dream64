@@ -1633,11 +1633,18 @@ pub(crate) fn numeric_trace_instructions(
     let reachable = reachable_from_entry(&program.instructions);
     let mut field_names: Vec<FieldName> = Vec::new();
     let mut global_names: Vec<FieldName> = Vec::new();
-    let instructions = program
-        .instructions
-        .iter()
-        .enumerate()
-        .map(|(pc, instruction)| match instruction {
+    let mut instructions = Vec::with_capacity(program.instructions.len());
+    // Milestone 5: a call/allocation ends the compiled prefix instead of
+    // rejecting the whole procedure, but only when it's reached by a pure
+    // straight line from entry — no branch anywhere before it. Bytecode
+    // *array* order isn't execution order once a jump exists (an earlier
+    // branch could skip the call entirely, or reach later code some other
+    // way), so accepting one after a branch would risk silently discarding
+    // a reachable path rather than just being conservative. `seen_branch`
+    // keeps this truncation to the one shape it's actually proven for.
+    let mut seen_branch = false;
+    for (pc, instruction) in program.instructions.iter().enumerate() {
+        let translated = match instruction {
             Instruction::PushNumber(number) => Some(NumericInstruction::Constant(number.to_f32())),
             Instruction::LoadLocal(slot) => Some(NumericInstruction::LoadLocal(*slot)),
             // Writing a declared argument is observable through the live args
@@ -1660,10 +1667,16 @@ pub(crate) fn numeric_trace_instructions(
             Instruction::LessEqual => Some(NumericInstruction::LessThanOrEqual),
             Instruction::Greater => Some(NumericInstruction::GreaterThan),
             Instruction::GreaterEqual => Some(NumericInstruction::GreaterThanOrEqual),
-            Instruction::Jump(target) => u32::try_from(*target).ok().map(NumericInstruction::Jump),
-            Instruction::JumpIfFalse(target) => u32::try_from(*target)
-                .ok()
-                .map(NumericInstruction::JumpIfFalse),
+            Instruction::Jump(target) => {
+                seen_branch = true;
+                u32::try_from(*target).ok().map(NumericInstruction::Jump)
+            }
+            Instruction::JumpIfFalse(target) => {
+                seen_branch = true;
+                u32::try_from(*target)
+                    .ok()
+                    .map(NumericInstruction::JumpIfFalse)
+            }
             Instruction::Return => Some(NumericInstruction::Return),
             Instruction::LoadSrc => Some(NumericInstruction::LoadSrc),
             Instruction::LoadField(name) => {
@@ -1675,9 +1688,33 @@ pub(crate) fn numeric_trace_instructions(
                 .map(NumericInstruction::LoadGlobalDynamic),
             Instruction::StoreGlobal(name) => resolve_name_index(&mut global_names, name)
                 .map(NumericInstruction::StoreGlobalDynamic),
+            Instruction::Call { argument_count, .. } if !seen_branch && reachable[pc] => {
+                instructions.push(NumericInstruction::CallSideExit {
+                    argument_count: *argument_count,
+                });
+                break;
+            }
+            Instruction::CallCurrent { argument_count }
+            | Instruction::CallParent { argument_count, .. }
+                if !seen_branch && reachable[pc] =>
+            {
+                instructions.push(NumericInstruction::CallSideExit {
+                    argument_count: argument_count.unwrap_or(0),
+                });
+                break;
+            }
+            Instruction::AllocateCurrentDatum { argument_count }
+                if !seen_branch && reachable[pc] =>
+            {
+                instructions.push(NumericInstruction::CallSideExit {
+                    argument_count: *argument_count,
+                });
+                break;
+            }
             _ if !reachable[pc] => Some(NumericInstruction::Return),
             _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
+        };
+        instructions.push(translated?);
+    }
     Some((instructions, field_names, global_names))
 }
