@@ -46,6 +46,14 @@ pub enum NumericInstruction {
     /// check is (a store's receiver sits under an arbitrary-length value
     /// expression, not immediately below the store).
     StoreFieldDynamic(u16),
+    /// Push one persistent runtime global's guarded numeric value, read live
+    /// through the `load_global_dynamic` slow-path callback. Unlike fields,
+    /// globals have no receiver, so unlike `LoadFieldDynamic` this pops
+    /// nothing.
+    LoadGlobalDynamic(u16),
+    /// Pop a value and write it to one persistent runtime global through the
+    /// `store_global_dynamic` slow-path callback.
+    StoreGlobalDynamic(u16),
     /// Set a VM-defined deferred action bit, committed after native exit.
     RaiseAction(u8),
     /// Duplicate the top operand.
@@ -491,7 +499,7 @@ impl CompiledNumericTrace {
         // exact `(pointer) -> f32` ABI. The module is retained by `self`, and
         // `locals` remains live and contains the validated number of elements.
         let mut state = self.initial_state(locals)?;
-        match self.run_budgeted(&mut state, u32::MAX, &mut |_| None, &mut |_, _| false)? {
+        match self.run_budgeted(&mut state, u32::MAX, &mut NoCallbacks)? {
             NumericRunOutcome::Returned { value, .. } => Some(value),
             NumericRunOutcome::BudgetExhausted { .. } | NumericRunOutcome::SideExit { .. } => None,
         }
@@ -532,23 +540,16 @@ impl CompiledNumericTrace {
     /// Runs at most `max_steps` bytecode instructions and leaves locals, operand
     /// stack, and the exact resume PC materialized in `state` on budget exit.
     ///
-    /// `load_field` answers a `LoadFieldDynamic(field_index)` instruction with
-    /// the current guarded numeric value of that field on the region's
-    /// implicit `src`, or `None` to side-exit. `store_field` answers a
-    /// `StoreFieldDynamic(field_index, value)` instruction with whether the
-    /// guarded write succeeded; on `false` the trace also leaves the value
-    /// that would have been stored in `state.stack[0]` (the same slot
-    /// `Returned` uses), since the interpreter resuming this exact
-    /// `StoreField` needs it rematerialized — see `try_run_region_numeric_jit`.
-    /// Traces that never lower either instruction still take both
-    /// parameters — they are simply never called — so callers with nothing
-    /// to answer can pass `&mut |_| None` / `&mut |_, _| false`.
+    /// `callbacks` answers every `*Dynamic` instruction this trace may lower
+    /// (`LoadFieldDynamic`/`StoreFieldDynamic`/`LoadGlobalDynamic`/
+    /// `StoreGlobalDynamic` today) — see `RegionCallbacks` for what each
+    /// method means. A trace that never lowers a given instruction simply
+    /// never calls the matching method.
     pub fn run_budgeted(
         &self,
         state: &mut NumericExecutionState,
         max_steps: u32,
-        load_field: &mut dyn FnMut(u32) -> Option<f32>,
-        store_field: &mut dyn FnMut(u32, f32) -> bool,
+        callbacks: &mut dyn RegionCallbacks,
     ) -> Option<NumericRunOutcome> {
         let redzone_start = self.max_stack_depth.max(1);
         if state.locals.len() != self.local_count
@@ -562,15 +563,12 @@ impl CompiledNumericTrace {
         {
             return None;
         }
-        let mut dispatch = SafeFieldDispatch {
-            load_field,
-            store_field,
-        };
+        let mut dispatch = RegionDispatchContext { callbacks };
         // SAFETY: `dispatch` outlives the call below (it is not returned or
-        // stored), and `safe_load_field_dynamic`/`safe_store_field_dynamic`
-        // — the only functions this module's compiled code can call through
-        // `context_pointer` — both cast it back to this exact type.
-        let context_pointer = (&mut dispatch as *mut SafeFieldDispatch<'_>).cast();
+        // stored), and every `safe_*_dynamic` trampoline — the only
+        // functions this module's compiled code can call through
+        // `context_pointer` — casts it back to this exact type.
+        let context_pointer = (&mut dispatch as *mut RegionDispatchContext<'_>).cast();
         let packed = unsafe {
             (self.entry)(
                 state.locals.as_mut_ptr(),
@@ -620,20 +618,70 @@ pub fn compile_numeric_trace(
     instructions: &[NumericInstruction],
     local_count: usize,
 ) -> Result<CompiledNumericTrace, CompileError> {
-    compile_numeric_field_trace(instructions, local_count, 0, 0)
+    compile_numeric_field_trace(instructions, local_count, 0, 0, 0)
 }
 
-/// Context wrapper for `run_budgeted`'s `load_field`/`store_field` closures.
-/// A thin, pointer-sized struct so the fat `&mut dyn FnMut` references can
+/// Slow-path callbacks one compiled region calls into for anything it can't
+/// do with pure register arithmetic. One combined trait, not one closure
+/// parameter per callback: every callback shares a *single*
+/// `context_pointer` parameter on the compiled side (there's only one slot
+/// for it in the function signature), so their Rust-side dispatch has to
+/// agree on one type behind that pointer regardless. A trait with `&mut
+/// self` methods also sidesteps needing `RefCell` in a `dm-vm` implementor
+/// that must answer more than one of these from the same `&mut
+/// ExecutionState` — native code only ever calls one method at a time, so
+/// each call is free to take a fresh, non-overlapping `&mut self` borrow,
+/// unlike two independent closures the borrow checker must consider
+/// simultaneously alive.
+pub trait RegionCallbacks {
+    /// Answers a `LoadFieldDynamic(field_index)` instruction with the
+    /// current guarded numeric value of that field on the region's implicit
+    /// `src`, or `None` to side-exit (the interpreter re-runs this
+    /// instruction).
+    fn load_field(&mut self, field_index: u32) -> Option<f32>;
+    /// Answers a `StoreFieldDynamic(field_index, value)` instruction with
+    /// whether the guarded write succeeded. On `false` the trace also
+    /// leaves `value` in `state.stack[0]` (the same slot `Returned` uses),
+    /// since the interpreter resuming this exact `StoreField` needs it
+    /// rematerialized — see `try_run_region_numeric_jit` in `dm-vm`.
+    fn store_field(&mut self, field_index: u32, value: f32) -> bool;
+    /// Answers a `LoadGlobalDynamic(global_index)` instruction with the
+    /// current guarded numeric value of that persistent global, or `None`
+    /// to side-exit. Unlike fields, globals have no receiver.
+    fn load_global(&mut self, global_index: u32) -> Option<f32>;
+    /// Answers a `StoreGlobalDynamic(global_index, value)` instruction with
+    /// whether the guarded write succeeded (in practice this never
+    /// declines — `ExecutionState::set_global` cannot fail — but the ABI
+    /// stays symmetric with `store_field` rather than special-casing it).
+    fn store_global(&mut self, global_index: u32, value: f32) -> bool;
+}
+
+/// A `RegionCallbacks` that declines everything. Fits any trace that never
+/// lowers a `*Dynamic` instruction — used by `CompiledNumericTrace::run`,
+/// the plain-arithmetic convenience entry point with nothing to answer.
+struct NoCallbacks;
+
+impl RegionCallbacks for NoCallbacks {
+    fn load_field(&mut self, _field_index: u32) -> Option<f32> {
+        None
+    }
+    fn store_field(&mut self, _field_index: u32, _value: f32) -> bool {
+        false
+    }
+    fn load_global(&mut self, _global_index: u32) -> Option<f32> {
+        None
+    }
+    fn store_global(&mut self, _global_index: u32, _value: f32) -> bool {
+        false
+    }
+}
+
+/// Context wrapper for `run_budgeted`'s `callbacks` argument. A thin,
+/// pointer-sized struct so the fat `&mut dyn RegionCallbacks` reference can
 /// cross the FFI boundary as a single `*mut c_void` — the same reason
-/// `SafeRootedDispatch` exists for `CompiledRootedBlock`. One combined
-/// struct, not two: both `dream64_load_field_dynamic` and
-/// `dream64_store_field_dynamic` are registered against the *same*
-/// `context_pointer` parameter of the compiled function (there is only one),
-/// so they must agree on what type is behind it.
-struct SafeFieldDispatch<'a> {
-    load_field: &'a mut dyn FnMut(u32) -> Option<f32>,
-    store_field: &'a mut dyn FnMut(u32, f32) -> bool,
+/// `SafeRootedDispatch` exists for `CompiledRootedBlock`.
+struct RegionDispatchContext<'a> {
+    callbacks: &'a mut dyn RegionCallbacks,
 }
 
 /// Trampoline registered as `dream64_load_field_dynamic` in every compiled
@@ -641,8 +689,8 @@ struct SafeFieldDispatch<'a> {
 /// success (so the packed value is always `>= 2^32`) or `0` on a declined
 /// field (the trace side-exits and the interpreter resumes this instruction).
 unsafe extern "C" fn safe_load_field_dynamic(context: *mut c_void, field_index: u32) -> u64 {
-    let context = unsafe { &mut *context.cast::<SafeFieldDispatch<'_>>() };
-    match (context.load_field)(field_index) {
+    let context = unsafe { &mut *context.cast::<RegionDispatchContext<'_>>() };
+    match context.callbacks.load_field(field_index) {
         Some(value) => 0x1_0000_0000_u64 | u64::from(value.to_bits()),
         None => 0,
     }
@@ -657,9 +705,31 @@ unsafe extern "C" fn safe_store_field_dynamic(
     field_index: u32,
     value_bits: u32,
 ) -> u64 {
-    let context = unsafe { &mut *context.cast::<SafeFieldDispatch<'_>>() };
+    let context = unsafe { &mut *context.cast::<RegionDispatchContext<'_>>() };
     let value = f32::from_bits(value_bits);
-    u64::from((context.store_field)(field_index, value))
+    u64::from(context.callbacks.store_field(field_index, value))
+}
+
+/// Trampoline registered as `dream64_load_global_dynamic`. Same packing
+/// convention as `safe_load_field_dynamic`.
+unsafe extern "C" fn safe_load_global_dynamic(context: *mut c_void, global_index: u32) -> u64 {
+    let context = unsafe { &mut *context.cast::<RegionDispatchContext<'_>>() };
+    match context.callbacks.load_global(global_index) {
+        Some(value) => 0x1_0000_0000_u64 | u64::from(value.to_bits()),
+        None => 0,
+    }
+}
+
+/// Trampoline registered as `dream64_store_global_dynamic`. Same convention
+/// as `safe_store_field_dynamic`, minus a receiver — globals have none.
+unsafe extern "C" fn safe_store_global_dynamic(
+    context: *mut c_void,
+    global_index: u32,
+    value_bits: u32,
+) -> u64 {
+    let context = unsafe { &mut *context.cast::<RegionDispatchContext<'_>>() };
+    let value = f32::from_bits(value_bits);
+    u64::from(context.callbacks.store_global(global_index, value))
 }
 
 /// Compiles a trace over guarded numeric field snapshots. The VM validates and
@@ -669,11 +739,18 @@ pub fn compile_numeric_field_trace(
     local_count: usize,
     field_count: usize,
     dynamic_field_count: usize,
+    dynamic_global_count: usize,
 ) -> Result<CompiledNumericTrace, CompileError> {
     if field_count > 64 {
         return Err(CompileError::TooManyFields(field_count));
     }
-    let validation = validate(instructions, local_count, field_count, dynamic_field_count)?;
+    let validation = validate(
+        instructions,
+        local_count,
+        field_count,
+        dynamic_field_count,
+        dynamic_global_count,
+    )?;
 
     let mut builder = JITBuilder::new(cranelift_module::default_libcall_names())
         .map_err(|error| CompileError::Backend(error.to_string()))?;
@@ -684,6 +761,14 @@ pub fn compile_numeric_field_trace(
     builder.symbol(
         "dream64_store_field_dynamic",
         safe_store_field_dynamic as *const u8,
+    );
+    builder.symbol(
+        "dream64_load_global_dynamic",
+        safe_load_global_dynamic as *const u8,
+    );
+    builder.symbol(
+        "dream64_store_global_dynamic",
+        safe_store_global_dynamic as *const u8,
     );
     let mut module = JITModule::new(builder);
     let mut load_field_dynamic_signature = module.make_signature();
@@ -715,6 +800,39 @@ pub fn compile_numeric_field_trace(
             "dream64_store_field_dynamic",
             Linkage::Import,
             &store_field_dynamic_signature,
+        )
+        .map_err(|error| CompileError::Backend(error.to_string()))?;
+    let mut load_global_dynamic_signature = module.make_signature();
+    load_global_dynamic_signature
+        .params
+        .push(AbiParam::new(types::I64));
+    load_global_dynamic_signature
+        .params
+        .push(AbiParam::new(types::I32));
+    load_global_dynamic_signature
+        .returns
+        .push(AbiParam::new(types::I64));
+    let load_global_dynamic_id = module
+        .declare_function(
+            "dream64_load_global_dynamic",
+            Linkage::Import,
+            &load_global_dynamic_signature,
+        )
+        .map_err(|error| CompileError::Backend(error.to_string()))?;
+    let mut store_global_dynamic_signature = module.make_signature();
+    for ty in [types::I64, types::I32, types::I32] {
+        store_global_dynamic_signature
+            .params
+            .push(AbiParam::new(ty));
+    }
+    store_global_dynamic_signature
+        .returns
+        .push(AbiParam::new(types::I64));
+    let store_global_dynamic_id = module
+        .declare_function(
+            "dream64_store_global_dynamic",
+            Linkage::Import,
+            &store_global_dynamic_signature,
         )
         .map_err(|error| CompileError::Backend(error.to_string()))?;
     let mut context = module.make_context();
@@ -774,6 +892,10 @@ pub fn compile_numeric_field_trace(
         module.declare_func_in_func(load_field_dynamic_id, &mut context.func);
     let store_field_dynamic_ref =
         module.declare_func_in_func(store_field_dynamic_id, &mut context.func);
+    let load_global_dynamic_ref =
+        module.declare_func_in_func(load_global_dynamic_id, &mut context.func);
+    let store_global_dynamic_ref =
+        module.declare_func_in_func(store_global_dynamic_id, &mut context.func);
 
     let mut frontend_context = FunctionBuilderContext::new();
     {
@@ -1004,6 +1126,71 @@ pub fn compile_numeric_field_trace(
                     // unconditionally: the whole native operand stack is
                     // abandoned the moment this trace side-exits, exactly
                     // like `Return`'s use of the same slot below.
+                    memory_store(&mut function_builder, stack_pointer, 0, value);
+                    let side_exit = pack_side_exit(&mut function_builder, pc as u32, steps);
+                    function_builder.ins().return_(&[side_exit]);
+
+                    function_builder.switch_to_block(stored);
+                    function_builder.seal_block(stored);
+                }
+                NumericInstruction::LoadGlobalDynamic(global) => {
+                    // No receiver to pop or discard — globals aren't
+                    // per-datum, unlike LoadFieldDynamic above.
+                    let global_index = function_builder.ins().iconst(types::I32, i64::from(global));
+                    let call = function_builder
+                        .ins()
+                        .call(load_global_dynamic_ref, &[context_pointer, global_index]);
+                    let packed = function_builder.inst_results(call)[0];
+                    let failed = function_builder.ins().icmp_imm(
+                        IntCC::UnsignedLessThan,
+                        packed,
+                        0x1_0000_0000_i64,
+                    );
+                    let declined = function_builder.create_block();
+                    let loaded = function_builder.create_block();
+                    function_builder
+                        .ins()
+                        .brif(failed, declined, &[], loaded, &[]);
+
+                    function_builder.switch_to_block(declined);
+                    function_builder.seal_block(declined);
+                    let side_exit = pack_side_exit(&mut function_builder, pc as u32, steps);
+                    function_builder.ins().return_(&[side_exit]);
+
+                    function_builder.switch_to_block(loaded);
+                    function_builder.seal_block(loaded);
+                    let value_bits = function_builder.ins().ireduce(types::I32, packed);
+                    let value = function_builder.ins().bitcast(
+                        types::F32,
+                        cranelift_codegen::ir::MemFlags::new(),
+                        value_bits,
+                    );
+                    memory_push(&mut function_builder, stack_pointer, &mut depth, value);
+                }
+                NumericInstruction::StoreGlobalDynamic(global) => {
+                    // No receiver to discard, unlike StoreFieldDynamic above
+                    // — only the value itself needs stashing on decline.
+                    let value = memory_pop(&mut function_builder, stack_pointer, &mut depth);
+                    let global_index = function_builder.ins().iconst(types::I32, i64::from(global));
+                    let value_bits = function_builder.ins().bitcast(
+                        types::I32,
+                        cranelift_codegen::ir::MemFlags::new(),
+                        value,
+                    );
+                    let call = function_builder.ins().call(
+                        store_global_dynamic_ref,
+                        &[context_pointer, global_index, value_bits],
+                    );
+                    let result = function_builder.inst_results(call)[0];
+                    let failed = function_builder.ins().icmp_imm(IntCC::Equal, result, 0);
+                    let declined = function_builder.create_block();
+                    let stored = function_builder.create_block();
+                    function_builder
+                        .ins()
+                        .brif(failed, declined, &[], stored, &[]);
+
+                    function_builder.switch_to_block(declined);
+                    function_builder.seal_block(declined);
                     memory_store(&mut function_builder, stack_pointer, 0, value);
                     let side_exit = pack_side_exit(&mut function_builder, pc as u32, steps);
                     function_builder.ins().return_(&[side_exit]);
@@ -1286,6 +1473,7 @@ fn validate(
     local_count: usize,
     field_count: usize,
     dynamic_field_count: usize,
+    dynamic_global_count: usize,
 ) -> Result<Validation, CompileError> {
     if instructions.is_empty() {
         return Err(CompileError::InvalidResultStack(0));
@@ -1352,9 +1540,10 @@ fn validate(
                 // The popped placeholder is discarded unconditionally by
                 // codegen (the real receiver travels through the callback
                 // context, not this stack), so unlike `StoreFieldDynamic`
-                // below, its kind is never checked here — the VM-side
-                // translator's adjacency rule is the whole soundness
-                // argument for reads (see `numeric_trace_instructions`).
+                // below, its kind is never checked here — nothing downstream
+                // ever reads it, so a `Number`-kind placeholder here would be
+                // just as sound; kind tracking's job is only to catch `Src`
+                // reaching somewhere it would matter, and reads don't care.
                 if stack.pop().is_none() {
                     return Err(CompileError::StackUnderflow);
                 }
@@ -1366,6 +1555,18 @@ fn validate(
                 }
                 pop_number(pc, &mut stack)?;
                 pop_src(pc, &mut stack)?;
+            }
+            NumericInstruction::LoadGlobalDynamic(global) => {
+                if usize::from(global) >= dynamic_global_count {
+                    return Err(CompileError::InvalidField(global));
+                }
+                stack.push(StackKind::Number);
+            }
+            NumericInstruction::StoreGlobalDynamic(global) => {
+                if usize::from(global) >= dynamic_global_count {
+                    return Err(CompileError::InvalidField(global));
+                }
+                pop_number(pc, &mut stack)?;
             }
             NumericInstruction::Add
             | NumericInstruction::Subtract
@@ -1476,9 +1677,51 @@ fn add_edge(
 #[cfg(test)]
 mod tests {
     use super::{
-        CompileError, NumericInstruction, NumericRunOutcome, compile_numeric_field_trace,
-        compile_numeric_trace,
+        CompileError, NumericInstruction, NumericRunOutcome, RegionCallbacks,
+        compile_numeric_field_trace, compile_numeric_trace,
     };
+
+    /// Closure-backed `RegionCallbacks` for tests: each method just calls the
+    /// correspondingly-named closure, so a test only names the callback(s) it
+    /// actually cares about instead of hand-writing a trait impl every time.
+    struct TestCallbacks<LF, SF, LG, SG> {
+        load_field: LF,
+        store_field: SF,
+        load_global: LG,
+        store_global: SG,
+    }
+
+    impl<LF, SF, LG, SG> RegionCallbacks for TestCallbacks<LF, SF, LG, SG>
+    where
+        LF: FnMut(u32) -> Option<f32>,
+        SF: FnMut(u32, f32) -> bool,
+        LG: FnMut(u32) -> Option<f32>,
+        SG: FnMut(u32, f32) -> bool,
+    {
+        fn load_field(&mut self, field_index: u32) -> Option<f32> {
+            (self.load_field)(field_index)
+        }
+        fn store_field(&mut self, field_index: u32, value: f32) -> bool {
+            (self.store_field)(field_index, value)
+        }
+        fn load_global(&mut self, global_index: u32) -> Option<f32> {
+            (self.load_global)(global_index)
+        }
+        fn store_global(&mut self, global_index: u32, value: f32) -> bool {
+            (self.store_global)(global_index, value)
+        }
+    }
+
+    /// Every callback declines. Fits any trace that never lowers a `*Dynamic`
+    /// instruction — the common case for most of this module's fixtures.
+    fn no_callbacks() -> impl RegionCallbacks {
+        TestCallbacks {
+            load_field: |_: u32| None,
+            store_field: |_: u32, _: f32| false,
+            load_global: |_: u32| None,
+            store_global: |_: u32, _: f32| false,
+        }
+    }
 
     #[test]
     fn compiles_binary32_arithmetic() {
@@ -1563,6 +1806,7 @@ mod tests {
             0,
             0,
             1,
+            0,
         )
         .expect("dynamic field trace compiles");
         let mut state = trace.initial_state(&[]).unwrap();
@@ -1570,11 +1814,15 @@ mod tests {
             .run_budgeted(
                 &mut state,
                 10,
-                &mut |index| {
-                    assert_eq!(index, 0, "only field-table index 0 was declared");
-                    Some(42.0)
+                &mut TestCallbacks {
+                    load_field: |index| {
+                        assert_eq!(index, 0, "only field-table index 0 was declared");
+                        Some(42.0)
+                    },
+                    store_field: |_: u32, _: f32| false,
+                    load_global: |_: u32| None,
+                    store_global: |_: u32, _: f32| false,
                 },
-                &mut |_, _| false,
             )
             .unwrap();
         assert_eq!(
@@ -1597,11 +1845,12 @@ mod tests {
             0,
             0,
             1,
+            0,
         )
         .expect("dynamic field trace compiles");
         let mut state = trace.initial_state(&[]).unwrap();
         let outcome = trace
-            .run_budgeted(&mut state, 10, &mut |_| None, &mut |_, _| false)
+            .run_budgeted(&mut state, 10, &mut no_callbacks())
             .unwrap();
         assert_eq!(
             outcome,
@@ -1630,6 +1879,7 @@ mod tests {
                 0,
                 0,
                 1,
+                0,
             ),
             Err(CompileError::InvalidField(1))
         ));
@@ -1648,15 +1898,25 @@ mod tests {
             1,
             0,
             1,
+            0,
         )
         .expect("dynamic field store trace compiles");
         let mut state = trace.initial_state(&[9.0]).unwrap();
         let mut received = None;
         let outcome = trace
-            .run_budgeted(&mut state, 10, &mut |_| None, &mut |index, value| {
-                received = Some((index, value));
-                true
-            })
+            .run_budgeted(
+                &mut state,
+                10,
+                &mut TestCallbacks {
+                    load_field: |_: u32| None,
+                    store_field: |index, value| {
+                        received = Some((index, value));
+                        true
+                    },
+                    load_global: |_: u32| None,
+                    store_global: |_: u32, _: f32| false,
+                },
+            )
             .unwrap();
         assert_eq!(received, Some((0, 9.0)));
         assert_eq!(
@@ -1681,17 +1941,175 @@ mod tests {
             1,
             0,
             1,
+            0,
         )
         .expect("dynamic field store trace compiles");
         let mut state = trace.initial_state(&[9.0]).unwrap();
         let outcome = trace
-            .run_budgeted(&mut state, 10, &mut |_| None, &mut |_, _| false)
+            .run_budgeted(&mut state, 10, &mut no_callbacks())
             .unwrap();
         assert_eq!(
             outcome,
             NumericRunOutcome::SideExit {
                 instruction: 2,
                 steps: 2,
+            }
+        );
+        assert_eq!(
+            state.stack[0], 9.0,
+            "the value that would have been written must be recoverable from stack slot 0"
+        );
+    }
+
+    #[test]
+    fn load_global_dynamic_reads_a_guarded_global_via_callback() {
+        // Unlike fields, a global has no receiver at all, so no LoadSrc/
+        // placeholder machinery is involved — just the index.
+        let trace = compile_numeric_field_trace(
+            &[
+                NumericInstruction::LoadGlobalDynamic(0),
+                NumericInstruction::Return,
+            ],
+            0,
+            0,
+            0,
+            1,
+        )
+        .expect("dynamic global trace compiles");
+        let mut state = trace.initial_state(&[]).unwrap();
+        let outcome = trace
+            .run_budgeted(
+                &mut state,
+                10,
+                &mut TestCallbacks {
+                    load_field: |_: u32| None,
+                    store_field: |_: u32, _: f32| false,
+                    load_global: |index| {
+                        assert_eq!(index, 0, "only global-table index 0 was declared");
+                        Some(99.0)
+                    },
+                    store_global: |_: u32, _: f32| false,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            NumericRunOutcome::Returned {
+                value: 99.0,
+                steps: 2
+            }
+        );
+    }
+
+    #[test]
+    fn load_global_dynamic_side_exits_when_the_callback_declines() {
+        let trace = compile_numeric_field_trace(
+            &[
+                NumericInstruction::LoadGlobalDynamic(0),
+                NumericInstruction::Return,
+            ],
+            0,
+            0,
+            0,
+            1,
+        )
+        .expect("dynamic global trace compiles");
+        let mut state = trace.initial_state(&[]).unwrap();
+        let outcome = trace
+            .run_budgeted(&mut state, 10, &mut no_callbacks())
+            .unwrap();
+        assert_eq!(
+            outcome,
+            NumericRunOutcome::SideExit {
+                instruction: 0,
+                steps: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn load_global_dynamic_rejects_an_out_of_range_global_index() {
+        assert!(matches!(
+            compile_numeric_field_trace(
+                &[
+                    NumericInstruction::LoadGlobalDynamic(1),
+                    NumericInstruction::Return,
+                ],
+                0,
+                0,
+                0,
+                1,
+            ),
+            Err(CompileError::InvalidField(1))
+        ));
+    }
+
+    #[test]
+    fn store_global_dynamic_writes_a_guarded_global_via_callback() {
+        let trace = compile_numeric_field_trace(
+            &[
+                NumericInstruction::LoadLocal(0),
+                NumericInstruction::StoreGlobalDynamic(0),
+                NumericInstruction::Constant(1.0),
+                NumericInstruction::Return,
+            ],
+            1,
+            0,
+            0,
+            1,
+        )
+        .expect("dynamic global store trace compiles");
+        let mut state = trace.initial_state(&[9.0]).unwrap();
+        let mut received = None;
+        let outcome = trace
+            .run_budgeted(
+                &mut state,
+                10,
+                &mut TestCallbacks {
+                    load_field: |_: u32| None,
+                    store_field: |_: u32, _: f32| false,
+                    load_global: |_: u32| None,
+                    store_global: |index, value| {
+                        received = Some((index, value));
+                        true
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(received, Some((0, 9.0)));
+        assert_eq!(
+            outcome,
+            NumericRunOutcome::Returned {
+                value: 1.0,
+                steps: 4
+            }
+        );
+    }
+
+    #[test]
+    fn store_global_dynamic_side_exits_and_stashes_the_declined_value() {
+        let trace = compile_numeric_field_trace(
+            &[
+                NumericInstruction::LoadLocal(0),
+                NumericInstruction::StoreGlobalDynamic(0),
+                NumericInstruction::Constant(1.0),
+                NumericInstruction::Return,
+            ],
+            1,
+            0,
+            0,
+            1,
+        )
+        .expect("dynamic global store trace compiles");
+        let mut state = trace.initial_state(&[9.0]).unwrap();
+        let outcome = trace
+            .run_budgeted(&mut state, 10, &mut no_callbacks())
+            .unwrap();
+        assert_eq!(
+            outcome,
+            NumericRunOutcome::SideExit {
+                instruction: 1,
+                steps: 1,
             }
         );
         assert_eq!(
@@ -1749,6 +2167,7 @@ mod tests {
                 0,
                 0,
                 1,
+                0,
             ),
             Err(CompileError::InvalidOperandKind(_))
         ));
@@ -1780,10 +2199,7 @@ mod tests {
         assert!(state.stack.spilled());
         let redzone = trace.max_stack_depth.max(1);
         state.stack[redzone] = 0.0;
-        assert_eq!(
-            trace.run_budgeted(&mut state, 2, &mut |_| None, &mut |_, _| false),
-            None
-        );
+        assert_eq!(trace.run_budgeted(&mut state, 2, &mut no_callbacks()), None);
     }
 
     #[test]
@@ -1818,7 +2234,7 @@ mod tests {
 
         let mut state = trace.initial_state(&[5.0, 123.0]).unwrap();
         assert_eq!(
-            trace.run_budgeted(&mut state, 0, &mut |_| None, &mut |_, _| false),
+            trace.run_budgeted(&mut state, 0, &mut no_callbacks()),
             Some(NumericRunOutcome::BudgetExhausted {
                 instruction: 0,
                 steps: 0
@@ -1827,7 +2243,7 @@ mod tests {
         let mut total_steps = 0;
         loop {
             match trace
-                .run_budgeted(&mut state, 10, &mut |_| None, &mut |_, _| false)
+                .run_budgeted(&mut state, 10, &mut no_callbacks())
                 .unwrap()
             {
                 NumericRunOutcome::BudgetExhausted { steps, .. } => {
@@ -1874,6 +2290,7 @@ mod tests {
             2,
             1,
             0,
+            0,
         )
         .expect("guarded field loop compiles");
         let mut state = trace
@@ -1886,7 +2303,7 @@ mod tests {
         loop {
             if matches!(
                 trace
-                    .run_budgeted(&mut state, 7, &mut |_| None, &mut |_, _| false)
+                    .run_budgeted(&mut state, 7, &mut no_callbacks())
                     .unwrap(),
                 NumericRunOutcome::Returned { value: 17.0, .. }
             ) {
@@ -1933,6 +2350,7 @@ mod tests {
             0,
             1,
             0,
+            0,
         )
         .unwrap();
         let mut native = trace.initial_state_with_fields(&[], &[0.0]).unwrap();
@@ -1940,7 +2358,7 @@ mod tests {
         for _ in 0..CALLS {
             black_box(
                 trace
-                    .run_budgeted(&mut native, 6, &mut |_| None, &mut |_, _| false)
+                    .run_budgeted(&mut native, 6, &mut no_callbacks())
                     .unwrap(),
             );
         }

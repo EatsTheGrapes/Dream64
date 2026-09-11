@@ -9367,6 +9367,106 @@ fn region_jit_field_write_side_exits_to_the_interpreter_when_src_is_not_a_datum(
 }
 
 #[test]
+fn region_jit_numeric_core_supports_global_reads_and_writes() {
+    // Milestone 4: `LoadGlobalDynamic`/`StoreGlobalDynamic`, the global
+    // counterpart of Milestone 3's field access -- simpler, since a global
+    // has no receiver at all to prove anything about. Exercises a write then
+    // a read of the same global in one call, so both directions run
+    // together, matching the field write test's shape.
+    let source = parse(concat!(
+        "/proc/set_counter(n)\n",
+        "\tregion_global_counter = n\n",
+        "\treturn region_global_counter * 2\n",
+    ))
+    .unwrap();
+    let module = compile_module_specs(&[ProcedureSpec {
+        path: "/proc/set_counter".to_owned(),
+        definition: &source.definitions[0],
+        parent: None,
+        static_calls: BTreeMap::new(),
+        src_fields: BTreeMap::new(),
+        global_fields: BTreeMap::from([(
+            "region_global_counter".to_owned(),
+            field("region_global_counter"),
+        )]),
+    }])
+    .unwrap();
+    let entry = module.procedure_id("/proc/set_counter").unwrap();
+    let mut state = ExecutionState::new();
+
+    assert!(!state.region_installed_at_entry(module.identity.0, entry));
+    for round in 0..20 {
+        let n = round as f32;
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::number(n)], &mut state),
+            Ok(Value::number(n * 2.0)),
+            "round {round}"
+        );
+    }
+    assert!(
+        state.region_installed_at_entry(module.identity.0, entry),
+        "a global-reading/writing procedure entered this many times must compile natively"
+    );
+    for round in 20..40 {
+        let n = round as f32;
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::number(n)], &mut state),
+            Ok(Value::number(n * 2.0)),
+            "post-installation round {round}"
+        );
+    }
+    assert_eq!(
+        state.global(&field("region_global_counter")),
+        Some(&Value::number(39.0)),
+        "the global must actually be persisted, not just computed"
+    );
+}
+
+#[test]
+fn region_jit_global_read_side_exits_to_the_interpreter_for_a_non_numeric_global() {
+    // The global counterpart of the field read side-exit test: a declined
+    // `LoadGlobalDynamic` must hand off with nothing pushed onto
+    // `frame.stack` at all (unlike a field, a global has no receiver to
+    // rematerialize), leaving the interpreter to redo `LoadGlobal` cold.
+    let source = parse(concat!(
+        "/proc/read_flag()\n",
+        "\treturn region_global_flag * 2\n",
+    ))
+    .unwrap();
+    let module = compile_module_specs(&[ProcedureSpec {
+        path: "/proc/read_flag".to_owned(),
+        definition: &source.definitions[0],
+        parent: None,
+        static_calls: BTreeMap::new(),
+        src_fields: BTreeMap::new(),
+        global_fields: BTreeMap::from([(
+            "region_global_flag".to_owned(),
+            field("region_global_flag"),
+        )]),
+    }])
+    .unwrap();
+    let entry = module.procedure_id("/proc/read_flag").unwrap();
+
+    let null_flag_result = |state: &mut ExecutionState| {
+        state.set_global(field("region_global_flag"), Value::Null);
+        execute_module_in_state(&module, entry, &[], state)
+    };
+
+    let mut baseline_state = ExecutionState::new();
+    let baseline = null_flag_result(&mut baseline_state);
+    assert!(!baseline_state.region_installed_at_entry(module.identity.0, entry));
+
+    let mut state = ExecutionState::new();
+    for round in 0..20 {
+        state.set_global(field("region_global_flag"), Value::number(round as f32));
+        execute_module_in_state(&module, entry, &[], &mut state).unwrap();
+    }
+    assert!(state.region_installed_at_entry(module.identity.0, entry));
+
+    assert_eq!(null_flag_result(&mut state), baseline);
+}
+
+#[test]
 fn field_slot_cache_routes_unmaterialized_reads_through_initial_value() {
     let source = parse(concat!(
         "/proc/read_default(target)\n",
@@ -21044,9 +21144,10 @@ fn numeric_jit_lowers_isolated_locals_and_cfg_conservatively() {
     let module = compile_module(&syntax.definitions).expect("numeric CFG fixture compiles");
     let entry = module.procedure_id("/proc/calculate").unwrap();
     let program = &module.procedures[entry.index()];
-    let (lowered, field_names) =
+    let (lowered, field_names, global_names) =
         crate::numeric_trace_instructions(program).expect("safe numeric CFG lowers");
     assert!(field_names.is_empty(), "this fixture reads no fields");
+    assert!(global_names.is_empty(), "this fixture reads no globals");
     assert!(
         lowered
             .iter()

@@ -233,27 +233,35 @@ fn run_frames_inner(
                 RegionCompletion::SideExit(instruction) => {
                     // Native execution never touches the real `frame.stack` —
                     // only its own internal f32 array — so the interpreter,
-                    // resuming at the original `LoadField`/`StoreField` this
-                    // instruction was translated from, must find what it
-                    // expects to pop rematerialized here first. The receiver
-                    // is always exactly `src` (`validate`'s `StackKind`
-                    // tracking proves it, in dm-jit). A declined `StoreField`
-                    // also stashed the value it would have written in
-                    // `state.stack[0]` (the same slot `Returned` uses) before
-                    // side-exiting, since that value only ever existed in
-                    // native registers otherwise — read it before the state
+                    // resuming at the original bytecode this instruction was
+                    // translated from, must find what it expects to pop
+                    // rematerialized here first: `LoadField`/`StoreField`
+                    // expect a receiver (always exactly `src` — `validate`'s
+                    // `StackKind` tracking proves it, in dm-jit); `LoadGlobal`
+                    // has no receiver at all; `StoreField`/`StoreGlobal` also
+                    // need the value they would have written, which only ever
+                    // existed in native registers — a declined store stashed
+                    // it in `state.stack[0]` (the same slot `Returned` uses)
+                    // before side-exiting, so read it before the state
                     // backing it is cleared below.
-                    let is_store = matches!(
-                        program.instructions.get(instruction as usize),
-                        Some(Instruction::StoreField(_))
+                    let original = program.instructions.get(instruction as usize);
+                    let needs_src = matches!(
+                        original,
+                        Some(Instruction::LoadField(_) | Instruction::StoreField(_))
                     );
-                    let stashed_value = is_store
+                    let needs_stashed_value = matches!(
+                        original,
+                        Some(Instruction::StoreField(_) | Instruction::StoreGlobal(_))
+                    );
+                    let stashed_value = needs_stashed_value
                         .then(|| frames[frame_index].numeric_jit_state())
                         .flatten()
                         .map(|state| state.stack[0]);
                     frames[frame_index].set_numeric_jit_state(None);
-                    let src = frames[frame_index].src.clone();
-                    frames[frame_index].stack.push(src);
+                    if needs_src {
+                        let src = frames[frame_index].src.clone();
+                        frames[frame_index].stack.push(src);
+                    }
                     if let Some(value) = stashed_value {
                         frames[frame_index].stack.push(Value::number(value));
                     }
