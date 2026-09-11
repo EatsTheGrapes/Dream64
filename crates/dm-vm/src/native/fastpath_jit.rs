@@ -14,7 +14,7 @@ use crate::value_ops::{
 use crate::{CallFrame, ExecutionState, declared_argument_count};
 use dm_jit::{
     CompiledNumericTrace, CompiledRootedBlock, NumericInstruction, NumericRunOutcome,
-    RootedBlockOutcome, compile_numeric_field_trace, compile_safe_rooted_block,
+    RegionCallbacks, RootedBlockOutcome, compile_numeric_field_trace, compile_safe_rooted_block,
 };
 use dm_value::{DatumId, FieldName, ListId, TypePath, Value, ValueError};
 use smallvec::SmallVec;
@@ -1229,8 +1229,7 @@ fn try_run_lumcount_jit(
         let outcome = trace.compiled.run_budgeted(
             frame.numeric_jit_state_mut()?,
             budget,
-            &mut |_| None,
-            &mut |_, _| false,
+            &mut NoDynamicFieldAccess,
         )?;
         let native = frame.numeric_jit_state_mut()?;
         for (index, field) in trace.fields.iter().enumerate() {
@@ -1346,7 +1345,7 @@ pub(crate) fn compile_lumcount_trace(program: &Program) -> Option<LumcountTrace>
         NumericInstruction::Constant(0.0),
         NumericInstruction::Return,
     ];
-    let compiled = compile_numeric_field_trace(&native, program.local_count, 4, 0)
+    let compiled = compile_numeric_field_trace(&native, program.local_count, 4, 0, 0)
         .inspect_err(|error| eprintln!("lumcount JIT compile rejected: {error}"))
         .ok()?;
     Some(LumcountTrace {
@@ -1363,28 +1362,114 @@ pub(crate) fn compile_lumcount_trace(program: &Program) -> Option<LumcountTrace>
 /// crosses the threshold — so, unlike the pre-region design, this pays a
 /// translation/compile attempt per *distinct* procedure that gets hot, not on
 /// every call.
-/// A compiled region plus the field-name table its `LoadFieldDynamic`
-/// instructions index into. `dm-jit` only ever sees dense `u16` indices —
-/// resolving one back to a `FieldName` is entirely a `dm-vm` concern, so this
-/// wrapper (not `CompiledNumericTrace` alone) is what `PcCache::Region`
-/// stores from Milestone 3 on.
+/// A compiled region plus the field-name and global-name tables its
+/// `*Dynamic` instructions index into. `dm-jit` only ever sees dense `u16`
+/// indices — resolving one back to a `FieldName` is entirely a `dm-vm`
+/// concern, so this wrapper (not `CompiledNumericTrace` alone) is what
+/// `PcCache::Region` stores from Milestone 3 on.
 pub(crate) struct CompiledRegion {
     pub(crate) trace: CompiledNumericTrace,
     pub(crate) field_names: Vec<FieldName>,
+    pub(crate) global_names: Vec<FieldName>,
 }
 
 pub(crate) fn compile_region_trace(program: &Program) -> Option<CompiledRegion> {
-    let compiled = numeric_trace_instructions(program).and_then(|(instructions, field_names)| {
-        compile_numeric_field_trace(&instructions, program.local_count, 0, field_names.len())
+    let compiled = numeric_trace_instructions(program).and_then(
+        |(instructions, field_names, global_names)| {
+            compile_numeric_field_trace(
+                &instructions,
+                program.local_count,
+                0,
+                field_names.len(),
+                global_names.len(),
+            )
             .ok()
-            .map(|trace| CompiledRegion { trace, field_names })
-    });
+            .map(|trace| CompiledRegion {
+                trace,
+                field_names,
+                global_names,
+            })
+        },
+    );
     if compiled.is_some() {
         GUARDED_JIT_NUMERIC_COMPILED.fetch_add(1, Ordering::Relaxed);
     } else {
         GUARDED_JIT_NUMERIC_REJECTED.fetch_add(1, Ordering::Relaxed);
     }
     compiled
+}
+
+/// `dm-jit`'s `RegionCallbacks` implementor for one region call: a receiver
+/// (`src`, resolved once up front) plus the field/global name tables to
+/// translate a `*Dynamic` instruction's dense index back into a `FieldName`,
+/// and the live `&mut ExecutionState` to actually answer with. Trait methods
+/// taking `&mut self` mean each callback gets its own fresh, non-overlapping
+/// borrow of `state` in turn — native code never calls two of them at once,
+/// so no `RefCell` is needed the way two independent closures would have.
+struct RegionDispatch<'a> {
+    state: &'a mut ExecutionState,
+    src: Option<DatumId>,
+    field_names: &'a [FieldName],
+    global_names: &'a [FieldName],
+}
+
+impl RegionCallbacks for RegionDispatch<'_> {
+    fn load_field(&mut self, field_index: u32) -> Option<f32> {
+        let name = self.field_names.get(usize::try_from(field_index).ok()?)?;
+        datum_field_or_shared(self.state, self.src?, name)
+            .ok()?
+            .as_number()
+    }
+
+    fn store_field(&mut self, field_index: u32, value: f32) -> bool {
+        let Some(name) = self
+            .field_names
+            .get(usize::try_from(field_index).ok().unwrap_or(usize::MAX))
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(src) = self.src else { return false };
+        assign_datum_or_shared_field(self.state, src, name, Value::number(value)).is_ok()
+    }
+
+    fn load_global(&mut self, global_index: u32) -> Option<f32> {
+        let name = self.global_names.get(usize::try_from(global_index).ok()?)?;
+        self.state.global(name)?.as_number()
+    }
+
+    fn store_global(&mut self, global_index: u32, value: f32) -> bool {
+        let Some(name) = self
+            .global_names
+            .get(usize::try_from(global_index).ok().unwrap_or(usize::MAX))
+            .cloned()
+        else {
+            return false;
+        };
+        self.state.set_global(name, Value::number(value));
+        true
+    }
+}
+
+/// A `RegionCallbacks` that declines everything, for compiled traces with no
+/// `*Dynamic` instruction to answer — lumcount's bespoke trace guards its
+/// fixed field set through the older flat pre-fetched array instead (see
+/// `try_run_lumcount_jit`), so it never calls any of these.
+struct NoDynamicFieldAccess;
+
+impl RegionCallbacks for NoDynamicFieldAccess {
+    fn load_field(&mut self, _field_index: u32) -> Option<f32> {
+        None
+    }
+    fn store_field(&mut self, _field_index: u32, _value: f32) -> bool {
+        false
+    }
+    fn load_global(&mut self, _global_index: u32) -> Option<f32> {
+        None
+    }
+    fn store_global(&mut self, _global_index: u32, _value: f32) -> bool {
+        false
+    }
 }
 
 /// Drives a region installed by `compile_region_trace` for one call, exactly
@@ -1423,37 +1508,15 @@ pub(crate) fn try_run_region_numeric_jit(
         Value::Datum(id) => Some(id),
         _ => None,
     };
-    let field_names = &region.field_names;
-    // `load_field` and `store_field` are two separate closures (`dm-jit`'s
-    // callback ABI has two separate imports) that both need `state`, but
-    // native code never calls them concurrently — only one is ever on the
-    // call stack at a time. `RefCell` sidesteps the borrow checker seeing two
-    // simultaneously-alive closures over the same `&mut` with a runtime check
-    // that can never actually fail here, rather than an unsound `unsafe`
-    // aliased pointer (which `dm-vm` forbids outright).
-    let state_cell = RefCell::new(state);
-    let mut load_field = |field_index: u32| -> Option<f32> {
-        let name = field_names.get(usize::try_from(field_index).ok()?)?;
-        let state = state_cell.borrow();
-        datum_field_or_shared(&state, src?, name).ok()?.as_number()
+    let mut dispatch = RegionDispatch {
+        state,
+        src,
+        field_names: &region.field_names,
+        global_names: &region.global_names,
     };
-    let mut store_field = |field_index: u32, value: f32| -> bool {
-        let Some(name) = field_names
-            .get(usize::try_from(field_index).ok().unwrap_or(usize::MAX))
-            .cloned()
-        else {
-            return false;
-        };
-        let Some(src) = src else { return false };
-        let mut state = state_cell.borrow_mut();
-        assign_datum_or_shared_field(&mut state, src, name, Value::number(value)).is_ok()
-    };
-    let outcome = region.trace.run_budgeted(
-        frame.numeric_jit_state_mut()?,
-        budget,
-        &mut load_field,
-        &mut store_field,
-    );
+    let outcome = region
+        .trace
+        .run_budgeted(frame.numeric_jit_state_mut()?, budget, &mut dispatch);
     if let Some(outcome) = &outcome {
         GUARDED_JIT_RUNS.fetch_add(1, Ordering::Relaxed);
         let steps = match outcome {
@@ -1519,40 +1582,43 @@ fn reachable_from_entry(instructions: &[Instruction]) -> Vec<bool> {
     reachable
 }
 
-/// Finds `name`'s index in this region's dense field-name table, adding it
-/// if this is the first reference. `LoadFieldDynamic`/`StoreFieldDynamic`
-/// carry this index, not a `FieldName` — `dm-jit` never sees one.
-fn resolve_field_index(field_names: &mut Vec<FieldName>, name: &FieldName) -> Option<u16> {
-    let index = field_names
+/// Finds `name`'s index in a dense name table (the region's field-name table
+/// for `LoadFieldDynamic`/`StoreFieldDynamic`, or its global-name table for
+/// `LoadGlobalDynamic`/`StoreGlobalDynamic`), adding it if this is the first
+/// reference. `*Dynamic` instructions carry this index, not a `FieldName` —
+/// `dm-jit` never sees one.
+fn resolve_name_index(names: &mut Vec<FieldName>, name: &FieldName) -> Option<u16> {
+    let index = names
         .iter()
         .position(|existing| existing == name)
         .unwrap_or_else(|| {
-            field_names.push(name.clone());
-            field_names.len() - 1
+            names.push(name.clone());
+            names.len() - 1
         });
     u16::try_from(index).ok()
 }
 
 /// Translates one procedure's bytecode into the region tier's closed numeric
-/// IR, alongside the distinct field names it references dynamically (the
-/// `LoadFieldDynamic`/`StoreFieldDynamic` table `compile_region_trace` hands
-/// to `dm-jit`).
+/// IR, alongside the distinct field and global names it references
+/// dynamically (the `*Dynamic` tables `compile_region_trace` hands to
+/// `dm-jit`).
 ///
 /// `LoadSrc` always translates to `NumericInstruction::LoadSrc`, and every
-/// `LoadField`/`StoreField` always translates to
-/// `LoadFieldDynamic`/`StoreFieldDynamic` — this translator no longer proves
-/// the receiver is `src` itself (earlier versions used a 1-instruction
-/// lookback, sound only for reads: a store's receiver sits under an
-/// arbitrary-length value expression, not immediately below the store).
-/// `dm-jit`'s `validate` now carries that proof, via `StackKind` tracking —
-/// see the "Milestone 3" module doc in `dm-jit/src/lib.rs`. A procedure using
+/// `LoadField`/`StoreField`/`LoadGlobal`/`StoreGlobal` always translates to
+/// its `*Dynamic` counterpart — this translator no longer proves the
+/// receiver is `src` itself for fields (earlier versions used a
+/// 1-instruction lookback, sound only for reads: a store's receiver sits
+/// under an arbitrary-length value expression, not immediately below the
+/// store), and globals have no receiver to prove anything about at all.
+/// `dm-jit`'s `validate` carries that proof, via `StackKind` tracking — see
+/// the "Milestone 3" module doc in `dm-jit/src/lib.rs`. A procedure using
 /// `src` any other way (storing it in a local, testing it as a branch
 /// condition, returning it directly) fails validation there and this whole
 /// function's caller falls back to the interpreter, exactly as it always has
 /// for any other unsupported shape.
 pub(crate) fn numeric_trace_instructions(
     program: &Program,
-) -> Option<(Vec<NumericInstruction>, Vec<FieldName>)> {
+) -> Option<(Vec<NumericInstruction>, Vec<FieldName>, Vec<FieldName>)> {
     if program.instructions.is_empty()
         || program.instructions.iter().any(|instruction| {
             matches!(
@@ -1566,6 +1632,7 @@ pub(crate) fn numeric_trace_instructions(
     let declared_arguments = declared_argument_count(program);
     let reachable = reachable_from_entry(&program.instructions);
     let mut field_names: Vec<FieldName> = Vec::new();
+    let mut global_names: Vec<FieldName> = Vec::new();
     let instructions = program
         .instructions
         .iter()
@@ -1599,13 +1666,18 @@ pub(crate) fn numeric_trace_instructions(
                 .map(NumericInstruction::JumpIfFalse),
             Instruction::Return => Some(NumericInstruction::Return),
             Instruction::LoadSrc => Some(NumericInstruction::LoadSrc),
-            Instruction::LoadField(name) => resolve_field_index(&mut field_names, name)
-                .map(NumericInstruction::LoadFieldDynamic),
-            Instruction::StoreField(name) => resolve_field_index(&mut field_names, name)
+            Instruction::LoadField(name) => {
+                resolve_name_index(&mut field_names, name).map(NumericInstruction::LoadFieldDynamic)
+            }
+            Instruction::StoreField(name) => resolve_name_index(&mut field_names, name)
                 .map(NumericInstruction::StoreFieldDynamic),
+            Instruction::LoadGlobal(name) => resolve_name_index(&mut global_names, name)
+                .map(NumericInstruction::LoadGlobalDynamic),
+            Instruction::StoreGlobal(name) => resolve_name_index(&mut global_names, name)
+                .map(NumericInstruction::StoreGlobalDynamic),
             _ if !reachable[pc] => Some(NumericInstruction::Return),
             _ => None,
         })
         .collect::<Option<Vec<_>>>()?;
-    Some((instructions, field_names))
+    Some((instructions, field_names, global_names))
 }
