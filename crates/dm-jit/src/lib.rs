@@ -1147,9 +1147,11 @@ mod tests {
 
     #[test]
     fn compiles_not_as_dm_truth_value_negation() {
-        let trace =
-            compile_numeric_trace(&[NumericInstruction::LoadLocal(0), NumericInstruction::Not], 1)
-                .expect("trace compiles");
+        let trace = compile_numeric_trace(
+            &[NumericInstruction::LoadLocal(0), NumericInstruction::Not],
+            1,
+        )
+        .expect("trace compiles");
         assert_eq!(trace.run(&[0.0]), Some(1.0));
         assert_eq!(trace.run(&[1.0]), Some(0.0));
         assert_eq!(trace.run(&[-3.5]), Some(0.0));

@@ -149,11 +149,10 @@ pub(crate) use native::{
     execute_compact_fast_instruction, false_tick_check_target, numeric_dispatch_candidate,
     set_world_numeric_field, trace_tgm_route, try_run_build_coordinate_prefix,
     try_run_camera_chunk_fast_path, try_run_discover_offset_fast_path,
-    try_run_dmm_preload_measurement_fast_path, try_run_guarded_jit,
-    try_run_numeric_dispatch_block, try_run_numeric_local_update, try_run_numeric_loop_branch,
-    try_run_parsed_dmm_new_fast_path, try_run_region_numeric_jit,
-    try_run_register_signal_fast_path, try_run_rooted_list_jit, try_run_ruin_affected_turfs_batch,
-    try_run_tgm_build_cache_simple_member, world_numeric_field,
+    try_run_dmm_preload_measurement_fast_path, try_run_guarded_jit, try_run_numeric_dispatch_block,
+    try_run_numeric_local_update, try_run_numeric_loop_branch, try_run_parsed_dmm_new_fast_path,
+    try_run_region_numeric_jit, try_run_register_signal_fast_path, try_run_rooted_list_jit,
+    try_run_ruin_affected_turfs_batch, try_run_tgm_build_cache_simple_member, world_numeric_field,
 };
 
 #[cfg(test)]

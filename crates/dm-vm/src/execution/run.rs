@@ -185,8 +185,12 @@ fn run_frames_inner(
         if instruction_index == 0
             && remaining_steps > 0
             && let Some(region) = sidecar.region_at_entry()
-            && let Some(outcome) =
-                try_run_region_numeric_jit(region, program, &mut frames[frame_index], remaining_steps)
+            && let Some(outcome) = try_run_region_numeric_jit(
+                region,
+                program,
+                &mut frames[frame_index],
+                remaining_steps,
+            )
         {
             let (accounted_steps, result) = match outcome {
                 NumericRunOutcome::Returned { value, steps } => {
