@@ -9235,6 +9235,138 @@ fn region_jit_field_read_side_exits_to_the_interpreter_for_a_non_numeric_field()
 }
 
 #[test]
+fn region_jit_numeric_core_supports_field_writes_to_src() {
+    // Milestone 3b: `StoreFieldDynamic` writes a field of the region's
+    // implicit `src` through a live slow-path callback. Verifies both the
+    // return value AND that the datum's field was actually updated (not just
+    // that the trace computed the right answer without persisting it) —
+    // and, since `set_value` both writes then reads `value` back, exercises
+    // `LoadFieldDynamic` and `StoreFieldDynamic` together in one procedure.
+    let source = parse(concat!(
+        "/datum/proc/set_value(n)\n",
+        "\tvalue = n\n",
+        "\treturn value\n",
+    ))
+    .unwrap();
+    let module = compile_module_specs(&[ProcedureSpec {
+        path: "/datum/proc/set_value".to_owned(),
+        definition: &source.definitions[0],
+        parent: None,
+        static_calls: BTreeMap::new(),
+        src_fields: BTreeMap::from([("value".to_owned(), field("value"))]),
+        global_fields: BTreeMap::new(),
+    }])
+    .unwrap();
+    let entry = module.procedure_id("/datum/proc/set_value").unwrap();
+    let mut state = ExecutionState::new();
+
+    let call = |state: &mut ExecutionState, n: f32| {
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/region_field_write_fixture").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(datum, field("value"), Value::number(0.0))
+            .unwrap();
+        let result = execute_module_in_context(
+            &module,
+            entry,
+            &[Value::number(n)],
+            state,
+            &ExecutionContext::new(Value::Datum(datum), Value::Null),
+        );
+        let persisted = datum_field_or_initial(state, datum, &field("value")).unwrap();
+        (result, persisted)
+    };
+
+    assert!(!state.region_installed_at_entry(module.identity.0, entry));
+    for round in 0..20 {
+        let n = round as f32;
+        let (result, persisted) = call(&mut state, n);
+        assert_eq!(result, Ok(Value::number(n)), "round {round}");
+        assert_eq!(persisted, Value::number(n), "round {round} did not persist");
+    }
+    assert!(
+        state.region_installed_at_entry(module.identity.0, entry),
+        "a field-writing procedure entered this many times must compile natively"
+    );
+    for round in 20..40 {
+        let n = round as f32;
+        let (result, persisted) = call(&mut state, n);
+        assert_eq!(
+            result,
+            Ok(Value::number(n)),
+            "post-installation round {round}"
+        );
+        assert_eq!(
+            persisted,
+            Value::number(n),
+            "post-installation round {round} did not persist"
+        );
+    }
+}
+
+#[test]
+fn region_jit_field_write_side_exits_to_the_interpreter_when_src_is_not_a_datum() {
+    // The write-side counterpart of the read side-exit test above: a
+    // `StoreFieldDynamic` decline must hand off to the interpreter with both
+    // the receiver AND the value it would have written rematerialized onto
+    // `frame.stack`, in the order `StoreField` expects to pop them.
+    let source = parse(concat!(
+        "/datum/proc/set_value(n)\n",
+        "\tvalue = n\n",
+        "\treturn value\n",
+    ))
+    .unwrap();
+    let module = compile_module_specs(&[ProcedureSpec {
+        path: "/datum/proc/set_value".to_owned(),
+        definition: &source.definitions[0],
+        parent: None,
+        static_calls: BTreeMap::new(),
+        src_fields: BTreeMap::from([("value".to_owned(), field("value"))]),
+        global_fields: BTreeMap::new(),
+    }])
+    .unwrap();
+    let entry = module.procedure_id("/datum/proc/set_value").unwrap();
+
+    let null_src_result = |state: &mut ExecutionState| {
+        execute_module_in_context(
+            &module,
+            entry,
+            &[Value::number(7.0)],
+            state,
+            &ExecutionContext::new(Value::Null, Value::Null),
+        )
+    };
+
+    let mut baseline_state = ExecutionState::new();
+    let baseline = null_src_result(&mut baseline_state);
+    assert!(!baseline_state.region_installed_at_entry(module.identity.0, entry));
+
+    let mut state = ExecutionState::new();
+    for round in 0..20 {
+        let datum = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/region_field_write_fixture").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(datum, field("value"), Value::number(0.0))
+            .unwrap();
+        execute_module_in_context(
+            &module,
+            entry,
+            &[Value::number(round as f32)],
+            &mut state,
+            &ExecutionContext::new(Value::Datum(datum), Value::Null),
+        )
+        .unwrap();
+    }
+    assert!(state.region_installed_at_entry(module.identity.0, entry));
+
+    assert_eq!(null_src_result(&mut state), baseline);
+}
+
+#[test]
 fn field_slot_cache_routes_unmaterialized_reads_through_initial_value() {
     let source = parse(concat!(
         "/proc/read_default(target)\n",
