@@ -140,12 +140,28 @@ number. Reject anything that regresses parity or the short gates.
 1. **ABI + `RegionVm` + side-exit plumbing, zero ops supported.** Every region
    compiles to "side-exit at PC 0". Proves the enter/exit/materialize/step
    accounting round-trips with no behaviour change. Pure infrastructure PR.
-2. **Numeric core.** Constants, locals (unboxed), arithmetic, comparisons,
-   `Not`/`And`/`Or`, `Jump`/`JumpIfFalse`, `Return` of a number. This is
-   `compile_numeric_field_trace` generalised to the region entry/exit model.
-   First measurable target: whole numeric leaf procedures (the 2036 the
-   Cranelift guarded JIT already catches — move them onto this path and delete
-   the old one).
+   **Done** (`023a754`) — proven behaviour-inert via a full boot-to-pregame A/B.
+2. **Numeric core. Done.** Constants, locals (unboxed), arithmetic, comparisons,
+   `Not`/`And`/`Or`, `Jump`/`JumpIfFalse`, `Return` of a number — `dm-vm`'s
+   `PcCache::Region` now installs a `dm_jit::CompiledNumericTrace` directly (no
+   separate region wrapper type: for an all-numeric procedure the existing
+   trace compiler *is* the region entry/exit model, so nothing new was needed
+   in `dm-jit` beyond the `Not`/`And`/`Or` opcodes themselves — `compile_numeric_trace`,
+   `NumericExecutionState`, `run_budgeted` are unchanged). Replaces the old
+   whole-procedure guarded JIT's generic-numeric path outright (thread-local
+   cache → sidecar-hosted warm-up/install at PC 0; `try_run_numeric_jit`/
+   `numeric_jit_prefix_candidate` deleted); lumcount's bespoke field trace is
+   untouched. `Not`/`And`/`Or` are new coverage the old JIT never had — DM's
+   `&&`/`||` always short-circuit to `Jump`/`JumpIfFalse` (so eager `And`/`Or`
+   only ever come from a `switch` statement's `to`-range or multi-value
+   alternatives), `!` compiles straight to `Not`. `numeric_trace_instructions`
+   also grew a reachability pass so a procedure whose every real path already
+   returns doesn't get rejected over its compiler-appended, unreachable
+   trailing `LoadResult; Return` — a pattern common enough (any exhaustive
+   `if`/`else` or `switch`) to be worth not paying full interpreter cost for.
+   Resumption across a budget boundary reuses the pre-existing per-`CallFrame`
+   `numeric_jit_state` slot exactly as the old JIT did (same safe, already
+   continuation-tested mechanism — deliberately not reinvented).
 3. **Guarded field r/w.** `load_field`/`store_field` via the integer shape
    guard + slot read, numeric fields stay unboxed. Target: `update_lumcount`
    (~1.8 % of boot, 48 instrs, its bespoke JIT never matches Monke) and the

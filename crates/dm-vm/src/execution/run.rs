@@ -20,7 +20,7 @@ use crate::{
     trace_tgm_route, try_run_build_coordinate_prefix, try_run_camera_chunk_fast_path,
     try_run_discover_offset_fast_path, try_run_dmm_preload_measurement_fast_path,
     try_run_guarded_jit, try_run_numeric_dispatch_block, try_run_numeric_local_update,
-    try_run_numeric_loop_branch, try_run_parsed_dmm_new_fast_path,
+    try_run_numeric_loop_branch, try_run_parsed_dmm_new_fast_path, try_run_region_numeric_jit,
     try_run_register_signal_fast_path, try_run_rooted_list_jit, try_run_ruin_affected_turfs_batch,
     try_run_tgm_build_cache_simple_member,
 };
@@ -170,26 +170,48 @@ fn run_frames_inner(
                 &mut *active_sidecar.insert((procedure, resolved)).1
             }
         };
-        // Baseline region JIT, Milestone 1 (docs/performance/baseline-region-jit.md):
-        // warm up and, once hot enough, compile a region at the procedure's
-        // entry. No milestone-1 region supports any bytecode — every call
-        // immediately deopts back to this same instruction having retired zero
-        // steps — so this block is inert on today's boot and only proves the
-        // compile/call/decode/account round trip on real traffic. Checked only
-        // at instruction 0 (not every instruction) to keep that inertness cheap.
+        // Baseline region JIT (docs/performance/baseline-region-jit.md).
+        // Milestone 1 proved the warm-up/compile/install round trip with a
+        // stub that always deopted; Milestone 2 installs a real binary32
+        // numeric-core trace here (constants, locals, arithmetic, comparisons,
+        // Not/And/Or, branches, return of a number) — see
+        // `region_at_entry`/`poll_region_at_entry` in the sidecar and
+        // `try_run_region_numeric_jit`. Checked only at instruction 0: a
+        // region only ever installs at, and runs from, a procedure's own
+        // entry.
         if instruction_index == 0 {
-            sidecar.poll_region_at_entry();
-            if let Some(dm_jit::RegionOutcome::Deopt { resume_pc, steps }) =
-                sidecar.run_region_at_entry(0, u32::try_from(remaining_steps).unwrap_or(u32::MAX))
-            {
-                let steps = u64::from(steps);
-                let scheduler_batches_before = executed_steps / 4_096;
-                remaining_steps = remaining_steps.saturating_sub(steps);
-                executed_steps += steps;
-                for _ in scheduler_batches_before..(executed_steps / 4_096) {
-                    account_scheduler_tick_usage(state);
+            sidecar.poll_region_at_entry(program);
+        }
+        if instruction_index == 0
+            && remaining_steps > 0
+            && let Some(region) = sidecar.region_at_entry()
+            && let Some(outcome) =
+                try_run_region_numeric_jit(region, program, &mut frames[frame_index], remaining_steps)
+        {
+            let (accounted_steps, result) = match outcome {
+                NumericRunOutcome::Returned { value, steps } => {
+                    // Native Return has no VM-visible side effect. Replay that
+                    // final instruction through the ordinary arm below so call
+                    // unwinding, tracing, and scheduler behavior stay unified —
+                    // mirrors `try_run_guarded_jit`'s call site below exactly.
+                    (u64::from(steps.saturating_sub(1)), Some(value))
                 }
-                frames[frame_index].instruction = resume_pc as usize;
+                NumericRunOutcome::BudgetExhausted { steps, .. } => (u64::from(steps), None),
+            };
+            let scheduler_batches_before = executed_steps / 4_096;
+            remaining_steps = remaining_steps.saturating_sub(accounted_steps);
+            executed_steps += accounted_steps;
+            for _ in scheduler_batches_before..(executed_steps / 4_096) {
+                account_scheduler_tick_usage(state);
+            }
+            if let Some(profile) = &mut state.atoms_profile {
+                profile.total_instructions =
+                    profile.total_instructions.saturating_add(accounted_steps);
+            }
+            if let Some(value) = result {
+                frames[frame_index].set_numeric_jit_state(None);
+                frames[frame_index].stack.push(Value::number(value));
+                frames[frame_index].instruction = program.instructions.len() - 1;
             }
         }
         // A packed numeric dispatch block that exhausts its step budget stashes

@@ -21,8 +21,9 @@
 
 use std::collections::HashMap;
 
-use crate::bytecode::ProcedureId;
+use crate::bytecode::{ProcedureId, Program};
 use crate::execution::state::FieldSlotCache;
+use dm_jit::CompiledNumericTrace;
 
 /// The specialization state for one bytecode instruction. Every non-`Cold`
 /// variant boxes its payload so an all-`Cold` procedure array stays at one
@@ -40,8 +41,12 @@ pub(crate) enum PcCache {
     /// toward a region-compile attempt. See
     /// `docs/performance/baseline-region-jit.md`.
     RegionCounting(u16),
-    /// A compiled region installed at this call site's entry PC.
-    Region(Box<dm_jit::CompiledRegion>),
+    /// A compiled region installed at this procedure's entry (PC 0).
+    /// Milestone 2 (numeric core): every region is currently a whole-procedure
+    /// binary32 trace — see the module doc comment in `dm-jit`'s
+    /// `baseline region JIT` section for why `CompiledNumericTrace` fills the
+    /// region role directly rather than through a separate wrapper type.
+    Region(Box<CompiledNumericTrace>),
     /// A region-compile attempt at this site failed or the shape was
     /// unsupported; never retried.
     RegionRejected,
@@ -115,18 +120,17 @@ impl ProcedureSidecar {
         })
     }
 
-    /// Procedure entries observed at PC 0 before Milestone 1 attempts to
-    /// compile a region there. Small and arbitrary: the compiled body does
-    /// nothing yet (see `docs/performance/baseline-region-jit.md`), so this
-    /// threshold only proves the warm-up/compile/install machinery behaves —
-    /// it is not evidence for the right threshold once regions do real work.
+    /// Procedure entries observed at PC 0 before a region-compile attempt.
+    /// Small and arbitrary — chosen in Milestone 1 to prove the warm-up/
+    /// compile/install machinery behaves, not tuned as the right threshold;
+    /// still unrevisited in Milestone 2.
     const REGION_ENTRY_THRESHOLD: u16 = 16;
 
     /// Called once per procedure entry (`instruction_index == 0`). Advances
     /// the PC-0 slot toward a region-compile attempt; a no-op once the slot
     /// holds anything else (a region, a rejection, or — rare, but possible for
     /// a one-instruction procedure — an installed field-read cache).
-    pub(crate) fn poll_region_at_entry(&mut self) {
+    pub(crate) fn poll_region_at_entry(&mut self, program: &Program) {
         let Some(slot) = self.pcs.first_mut() else {
             return;
         };
@@ -134,9 +138,9 @@ impl ProcedureSidecar {
             PcCache::Cold => *slot = PcCache::RegionCounting(1),
             PcCache::RegionCounting(count) => {
                 if *count + 1 >= Self::REGION_ENTRY_THRESHOLD {
-                    *slot = match dm_jit::compile_trivial_region() {
-                        Ok(region) => PcCache::Region(Box::new(region)),
-                        Err(_) => PcCache::RegionRejected,
+                    *slot = match crate::compile_region_trace(program) {
+                        Some(region) => PcCache::Region(Box::new(region)),
+                        None => PcCache::RegionRejected,
                     };
                 } else {
                     *count += 1;
@@ -146,16 +150,13 @@ impl ProcedureSidecar {
         }
     }
 
-    /// Runs the region installed at PC 0, if any. `entry_pc` is always `0` in
-    /// Milestone 1 (a region only ever installs at a procedure's own entry);
-    /// later milestones that compile from loop headers pass the header PC.
-    pub(crate) fn run_region_at_entry(
-        &self,
-        entry_pc: u32,
-        budget: u32,
-    ) -> Option<dm_jit::RegionOutcome> {
+    /// The region compiled at this procedure's entry (PC 0), if any. Callers
+    /// drive it exactly as the pre-region whole-procedure numeric JIT drove
+    /// its own cached trace: build/resume a `NumericExecutionState` from the
+    /// caller's frame and call `run_budgeted`.
+    pub(crate) fn region_at_entry(&self) -> Option<&CompiledNumericTrace> {
         match self.pcs.first()? {
-            PcCache::Region(region) => Some(region.run(entry_pc, budget)),
+            PcCache::Region(region) => Some(region),
             _ => None,
         }
     }

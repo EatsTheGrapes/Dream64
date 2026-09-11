@@ -41,12 +41,18 @@ pub enum NumericInstruction {
     Divide,
     /// Negate the top operand.
     Negate,
+    /// DM truth-value negation: `1.0` when the operand is `0.0`, else `0.0`.
+    Not,
     Equal,
     NotEqual,
     LessThan,
     LessThanOrEqual,
     GreaterThan,
     GreaterThanOrEqual,
+    /// Eager boolean conjunction: `1.0` when both operands are non-zero.
+    And,
+    /// Eager boolean disjunction: `1.0` when either operand is non-zero.
+    Or,
     /// Continue execution at an absolute instruction index.
     Jump(u32),
     /// Pop a number and jump when it is zero (DM false for this numeric tier).
@@ -756,6 +762,17 @@ pub fn compile_numeric_field_trace(
                     let value = function_builder.ins().fneg(value);
                     memory_push(&mut function_builder, stack_pointer, &mut depth, value);
                 }
+                NumericInstruction::Not => {
+                    // DM truth-value negation: numeric_core.rs's reference
+                    // formula is `f32::from(value == 0.0)`, mirrored bitwise
+                    // here (NaN != 0.0, so `!NaN` is 0.0, same as that path).
+                    let value = memory_pop(&mut function_builder, stack_pointer, &mut depth);
+                    let zero = function_builder.ins().f32const(0.0);
+                    let is_zero = function_builder.ins().fcmp(FloatCC::Equal, value, zero);
+                    let one = function_builder.ins().f32const(1.0);
+                    let value = function_builder.ins().select(is_zero, one, zero);
+                    memory_push(&mut function_builder, stack_pointer, &mut depth, value);
+                }
                 NumericInstruction::Jump(target) => {
                     function_builder.ins().jump(
                         checks[target as usize],
@@ -812,6 +829,23 @@ pub fn compile_numeric_field_trace(
                             let one = function_builder.ins().f32const(1.0);
                             let zero = function_builder.ins().f32const(0.0);
                             function_builder.ins().select(predicate, one, zero)
+                        }
+                        NumericInstruction::And | NumericInstruction::Or => {
+                            // Eager, non-short-circuiting: both operands are
+                            // already on the stack. Matches numeric_core.rs's
+                            // `left != 0.0 && right != 0.0` / `||` reference.
+                            let zero = function_builder.ins().f32const(0.0);
+                            let left_truthy =
+                                function_builder.ins().fcmp(FloatCC::NotEqual, left, zero);
+                            let right_truthy =
+                                function_builder.ins().fcmp(FloatCC::NotEqual, right, zero);
+                            let combined = if matches!(operation, NumericInstruction::And) {
+                                function_builder.ins().band(left_truthy, right_truthy)
+                            } else {
+                                function_builder.ins().bor(left_truthy, right_truthy)
+                            };
+                            let one = function_builder.ins().f32const(1.0);
+                            function_builder.ins().select(combined, one, zero)
                         }
                         _ => unreachable!("non-binary instructions handled above"),
                     };
@@ -985,7 +1019,7 @@ fn validate(
                 }
                 depth -= 1;
             }
-            NumericInstruction::Negate => {
+            NumericInstruction::Negate | NumericInstruction::Not => {
                 if depth < 1 {
                     return Err(CompileError::StackUnderflow);
                 }
@@ -999,7 +1033,9 @@ fn validate(
             | NumericInstruction::LessThan
             | NumericInstruction::LessThanOrEqual
             | NumericInstruction::GreaterThan
-            | NumericInstruction::GreaterThanOrEqual => {
+            | NumericInstruction::GreaterThanOrEqual
+            | NumericInstruction::And
+            | NumericInstruction::Or => {
                 if depth < 2 {
                     return Err(CompileError::StackUnderflow);
                 }
@@ -1070,189 +1106,26 @@ fn add_edge(
 //
 // A "region" compiles a run of DM bytecode starting at a hot entry PC to
 // native code, calling back into a Rust slow path for anything it cannot do
-// inline. This is Milestone 1: the Cranelift compile/call/outcome-decode round
-// trip, with **zero bytecode instructions supported**. Every compiled region
-// immediately deopts at its own entry PC having retired zero steps — behaving
-// exactly as if it were never called. The point is to prove the calling
-// convention and the `dm-vm` integration (sidecar installation, step
-// accounting, the interpreter fallback) are live and inert on real boot
-// traffic before any milestone teaches a region to actually execute anything.
-// Later milestones extend `compile_trivial_region`'s function body and the
-// `RegionEntry` signature; `dm-vm` call sites are not expected to change shape.
-
-/// Outcome of one region-entry call, decoded from the packed `u64` every
-/// region ABI function returns.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RegionOutcome {
-    /// The region retired `steps` bytecodes and then gave up — either because
-    /// it hit an unsupported instruction, a guard failed, or (Milestone 1)
-    /// because it supports nothing at all. `resume_pc` is the exact bytecode
-    /// index the interpreter must continue from; it is always within the
-    /// procedure the region was compiled for.
-    Deopt { resume_pc: u32, steps: u32 },
-}
-
-fn unpack_region_outcome(packed: u64) -> RegionOutcome {
-    RegionOutcome::Deopt {
-        resume_pc: packed as u32,
-        steps: (packed >> 32) as u32,
-    }
-}
-
-type RegionEntry = unsafe extern "C" fn(entry_pc: u32, budget: u32) -> u64;
-
-/// Executable native code for one compiled region.
-///
-/// Not `Clone`: the owning module keeps the finalized function's code pages
-/// alive, and a region is only ever reached through the `PcCache` slot that
-/// owns it.
-pub struct CompiledRegion {
-    _module: JITModule,
-    entry: RegionEntry,
-}
-
-impl CompiledRegion {
-    /// Runs the region starting at `entry_pc` with `budget` logical bytecode
-    /// steps available. Milestone 1's compiled body reads no memory and calls
-    /// nothing else — it unconditionally returns `Deopt { resume_pc: entry_pc,
-    /// steps: 0 }` — so this is safe to expose without an `unsafe` marker at
-    /// the `dm-vm` call site (which cannot use `unsafe` at all; see the module
-    /// doc comment above).
-    #[must_use]
-    pub fn run(&self, entry_pc: u32, budget: u32) -> RegionOutcome {
-        // SAFETY: `entry` is a pointer into `_module`'s finalized code, kept
-        // alive for exactly as long as `self` is, produced by Cranelift from
-        // the signature declared in `compile_trivial_region` below and called
-        // with that exact signature here. The compiled body touches no memory
-        // beyond its own two integer parameters.
-        let packed = unsafe { (self.entry)(entry_pc, budget) };
-        unpack_region_outcome(packed)
-    }
-}
-
-/// Compiles a region that supports no bytecode: calling it always returns
-/// `Deopt` at its own entry PC having retired zero steps. See the module doc
-/// comment above — this is Milestone 1 of the baseline region JIT, proving the
-/// Cranelift build/call/decode path before any milestone teaches it real ops.
-///
-/// # Errors
-///
-/// Returns [`CompileError::Backend`] if Cranelift rejects the generated
-/// module. The caller's correct response is the same as any other rejected
-/// region: keep interpreting that procedure, never retry.
-pub fn compile_trivial_region() -> Result<CompiledRegion, CompileError> {
-    let builder = JITBuilder::new(cranelift_module::default_libcall_names())
-        .map_err(|error| CompileError::Backend(error.to_string()))?;
-    let mut module = JITModule::new(builder);
-    let mut context = module.make_context();
-    context
-        .func
-        .signature
-        .params
-        .push(AbiParam::new(types::I32));
-    context
-        .func
-        .signature
-        .params
-        .push(AbiParam::new(types::I32));
-    context
-        .func
-        .signature
-        .returns
-        .push(AbiParam::new(types::I64));
-    let function = module
-        .declare_function(
-            "dream64_region_entry",
-            Linkage::Local,
-            &context.func.signature,
-        )
-        .map_err(|error| CompileError::Backend(error.to_string()))?;
-    let mut frontend_context = FunctionBuilderContext::new();
-    {
-        let mut function_builder = FunctionBuilder::new(&mut context.func, &mut frontend_context);
-        let entry_block = function_builder.create_block();
-        function_builder.append_block_params_for_function_params(entry_block);
-        function_builder.switch_to_block(entry_block);
-        let entry_pc = function_builder.block_params(entry_block)[0];
-        // Pack { steps: 0, resume_pc: entry_pc } exactly as `unpack_region_outcome`
-        // reads it: resume_pc in the low 32 bits, steps in the high 32 bits.
-        let packed = function_builder.ins().uextend(types::I64, entry_pc);
-        function_builder.ins().return_(&[packed]);
-        function_builder.seal_all_blocks();
-        function_builder.finalize();
-    }
-    module
-        .define_function(function, &mut context)
-        .map_err(|error| CompileError::Backend(format!("{error:?}\n{}", context.func.display())))?;
-    module.clear_context(&mut context);
-    module
-        .finalize_definitions()
-        .map_err(|error| CompileError::Backend(error.to_string()))?;
-    let pointer = module.get_finalized_function(function);
-    // SAFETY: Cranelift finalized `function` with the two-`i32`-params,
-    // one-`i64`-return signature declared above, matching `RegionEntry` exactly.
-    let entry: RegionEntry = unsafe { std::mem::transmute(pointer) };
-    Ok(CompiledRegion {
-        _module: module,
-        entry,
-    })
-}
+// inline. Milestone 1 proved the Cranelift compile/call/outcome-decode round
+// trip with a stub that supported no bytecode and always deopted. Milestone 2
+// (numeric core) is the first region that does real work: `dm-vm` installs a
+// [`CompiledNumericTrace`] directly as the `PcCache::Region` payload — the
+// existing binary32 trace compiler below *is* the region entry/exit model for
+// an all-numeric procedure, so no separate region wrapper type is needed.
+// `dm-vm`'s sidecar calls `initial_state`/`run_budgeted` exactly as the
+// pre-region whole-procedure numeric JIT did; only the caching/warm-up model
+// moved (from an unconditional first-call compile in a thread-local map, to a
+// warm-up-counted compile installed at the procedure's PC-0 sidecar slot).
+// Later milestones (fields, globals, calls) will need regions to do more than
+// pure numerics, at which point this may grow into a dedicated wrapper type;
+// until then `CompiledNumericTrace` fills the role directly.
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CompileError, NumericInstruction, NumericRunOutcome, RegionOutcome,
-        compile_numeric_field_trace, compile_numeric_trace, compile_trivial_region,
+        CompileError, NumericInstruction, NumericRunOutcome, compile_numeric_field_trace,
+        compile_numeric_trace,
     };
-
-    #[test]
-    fn trivial_region_always_deopts_at_its_own_entry_pc_with_no_steps_retired() {
-        let region = compile_trivial_region().expect("trivial region compiles");
-        for entry_pc in [0, 1, 5, 138, u32::MAX] {
-            for budget in [0, 1, 4_096, u32::MAX] {
-                assert_eq!(
-                    region.run(entry_pc, budget),
-                    RegionOutcome::Deopt {
-                        resume_pc: entry_pc,
-                        steps: 0
-                    },
-                    "entry_pc={entry_pc} budget={budget}",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn trivial_region_compiles_repeatedly_and_independently() {
-        // Each call site (each PC-0 slot) gets its own compiled module; two
-        // independently compiled trivial regions must behave identically and
-        // neither's lifetime affects the other's.
-        let first = compile_trivial_region().unwrap();
-        let second = compile_trivial_region().unwrap();
-        assert_eq!(
-            first.run(7, 100),
-            RegionOutcome::Deopt {
-                resume_pc: 7,
-                steps: 0
-            }
-        );
-        assert_eq!(
-            second.run(9, 100),
-            RegionOutcome::Deopt {
-                resume_pc: 9,
-                steps: 0
-            }
-        );
-        // The first region is still independently callable after the second
-        // compiled (no shared/overwritten code pages).
-        assert_eq!(
-            first.run(7, 100),
-            RegionOutcome::Deopt {
-                resume_pc: 7,
-                steps: 0
-            }
-        );
-    }
 
     #[test]
     fn compiles_binary32_arithmetic() {
@@ -1270,6 +1143,53 @@ mod tests {
         .expect("trace compiles");
         assert_eq!(trace.run(&[3.0, 4.0]), Some(-10.0));
         assert_eq!(trace.run(&[3.0]), None);
+    }
+
+    #[test]
+    fn compiles_not_as_dm_truth_value_negation() {
+        let trace =
+            compile_numeric_trace(&[NumericInstruction::LoadLocal(0), NumericInstruction::Not], 1)
+                .expect("trace compiles");
+        assert_eq!(trace.run(&[0.0]), Some(1.0));
+        assert_eq!(trace.run(&[1.0]), Some(0.0));
+        assert_eq!(trace.run(&[-3.5]), Some(0.0));
+        assert_eq!(trace.run(&[f32::NAN]), Some(0.0));
+    }
+
+    #[test]
+    fn compiles_and_or_as_eager_canonicalized_booleans() {
+        let and_trace = compile_numeric_trace(
+            &[
+                NumericInstruction::LoadLocal(0),
+                NumericInstruction::LoadLocal(1),
+                NumericInstruction::And,
+            ],
+            2,
+        )
+        .expect("and trace compiles");
+        let or_trace = compile_numeric_trace(
+            &[
+                NumericInstruction::LoadLocal(0),
+                NumericInstruction::LoadLocal(1),
+                NumericInstruction::Or,
+            ],
+            2,
+        )
+        .expect("or trace compiles");
+        for (left, right) in [(0.0, 0.0), (1.0, 0.0), (0.0, 2.0), (3.0, -3.0)] {
+            let expected_and = f32::from(left != 0.0 && right != 0.0);
+            let expected_or = f32::from(left != 0.0 || right != 0.0);
+            assert_eq!(
+                and_trace.run(&[left, right]),
+                Some(expected_and),
+                "and({left}, {right})"
+            );
+            assert_eq!(
+                or_trace.run(&[left, right]),
+                Some(expected_or),
+                "or({left}, {right})"
+            );
+        }
     }
 
     #[test]
