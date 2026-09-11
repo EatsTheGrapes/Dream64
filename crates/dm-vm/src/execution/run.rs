@@ -257,6 +257,27 @@ fn run_frames_inner(
                         .then(|| frames[frame_index].numeric_jit_state())
                         .flatten()
                         .map(|state| state.stack[0]);
+                    // The interpreter also reads `frame.locals` directly from
+                    // here on, and native execution never touched it either —
+                    // any local a `StoreLocal` wrote since entry only exists
+                    // in `NumericExecutionState.locals` until written back
+                    // here. `dirty_locals` (not just a changed f32 value)
+                    // tells apart "this trace wrote it" from "still the
+                    // still-`Null` placeholder the entry guard let through
+                    // unwritten" — the latter must stay `Null`, not become
+                    // `Value::number(0.0)`.
+                    let dirty_locals: Vec<(usize, f32)> = frames[frame_index]
+                        .numeric_jit_state()
+                        .map(|state| {
+                            state
+                                .locals
+                                .iter()
+                                .copied()
+                                .enumerate()
+                                .filter(|(index, _)| state.dirty_locals & (1_u64 << index) != 0)
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     frames[frame_index].set_numeric_jit_state(None);
                     if needs_src {
                         let src = frames[frame_index].src.clone();
@@ -264,6 +285,11 @@ fn run_frames_inner(
                     }
                     if let Some(value) = stashed_value {
                         frames[frame_index].stack.push(Value::number(value));
+                    }
+                    for (index, value) in dirty_locals {
+                        if let Some(slot) = frames[frame_index].locals.get_mut(index) {
+                            *slot = Value::number(value);
+                        }
                     }
                     frames[frame_index].instruction = instruction as usize;
                 }

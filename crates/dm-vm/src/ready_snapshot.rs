@@ -347,6 +347,7 @@ struct NumericStateSnapshot {
     stack: Vec<f32>,
     fields: Vec<f32>,
     dirty_fields: u64,
+    dirty_locals: u64,
     action_bits: u64,
     instruction: u32,
 }
@@ -986,6 +987,7 @@ impl From<&NumericExecutionState> for NumericStateSnapshot {
             stack: state.stack.to_vec(),
             fields: state.fields.to_vec(),
             dirty_fields: state.dirty_fields,
+            dirty_locals: state.dirty_locals,
             action_bits: state.action_bits,
             instruction: state.instruction,
         }
@@ -999,6 +1001,7 @@ impl NumericStateSnapshot {
             stack: self.stack.into(),
             fields: self.fields.into(),
             dirty_fields: self.dirty_fields,
+            dirty_locals: self.dirty_locals,
             action_bits: self.action_bits,
             instruction: self.instruction,
         }
