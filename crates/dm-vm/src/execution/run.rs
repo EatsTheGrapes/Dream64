@@ -165,6 +165,16 @@ fn run_frames_inner(
             _ => {
                 // Release any previous procedure's borrow before re-borrowing.
                 active_sidecar = None;
+                // A procedure switch is the only point this loop can reach
+                // `sidecars` without conflicting with the `active_sidecar`
+                // borrow just released above — the natural, already-paid-for
+                // place to install any region compiles the background
+                // worker (`region_compile_worker`) has finished since the
+                // last switch. A no-op unless this world opted in
+                // (`ExecutionState::enable_async_region_compile`).
+                if let Some(async_compile) = state.async_region_compile.as_ref() {
+                    sidecars.drain_async_region_results(async_compile);
+                }
                 let resolved =
                     sidecars.resolve(module.identity.0, procedure, program.instructions.len());
                 &mut *active_sidecar.insert((procedure, resolved)).1
@@ -184,7 +194,13 @@ fn run_frames_inner(
         // instruction no side-exit has ever registered).
         let region_site = instruction_index == 0 || sidecar.is_region_site(instruction_index);
         if region_site {
-            sidecar.poll_region_at(module, program, instruction_index);
+            sidecar.poll_region_at(
+                module,
+                program,
+                procedure,
+                instruction_index,
+                state.async_region_compile.as_ref(),
+            );
         }
         if region_site
             && remaining_steps > 0

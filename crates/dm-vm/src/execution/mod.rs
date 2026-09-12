@@ -11,6 +11,7 @@ mod frame;
 mod heap_gc;
 mod host_services;
 mod interpreter;
+mod region_compile_worker;
 mod run;
 mod run_support;
 mod scheduler;

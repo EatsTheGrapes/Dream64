@@ -1129,6 +1129,15 @@ impl RuntimeImage {
             .deserialize(host_bytes)
             .map_err(|error| error.to_string())?;
         let mut state = ExecutionState::new();
+        // Real boots compile far more region-tier call-resume candidates
+        // (docs/performance/baseline-region-jit.md, Milestone 7) than a
+        // procedure's own entry alone ever did; moving those Cranelift
+        // compiles off this thread and onto a background worker keeps them
+        // from costing boot wall-clock time synchronously. Every dm-vm
+        // region-JIT test relies on staying synchronous, so this is an
+        // explicit opt-in here rather than `ExecutionState::new()`'s default
+        // — see `enable_async_region_compile`'s own doc.
+        state.enable_async_region_compile(executable);
         state
             .restore_runtime_catalog_from(&mut catalog.as_ref())
             .map_err(|error| error.to_string())?;

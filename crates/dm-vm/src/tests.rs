@@ -8969,6 +8969,73 @@ fn region_jit_numeric_core_installs_and_computes_correctly() {
 }
 
 #[test]
+fn region_jit_async_compile_installs_a_correct_region_off_the_calling_thread() {
+    // `ExecutionState::enable_async_region_compile` (region_compile_worker.rs)
+    // moves the same compile this test's sibling above exercises onto a
+    // background thread — a real boot's own opt-in, not the default. Proves
+    // three things the synchronous tests can't: (1) crossing the warm-up
+    // threshold does NOT install a region on the calling thread — the slot
+    // must still be interpreted immediately afterward; (2) the region
+    // eventually installs anyway, driven purely by later calls draining the
+    // background worker's results (never a sleep in this thread's own
+    // control flow, only a bounded wait on an outcome that must eventually
+    // become true); (3) once installed, it computes exactly the same answers
+    // the synchronous path does — the only thing async compilation may ever
+    // change is when a region starts helping, never what it computes.
+    let source = parse(concat!("/proc/double(n)\n", "\treturn n * 2\n",)).unwrap();
+    let module = compile_module(&source.definitions).unwrap();
+    let entry = module.procedure_id("/proc/double").unwrap();
+    let mut state = ExecutionState::new();
+    state.enable_async_region_compile(&module);
+
+    for n in 0..16 {
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::number(n as f32)], &mut state),
+            Ok(Value::number((n * 2) as f32)),
+            "call {n} must compute correctly while only interpreted"
+        );
+    }
+    assert!(
+        !state.region_installed_at_entry(module.identity.0, entry),
+        "crossing the warm-up threshold must enqueue a background compile, \
+         not install a region synchronously on this thread"
+    );
+
+    // Every further call is itself a fresh top-level dispatch (a "procedure
+    // switch" from `run_frames_inner`'s very first instruction), which is
+    // exactly where the background worker's finished results get drained —
+    // so simply continuing to call the procedure is what lets the
+    // already-enqueued compile surface, with no sleep of this thread's own.
+    // Bounded so a genuinely broken worker fails the test instead of hanging
+    // it; a trivial one-line procedure's Cranelift compile finishing within
+    // this many calls is not a close margin.
+    let mut installed = false;
+    for n in 16..1000 {
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::number(n as f32)], &mut state),
+            Ok(Value::number((n * 2) as f32)),
+            "call {n} must compute correctly whether still interpreted or now native"
+        );
+        if state.region_installed_at_entry(module.identity.0, entry) {
+            installed = true;
+            break;
+        }
+    }
+    assert!(
+        installed,
+        "the background compile must eventually install a region"
+    );
+
+    for n in 1000..1020 {
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[Value::number(n as f32)], &mut state),
+            Ok(Value::number((n * 2) as f32)),
+            "call {n} (native, post-installation) must still compute correctly"
+        );
+    }
+}
+
+#[test]
 fn region_jit_numeric_core_is_independent_per_procedure() {
     // Two hot procedures in the same module each warm up and compile their
     // own region independently; one installing must not affect the other's
