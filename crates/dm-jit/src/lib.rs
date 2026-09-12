@@ -569,6 +569,22 @@ impl CompiledNumericTrace {
 
     #[must_use]
     pub fn initial_state(&self, locals: &[f32]) -> Option<NumericExecutionState> {
+        self.initial_state_at(locals, 0)
+    }
+
+    /// Milestone 7: seeds state for a region installed at an arbitrary
+    /// reachable instruction, not just a procedure's own entry (PC 0) —
+    /// resuming native execution after a call, at a point the VM has
+    /// proven has an empty operand stack (see
+    /// `crates/dm-vm/src/native/fastpath_jit.rs`'s call-resume-candidate
+    /// analysis), so seeding from `locals` alone is exactly as sound here
+    /// as it is at PC 0.
+    #[must_use]
+    pub fn initial_state_at(
+        &self,
+        locals: &[f32],
+        instruction: u32,
+    ) -> Option<NumericExecutionState> {
         (locals.len() == self.local_count && self.field_count == 0).then(|| NumericExecutionState {
             locals: locals.iter().copied().collect(),
             stack: numeric_stack_storage(self.max_stack_depth),
@@ -576,7 +592,7 @@ impl CompiledNumericTrace {
             dirty_fields: 0,
             dirty_locals: 0,
             action_bits: 0,
-            instruction: 0,
+            instruction,
         })
     }
 
@@ -806,6 +822,34 @@ pub fn compile_numeric_field_trace(
     dynamic_field_count: usize,
     dynamic_global_count: usize,
 ) -> Result<CompiledNumericTrace, CompileError> {
+    compile_numeric_field_trace_at(
+        instructions,
+        local_count,
+        field_count,
+        dynamic_field_count,
+        dynamic_global_count,
+        0,
+    )
+}
+
+/// Milestone 7: compiles a region entering at an arbitrary reachable
+/// instruction, not just a procedure's own entry (PC 0) — resuming native
+/// execution after a call, at a real-bytecode position `dm-vm` has proven
+/// has an empty operand stack (see
+/// `crates/dm-vm/src/native/fastpath_jit.rs`'s call-resume-candidate
+/// analysis). Codegen itself needs no changes for this: the compiled
+/// function's entry dispatch table already routes to `checks[resume_pc]`
+/// for whichever `resume_pc` the caller passes in — the exact mechanism
+/// budget-exhaustion resumption already relies on — so only `validate`'s
+/// reachability BFS needs to start from `entry_pc` instead of always 0.
+pub fn compile_numeric_field_trace_at(
+    instructions: &[NumericInstruction],
+    local_count: usize,
+    field_count: usize,
+    dynamic_field_count: usize,
+    dynamic_global_count: usize,
+    entry_pc: usize,
+) -> Result<CompiledNumericTrace, CompileError> {
     if field_count > 64 {
         return Err(CompileError::TooManyFields(field_count));
     }
@@ -818,6 +862,7 @@ pub fn compile_numeric_field_trace(
         field_count,
         dynamic_field_count,
         dynamic_global_count,
+        entry_pc,
     )?;
 
     let mut builder = JITBuilder::new(cranelift_module::default_libcall_names())
@@ -1586,15 +1631,16 @@ fn validate(
     field_count: usize,
     dynamic_field_count: usize,
     dynamic_global_count: usize,
+    entry_pc: usize,
 ) -> Result<Validation, CompileError> {
-    if instructions.is_empty() {
+    if instructions.is_empty() || entry_pc >= instructions.len() {
         return Err(CompileError::InvalidResultStack(0));
     }
     let mut depths = vec![None; instructions.len()];
     let mut kinds: Vec<Option<SmallVec<[StackKind; 8]>>> = vec![None; instructions.len()];
-    depths[0] = Some(0);
-    kinds[0] = Some(SmallVec::new());
-    let mut work = vec![0usize];
+    depths[entry_pc] = Some(0);
+    kinds[entry_pc] = Some(SmallVec::new());
+    let mut work = vec![entry_pc];
     let mut max_depth = 0;
     while let Some(pc) = work.pop() {
         let mut stack = kinds[pc].clone().expect("queued reachable instruction");
@@ -1827,7 +1873,7 @@ fn add_edge(
 mod tests {
     use super::{
         CompileError, NumericInstruction, NumericRunOutcome, RegionCallbacks,
-        compile_numeric_field_trace, compile_numeric_trace,
+        compile_numeric_field_trace, compile_numeric_field_trace_at, compile_numeric_trace,
     };
 
     /// Closure-backed `RegionCallbacks` for tests: each method just calls the
@@ -2609,6 +2655,31 @@ mod tests {
         // local's real interpreter-side value with a reconstructed one.
         assert_eq!(state.dirty_locals, 0b10);
         assert_eq!(state.locals.as_slice(), &[9.0, 5.0]);
+    }
+
+    #[test]
+    fn compile_numeric_field_trace_at_enters_from_a_non_zero_pc() {
+        // Milestone 7's foundation: two independent "regions" packed into
+        // one instruction array — a trace entering at pc 2 must be entirely
+        // unaffected by whatever sits at pc 0-1, since those are simply
+        // unreachable from this entry point and codegen skips them (exactly
+        // like any other unreachable pc `validate`'s BFS never visits).
+        let instructions = [
+            NumericInstruction::Constant(1.0),
+            NumericInstruction::Return,
+            NumericInstruction::Constant(2.0),
+            NumericInstruction::Return,
+        ];
+        let trace = compile_numeric_field_trace_at(&instructions, 0, 0, 0, 0, 2)
+            .expect("a trace entering mid-array compiles");
+        let mut state = trace.initial_state_at(&[], 2).unwrap();
+        assert_eq!(
+            trace.run_budgeted(&mut state, 10, &mut no_callbacks()),
+            Some(NumericRunOutcome::Returned {
+                value: 2.0,
+                steps: 2
+            })
+        );
     }
 
     #[test]

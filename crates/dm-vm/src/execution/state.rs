@@ -708,6 +708,20 @@ impl ExecutionState {
             .region_installed(module_identity, procedure)
     }
 
+    /// Whether a milestone-7 region has been compiled and installed at an
+    /// arbitrary `pc` within `procedure` — its own call-resume candidate,
+    /// not necessarily the procedure's entry (see `region_installed_at_entry`).
+    #[cfg(test)]
+    pub(crate) fn region_installed_at(
+        &self,
+        module_identity: u64,
+        procedure: ProcedureId,
+        pc: usize,
+    ) -> bool {
+        self.program_sidecars
+            .region_installed_at(module_identity, procedure, pc)
+    }
+
     /// Returns the earliest tick at which pending scheduler work is due.
     #[must_use]
     pub fn next_scheduled_tick(&self) -> Option<u64> {

@@ -15,7 +15,7 @@ use crate::{
     boot_trace_enabled, canonical_tgm_load_path, drive_ruin_candidate_scan, drive_tgm_load,
     execute_compact_fast_instruction, instr_category, is_atoms_initialize_path,
     is_subsystem_initialize_path, numeric_dispatch_candidate, proc_step_profile_enabled,
-    slow_instruction_trace_threshold, startup_instruction_category,
+    safe_call_resume_pc, slow_instruction_trace_threshold, startup_instruction_category,
     startup_instruction_profile_enabled, startup_profile_enabled, tgm_profiling_enabled,
     trace_tgm_route, try_run_build_coordinate_prefix, try_run_camera_chunk_fast_path,
     try_run_discover_offset_fast_path, try_run_dmm_preload_measurement_fast_path,
@@ -175,22 +175,27 @@ fn run_frames_inner(
         // stub that always deopted; Milestone 2 installs a real binary32
         // numeric-core trace here (constants, locals, arithmetic, comparisons,
         // Not/And/Or, branches, return of a number) — see
-        // `region_at_entry`/`poll_region_at_entry` in the sidecar and
-        // `try_run_region_numeric_jit`. Checked only at instruction 0: a
-        // region only ever installs at, and runs from, a procedure's own
-        // entry.
-        if instruction_index == 0 {
-            sidecar.poll_region_at_entry(module, program);
+        // `region_at`/`poll_region_at` in the sidecar and
+        // `try_run_region_numeric_jit`. A region always installs at PC 0;
+        // milestone 7 additionally allows one at any PC the `SideExit`
+        // handling below has already proven safe and registered as a
+        // call-resume candidate (`is_region_site` — a single array read that
+        // stays `false`, at effectively no cost, for every ordinary
+        // instruction no side-exit has ever registered).
+        let region_site = instruction_index == 0 || sidecar.is_region_site(instruction_index);
+        if region_site {
+            sidecar.poll_region_at(module, program, instruction_index);
         }
-        if instruction_index == 0
+        if region_site
             && remaining_steps > 0
-            && let Some(region) = sidecar.region_at_entry()
+            && let Some(region) = sidecar.region_at(instruction_index)
             && let Some(outcome) = try_run_region_numeric_jit(
                 region,
                 program,
                 &mut frames[frame_index],
                 remaining_steps,
                 state,
+                instruction_index,
             )
         {
             // What the frame needs after accounting, beyond `Continue`
@@ -276,6 +281,21 @@ fn run_frames_inner(
                         }
                         _ => None,
                     };
+                    // Milestone 7: a call-family side-exit's own analysis
+                    // already knows exactly where the interpreter will resume
+                    // once it redoes this call — the instruction right after
+                    // whichever `Pop`/`StoreResult`/`StoreLocal` consumes its
+                    // result. When that position is provably a safe re-entry
+                    // (`safe_call_resume_pc` — never a jump target, so no
+                    // other stack depth could ever reach it), register it so
+                    // future calls to this same site can pick back up in a
+                    // second native region instead of falling back to the
+                    // interpreter for the rest of the procedure.
+                    if call_argument_count.is_some()
+                        && let Some(resume_pc) = safe_call_resume_pc(program, instruction as usize)
+                    {
+                        sidecar.register_region_candidate(resume_pc);
+                    }
                     let call_arguments: Vec<f32> = call_argument_count
                         .and_then(|count| {
                             frames[frame_index]

@@ -14,7 +14,8 @@ use crate::value_ops::{
 use crate::{CallFrame, ExecutionState, declared_argument_count};
 use dm_jit::{
     CompiledNumericTrace, CompiledRootedBlock, NumericInstruction, NumericRunOutcome,
-    RegionCallbacks, RootedBlockOutcome, compile_numeric_field_trace, compile_safe_rooted_block,
+    RegionCallbacks, RootedBlockOutcome, compile_numeric_field_trace,
+    compile_numeric_field_trace_at, compile_safe_rooted_block,
 };
 use dm_value::{DatumId, FieldName, ListId, TypePath, Value, ValueError};
 use smallvec::SmallVec;
@@ -1127,7 +1128,7 @@ pub(crate) fn try_run_guarded_jit(
     }
     // Lumcount is an exact 48-instruction/four-local trace. The generic
     // numeric core (constants/locals/arithmetic/comparisons/branches) runs
-    // through the region tier instead — see `region_at_entry` in the sidecar
+    // through the region tier instead — see `region_at` in the sidecar
     // and `try_run_region_numeric_jit` below.
     if program.instructions.len() == 48
         && program.local_count == 4
@@ -1357,11 +1358,12 @@ pub(crate) fn compile_lumcount_trace(program: &Program) -> Option<LumcountTrace>
 }
 
 /// Translates and compiles `program` for the region tier's numeric core, or
-/// declines. Called at most once per procedure — from
-/// `ProcedureSidecar::poll_region_at_entry`, once its PC-0 warm-up counter
+/// declines. Called at most once per `(procedure, entry pc)` — from
+/// `ProcedureSidecar::poll_region_at`, once that slot's own warm-up counter
 /// crosses the threshold — so, unlike the pre-region design, this pays a
-/// translation/compile attempt per *distinct* procedure that gets hot, not on
-/// every call.
+/// translation/compile attempt per *distinct* hot site (a procedure's own
+/// entry, plus — since milestone 7 — any call-resume candidate site that
+/// independently gets hot), not on every call.
 /// A compiled region plus the field-name and global-name tables its
 /// `*Dynamic` instructions index into. `dm-jit` only ever sees dense `u16`
 /// indices — resolving one back to a `FieldName` is entirely a `dm-vm`
@@ -1373,15 +1375,24 @@ pub(crate) struct CompiledRegion {
     pub(crate) global_names: Vec<FieldName>,
 }
 
-pub(crate) fn compile_region_trace(module: &Module, program: &Program) -> Option<CompiledRegion> {
-    let compiled = numeric_trace_instructions(module, program).and_then(
+/// Compiles a region entering at `entry_pc` — 0 for a procedure's own entry
+/// (the only case before milestone 7), or an arbitrary other reachable
+/// instruction for one of milestone 7's call-resume candidates. See
+/// `numeric_trace_instructions_at`.
+pub(crate) fn compile_region_trace_at(
+    module: &Module,
+    program: &Program,
+    entry_pc: usize,
+) -> Option<CompiledRegion> {
+    let compiled = numeric_trace_instructions_at(module, program, entry_pc).and_then(
         |(instructions, field_names, global_names, local_count)| {
-            compile_numeric_field_trace(
+            compile_numeric_field_trace_at(
                 &instructions,
                 local_count,
                 0,
                 field_names.len(),
                 global_names.len(),
+                entry_pc,
             )
             .ok()
             .map(|trace| CompiledRegion {
@@ -1472,7 +1483,7 @@ impl RegionCallbacks for NoDynamicFieldAccess {
     }
 }
 
-/// Drives a region installed by `compile_region_trace` for one call, exactly
+/// Drives a region installed by `compile_region_trace_at` for one call, exactly
 /// as the pre-region whole-procedure numeric JIT drove its own cached trace:
 /// guard every live local as a definite number (or a not-yet-read null),
 /// then resume or start `frame.numeric_jit_state` and run the budgeted trace.
@@ -1485,6 +1496,7 @@ pub(crate) fn try_run_region_numeric_jit(
     frame: &mut CallFrame,
     remaining_steps: u64,
     state: &mut ExecutionState,
+    entry_pc: usize,
 ) -> Option<NumericRunOutcome> {
     if frame.numeric_jit_state().is_none() {
         // May exceed `program.local_count`: an inlined leaf call's own
@@ -1499,12 +1511,16 @@ pub(crate) fn try_run_region_numeric_jit(
                 numeric_locals[index] = value;
             } else if !matches!(local, Value::Null)
                 || index < declared_argument_count(program)
-                || !local_is_definitely_initialized_before_load(program, index)
+                || !local_is_definitely_initialized_before_load(program, entry_pc, index)
             {
                 return None;
             }
         }
-        frame.set_numeric_jit_state(region.trace.initial_state(&numeric_locals));
+        frame.set_numeric_jit_state(
+            region
+                .trace
+                .initial_state_at(&numeric_locals, entry_pc as u32),
+        );
     }
     let budget = u32::try_from(remaining_steps).unwrap_or(u32::MAX);
     // `src` is captured by value (a `DatumId` is `Copy`) before the
@@ -1535,19 +1551,36 @@ pub(crate) fn try_run_region_numeric_jit(
     outcome
 }
 
-fn local_is_definitely_initialized_before_load(program: &Program, local: usize) -> bool {
-    let Some(first_load) = program.instructions.iter().position(
+/// Whether `local` is provably written before it's ever read, from
+/// `start_pc` onward — i.e., whether a still-`Null` `local` is safe to seed
+/// as this milestone's 0.0 placeholder, since nothing between `start_pc`
+/// and the first read can observe it before a real write overwrites it.
+/// `start_pc` is 0 for a whole-procedure region's own entry; milestone 7's
+/// mid-procedure resume points use their own real `start_pc`, bounding the
+/// search to only the code that region actually covers — a store *before*
+/// `start_pc` doesn't help this region, since it cold-starts fresh from
+/// `frame.locals` at `start_pc`, not from the procedure's full history.
+fn local_is_definitely_initialized_before_load(
+    program: &Program,
+    start_pc: usize,
+    local: usize,
+) -> bool {
+    let Some(first_load) = program.instructions[start_pc..].iter().position(
         |instruction| matches!(instruction, Instruction::LoadLocal(slot) if usize::from(*slot) == local),
-    ) else {
+    ).map(|offset| offset + start_pc) else {
         return true;
     };
-    let Some(first_store) = program.instructions[..first_load].iter().position(
+    let Some(first_store) = program.instructions[start_pc..first_load].iter().position(
         |instruction| matches!(instruction, Instruction::StoreLocal(slot) if usize::from(*slot) == local),
-    ) else {
+    ).map(|offset| offset + start_pc) else {
         return false;
     };
-    // No edge originating before the initializer may skip over it.
-    !program.instructions[..=first_store]
+    // No edge originating between `start_pc` and the initializer may skip
+    // over it. A target before `start_pc` can't happen here: the region
+    // that installed this analysis already rejected any such jump outright
+    // (see `numeric_trace_instructions_at`), so this trace was never
+    // compiled in the first place if one existed.
+    !program.instructions[start_pc..=first_store]
         .iter()
         .any(|instruction| {
             matches!(instruction,
@@ -1555,7 +1588,55 @@ fn local_is_definitely_initialized_before_load(program: &Program, local: usize) 
         })
 }
 
-/// Every instruction reachable from PC 0, by DM bytecode's own control-flow
+/// Milestone 7: whether `program`'s instruction at `call_pc` (a
+/// `Call`/`CallCurrent`/`CallParent`/`AllocateCurrentDatum` that just
+/// side-exited) has a safe resume point past its own result — a real
+/// bytecode position provably reached *only* by falling through from a
+/// single, already-understood instruction, with an empty operand stack, so
+/// a fresh region can cold-start there exactly like PC 0 already does. This
+/// is deliberately a narrow, local check rather than a general
+/// whole-procedure operand-stack analysis (which would need an accurate
+/// pop/push count for every `Instruction` variant to get right — real risk
+/// for comparatively little gain over this): a call's own result lands on
+/// `frame.stack` when it returns, so the position right after it has depth
+/// 1 (just that result) — if the *next* instruction is one of the few
+/// whose stack effect is simple and certain (`Pop` discards it,
+/// `StoreResult` or `StoreLocal` both pop exactly one value and push
+/// nothing), the position after *that* has depth 0, unconditionally.
+/// Requiring the candidate to never be a jump target *anywhere* in the
+/// procedure (checked across every jump-shaped instruction
+/// `reachable_from_entry` also recognizes) is what makes "reached only by
+/// falling through" airtight without inspecting anything else in the
+/// procedure at all.
+pub(crate) fn safe_call_resume_pc(program: &Program, call_pc: usize) -> Option<usize> {
+    let consumer_pc = call_pc.checked_add(1)?;
+    let resume_pc = call_pc.checked_add(2)?;
+    if resume_pc >= program.instructions.len() {
+        return None;
+    }
+    if !matches!(
+        program.instructions.get(consumer_pc)?,
+        Instruction::Pop | Instruction::StoreResult | Instruction::StoreLocal(_)
+    ) {
+        return None;
+    }
+    let is_jump_target_of = |instruction: &Instruction| -> bool {
+        matches!(instruction,
+            Instruction::Jump(target)
+            | Instruction::JumpIfFalse(target)
+            | Instruction::JumpIfNull(target)
+            | Instruction::LoadStaticLocalOrJump { target, .. }
+            | Instruction::JumpIfArgumentSupplied { target, .. }
+                if *target == resume_pc)
+    };
+    if program.instructions.iter().any(is_jump_target_of) {
+        return None;
+    }
+    Some(resume_pc)
+}
+
+/// Every instruction reachable from `entry_pc` (0 for a whole procedure, or
+/// milestone 7's own non-zero entry points), by DM bytecode's own control-flow
 /// edges (`Jump`/`JumpIfFalse`/`JumpIfNull`/`LoadStaticLocalOrJump`/
 /// `JumpIfArgumentSupplied`/`Return`; every other instruction falls through).
 /// A DM procedure whose every real path already returns still gets a
@@ -1564,9 +1645,9 @@ fn local_is_definitely_initialized_before_load(program: &Program, local: usize) 
 /// `if`/`else` or `switch` produces it) that `numeric_trace_instructions`
 /// tolerates an unsupported opcode there instead of rejecting the whole
 /// procedure over code that can never execute.
-fn reachable_from_entry(instructions: &[Instruction]) -> Vec<bool> {
+fn reachable_from_entry(instructions: &[Instruction], entry_pc: usize) -> Vec<bool> {
     let mut reachable = vec![false; instructions.len()];
-    let mut stack = vec![0_usize];
+    let mut stack = vec![entry_pc];
     while let Some(pc) = stack.pop() {
         if reachable.get(pc).copied().unwrap_or(true) {
             continue;
@@ -1606,7 +1687,7 @@ fn resolve_name_index(names: &mut Vec<FieldName>, name: &FieldName) -> Option<u1
 
 /// Translates one procedure's bytecode into the region tier's closed numeric
 /// IR, alongside the distinct field and global names it references
-/// dynamically (the `*Dynamic` tables `compile_region_trace` hands to
+/// dynamically (the `*Dynamic` tables `compile_region_trace_at` hands to
 /// `dm-jit`).
 ///
 /// `LoadSrc` always translates to `NumericInstruction::LoadSrc`, and every
@@ -1638,12 +1719,33 @@ type NumericTraceLowering = (
 // reasoning `run_frames_inner`'s own `#[allow(clippy::too_many_lines)]`
 // gives: splitting it would only move each arm behind another call boundary
 // without making any single arm simpler.
-#[allow(clippy::too_many_lines)]
 pub(crate) fn numeric_trace_instructions(
     module: &Module,
     program: &Program,
 ) -> Option<NumericTraceLowering> {
+    numeric_trace_instructions_at(module, program, 0)
+}
+
+/// Milestone 7: as `numeric_trace_instructions`, but for a region entering
+/// at an arbitrary reachable instruction instead of a procedure's own entry
+/// (PC 0) — resuming native execution after a call, at a real-bytecode
+/// position `safe_call_resume_pc` has proven has an empty operand stack and
+/// is never a jump target from anywhere else in the procedure. Positions
+/// before `entry_pc` are never examined at all — filled with an inert
+/// placeholder instead, since `entry_pc`-seeded reachability (both here and
+/// in `dm-jit`'s own `validate`, seeded identically via
+/// `compile_numeric_field_trace_at`) never visits them, so the placeholder
+/// is never actually reached by anything; it exists only to keep this
+/// trace's positions numbered identically to the real bytecode's; every
+/// side-exit's resume-PC packing, and every jump target, depends on that.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn numeric_trace_instructions_at(
+    module: &Module,
+    program: &Program,
+    entry_pc: usize,
+) -> Option<NumericTraceLowering> {
     if program.instructions.is_empty()
+        || entry_pc >= program.instructions.len()
         || program.instructions.iter().any(|instruction| {
             matches!(
                 instruction,
@@ -1654,7 +1756,7 @@ pub(crate) fn numeric_trace_instructions(
         return None;
     }
     let declared_arguments = declared_argument_count(program);
-    let reachable = reachable_from_entry(&program.instructions);
+    let reachable = reachable_from_entry(&program.instructions, entry_pc);
     let mut field_names: Vec<FieldName> = Vec::new();
     let mut global_names: Vec<FieldName> = Vec::new();
     let mut instructions = Vec::with_capacity(program.instructions.len());
@@ -1681,13 +1783,21 @@ pub(crate) fn numeric_trace_instructions(
     // bytecode positions, and a splice breaks that identity for everything
     // after it. Requiring the whole caller branch-free sidesteps rewriting
     // jump targets entirely, rather than risking getting that math wrong.
-    let caller_is_branch_free = !program.instructions.iter().any(|instruction| {
+    // Only `[entry_pc..]` is *this* trace, so only that range's own
+    // branch-freedom matters here — whatever precedes `entry_pc` (a prior
+    // call site, its own branches, ...) belongs to a different trace, if
+    // any, and has no bearing on this one's own soundness.
+    let caller_is_branch_free = !program.instructions[entry_pc..].iter().any(|instruction| {
         matches!(
             instruction,
             Instruction::Jump(_) | Instruction::JumpIfFalse(_)
         )
     });
     for (pc, instruction) in program.instructions.iter().enumerate() {
+        if pc < entry_pc {
+            instructions.push(NumericInstruction::Return);
+            continue;
+        }
         let translated = match instruction {
             Instruction::PushNumber(number) => Some(NumericInstruction::Constant(number.to_f32())),
             Instruction::LoadLocal(slot) => Some(NumericInstruction::LoadLocal(*slot)),
@@ -1712,10 +1822,23 @@ pub(crate) fn numeric_trace_instructions(
             Instruction::Greater => Some(NumericInstruction::GreaterThan),
             Instruction::GreaterEqual => Some(NumericInstruction::GreaterThanOrEqual),
             Instruction::Jump(target) => {
+                // A target before `entry_pc` would jump into a position
+                // this trace never actually translated (the inert
+                // placeholder above) — reject outright rather than silently
+                // treating dead placeholder content as real code. Only
+                // relevant for a non-zero `entry_pc`: a whole-procedure
+                // trace (`entry_pc == 0`) can never see this, since nothing
+                // exists before position 0.
+                if *target < entry_pc {
+                    return None;
+                }
                 seen_branch = true;
                 u32::try_from(*target).ok().map(NumericInstruction::Jump)
             }
             Instruction::JumpIfFalse(target) => {
+                if *target < entry_pc {
+                    return None;
+                }
                 seen_branch = true;
                 u32::try_from(*target)
                     .ok()
@@ -1820,7 +1943,7 @@ fn try_inline_leaf_call(
     // otherwise silently read this splice's 0.0 instead of `.`'s real
     // default of `null`.
     if (declared_argument_count(callee_program)..callee_program.local_count)
-        .any(|local| !local_is_definitely_initialized_before_load(callee_program, local))
+        .any(|local| !local_is_definitely_initialized_before_load(callee_program, 0, local))
     {
         return None;
     }
