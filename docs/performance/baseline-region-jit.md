@@ -404,6 +404,93 @@ the real work. That's now a distinct, larger follow-on effort rather than a
 seventh numbered milestone in this plan — the 2–4x in VM-heavy regions this
 doc opens with is plausible once it lands.
 
+## Milestone 7 (follow-on, beyond the six-milestone plan) — PC-indexed
+call-resume regions. Done, narrower in scope than "true resume-after-call"
+above promised, and its boot-time payoff at current scale is within
+measurement noise.
+
+Delivers piece (a) from the follow-on paragraph above — PC-indexed region
+re-entry — but deliberately not piece (b): this still stays numeric-only,
+exactly like milestones 2-6, so it does not unlock list/datum-shaped
+resume tails. What "true resume-after-call" needs is a real rooted-`Value`
+GC-scanned side-array; this milestone doesn't build one and doesn't need
+one, because it only ever resumes into more constants/locals/arithmetic/
+guarded field+global access — the same numeric surface every earlier
+milestone already proved safe.
+
+**Mechanism.** `dm-jit`'s `validate`/BFS and Cranelift codegen turned out to
+already be entry-PC-generic (this is how budget-exhaustion resume already
+worked) — only the BFS seed needed a parameter
+(`compile_numeric_field_trace_at`/`CompiledNumericTrace::initial_state_at`).
+The real new work is on the `dm-vm` side: `numeric_trace_instructions_at`
+translates starting at an arbitrary `entry_pc`, filling positions before it
+with an inert `Return` placeholder (never actually reached, so position
+alignment with real bytecode — which every side-exit resume-PC and jump
+target depends on — never has to be renumbered); the sidecar's
+`PcCache` array (already proven arbitrary-PC-capable by the pre-existing
+field-read cache) grows `is_region_site`/`register_region_candidate` so a
+second, independent warm-up counter can live at a non-zero PC alongside PC
+0's own. The candidate PC itself comes from a narrow, local check
+(`safe_call_resume_pc`) rather than a general whole-procedure operand-stack
+analysis (which would need an accurate pop/push table for every DM
+`Instruction` variant, including a genuinely runtime-dependent one,
+`ExpandArgumentLists` — real risk for comparatively little gain): a
+call-family side-exit's resume candidate is accepted only when the
+instruction immediately following the call is `Pop`/`StoreResult`/
+`StoreLocal` (all provably pop-1-push-0, so the position after *that* has
+depth 0 unconditionally) and the resulting position is never a jump target
+anywhere in the procedure — proven once, by scanning every jump-shaped
+instruction, rather than trusting an accumulated depth count.
+
+**A real interaction found via this milestone's own end-to-end test, before
+ever reaching a boot.** The pre-existing tier-1 `numeric_dispatch_candidate`
+quick-block (`numeric_core.rs`, predates the region tier entirely — a
+cheaper, still-interpreted batched-dispatch fast path, not a JIT) already
+covers `PushNumber`/`LoadLocal`/`StoreLocal`/arithmetic/comparisons/branches.
+Since a call's own consumer (`Pop`/`StoreResult`/`StoreLocal`) is itself one
+of its candidates, it gets first crack at any resume site starting from one
+instruction *before* this milestone's own entry point, and (correctly, just
+inconveniently) runs the whole numeric span in one shot — meaning the
+interpreter's main loop can go on to never revisit this milestone's own
+entry PC as its own dispatch, so the sidecar never sees it and a resume
+region that would otherwise be perfectly valid never gets the chance to
+warm up or compile at all. Not a correctness bug — the quick-block computes
+the same answer — but a real, silent way for this milestone's own mechanism
+to never fire for an all-arithmetic resume tail. Confirmed empirically: **a
+pure-arithmetic resume tail is already "handled well enough" by the older
+mechanism**, so this milestone's own distinct, additive contribution is
+specifically for resume tails that touch a field or global (the tier-1
+quick-block has no `LoadField`/`LoadGlobal` support at all) — a real and
+probably common shape (e.g. `var/result = SomeProc(x); src.value = result`),
+but narrower than "every call site with a numeric tail" might suggest.
+
+**Boot-parity result — mechanism correct, payoff not measurable yet.** Full
+lib suites green (30 dm-jit + 71 dm-value + 673 dm-vm), zero new clippy
+warnings, boot-to-pregame parity clean (`rc=0`, `field_quickening
+hit_pct=87.0`, identical to the M6 baseline). `jit_guarded` telemetry
+confirms the mechanism is real and exercised, not just present:
+`numeric_compiled` 6,027 → 6,284 (+257 more regions installed, at call-resume
+sites this milestone specifically enables), native region `runs` 1,879,644
+→ 2,172,351 (+15.6%), steps served natively 3,275,155 → 3,475,534 (+6.1%).
+But the wall-clock/`avg_ns_per_instr` delta this produced (+5.5%, +33s;
+GC time +16.3%) turned out to be **within the same boot's own measurement
+noise floor**: a same-binary control (the unmodified M6 baseline, run again
+on the same machine) produced a comparable swing on every metric —
+`avg_ns_per_instr` +4.15%, GC time +15.2%, `exec_steps` +0.51% (larger than
+this milestone's own +0.12% exec_steps delta) — from nothing but ordinary
+map-generation/run-to-run variance. Cross-checking `update_corners` (a
+procedure structurally incapable of using any region-tier optimization, in
+either run) showed its own step count scaling proportionally with each
+run's overall workload, confirming the swing is workload noise, not a
+regression this milestone introduced. **Net assessment: this milestone adds
+a real, correctness-proven, measurably-exercised capability, not yet a
+proven boot-time win** — extracting one, per the pre-existing "Risks"
+section below, most likely needs the compile side of this (many more
+independent call-resume sites than PC-0 entries alone, each a synchronous
+Cranelift compile on the boot thread) to stop paying for itself inline and
+move to a worker, rather than more of the numeric-surface coverage this
+milestone itself adds.
+
 ## Risks
 
 - Cranelift compile latency on a cold boot. Mitigate by compiling on workers

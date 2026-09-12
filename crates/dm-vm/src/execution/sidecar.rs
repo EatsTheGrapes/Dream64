@@ -41,11 +41,12 @@ pub(crate) enum PcCache {
     /// toward a region-compile attempt. See
     /// `docs/performance/baseline-region-jit.md`.
     RegionCounting(u16),
-    /// A compiled region installed at this procedure's entry (PC 0). Since
-    /// Milestone 3, `CompiledRegion` bundles the whole-procedure binary32
-    /// trace with the dense `FieldName` table its `LoadFieldDynamic`
-    /// instructions index into (`dm-jit` never sees a `FieldName`, only
-    /// indices) — see `compile_region_trace`.
+    /// A compiled region installed at this PC — a procedure's own entry
+    /// (PC 0), or, since Milestone 7, a call-resume candidate elsewhere.
+    /// Since Milestone 3, `CompiledRegion` bundles the whole-procedure
+    /// binary32 trace with the dense `FieldName` table its
+    /// `LoadFieldDynamic` instructions index into (`dm-jit` never sees a
+    /// `FieldName`, only indices) — see `compile_region_trace_at`.
     Region(Box<CompiledRegion>),
     /// A region-compile attempt at this site failed or the shape was
     /// unsupported; never retried.
@@ -77,11 +78,12 @@ impl ProcedureSidecar {
     ) -> Option<&mut FieldSlotCache> {
         match self.pcs.get_mut(instruction_index)? {
             PcCache::FieldRead(cache) => Some(cache),
-            // `Cold`: nothing installed yet. The `Region*` variants only ever
-            // occupy PC 0 (see `poll_region_at_entry`) and claim that slot for
-            // region-compile bookkeeping instead — a procedure whose very
-            // first instruction is a `LoadField` simply never gets a field
-            // cache at PC 0, same as any other declined quickening attempt.
+            // `Cold`: nothing installed yet. The `Region*` variants occupy
+            // PC 0 and — since milestone 7 — any call-resume candidate PC
+            // (see `poll_region_at`) and claim that slot for region-compile
+            // bookkeeping instead — a procedure whose very first instruction
+            // is a `LoadField` simply never gets a field cache at PC 0, same
+            // as any other declined quickening attempt.
             PcCache::Cold
             | PcCache::RegionCounting(_)
             | PcCache::Region(_)
@@ -126,19 +128,25 @@ impl ProcedureSidecar {
     /// still unrevisited in Milestone 2.
     const REGION_ENTRY_THRESHOLD: u16 = 16;
 
-    /// Called once per procedure entry (`instruction_index == 0`). Advances
-    /// the PC-0 slot toward a region-compile attempt; a no-op once the slot
-    /// holds anything else (a region, a rejection, or — rare, but possible for
-    /// a one-instruction procedure — an installed field-read cache).
-    pub(crate) fn poll_region_at_entry(&mut self, module: &Module, program: &Program) {
-        let Some(slot) = self.pcs.first_mut() else {
+    /// Called once per procedure entry (`instruction_index == 0`), or once
+    /// per milestone-7 call-resume candidate PC that a side-exit's own
+    /// analysis has proven safe and registered via
+    /// `register_region_candidate` — `run.rs`'s `region_site` check decides
+    /// which. Advances that slot toward a region-compile attempt; a no-op
+    /// once the slot holds anything else (a region, a rejection, or — rare,
+    /// but possible for a one-instruction procedure — an installed
+    /// field-read cache). Each candidate PC's slot is an independent cell in
+    /// the same dense array PC 0 already used, so this needs no separate
+    /// bookkeeping structure for the extra candidates.
+    pub(crate) fn poll_region_at(&mut self, module: &Module, program: &Program, pc: usize) {
+        let Some(slot) = self.pcs.get_mut(pc) else {
             return;
         };
         match slot {
             PcCache::Cold => *slot = PcCache::RegionCounting(1),
             PcCache::RegionCounting(count) => {
                 if *count + 1 >= Self::REGION_ENTRY_THRESHOLD {
-                    *slot = match crate::compile_region_trace(module, program) {
+                    *slot = match crate::compile_region_trace_at(module, program, pc) {
                         Some(region) => PcCache::Region(Box::new(region)),
                         None => PcCache::RegionRejected,
                     };
@@ -150,14 +158,41 @@ impl ProcedureSidecar {
         }
     }
 
-    /// The region compiled at this procedure's entry (PC 0), if any. Callers
-    /// drive it exactly as the pre-region whole-procedure numeric JIT drove
-    /// its own cached trace: build/resume a `NumericExecutionState` from the
+    /// The region compiled at `pc` (0 for a procedure's own entry, or a
+    /// milestone-7 call-resume candidate elsewhere), if any. Callers drive
+    /// it exactly as the pre-region whole-procedure numeric JIT drove its
+    /// own cached trace: build/resume a `NumericExecutionState` from the
     /// caller's frame and call `run_budgeted`.
-    pub(crate) fn region_at_entry(&self) -> Option<&CompiledRegion> {
-        match self.pcs.first()? {
+    pub(crate) fn region_at(&self, pc: usize) -> Option<&CompiledRegion> {
+        match self.pcs.get(pc)? {
             PcCache::Region(region) => Some(region),
             _ => None,
+        }
+    }
+
+    /// Milestone 7: whether `pc` has ever been registered as a call-resume
+    /// candidate (or is itself already a `Region`/`RegionRejected`) — i.e.,
+    /// whether the run loop should even bother polling/attempting a region
+    /// here at all. `Cold` (the overwhelming majority of ordinary
+    /// instructions, which are never candidates) short-circuits this to a
+    /// single array read, so per-instruction dispatch pays no cost for
+    /// procedures where no side-exit has ever registered anything.
+    pub(crate) fn is_region_site(&self, pc: usize) -> bool {
+        !matches!(
+            self.pcs.get(pc),
+            None | Some(PcCache::Cold | PcCache::FieldRead(_))
+        )
+    }
+
+    /// Milestone 7: registers `pc` as a call-resume candidate the first time
+    /// a side-exit's own analysis proves it safe (`safe_call_resume_pc`) —
+    /// a no-op if the slot already holds anything else (already registered,
+    /// already compiled, already rejected, or claimed by a field-read cache
+    /// first). Does not itself attempt a region-compile; `poll_region_at`
+    /// does that once this slot has been observed enough times.
+    pub(crate) fn register_region_candidate(&mut self, pc: usize) {
+        if let Some(slot @ PcCache::Cold) = self.pcs.get_mut(pc) {
+            *slot = PcCache::RegionCounting(0);
         }
     }
 
@@ -165,6 +200,14 @@ impl ProcedureSidecar {
     #[cfg(test)]
     pub(crate) fn has_region_at_entry(&self) -> bool {
         matches!(self.pcs.first(), Some(PcCache::Region(_)))
+    }
+
+    /// Whether a region has been compiled and installed at an arbitrary
+    /// `pc` — milestone 7's call-resume regions, unlike the entry region
+    /// `has_region_at_entry` checks, can live anywhere in the array.
+    #[cfg(test)]
+    pub(crate) fn has_region_at(&self, pc: usize) -> bool {
+        matches!(self.pcs.get(pc), Some(PcCache::Region(_)))
     }
 }
 
@@ -218,5 +261,21 @@ impl ProgramSidecars {
         self.by_procedure
             .get(&(module_identity, procedure))
             .is_some_and(ProcedureSidecar::has_region_at_entry)
+    }
+
+    /// Whether a region has been compiled and installed at an arbitrary `pc`
+    /// within `procedure` — milestone 7's own call-resume candidates, which
+    /// unlike the entry region `region_installed` checks are not necessarily
+    /// at PC 0.
+    #[cfg(test)]
+    pub(crate) fn region_installed_at(
+        &self,
+        module_identity: u64,
+        procedure: ProcedureId,
+        pc: usize,
+    ) -> bool {
+        self.by_procedure
+            .get(&(module_identity, procedure))
+            .is_some_and(|sidecar| sidecar.has_region_at(pc))
     }
 }

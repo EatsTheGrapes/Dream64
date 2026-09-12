@@ -38,7 +38,7 @@ pub use self::tgm_ruin::{
 };
 
 pub(crate) use self::fastpath_jit::{
-    CompiledRegion, compile_region_trace, execute_compact_fast_instruction,
+    CompiledRegion, compile_region_trace_at, execute_compact_fast_instruction, safe_call_resume_pc,
     try_run_camera_chunk_fast_path, try_run_discover_offset_fast_path,
     try_run_dmm_preload_measurement_fast_path, try_run_guarded_jit,
     try_run_parsed_dmm_new_fast_path, try_run_region_numeric_jit,

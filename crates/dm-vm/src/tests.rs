@@ -21742,6 +21742,123 @@ fn region_jit_prefix_ending_call_side_exits_when_the_callee_has_a_branch() {
 }
 
 #[test]
+fn region_jit_installs_a_second_region_after_a_call_side_exit_and_runs_it_natively() {
+    // Milestone 7 end-to-end: the entry region compiles `var/x = 5`, then
+    // unconditionally side-exits at the call to `region_resume_helper` (a
+    // branchy callee, so milestone 6 can never inline it). Once that
+    // side-exit's own analysis has repeatedly proven the instruction right
+    // after the call's `StoreLocal` consumer is a safe re-entry point, a
+    // *second*, independent region should compile there and take over the
+    // `resume_global + x + y` tail natively.
+    //
+    // The tail deliberately reads a global rather than only doing arithmetic:
+    // the pre-existing tier-1 `numeric_dispatch_candidate` quick-block (an
+    // older, cheaper, non-JIT fast path — see `numeric_core.rs`) already
+    // covers `PushNumber`/`LoadLocal`/`StoreLocal`/arithmetic, and its check
+    // re-reads `frame.instruction` directly rather than going through the
+    // sidecar's `is_region_site` gate. Since the call's own consumer
+    // (`StoreLocal`) is itself one of its candidates, it would otherwise grab
+    // the whole span starting one instruction *before* this trace's own
+    // `entry_pc` and run it to completion in one shot, so the interpreter's
+    // main loop would never revisit `entry_pc` as its own dispatch and the
+    // sidecar would never see it — not a correctness bug (the quick-block
+    // computes the same answer), but it would starve this second region of
+    // ever actually compiling, silently defeating the very thing this test
+    // means to prove. A `LoadGlobalDynamic` right at `entry_pc` — outside the
+    // quick-block's instruction set, native only in the milestone-7 region —
+    // forces the quick-block to stop exactly one instruction short and hand
+    // control back to the sidecar at the right place.
+    let source = parse(concat!(
+        "/proc/region_resume_helper(a)\n",
+        "\tif(a > 0)\n",
+        "\t\treturn a\n",
+        "\treturn -a\n",
+        "/proc/region_resume_caller()\n",
+        "\tvar/x = 5\n",
+        "\tvar/y = region_resume_helper(-9)\n",
+        "\treturn resume_global + x + y\n",
+    ))
+    .unwrap();
+    let module = compile_module_specs(&[
+        ProcedureSpec {
+            path: "/proc/region_resume_helper".to_owned(),
+            definition: &source.definitions[0],
+            parent: None,
+            static_calls: BTreeMap::new(),
+            src_fields: BTreeMap::new(),
+            global_fields: BTreeMap::new(),
+        },
+        ProcedureSpec {
+            path: "/proc/region_resume_caller".to_owned(),
+            definition: &source.definitions[1],
+            parent: None,
+            static_calls: BTreeMap::from([("region_resume_helper".to_owned(), 0)]),
+            src_fields: BTreeMap::new(),
+            global_fields: BTreeMap::from([("resume_global".to_owned(), field("resume_global"))]),
+        },
+    ])
+    .unwrap();
+    let entry = module.procedure_id("/proc/region_resume_caller").unwrap();
+    let program = &module.procedures[entry.index()];
+
+    let call_pc = program
+        .instructions
+        .iter()
+        .position(|instruction| matches!(instruction, Instruction::Call { .. }))
+        .expect("the call to region_resume_helper compiles to a Call instruction");
+    assert!(
+        matches!(
+            program.instructions[call_pc + 1],
+            Instruction::StoreLocal(_)
+        ),
+        "the call's result must be consumed by a StoreLocal for this shape to \
+         qualify as a milestone-7 call-resume candidate"
+    );
+    let resume_pc = call_pc + 2;
+    assert!(
+        matches!(program.instructions[resume_pc], Instruction::LoadGlobal(_)),
+        "the resume site's own first instruction must be outside the tier-1 \
+         quick-block's instruction set, or it will absorb this pc before the \
+         sidecar ever sees it"
+    );
+
+    let mut state = ExecutionState::new();
+    state.set_global(field("resume_global"), Value::number(3.0));
+
+    let baseline = execute_module_in_state(&module, entry, &[], &mut state);
+    assert_eq!(baseline, Ok(Value::number(17.0)));
+
+    // The entry region needs its own 16-call warm-up before it starts
+    // side-exiting at all; only from then on does each call even attempt to
+    // register and warm up the resume-site candidate, so this needs enough
+    // calls to cross both thresholds in sequence, not just one.
+    for _ in 0..40 {
+        assert_eq!(
+            execute_module_in_state(&module, entry, &[], &mut state),
+            Ok(Value::number(17.0)),
+        );
+    }
+    assert!(
+        state.region_installed_at_entry(module.identity.0, entry),
+        "40 complete calls must be enough to warm up the entry region"
+    );
+    assert!(
+        state.region_installed_at(module.identity.0, entry, resume_pc),
+        "40 complete calls must also be enough to warm up and compile the \
+         call-resume region, once the entry region has been side-exiting \
+         into it for most of them"
+    );
+
+    assert_eq!(
+        execute_module_in_state(&module, entry, &[], &mut state),
+        Ok(Value::number(17.0)),
+        "the entry region's prefix, the interpreter's call hand-off, and the \
+         second region's native tail must together match the pure-interpreter \
+         baseline exactly"
+    );
+}
+
+#[test]
 fn numeric_jit_loop_resumes_at_budget_safepoints() {
     let source = "/proc/count(limit)\n\tvar/i = 0\n\twhile(i < limit)\n\t\ti = i + 1\n\treturn i";
     let syntax = parse(source).unwrap();
