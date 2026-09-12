@@ -21,6 +21,7 @@ use crate::{
 };
 use dm_value::{DatumId, FieldName, ListId, TypePath, Value, ValueHeap};
 
+use crate::execution::region_compile_worker::AsyncRegionCompile;
 use crate::execution::sidecar::ProgramSidecars;
 use crate::execution::support::DeclaredFieldQuickeningMetrics;
 
@@ -163,6 +164,11 @@ pub struct ExecutionState {
     // See [`crate::execution::sidecar`]. Field-read quickening is its first
     // consumer; global access, resolved calls, and list ops follow.
     pub(crate) program_sidecars: ProgramSidecars,
+    // `None` by default — every existing region-JIT test relies on a warm
+    // site compiling synchronously the instant it crosses threshold; only
+    // the real boot entry point (`enable_async_region_compile`) opts in. See
+    // `crate::execution::region_compile_worker`'s module doc for why.
+    pub(crate) async_region_compile: Option<AsyncRegionCompile>,
     pub(crate) declared_field_quickening: DeclaredFieldQuickeningMetrics,
     pub(crate) initial_values: Arc<BTreeMap<TypePath, BTreeMap<FieldName, Value>>>,
     // The initial-value catalog is immutable but can contain millions of
@@ -335,6 +341,7 @@ impl ExecutionState {
             dynamic_receiver_targets: HashMap::new(),
             dynamic_callsite_targets: HashMap::new(),
             program_sidecars: ProgramSidecars::default(),
+            async_region_compile: None,
             declared_field_quickening: DeclaredFieldQuickeningMetrics::default(),
             initial_values: Arc::new(BTreeMap::new()),
             initial_value_datum_roots: Arc::default(),
@@ -720,6 +727,17 @@ impl ExecutionState {
     ) -> bool {
         self.program_sidecars
             .region_installed_at(module_identity, procedure, pc)
+    }
+
+    /// Opts this world into background region-tier compilation
+    /// (`crate::execution::region_compile_worker`) instead of every region
+    /// compiling synchronously inline on this thread. Call once, with the
+    /// same `Module` this world will execute — a real boot's only caller is
+    /// `dm_runtime::RuntimeImage::decode_linked_artifact`. Deliberately not
+    /// the default: see the module doc for why every existing region-JIT
+    /// test depends on staying synchronous.
+    pub fn enable_async_region_compile(&mut self, module: &Module) {
+        self.async_region_compile = Some(AsyncRegionCompile::new(module));
     }
 
     /// Returns the earliest tick at which pending scheduler work is due.

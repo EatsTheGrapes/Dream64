@@ -491,11 +491,88 @@ Cranelift compile on the boot thread) to stop paying for itself inline and
 move to a worker, rather than more of the numeric-surface coverage this
 milestone itself adds.
 
+## Background region compilation (follow-on to Milestone 7) — moves
+Cranelift compilation off the boot-critical thread. Done; a real, modest
+win, honestly measured.
+
+Directly answers Milestone 7's own closing finding above and the "Cranelift
+compile latency on a cold boot" risk this doc has flagged, unmitigated,
+since the tier's very first milestone. `compile_region_trace_at` only ever
+reads `Module`/`Program` — immutable, `Send + Sync` data with zero
+dependency on `ExecutionState` or the executing frame — so it needed no
+`unsafe` (`dm-vm` forbids it) and no new external dependency (`std::thread`
++ `std::sync::mpsc`, the same primitives `compile.rs`'s
+`parallel_collect_ordered` and `tgm_planner.rs`'s `with_workers` already use
+elsewhere in this crate, just aimed at a persistent worker instead of a
+one-shot joined batch).
+
+**Mechanism** (`crates/dm-vm/src/execution/region_compile_worker.rs`): one
+background thread, spawned lazily and shared process-wide via a
+`OnceLock<mpsc::Sender<_>>` (a long-running server process has no shutdown
+story to build — the same reason `worker_lane`'s joined batches need none).
+`ProcedureSidecar` gains a `RegionCompiling` `PcCache` state: crossing the
+warm-up threshold now either compiles synchronously and installs
+immediately (`async_compile: None` — every case before this) or submits a
+request and marks the slot `RegionCompiling` (`Some`), with the finished
+`CompiledRegion` installed later via `ProgramSidecars::drain_async_region_results`.
+Draining happens at a procedure switch — an already-paid-for point in
+`run_frames_inner` (a `sidecars.resolve` call already happens there), not a
+new per-instruction cost — rather than blocking dispatch to poll a channel
+every step.
+
+**Deliberately opt-in, not the tier's new default.** Every existing
+region-JIT test (15+ of them, back to Milestone 1) asserts a region
+installs *synchronously*, the instant a warm-up counter crosses threshold —
+enabling this unconditionally would make that timing depend on real
+thread-scheduling variance and flake them. `ExecutionState::async_region_compile`
+defaults to `None`; only `ExecutionState::enable_async_region_compile`,
+called explicitly by the one real production entry point
+(`dm_runtime::RuntimeImage::decode_linked_artifact`, the `.d64`
+linked-artifact boot path every real `dream64-server boot` invocation goes
+through), turns it on. Every one of those existing tests passed unchanged
+under this change — confirmed via a full suite run before and after, not
+assumed. One new end-to-end test
+(`region_jit_async_compile_installs_a_correct_region_off_the_calling_thread`)
+proves the opt-in path itself: a region must NOT be installed the instant
+threshold crosses (it must still be `RegionCompiling`), and must eventually
+install (via a bounded retry loop, not a fixed sleep) with results
+identical to the synchronous path.
+
+**Boot-parity result, measured against the same rigor Milestone 7's own
+false alarm demanded.** Full suites green
+(30 dm-jit + 71 dm-value + 674 dm-vm + 65 dm-runtime), zero new clippy
+warnings, `rc=0`, `field_quickening` unchanged. Comparing against the M7
+baseline directly: `avg_ns_per_instr` 693.4 → ~679.8 (mean of two runs,
+**~2.0% faster**), `measured_s` 628.2s → ~618.0s (**~10s faster**), while
+`numeric_compiled` (6,284 → ~6,120) and native region `runs` (2,172,351 →
+~2,174,300) stayed within the same noise band throughout — i.e., this
+change does not alter *how much* region-tier work happens, only *where its
+compile cost lands*, exactly as designed. Unlike Milestone 7's own single-A/B
+false alarm, this result held up under the SAME same-binary-control
+discipline that caught that one: two independent runs of the async-compile
+binary landed at 680.9 and 678.7 ns/instr, only 0.3% apart — a noise floor
+far tighter than the ~4% swing a same-binary M6 control pair showed earlier
+in this same investigation — and BOTH runs sit clearly below the single M7
+sample being compared against. Honestly: this rests on two async samples
+against one M7 sample, not a full paired A/B in both directions, so treat
+the ~2% figure as directionally real but not tightly bounded — the
+mechanistic explanation (compile cost relocated, not eliminated or
+duplicated, confirmed by `numeric_compiled`/`runs` parity) matters more here
+than the exact percentage. Independent of the measured magnitude, this
+change is justified on its own architectural merits: it closes a
+structural risk this doc has carried since Milestone 1, one that only grows
+more expensive as later milestones (this one included) keep adding more
+independent compile sites than a procedure's own entry alone ever created.
+
 ## Risks
 
-- Cranelift compile latency on a cold boot. Mitigate by compiling on workers
-  and only after an entry-count threshold, and by caching compiled regions in
-  the ready-world image keyed by the engine-semantics fingerprint.
+- Cranelift compile latency on a cold boot. **Compiling on workers: done**
+  (see "Background region compilation" above) — opt-in, real boots only,
+  every region-JIT test still exercises the synchronous path. Compiling
+  only after an entry-count threshold was already in place from Milestone 1.
+  Caching compiled regions in the ready-world image keyed by the
+  engine-semantics fingerprint remains undone — every boot still recompiles
+  every region from scratch, just off the critical path now instead of on it.
 - GC safety of parked `Value`s. **Revised ahead of milestone 5** (see the
   "Operand model" correction above): no ready-made root-scanned rooted-slot
   array exists yet — `CompiledRootedBlock`'s scratch array is real but is

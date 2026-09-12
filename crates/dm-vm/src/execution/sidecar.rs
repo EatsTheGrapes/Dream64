@@ -23,6 +23,7 @@ use std::collections::HashMap;
 
 use crate::CompiledRegion;
 use crate::bytecode::{Module, ProcedureId, Program};
+use crate::execution::region_compile_worker::AsyncRegionCompile;
 use crate::execution::state::FieldSlotCache;
 
 /// The specialization state for one bytecode instruction. Every non-`Cold`
@@ -41,6 +42,13 @@ pub(crate) enum PcCache {
     /// toward a region-compile attempt. See
     /// `docs/performance/baseline-region-jit.md`.
     RegionCounting(u16),
+    /// A compile request for this site has been submitted to the background
+    /// worker (`region_compile_worker`) and is awaiting a result — never
+    /// entered when background compilation isn't enabled for this world
+    /// (`ExecutionState::enable_async_region_compile`), in which case a
+    /// warm site compiles straight to `Region`/`RegionRejected` instead, as
+    /// every milestone before this one did.
+    RegionCompiling,
     /// A compiled region installed at this PC — a procedure's own entry
     /// (PC 0), or, since Milestone 7, a call-resume candidate elsewhere.
     /// Since Milestone 3, `CompiledRegion` bundles the whole-procedure
@@ -86,6 +94,7 @@ impl ProcedureSidecar {
             // as any other declined quickening attempt.
             PcCache::Cold
             | PcCache::RegionCounting(_)
+            | PcCache::RegionCompiling
             | PcCache::Region(_)
             | PcCache::RegionRejected => None,
         }
@@ -106,7 +115,10 @@ impl ProcedureSidecar {
             PcCache::Cold => unreachable!("slot was just promoted to FieldRead"),
             // See `field_read_cache` above: PC 0 already claimed for a region
             // attempt, decline rather than clobber it.
-            PcCache::RegionCounting(_) | PcCache::Region(_) | PcCache::RegionRejected => None,
+            PcCache::RegionCounting(_)
+            | PcCache::RegionCompiling
+            | PcCache::Region(_)
+            | PcCache::RegionRejected => None,
         }
     }
 
@@ -117,6 +129,7 @@ impl ProcedureSidecar {
             PcCache::FieldRead(cache) => Some(cache.as_ref()),
             PcCache::Cold
             | PcCache::RegionCounting(_)
+            | PcCache::RegionCompiling
             | PcCache::Region(_)
             | PcCache::RegionRejected => None,
         })
@@ -133,12 +146,28 @@ impl ProcedureSidecar {
     /// analysis has proven safe and registered via
     /// `register_region_candidate` — `run.rs`'s `region_site` check decides
     /// which. Advances that slot toward a region-compile attempt; a no-op
-    /// once the slot holds anything else (a region, a rejection, or — rare,
-    /// but possible for a one-instruction procedure — an installed
-    /// field-read cache). Each candidate PC's slot is an independent cell in
-    /// the same dense array PC 0 already used, so this needs no separate
-    /// bookkeeping structure for the extra candidates.
-    pub(crate) fn poll_region_at(&mut self, module: &Module, program: &Program, pc: usize) {
+    /// once the slot holds anything else (a region, a rejection, a pending
+    /// background compile, or — rare, but possible for a one-instruction
+    /// procedure — an installed field-read cache). Each candidate PC's slot
+    /// is an independent cell in the same dense array PC 0 already used, so
+    /// this needs no separate bookkeeping structure for the extra
+    /// candidates.
+    ///
+    /// `async_compile: None` compiles synchronously and installs the result
+    /// immediately, exactly as every milestone before background compilation
+    /// existed did (and as every existing region-JIT test still assumes —
+    /// see `region_compile_worker`'s module doc). `Some` submits the compile
+    /// to the background worker and marks the slot `RegionCompiling`
+    /// instead; the result arrives later via `install_region_result`, driven
+    /// by `ProgramSidecars::drain_async_region_results`.
+    pub(crate) fn poll_region_at(
+        &mut self,
+        module: &Module,
+        program: &Program,
+        procedure: ProcedureId,
+        pc: usize,
+        async_compile: Option<&AsyncRegionCompile>,
+    ) {
         let Some(slot) = self.pcs.get_mut(pc) else {
             return;
         };
@@ -146,16 +175,43 @@ impl ProcedureSidecar {
             PcCache::Cold => *slot = PcCache::RegionCounting(1),
             PcCache::RegionCounting(count) => {
                 if *count + 1 >= Self::REGION_ENTRY_THRESHOLD {
-                    *slot = match crate::compile_region_trace_at(module, program, pc) {
-                        Some(region) => PcCache::Region(Box::new(region)),
-                        None => PcCache::RegionRejected,
-                    };
+                    match async_compile {
+                        Some(async_compile) => {
+                            async_compile.enqueue(procedure, pc);
+                            *slot = PcCache::RegionCompiling;
+                        }
+                        None => {
+                            *slot = match crate::compile_region_trace_at(module, program, pc) {
+                                Some(region) => PcCache::Region(Box::new(region)),
+                                None => PcCache::RegionRejected,
+                            };
+                        }
+                    }
                 } else {
                     *count += 1;
                 }
             }
-            PcCache::FieldRead(_) | PcCache::Region(_) | PcCache::RegionRejected => {}
+            PcCache::FieldRead(_)
+            | PcCache::RegionCompiling
+            | PcCache::Region(_)
+            | PcCache::RegionRejected => {}
         }
+    }
+
+    /// Installs a background compile's result (`region_compile_worker`) once
+    /// it arrives — a no-op if the slot isn't still `RegionCompiling` (it
+    /// always will be in practice: exactly one request is ever sent per PC,
+    /// the moment it first transitions out of `RegionCounting`), so a
+    /// duplicate or late-for-a-cleared-world result can never clobber
+    /// something else.
+    pub(crate) fn install_region_result(&mut self, pc: usize, region: Option<CompiledRegion>) {
+        let Some(slot @ PcCache::RegionCompiling) = self.pcs.get_mut(pc) else {
+            return;
+        };
+        *slot = match region {
+            Some(region) => PcCache::Region(Box::new(region)),
+            None => PcCache::RegionRejected,
+        };
     }
 
     /// The region compiled at `pc` (0 for a procedure's own entry, or a
@@ -242,6 +298,30 @@ impl ProgramSidecars {
         self.by_procedure
             .entry((module_identity, procedure))
             .or_insert_with(|| ProcedureSidecar::new(instruction_count))
+    }
+
+    /// Installs every background region compile that has finished since the
+    /// last drain. Called at a procedure switch (`run.rs`) rather than every
+    /// instruction — dispatch never blocks on this, and a compile that
+    /// finishes between drains just sits in the channel a little longer, at
+    /// no cost to anything (it isn't consulted until `region_at`/`is_region_site`
+    /// next look at that PC, which only happens once this world reaches it
+    /// again). A result for a procedure this world no longer tracks (its
+    /// sidecar was cleared, e.g. by a ready-world snapshot restore, while the
+    /// compile was in flight) is simply dropped — the slot it would have
+    /// installed into no longer exists.
+    pub(crate) fn drain_async_region_results(&mut self, async_compile: &AsyncRegionCompile) {
+        for result in async_compile.drain_ready() {
+            if result.module_identity != async_compile.module_identity() {
+                continue;
+            }
+            if let Some(sidecar) = self
+                .by_procedure
+                .get_mut(&(result.module_identity, result.procedure))
+            {
+                sidecar.install_region_result(result.entry_pc, result.region);
+            }
+        }
     }
 
     /// The most receiver types any single field-read call site is tracking.
