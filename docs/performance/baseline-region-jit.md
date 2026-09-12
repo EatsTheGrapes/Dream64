@@ -358,20 +358,51 @@ number. Reject anything that regresses parity or the short gates.
      pre-existing test already (accidentally) satisfied this requirement,
      since each one happened to put its declining instruction first in its
      own expression.
-6. **Leaf-call inlining** for already-compiled numeric callees whose
-   arguments and return are provably numeric — invoked through a callback
-   exactly like `RegionCallbacks` today (a real Cranelift `call` to a Rust
-   trampoline that runs the callee's own `CompiledNumericTrace` and hands
-   back a plain `f32`), no side-exit, no rooted slots needed either, since
-   scope stays numeric-in-numeric-out by construction.
+6. **Leaf-call inlining. Done — as a compile-time splice, not the
+   originally-sketched runtime callback.** The doc's original plan called
+   for "a callback exactly like `RegionCallbacks` today... that runs the
+   callee's own `CompiledNumericTrace`" — reading the real code before
+   implementing found this architecturally blocked: `run_frames` hollows
+   `state.program_sidecars` out into a disjoint local for the whole run,
+   and neither `try_run_region_numeric_jit` nor its `RegionDispatch`
+   callback context ever receives the sidecars — there is no path from
+   inside a running region's callback back to another procedure's compiled
+   trace at runtime. Built instead as a genuine compiler inline: when the
+   translator (`numeric_trace_instructions`) reaches a `Call` whose callee
+   provably qualifies, it splices the callee's own translated instructions
+   directly into the caller's sequence at compile time (argument binding via
+   ordinary `StoreLocal`s, the callee's locals renumbered into fresh slots
+   past the caller's own, its final `Return` dropped since the value it
+   would have popped already sits on the shared native operand stack).
+   Qualification is narrow and safety-first, matching every milestone's own
+   pattern: both caller *and* callee must be entirely branch-free (a jump
+   target is an absolute instruction index; splicing shifts everything
+   after it out of alignment, so requiring branch-freedom on both sides
+   sidesteps rewriting those targets entirely rather than risking that math
+   being wrong); the callee must be a true leaf (no field/global access, no
+   calls or allocations of its own, which bounds this to exactly one level
+   of inlining by construction); the callee's declared parameter count must
+   exactly match the call site's argument count; and any of the callee's
+   *other* locals (DM reserves extra compiler-internal slots — the implicit
+   `.` variable among them — regardless of declared parameter count) must
+   be provably safe to default to zero, reusing the same
+   `local_is_definitely_initialized_before_load` check
+   `try_run_region_numeric_jit` already applies to a region's own top-level
+   entry locals. A real design bug — comparing the call site's argument
+   count against the callee's *total* local count instead of its *declared*
+   parameter count, which would have rejected nearly every real callee —
+   was caught by a translator-level test asserting the exact spliced
+   instruction sequence, before ever reaching a boot.
 
+**All six originally-planned milestones are now complete and merged.**
 True resume-after-call and rooted-`Value` support (the InitAtom-throughput
-and `update_corners`-class wins the original milestone 5 targeted) are now a
-later milestone, once (a) PC-indexed region re-entry and (b) a real
-GC-scanned rooted side-array both exist — (a) is structurally cheap (the
-sidecar's per-instruction cache array already supports arbitrary-PC entries),
-(b) is the real work. Milestone 6 and beyond is where the 2–4x in VM-heavy
-regions is plausible, once that lands.
+and `update_corners`-class wins this project originally targeted) remain
+future work, needing (a) PC-indexed region re-entry and (b) a real
+GC-scanned rooted side-array — (a) is structurally cheap (the sidecar's
+per-instruction cache array already supports arbitrary-PC entries), (b) is
+the real work. That's now a distinct, larger follow-on effort rather than a
+seventh numbered milestone in this plan — the 2–4x in VM-heavy regions this
+doc opens with is plausible once it lands.
 
 ## Risks
 
