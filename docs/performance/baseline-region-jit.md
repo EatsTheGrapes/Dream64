@@ -59,6 +59,44 @@ type/shape pass:
    `CallFrame`, analogous to how `locals`/`stack` are already scanned) — net
    new work, not reuse. Used for any non-number operand and for numbers about
    to cross the slow-path ABI, once built.
+   **Revised again, with the real mechanism confirmed (2026-09-13, ahead of
+   the rooted-Value follow-on):** the destination is `CallFrameCold`
+   (`crates/dm-vm/src/execution/frame.rs`), not a bare `ExecutionState` field
+   — and this is a small, precedented diff, not uncharted territory.
+   `CallFrameCold` already carries three live `Value`-bearing fields wired
+   into `heap_gc.rs`'s `add_frame_roots` closure one line at a time
+   (`pending_argument_roots`, `retained_call_roots`,
+   `caller_result_override`); a new rooted-slot array is the same shape of
+   change. Critically, **GC in this engine is cooperative and
+   yield-point-only, not allocation-triggered**: the real collector
+   (`ExecutionState::maybe_collect_unreachable_lists`) has exactly three
+   production call sites (`run.rs`'s wall-clock and instruction-budget
+   exhaustion paths, `interpreter.rs`'s genuine `waitfor=1` `Sleep`
+   suspension) — all three sit at the exact moment the *complete* `frames:
+   Vec<CallFrame>` is about to leave the dispatch loop and be handed to the
+   scheduler. An ordinary nested DM proc call cannot trigger a collection by
+   itself; only a real `Sleep`, or running long enough to hit a step/wall-clock
+   slice boundary, can. Two consequences that meaningfully de-risk this
+   compared to how uncertain this section used to read: (1) a
+   `CallFrameCold`-resident rooted array is automatically and unconditionally
+   safe against every collection this engine can currently trigger, with zero
+   additional lifetime bookkeeping, for as long as its owning `CallFrame`
+   stays live — side-exiting mid-region does not pop the frame, so rootedness
+   survives a side-exit exactly the way `locals`/`stack` already do; (2) the
+   array only needs draining/copying-out discipline at the one place that
+   already needs it for everything else in `CallFrameCold` — a `Return`,
+   which pops and drops the frame (`interpreter.rs`'s `Instruction::Return`
+   handling), so anything that must outlive the call has to be copied into
+   `result`/`caller_result_override` first, same as today. A second,
+   already-wired general-purpose stash also exists for a related but distinct
+   problem — `ExecutionState.host_value_roots` plus
+   `preserve_reentrant_frame_roots` (`frame.rs`), used today (e.g. around a
+   re-entrant field-initializer call in `interpreter.rs`) to keep an OUTER
+   frame's roots visible to a collection triggered inside a nested,
+   *disjoint* interpreter invocation that doesn't otherwise see them — a
+   coarser append/truncate channel, not a random-access operand slot, and not
+   what a region's own live operands need, but worth knowing about since it
+   solves a neighboring problem with no new root-scan code at all.
 
 Locals mirror this: a `locals_kind: [Unboxed|Slot; local_count]` plan. A local
 that is only ever a number lives in an `f64` stack slot; anything else is a
@@ -679,5 +717,31 @@ reappear.
   numeric-only and side-exiting (never rooting) anything that isn't a plain
   number; the discipline once the rooted array exists is still "every `Value`
   that outlives a slow-path call lives in a slot, never a register."
+  **Revised again (2026-09-13), with the real mechanism confirmed rather than
+  estimated:** this risk is smaller than it reads above. GC here is
+  yield-point-only (see "Operand model"'s second revision) — a
+  `CallFrameCold`-resident rooted array is unconditionally safe against every
+  collection the engine can trigger today, with zero new lifetime
+  bookkeeping, using the exact wiring pattern three existing
+  `CallFrameCold` fields already use. **What's still genuinely unbuilt, and
+  is the real remaining scope, is not the rooting mechanism but (i) an
+  operand/local representation for a compiled region to hold a rooted slot
+  index alongside its existing `f64` registers, plus the Cranelift codegen
+  and broadened `RegionCallbacks` surface to actually DO anything with one
+  (list index/length/iteration, a non-numeric field read/write) — today's
+  `RegionCallbacks` is four numeric-only callbacks
+  (`load_field`/`store_field`/`load_global`/`store_global`), nothing list- or
+  datum-shaped; and (ii) true resume-after-call still separately needs
+  piece (b) from the "slow-path ABI" section above — cold-starting
+  `NumericExecutionState` (today entirely scalar, by design, per
+  `CallFrameCold`'s own inline comment) from a frame whose stack already
+  holds a live value, which remains completely unbuilt and is separable from
+  rooted-slot support itself: a first slice can add rooted LOCALS (sourced
+  from a parameter, global, or field — always a PC-0 entry with an empty
+  stack, exactly like every existing milestone) without yet needing (ii) at
+  all.** The `RegionVm`/full callback-table sketch in "The slow-path ABI"
+  above (the `alloc_datum`/`call_static`/`list_get` table) is aspirational —
+  grepping the codebase confirms it was never built; the real
+  `RegionCallbacks` trait is the narrow four-callback surface above.
 - Parity drift. The interpreter stays authoritative; regions are gated on
   byte-exact `field_quickening` / instruction-count parity every step.
