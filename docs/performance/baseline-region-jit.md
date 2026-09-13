@@ -564,6 +564,101 @@ structural risk this doc has carried since Milestone 1, one that only grows
 more expensive as later milestones (this one included) keep adding more
 independent compile sites than a procedure's own entry alone ever created.
 
+## Corner-apply loop trace (follow-on to background region compilation) — a
+bespoke trace for `update_corners`' hot inner loop. Catches a real hang bug
+along the way; boot-time payoff at current scale is within measurement
+noise, mirroring Milestone 7's own outcome.
+
+Targets `/datum/light_source/proc/apply_corners`' `APPLY_CORNER`/`LAZYADD`
+inner loop specifically — the `new_corners` loop, not the second "old
+corners reapplication" loop, which has a structurally different body and is
+deliberately deferred as a follow-up. A loop embedded partway through a much
+larger procedure, not a whole small one, so it's keyed by its own entry PC
+via `(module_identity, procedure, entry_pc)` rather than PC 0 like the
+whole-procedure bespoke traces (lumcount/camera-chunk/RegisterSignal) it
+sits alongside, and triggered directly off the current instruction's own
+shape (`NextLocalListIteration` is rare) rather than gated to
+`instruction_index == 0`.
+
+**Diagnosis first, not a guess.** Built a one-off
+`DREAM64_PROFILE_PROCEDURE_PCS` diagnostic — per-PC step accounting for one
+target procedure, one level deeper than the existing per-procedure
+`proc_step_samples` — specifically to find where `update_corners`' own cost
+concentrates. Confirmed the corner-apply loop dominates, not the
+`view()`-scanning loops. Also confirmed empirically (zero profiler samples on
+those exact PCs) that `NextLocalListIteration`'s real fused semantics — the
+has-more-items check, the positional item fetch, and the reference-list
+aliasing special case, all in one instruction, advancing `frame.instruction`
+by 7 directly — make the 6 "obvious" follow-up bytecode instructions dead
+code, never dispatched.
+
+**Mechanism.** `compile_corner_apply_body` exact-matches the loop's
+~110-instruction bytecode shape, with jump targets checked relative to
+`entry_pc` rather than as absolute literals, for robustness against
+recompiles. `try_run_corner_apply_loop_jit` then replicates
+`NextLocalListIteration`'s real semantics directly, computes the falloff
+math, and — rather than performing a real nested call — resolves
+`update_lumcount`'s target through the exact same dynamic-callsite cache the
+interpreter itself would populate, then drives the existing
+`LUMCOUNT_JIT_CACHE` (the same bespoke trace `try_run_lumcount_jit` already
+uses for whole-procedure calls) directly against a local
+`NumericExecutionState`. `update_lumcount`'s own canonical shape always
+returns exactly 0.0 (confirmed by reading its compiled trace directly, not
+assumed), so the `LAZYADD`/`effect_str[corner] = .` branch is dead code for
+this receiver type on real Monkestation as much as in the new end-to-end
+test — confirming that stays true is itself part of what the new test
+checks, alongside the real observable effects (lum_r/g/b deltas,
+needs_update, the lighting queue).
+
+**A real hang bug found via this milestone's own boot-parity benchmark, not
+a unit test.** The loop's per-iteration budget check declined near a
+step-budget boundary by returning `Some(0)` (report success, zero progress)
+rather than `None` (decline outright) whenever even the first iteration
+didn't fit in `remaining_steps`. `run.rs`'s caller re-enters unconditionally
+on any `Some(_)`, so a `remaining_steps` this small — which the whole-call
+budget legitimately reaches near a slice boundary, and `update_corners` runs
+often enough that some boot slice eventually catches it sitting exactly at
+this PC — meant the caller spun forever re-checking the same unmet budget
+instead of falling through to the interpreter, which correctly drains the
+last few steps on its own. The first real boot-parity run hung indefinitely:
+zero new boot-progress log output for over an hour, confirmed via CPU-time
+sampling to be actively spinning (~1.0x CPU-time-per-wall-time on one core),
+not blocked. Fixed by declining (`None`) rather than reporting zero progress
+whenever no real work has happened yet in the current call — matching the
+convention every other bespoke trace in this file already follows
+(`if remaining_steps < N { return None; }` up front, before doing anything).
+A new regression test
+(`corner_apply_loop_jit_declines_rather_than_spin_on_a_starved_budget`) calls
+the trace directly with a starved budget and asserts `None`; confirmed
+meaningful, not just present, by temporarily reverting the fix alone and
+watching the same test fail with `Some(0)` — the exact original symptom —
+before restoring it.
+
+**Boot-parity result — mechanism correct, boot-time payoff not measurable at
+current scale.** Full lib suites green (30 dm-jit + 71 dm-value + 676 dm-vm +
+75 dm-lifecycle + 65 dm-runtime), zero new clippy warnings, `rc=0`, reaches
+`startup=accepting lobby=pregame` cleanly — confirmed past the exact slice
+range the pre-fix build hung at. `avg_ns_per_instr` across four runs: two
+independent async-compile-baseline runs at 678.7 and 680.9 (established
+noise band, ~0.3% wide); two independent runs of this change at 680.0 and
+676.9. The two groups interleave rather than separate — this change's own
+lower sample sits *below* both baseline samples, its higher sample sits
+*between* them — with a combined four-run spread of 676.9-680.9 (~0.6%) and
+near-identical means (679.8 baseline vs 678.45 here). That is not a
+directional signal in either direction; it is the same noise floor Milestone
+7 already established at this boot's current scale. Mirrors Milestone 7's
+own outcome exactly: a real, correctness-proven, exercised capability
+(confirmed correct end-to-end, confirmed to actually fire via the dedicated
+test), not yet a proven boot-time win — most likely because
+`update_corners`' own share of total boot cost is small relative to the
+O(heap) iteration re-scans this doc's `README` already names as the
+dominant remaining cost, so accelerating one hot loop inside it doesn't move
+the aggregate needle yet. Independent of the measured magnitude, this change
+is justified on its own: it hardens the exact code path that shipped a real
+hang-inducing regression, with a dedicated test proving the fix and
+reproducing the original failure, so the same class of bug cannot silently
+reappear.
+
 ## Risks
 
 - Cranelift compile latency on a cold boot. **Compiling on workers: done**
