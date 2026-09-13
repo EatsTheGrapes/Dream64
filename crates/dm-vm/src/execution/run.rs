@@ -15,9 +15,10 @@ use crate::{
     boot_trace_enabled, canonical_tgm_load_path, drive_ruin_candidate_scan, drive_tgm_load,
     execute_compact_fast_instruction, instr_category, is_atoms_initialize_path,
     is_subsystem_initialize_path, numeric_dispatch_candidate, proc_step_profile_enabled,
-    safe_call_resume_pc, slow_instruction_trace_threshold, startup_instruction_category,
-    startup_instruction_profile_enabled, startup_profile_enabled, tgm_profiling_enabled,
-    trace_tgm_route, try_run_build_coordinate_prefix, try_run_camera_chunk_fast_path,
+    procedure_pc_profile_target, safe_call_resume_pc, slow_instruction_trace_threshold,
+    startup_instruction_category, startup_instruction_profile_enabled, startup_profile_enabled,
+    tgm_profiling_enabled, trace_tgm_route, try_run_build_coordinate_prefix,
+    try_run_camera_chunk_fast_path, try_run_corner_apply_loop_jit,
     try_run_discover_offset_fast_path, try_run_dmm_preload_measurement_fast_path,
     try_run_guarded_jit, try_run_numeric_dispatch_block, try_run_numeric_local_update,
     try_run_numeric_loop_branch, try_run_parsed_dmm_new_fast_path, try_run_region_numeric_jit,
@@ -107,6 +108,7 @@ fn run_frames_inner(
     // while off; the instruction histogram adds two `Instant::now()` per opcode
     // while on.
     let proc_step_profiling = proc_step_profile_enabled();
+    let pc_profiling = procedure_pc_profile_target().is_some();
     let instr_profiling = state.instruction_profile.is_some();
     // A frame retains only its stable procedure identity so scheduled continuations
     // remain self-contained. Cache the immutable program for the currently executing
@@ -157,6 +159,9 @@ fn run_frames_inner(
                     .map_err(|message| execution_error(module, &frames, message))?;
                 active_program = Some((procedure, program));
                 active_sidecar = None;
+                if pc_profiling {
+                    state.maybe_start_pc_profile(module, procedure, program);
+                }
                 program
             }
         };
@@ -754,6 +759,37 @@ fn run_frames_inner(
                 frames[frame_index].instruction = program.instructions.len() - 1;
             }
         }
+        // `update_corners`' own corner-apply loop (docs/performance/
+        // baseline-region-jit.md's background-region-compilation follow-on)
+        // — a bespoke trace alongside lumcount/camera-chunk/RegisterSignal
+        // above, but keyed by its own entry PC rather than PC 0, since it
+        // lives partway through a much larger procedure. Triggered directly
+        // off the current instruction's own shape (`NextLocalListIteration`
+        // is rare — a single tag check costs nothing for every other
+        // instruction), not gated to `instruction_index == 0` like the
+        // whole-procedure traces above.
+        if remaining_steps > 0
+            && let Some(accounted_steps) = try_run_corner_apply_loop_jit(
+                module,
+                procedure,
+                program,
+                &mut frames[frame_index],
+                remaining_steps,
+                state,
+            )
+        {
+            let scheduler_batches_before = executed_steps / 4_096;
+            remaining_steps = remaining_steps.saturating_sub(accounted_steps);
+            executed_steps += accounted_steps;
+            for _ in scheduler_batches_before..(executed_steps / 4_096) {
+                account_scheduler_tick_usage(state);
+            }
+            if let Some(profile) = &mut state.atoms_profile {
+                profile.total_instructions =
+                    profile.total_instructions.saturating_add(accounted_steps);
+            }
+            continue;
+        }
         let numeric_loop_steps =
             (!trace_enabled && !dashboard_enabled && state.atoms_profile.is_none())
                 .then(|| {
@@ -849,6 +885,7 @@ fn run_frames_inner(
         }
         let steps_to_scheduler_accounting = 4_096 - executed_steps % 4_096;
         let quick_block_budget = remaining_steps.min(steps_to_scheduler_accounting).min(256);
+        let quick_block_start_pc = frames[frame_index].instruction;
         let quick_block_steps = (!trace_enabled
             && !dashboard_enabled
             && state.atoms_profile.is_none()
@@ -872,6 +909,14 @@ fn run_frames_inner(
             });
             if proc_step_profiling {
                 *state.proc_step_samples.entry(procedure).or_default() += accounted_steps;
+            }
+            if pc_profiling {
+                state.record_pc_sample(
+                    module.identity.0,
+                    procedure,
+                    quick_block_start_pc,
+                    accounted_steps,
+                );
             }
             if let Some(started) = iter_start
                 && let Some(profile) = state.instruction_profile.as_mut()
@@ -927,6 +972,9 @@ fn run_frames_inner(
         executed_steps += 1;
         if proc_step_profiling {
             *state.proc_step_samples.entry(procedure).or_default() += 1;
+        }
+        if pc_profiling {
+            state.record_pc_sample(module.identity.0, procedure, instruction_index, 1);
         }
         if let Some(profile) = &mut state.atoms_profile {
             profile.total_instructions = profile.total_instructions.saturating_add(1);
@@ -1052,6 +1100,9 @@ fn run_frames_inner(
                     .map_err(|message| execution_error(module, &frames, message))?;
                 if proc_step_profiling {
                     *state.proc_step_samples.entry(procedure).or_default() += 1;
+                }
+                if pc_profiling {
+                    state.record_pc_sample(module.identity.0, procedure, instruction_index, 1);
                 }
                 if let (Some(started), Some(category)) = (started, category)
                     && let Some(profile) = state.instruction_profile.as_mut()

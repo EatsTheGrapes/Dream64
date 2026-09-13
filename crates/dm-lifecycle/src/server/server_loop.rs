@@ -359,6 +359,9 @@ fn report_boot_profiles(precompiled: &dm_lifecycle::PrecompiledLifecycle, at: &s
     {
         eprintln!("boot-profile at={at} proc_rank={} {line}", rank + 1);
     }
+    for (rank, line) in precompiled.pc_profile_lines(40).into_iter().enumerate() {
+        eprintln!("boot-profile at={at} procedure_pc_rank={} {line}", rank + 1);
+    }
 }
 
 /// Diagnostic: dump the Master Controller / `SSticker` state that governs the

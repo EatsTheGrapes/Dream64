@@ -7,11 +7,13 @@ use crate::bytecode::{
 };
 use crate::compact_wordcode;
 use crate::value_ops::{
-    assign_datum_or_shared_field, canonicalize_value, datum_field_or_initial,
-    datum_field_or_shared, logical_or_empty_list_field, logical_or_empty_list_index, pop,
-    read_list_value, runtime_truthy, stringify_dm_value, write_list_value,
+    assign_datum_or_shared_field, canonicalize_owned_value, canonicalize_value,
+    datum_field_or_initial, datum_field_or_shared, dm_list_length_number,
+    dynamic_call_target_named_at_callsite, logical_or_empty_list_field,
+    logical_or_empty_list_index, pop, read_list_value, runtime_truthy, stringify_dm_value,
+    value_to_list_index, write_list_value,
 };
-use crate::{CallFrame, ExecutionState, declared_argument_count};
+use crate::{CallFrame, ExecutionState, declared_argument_count, frame_context};
 use dm_jit::{
     CompiledNumericTrace, CompiledRootedBlock, NumericInstruction, NumericRunOutcome,
     RegionCallbacks, RootedBlockOutcome, compile_numeric_field_trace,
@@ -1354,6 +1356,609 @@ pub(crate) fn compile_lumcount_trace(program: &Program) -> Option<LumcountTrace>
         fields: [lum_r, lum_g, lum_b, needs_update],
         lighting_global,
         queue_field,
+    })
+}
+
+thread_local! {
+    /// Cache for [`try_run_corner_apply_loop_jit`]'s canonical shape match,
+    /// keyed one level deeper than the whole-procedure caches above: this
+    /// trace matches a *loop embedded inside* a much larger procedure
+    /// (`/datum/light_source/proc/update_corners`), not a whole small one,
+    /// so the loop's own entry `pc` is part of the cache key alongside
+    /// `(module identity, procedure)`.
+    static CORNER_APPLY_JIT_CACHE: RefCell<HashMap<(u64, ProcedureId, usize), Option<CornerApplyBody>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// One hand-matched `for (var/datum/lighting_corner/corner as anything in
+/// new_corners)` loop body — `update_corners`' own `APPLY_CORNER`+`LAZYADD`
+/// inner loop, the single largest measured contributor within that
+/// procedure's own ~10% of a real Monkestation boot (per
+/// `DREAM64_PROFILE_PROCEDURE_PCS` diagnostics). A bespoke trace alongside
+/// [`LumcountTrace`]/camera-chunk/RegisterSignal, but unlike those, this
+/// isn't a whole procedure: it starts at a `NextLocalListIteration` found
+/// partway through a much larger compiled artifact, so every jump target is
+/// validated relative to that PC (`entry_pc`) rather than as an absolute
+/// literal — the shape must keep matching regardless of where a future
+/// recompile happens to place it.
+pub(crate) struct CornerApplyBody {
+    list_slot: u16,
+    index_slot: u16,
+    item_slot: u16,
+    exit_pc: usize,
+    corner_x: FieldName,
+    corner_y: FieldName,
+    light_outer_range: FieldName,
+    light_falloff_curve: FieldName,
+    effect_str: FieldName,
+    affecting: FieldName,
+    turf_x_local: u16,
+    turf_y_local: u16,
+    range_divisor_local: u16,
+    light_power_local: u16,
+    applied_lum_r_local: u16,
+    applied_lum_g_local: u16,
+    applied_lum_b_local: u16,
+    lum_r_local: u16,
+    lum_g_local: u16,
+    lum_b_local: u16,
+}
+
+/// Validates the exact bytecode shape of `update_corners`' corner-apply
+/// loop starting at `entry_pc` (a `NextLocalListIteration`), or declines.
+/// `NextLocalListIteration`'s own fused runtime semantics
+/// (`execution/interpreter.rs`) already skip straight from `entry_pc` to
+/// `entry_pc + 7` on every real dispatch — the six instructions in between
+/// are dead code — but they're still matched here (as inert padding) so a
+/// coincidental, unrelated `NextLocalListIteration` elsewhere, followed by
+/// different real code, can never be mistaken for this loop.
+// `float_cmp`: every comparison here checks for an exact bytecode-level
+// constant the compiler either emitted or didn't (e.g. "is this literally
+// `PushNumber(2.0)`"), never an approximate runtime computation — the same
+// exact-bit-pattern check `compile_lumcount_trace`'s own canonical match
+// above already relies on. `similar_names`: the parallel `_r`/`_g`/`_b`
+// locals mirror the DM source's own `_lum_r`/`_lum_g`/`_lum_b` naming
+// exactly; renaming them to be less similar would only make this harder to
+// audit against that source, not safer.
+#[allow(clippy::too_many_lines, clippy::float_cmp, clippy::similar_names)]
+pub(crate) fn compile_corner_apply_body(
+    program: &Program,
+    entry_pc: usize,
+) -> Option<CornerApplyBody> {
+    let instructions = &program.instructions;
+    let at = |offset: usize| instructions.get(entry_pc.checked_add(offset)?);
+    let local_at = |offset: usize| match at(offset)? {
+        Instruction::LoadLocal(slot) => Some(*slot),
+        _ => None,
+    };
+    let Instruction::NextLocalListIteration {
+        list_slot,
+        index_slot,
+        item_slot,
+        exit,
+    } = at(0)?
+    else {
+        return None;
+    };
+    let (list_slot, index_slot, item_slot, exit_pc) = (*list_slot, *index_slot, *item_slot, *exit);
+    if !matches!(at(1)?, Instruction::ListLengthLocal(slot) if *slot == list_slot)
+        || !matches!(at(2)?, Instruction::LessEqual)
+        || !matches!(at(3)?, Instruction::JumpIfFalse(target) if *target == exit_pc)
+        || local_at(4)? != index_slot
+        || !matches!(at(5)?, Instruction::IndexLocalList(slot) if *slot == list_slot)
+        || !matches!(at(6)?, Instruction::StoreLocal(slot) if *slot == item_slot)
+        || local_at(7)? != item_slot
+    {
+        return None;
+    }
+    let Instruction::LoadDeclaredField(corner_x) = at(8)? else {
+        return None;
+    };
+    let turf_x_local = local_at(9)?;
+    if !matches!(at(10)?, Instruction::Subtract)
+        || !matches!(at(11)?, Instruction::PushNumber(n) if n.to_f32() == 2.0)
+        || !matches!(at(12)?, Instruction::Power)
+        || local_at(13)? != item_slot
+    {
+        return None;
+    }
+    let Instruction::LoadDeclaredField(corner_y) = at(14)? else {
+        return None;
+    };
+    let turf_y_local = local_at(15)?;
+    if !matches!(at(16)?, Instruction::Subtract)
+        || !matches!(at(17)?, Instruction::PushNumber(n) if n.to_f32() == 2.0)
+        || !matches!(at(18)?, Instruction::Power)
+        || !matches!(at(19)?, Instruction::Add)
+        || !matches!(at(20)?, Instruction::PushNumber(n) if n.to_f32() == 0.5)
+        || !matches!(at(21)?, Instruction::Power)
+        || !matches!(at(22)?, Instruction::LoadSrc)
+    {
+        return None;
+    }
+    let Instruction::LoadField(light_outer_range) = at(23)? else {
+        return None;
+    };
+    if !matches!(at(24)?, Instruction::Subtract) {
+        return None;
+    }
+    let range_divisor_local = local_at(25)?;
+    if !matches!(at(26)?, Instruction::Divide)
+        || !matches!(at(27)?, Instruction::Negate)
+        || !matches!(at(28)?, Instruction::PushNumber(n) if n.to_f32() == 0.0)
+        || !matches!(at(29)?, Instruction::PushNumber(n) if n.to_f32() == 1.0)
+        || !matches!(
+            at(30)?,
+            Instruction::StandardBuiltin { name, argument_count: 3, .. } if name == "clamp"
+        )
+        || !matches!(at(31)?, Instruction::LoadSrc)
+    {
+        return None;
+    }
+    let Instruction::LoadField(light_falloff_curve) = at(32)? else {
+        return None;
+    };
+    if !matches!(at(33)?, Instruction::Power)
+        || !matches!(at(34)?, Instruction::StoreResult)
+        || !matches!(at(35)?, Instruction::LoadResult)
+    {
+        return None;
+    }
+    let light_power_local = local_at(36)?;
+    if !matches!(at(37)?, Instruction::PushNumber(n) if n.to_f32() == 2.0)
+        || !matches!(at(38)?, Instruction::Power)
+        || !matches!(
+            at(39)?,
+            Instruction::CompoundAssignment(CompoundAssignmentOperator::Multiply)
+        )
+        || !matches!(at(40)?, Instruction::StoreResult)
+        || !matches!(at(41)?, Instruction::LoadResult)
+        || local_at(42)? != light_power_local
+        || !matches!(at(43)?, Instruction::PushNumber(n) if n.to_f32() == 0.0)
+        || !matches!(at(44)?, Instruction::Less)
+        || !matches!(at(45)?, Instruction::JumpIfFalse(target) if *target == entry_pc + 49)
+        || !matches!(at(46)?, Instruction::PushNumber(n) if n.to_f32() == 1.0)
+        || !matches!(at(47)?, Instruction::Negate)
+        || !matches!(at(48)?, Instruction::Jump(target) if *target == entry_pc + 50)
+        || !matches!(at(49)?, Instruction::PushNumber(n) if n.to_f32() == 1.0)
+        || !matches!(
+            at(50)?,
+            Instruction::CompoundAssignment(CompoundAssignmentOperator::Multiply)
+        )
+        || !matches!(at(51)?, Instruction::StoreResult)
+        || !matches!(at(52)?, Instruction::LoadSrc)
+    {
+        return None;
+    }
+    let Instruction::LoadField(effect_str) = at(53)? else {
+        return None;
+    };
+    if local_at(54)? != item_slot || !matches!(at(55)?, Instruction::IndexList) {
+        return None;
+    }
+    let old_local = match at(56)? {
+        Instruction::StoreLocal(slot) => *slot,
+        _ => return None,
+    };
+    if local_at(57)? != item_slot || !matches!(at(58)?, Instruction::LoadResult) {
+        return None;
+    }
+    let lum_r_local = local_at(59)?;
+    if !matches!(at(60)?, Instruction::Multiply) || local_at(61)? != old_local {
+        return None;
+    }
+    let applied_lum_r_local = local_at(62)?;
+    if !matches!(at(63)?, Instruction::Multiply)
+        || !matches!(at(64)?, Instruction::Subtract)
+        || !matches!(at(65)?, Instruction::LoadResult)
+    {
+        return None;
+    }
+    let lum_g_local = local_at(66)?;
+    if !matches!(at(67)?, Instruction::Multiply) || local_at(68)? != old_local {
+        return None;
+    }
+    let applied_lum_g_local = local_at(69)?;
+    if !matches!(at(70)?, Instruction::Multiply)
+        || !matches!(at(71)?, Instruction::Subtract)
+        || !matches!(at(72)?, Instruction::LoadResult)
+    {
+        return None;
+    }
+    let lum_b_local = local_at(73)?;
+    if !matches!(at(74)?, Instruction::Multiply) || local_at(75)? != old_local {
+        return None;
+    }
+    let applied_lum_b_local = local_at(76)?;
+    if !matches!(at(77)?, Instruction::Multiply) || !matches!(at(78)?, Instruction::Subtract) {
+        return None;
+    }
+    if !matches!(
+        at(79)?,
+        Instruction::CallDynamic {
+            static_selector: Some(selector),
+            argument_count: 3,
+            null_receiver_is_global: false,
+            ..
+        } if selector == "update_lumcount"
+    ) {
+        return None;
+    }
+    if !matches!(at(80)?, Instruction::Pop)
+        || !matches!(at(81)?, Instruction::LoadResult)
+        || !matches!(at(82)?, Instruction::PushNumber(n) if n.to_f32() == 0.0)
+        || !matches!(at(83)?, Instruction::NotEqual)
+        || !matches!(at(84)?, Instruction::JumpIfFalse(target) if *target == entry_pc + 104)
+        || local_at(85)? != item_slot
+    {
+        return None;
+    }
+    let Instruction::LoadDeclaredField(affecting) = at(86)? else {
+        return None;
+    };
+    if !matches!(at(87)?, Instruction::Not)
+        || !matches!(at(88)?, Instruction::JumpIfFalse(target) if *target == entry_pc + 92)
+        || local_at(89)? != item_slot
+        || !matches!(at(90)?, Instruction::MakeListEntries(entries) if entries.is_empty())
+        || !matches!(at(91)?, Instruction::StoreField(name) if name == affecting)
+        || local_at(92)? != item_slot
+        || !matches!(at(93)?, Instruction::Duplicate)
+        || !matches!(at(94)?, Instruction::LoadField(name) if name == affecting)
+        || !matches!(at(95)?, Instruction::LoadSrc)
+        || !matches!(
+            at(96)?,
+            Instruction::CompoundAssignment(CompoundAssignmentOperator::Add)
+        )
+        || !matches!(at(97)?, Instruction::StoreField(name) if name == affecting)
+        || !matches!(at(98)?, Instruction::LoadResult)
+        || !matches!(at(99)?, Instruction::LoadSrc)
+    {
+        return None;
+    }
+    let Instruction::LoadField(effect_str_write) = at(100)? else {
+        return None;
+    };
+    if effect_str_write != effect_str || local_at(101)? != item_slot {
+        return None;
+    }
+    if !matches!(at(102)?, Instruction::PrepareRhsFirstIndexAssignment)
+        || !matches!(at(103)?, Instruction::SetListIndex)
+        || local_at(104)? != index_slot
+        || !matches!(at(105)?, Instruction::PushNumber(n) if n.to_f32() == 1.0)
+        || !matches!(at(106)?, Instruction::Add)
+        || !matches!(at(107)?, Instruction::StoreLocal(slot) if *slot == index_slot)
+        || !matches!(at(108)?, Instruction::Jump(target) if *target == entry_pc)
+    {
+        return None;
+    }
+
+    Some(CornerApplyBody {
+        list_slot,
+        index_slot,
+        item_slot,
+        exit_pc,
+        corner_x: corner_x.clone(),
+        corner_y: corner_y.clone(),
+        light_outer_range: light_outer_range.clone(),
+        light_falloff_curve: light_falloff_curve.clone(),
+        effect_str: effect_str.clone(),
+        affecting: affecting.clone(),
+        turf_x_local,
+        turf_y_local,
+        range_divisor_local,
+        light_power_local,
+        applied_lum_r_local,
+        applied_lum_g_local,
+        applied_lum_b_local,
+        lum_r_local,
+        lum_g_local,
+        lum_b_local,
+    })
+}
+
+/// Drives a validated [`CornerApplyBody`] for as many corners as the
+/// remaining step budget allows, replacing `update_corners`' own
+/// `APPLY_CORNER`+`LAZYADD` loop iteration-for-iteration with native
+/// computation — reusing the *already-compiled* [`LumcountTrace`] for
+/// `update_lumcount` (`LUMCOUNT_JIT_CACHE`, shared with the ordinary
+/// interpreted call path — a corner whose runtime type overrides
+/// `update_lumcount` with something non-canonical simply never populates
+/// that cache with a `Some`, so this declines for that one corner exactly
+/// as it would for any other guard failure) rather than constructing a real
+/// nested call. Declines (returning `None`) the instant anything doesn't
+/// match what was validated, leaving `frame.instruction` untouched so the
+/// ordinary interpreter safely redoes the *entire* current call from
+/// scratch — every write this function makes happens only after its last
+/// possible decline point (the `update_lumcount` resolution), exactly
+/// mirroring the region tier's own side-exit discipline.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn try_run_corner_apply_loop_jit(
+    module: &Module,
+    procedure: ProcedureId,
+    program: &Program,
+    frame: &mut CallFrame,
+    remaining_steps: u64,
+    state: &mut ExecutionState,
+) -> Option<u64> {
+    if jit_disabled() {
+        return None;
+    }
+    let entry_pc = frame.instruction;
+    if !matches!(
+        program.instructions.get(entry_pc),
+        Some(Instruction::NextLocalListIteration { .. })
+    ) {
+        return None;
+    }
+    let Value::Datum(src) = frame.src else {
+        return None;
+    };
+    let caller_context = frame_context(frame);
+    let key = (module.identity.0, procedure, entry_pc);
+    CORNER_APPLY_JIT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let body = cache
+            .entry(key)
+            .or_insert_with(|| compile_corner_apply_body(program, entry_pc));
+        let body = body.as_ref()?;
+        let mut steps = 0_u64;
+        loop {
+            // A whole iteration's worst case is well under 128 steps; leave
+            // that much headroom rather than risk overrunning the budget.
+            // Decline outright (rather than report zero progress) when even
+            // the first iteration doesn't fit: `remaining_steps` is a
+            // whole-call budget that legitimately runs this low near a
+            // slice boundary, and `run.rs`'s caller re-enters unconditionally
+            // on `Some(_)` — returning `Some(0)` here would spin forever
+            // re-checking the same unmet budget instead of falling through
+            // to the interpreter, which correctly drains the last steps.
+            if steps + 128 > remaining_steps {
+                if steps == 0 {
+                    return None;
+                }
+                frame.instruction = entry_pc;
+                return Some(steps);
+            }
+            // Replicates `Instruction::NextLocalListIteration`'s own fused
+            // has-next-and-fetch semantics (`execution/interpreter.rs`)
+            // exactly, since the dead bytecode padding this trace matched
+            // is never actually dispatched at runtime.
+            let Some(Value::List(list)) = frame.locals.get(usize::from(body.list_slot)).cloned()
+            else {
+                return None;
+            };
+            let Some(Value::Number(index)) =
+                frame.locals.get(usize::from(body.index_slot)).cloned()
+            else {
+                return None;
+            };
+            let Ok(values) = state.heap.list(list) else {
+                return None;
+            };
+            let length = values.len();
+            if index.to_f32() > dm_list_length_number(length) {
+                steps += 1;
+                frame.instruction = body.exit_pc;
+                return Some(steps);
+            }
+            let Ok(positional_index) = value_to_list_index(&Value::Number(index)) else {
+                return None;
+            };
+            let Ok(item) = values.get(positional_index).cloned() else {
+                return None;
+            };
+            let item = canonicalize_owned_value(&state.heap, item);
+            let Value::Datum(corner) = item else {
+                return None;
+            };
+            if let Some(Value::List(reference)) = frame.locals.get(usize::from(body.item_slot))
+                && state.reference_lists.contains(reference)
+            {
+                // The rare reference-list aliasing path `NextLocalListIteration`
+                // itself handles — decline rather than duplicate that here.
+                return None;
+            }
+            frame.locals[usize::from(body.item_slot)] = Value::Datum(corner);
+            steps += 1;
+
+            let corner_x = datum_field_or_shared(state, corner, &body.corner_x)
+                .ok()?
+                .as_number()?;
+            let corner_y = datum_field_or_shared(state, corner, &body.corner_y)
+                .ok()?
+                .as_number()?;
+            let turf_x = frame
+                .locals
+                .get(usize::from(body.turf_x_local))?
+                .as_number()?;
+            let turf_y = frame
+                .locals
+                .get(usize::from(body.turf_y_local))?
+                .as_number()?;
+            let light_outer_range = datum_field_or_shared(state, src, &body.light_outer_range)
+                .ok()?
+                .as_number()?;
+            let range_divisor = frame
+                .locals
+                .get(usize::from(body.range_divisor_local))?
+                .as_number()?;
+            let light_falloff_curve = datum_field_or_shared(state, src, &body.light_falloff_curve)
+                .ok()?
+                .as_number()?;
+            let light_power = frame
+                .locals
+                .get(usize::from(body.light_power_local))?
+                .as_number()?;
+            steps += 38;
+
+            // LUM_FALLOFF(corner) * (_light_power ** 2) * sign(_light_power)
+            let distance = ((corner_x - turf_x).powi(2) + (corner_y - turf_y).powi(2)).powf(0.5);
+            let falloff = (-((distance - light_outer_range) / range_divisor))
+                .clamp(0.0, 1.0)
+                .powf(light_falloff_curve);
+            let mut delta = falloff * light_power.powi(2);
+            if light_power < 0.0 {
+                delta = -delta;
+                steps += 4;
+            } else {
+                steps += 2;
+            }
+
+            // var/OLD = effect_str[corner]
+            let Value::List(effect_str_list) =
+                datum_field_or_shared(state, src, &body.effect_str).ok()?
+            else {
+                return None;
+            };
+            let old =
+                match read_list_value(&state.heap, effect_str_list, &Value::Datum(corner), false) {
+                    Ok(Value::Number(n)) => n.to_f32(),
+                    Ok(Value::Null) | Err(ValueError::MissingKey) => 0.0,
+                    _ => return None,
+                };
+            let lum_r = frame
+                .locals
+                .get(usize::from(body.lum_r_local))?
+                .as_number()?;
+            let applied_lum_r = frame
+                .locals
+                .get(usize::from(body.applied_lum_r_local))?
+                .as_number()?;
+            let lum_g = frame
+                .locals
+                .get(usize::from(body.lum_g_local))?
+                .as_number()?;
+            let applied_lum_g = frame
+                .locals
+                .get(usize::from(body.applied_lum_g_local))?
+                .as_number()?;
+            let lum_b = frame
+                .locals
+                .get(usize::from(body.lum_b_local))?
+                .as_number()?;
+            let applied_lum_b = frame
+                .locals
+                .get(usize::from(body.applied_lum_b_local))?
+                .as_number()?;
+            let arg_r = delta.mul_add(lum_r, -(old * applied_lum_r));
+            let arg_g = delta.mul_add(lum_g, -(old * applied_lum_g));
+            let arg_b = delta.mul_add(lum_b, -(old * applied_lum_b));
+            steps += 35;
+
+            // corner.update_lumcount(arg_r, arg_g, arg_b) — resolved through
+            // the exact same callsite cache the interpreter itself would
+            // populate/hit for this bytecode position, then driven through
+            // the shared `LumcountTrace` cache rather than a real call.
+            let Ok((target, _context)) = dynamic_call_target_named_at_callsite(
+                module,
+                state,
+                &Value::Datum(corner),
+                "update_lumcount",
+                &caller_context,
+                false,
+                Some((procedure, entry_pc + 79)),
+            ) else {
+                return None;
+            };
+            let lum_result = LUMCOUNT_JIT_CACHE.with(|lumcount_cache| {
+                let mut lumcount_cache = lumcount_cache.borrow_mut();
+                let trace = lumcount_cache
+                    .entry((module.identity.0, target))
+                    .or_insert_with(|| {
+                        let target_program = module.resolve_procedure(target).ok()?;
+                        compile_lumcount_trace(target_program)
+                    });
+                let trace = trace.as_ref()?;
+                if arg_r == 0.0 && arg_g == 0.0 && arg_b == 0.0 {
+                    return Some(0.0);
+                }
+                let field_values: SmallVec<[f32; 8]> = trace
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        datum_field_or_initial(state, corner, field)
+                            .ok()?
+                            .as_number()
+                    })
+                    .collect::<Option<_>>()?;
+                let mut numeric_state = trace
+                    .compiled
+                    .initial_state_with_fields(&[arg_r, arg_g, arg_b, 0.0], &field_values)?;
+                let outcome = trace.compiled.run_budgeted(
+                    &mut numeric_state,
+                    64,
+                    &mut NoDynamicFieldAccess,
+                )?;
+                for (index, field) in trace.fields.iter().enumerate() {
+                    if numeric_state.dirty_fields & (1_u64 << index) != 0 {
+                        state
+                            .heap
+                            .set_datum_field(
+                                corner,
+                                field.clone(),
+                                Value::number(numeric_state.fields[index]),
+                            )
+                            .ok()?;
+                    }
+                }
+                if numeric_state.action_bits & 1 != 0 {
+                    let Value::Datum(lighting) = state.global(&trace.lighting_global)?.clone()
+                    else {
+                        return None;
+                    };
+                    let Value::List(queue) =
+                        datum_field_or_initial(state, lighting, &trace.queue_field).ok()?
+                    else {
+                        return None;
+                    };
+                    state.heap.list_mut(queue).ok()?.add(Value::Datum(corner));
+                }
+                let NumericRunOutcome::Returned { value, .. } = outcome else {
+                    return None;
+                };
+                Some(value)
+            });
+            let lum_result = lum_result?;
+            steps += 4;
+
+            if lum_result != 0.0 {
+                steps += 4;
+                let affecting_value = datum_field_or_shared(state, corner, &body.affecting).ok()?;
+                let affecting_list = if runtime_truthy(&state.heap, &affecting_value).ok()? {
+                    let Value::List(list) = affecting_value else {
+                        return None;
+                    };
+                    list
+                } else {
+                    let list = state.heap.allocate_list();
+                    state
+                        .heap
+                        .set_datum_field(corner, body.affecting.clone(), Value::List(list))
+                        .ok()?;
+                    steps += 3;
+                    list
+                };
+                state
+                    .heap
+                    .list_mut(affecting_list)
+                    .ok()?
+                    .add(Value::Datum(src));
+                let effect_str_is_associative = state.is_associative_list(effect_str_list);
+                write_list_value(
+                    &mut state.heap,
+                    effect_str_list,
+                    Value::Datum(corner),
+                    Value::number(lum_result),
+                    effect_str_is_associative,
+                )
+                .ok()?;
+                steps += 12;
+            }
+
+            let next_index = index.to_f32() + 1.0;
+            frame.locals[usize::from(body.index_slot)] = Value::number(next_index);
+            steps += 5;
+        }
     })
 }
 

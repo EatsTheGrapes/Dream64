@@ -13,7 +13,7 @@ use std::time::Instant;
 use smallvec::SmallVec;
 
 use crate::builtins;
-use crate::bytecode::{InstanceInitializer, Module, ProcedureId};
+use crate::bytecode::{InstanceInitializer, Module, ProcedureId, Program};
 use crate::{
     AtomsProfile, ClientState, DmmMeasurement, GlobalStore, NativeWalk, ParsedDmm, SavefileState,
     ScheduledSpawn, TgmProfile, datum_field_or_initial, datum_shared_storage,
@@ -105,6 +105,18 @@ impl FieldSlotCache {
     pub(crate) fn tracked_type_count(&self) -> usize {
         self.entries.len()
     }
+}
+
+/// Per-instruction self-time step counts for exactly one procedure, locked
+/// on by `ExecutionState::maybe_start_pc_profile` the first time a
+/// procedure's path matches `DREAM64_PROFILE_PROCEDURE_PCS`. Answers "which
+/// PCs within this one hot procedure are actually expensive" — finer
+/// granularity than the whole-procedure totals `proc_step_samples` gives,
+/// without hand-instrumenting the procedure itself.
+pub(crate) struct PcProfile {
+    procedure: ProcedureId,
+    module_identity: u64,
+    samples: Vec<u64>,
 }
 
 /// Mutable heap state shared by executions in one runtime world.
@@ -255,6 +267,10 @@ pub struct ExecutionState {
     /// Per-procedure self-time step counts. Populated only while
     /// `DREAM64_PROFILE_PROC_STEPS` is set.
     pub(crate) proc_step_samples: HashMap<ProcedureId, u64>,
+    /// Per-instruction self-time step counts for exactly one procedure,
+    /// selected by `DREAM64_PROFILE_PROCEDURE_PCS`. See
+    /// `maybe_start_pc_profile`.
+    pub(crate) pc_profile: Option<PcProfile>,
     /// Whole-boot instruction-category histogram. `Some` only while
     /// `DREAM64_PROFILE_INSTRUCTIONS` is set.
     pub(crate) instruction_profile: Option<Box<crate::StartupInstructionProfile>>,
@@ -381,6 +397,7 @@ impl ExecutionState {
             list_gc_elapsed: std::time::Duration::ZERO,
             total_executed_steps: 0,
             proc_step_samples: HashMap::new(),
+            pc_profile: None,
             instruction_profile: crate::instruction_profile_enabled()
                 .then(|| Box::new(crate::StartupInstructionProfile::default())),
             low_yield_collection_streak: 0,
@@ -516,6 +533,80 @@ impl ExecutionState {
             })
             .collect();
         rows.sort_unstable_by(|left, right| right.1.cmp(&left.1));
+        rows.truncate(limit);
+        rows
+    }
+
+    /// Locks per-instruction accounting onto `procedure` the first time its
+    /// path matches `DREAM64_PROFILE_PROCEDURE_PCS` — a no-op once a target
+    /// is already locked in, if the feature isn't enabled, or if this isn't
+    /// the target. Called once per procedure switch (not per instruction) by
+    /// `run_frames_inner`, which already resolves `program` there.
+    pub(crate) fn maybe_start_pc_profile(
+        &mut self,
+        module: &Module,
+        procedure: ProcedureId,
+        program: &Program,
+    ) {
+        if self.pc_profile.is_some() {
+            return;
+        }
+        let Some(needle) = crate::procedure_pc_profile_target() else {
+            return;
+        };
+        let path = module.procedure_path(procedure);
+        if !path.is_some_and(|path| path.contains(needle.as_str())) {
+            return;
+        }
+        eprintln!(
+            "boot-vm: pc-profile-begin procedure={}",
+            path.unwrap_or("<missing>")
+        );
+        self.pc_profile = Some(PcProfile {
+            procedure,
+            module_identity: module.identity.0,
+            samples: vec![0; program.instructions.len()],
+        });
+    }
+
+    /// Records `steps` against `pc` if `procedure` is the one
+    /// `maybe_start_pc_profile` locked onto — a no-op otherwise (including
+    /// when the feature isn't enabled at all, so this is safe to call
+    /// unconditionally from a hot loop).
+    pub(crate) fn record_pc_sample(
+        &mut self,
+        module_identity: u64,
+        procedure: ProcedureId,
+        pc: usize,
+        steps: u64,
+    ) {
+        let Some(profile) = &mut self.pc_profile else {
+            return;
+        };
+        if profile.module_identity != module_identity || profile.procedure != procedure {
+            return;
+        }
+        if let Some(slot) = profile.samples.get_mut(pc) {
+            *slot += steps;
+        }
+    }
+
+    /// `DREAM64_PROFILE_PROCEDURE_PCS` accounting: the `limit` instructions
+    /// with the most self-time steps within the one procedure profiling
+    /// locked onto, as `(pc, steps)` descending. Empty unless set and matched.
+    #[must_use]
+    pub fn pc_profile_top(&self, limit: usize) -> Vec<(usize, u64)> {
+        let Some(profile) = &self.pc_profile else {
+            return Vec::new();
+        };
+        let mut rows: Vec<(usize, u64)> = profile
+            .samples
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, steps)| *steps > 0)
+            .collect();
+        rows.sort_unstable_by_key(|row| std::cmp::Reverse(row.1));
         rows.truncate(limit);
         rows
     }

@@ -117,10 +117,11 @@ pub(crate) use profiling::{
     atoms_profile_snapshot_lines_if_due, boot_dashboard_enabled, boot_trace_enabled,
     dcs_trace_enabled, emit_atoms_profile, emit_tgm_profile, instr_category,
     instruction_profile_enabled, is_atoms_initialize_path, is_subsystem_initialize_path,
-    mark_boot_trace_frame, proc_step_profile_enabled, shuttle_trace_emit_snapshot,
-    shuttle_trace_enabled, shuttle_trace_prepare_call, shuttle_trace_slot_from_arguments,
-    slow_instruction_trace_threshold, startup_instruction_category,
-    startup_instruction_profile_enabled, startup_profile_enabled, tgm_profiling_enabled,
+    mark_boot_trace_frame, proc_step_profile_enabled, procedure_pc_profile_target,
+    shuttle_trace_emit_snapshot, shuttle_trace_enabled, shuttle_trace_prepare_call,
+    shuttle_trace_slot_from_arguments, slow_instruction_trace_threshold,
+    startup_instruction_category, startup_instruction_profile_enabled, startup_profile_enabled,
+    tgm_profiling_enabled,
 };
 
 #[cfg(test)]
@@ -148,7 +149,7 @@ pub(crate) use native::{
     canonical_type2parent_target, compile_region_trace_at, drive_ruin_candidate_scan,
     drive_tgm_load, execute_compact_fast_instruction, false_tick_check_target,
     numeric_dispatch_candidate, safe_call_resume_pc, set_world_numeric_field, trace_tgm_route,
-    try_run_build_coordinate_prefix, try_run_camera_chunk_fast_path,
+    try_run_build_coordinate_prefix, try_run_camera_chunk_fast_path, try_run_corner_apply_loop_jit,
     try_run_discover_offset_fast_path, try_run_dmm_preload_measurement_fast_path,
     try_run_guarded_jit, try_run_numeric_dispatch_block, try_run_numeric_local_update,
     try_run_numeric_loop_branch, try_run_parsed_dmm_new_fast_path, try_run_region_numeric_jit,
@@ -160,11 +161,11 @@ pub(crate) use native::{
 pub(crate) use native::{
     CANONICAL_MONKE_BUILD_COORDINATE_DIGEST, CANONICAL_TYPE2PARENT_SOURCE,
     REGISTER_SIGNAL_FAST_CACHE, build_tgm_load_continuation, cached_world_numeric_field,
-    canonical_type2parent_program, compile_lumcount_trace, compile_register_signal_trace,
-    compile_rooted_list_trace, discover_offset_native, jit_disabled, numeric_trace_instructions,
-    revalidated_ruin_rejection, ruin_scan_attach_at_call, run_ruin_affected_turfs_batch,
-    run_tgm_build_cache_simple_member, tgm_attach_location, try_run_packed_numeric_dispatch_block,
-    try_run_rich_numeric_dispatch_block,
+    canonical_type2parent_program, compile_corner_apply_body, compile_lumcount_trace,
+    compile_register_signal_trace, compile_rooted_list_trace, discover_offset_native, jit_disabled,
+    numeric_trace_instructions, revalidated_ruin_rejection, ruin_scan_attach_at_call,
+    run_ruin_affected_turfs_batch, run_tgm_build_cache_simple_member, tgm_attach_location,
+    try_run_packed_numeric_dispatch_block, try_run_rich_numeric_dispatch_block,
 };
 
 #[cfg(test)]

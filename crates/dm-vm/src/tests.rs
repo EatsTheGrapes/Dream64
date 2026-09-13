@@ -9008,9 +9008,11 @@ fn region_jit_async_compile_installs_a_correct_region_off_the_calling_thread() {
     // already-enqueued compile surface, with no sleep of this thread's own.
     // Bounded so a genuinely broken worker fails the test instead of hanging
     // it; a trivial one-line procedure's Cranelift compile finishing within
-    // this many calls is not a close margin.
+    // this many calls is not a close margin even under heavy parallel test
+    // load contending for the same background worker thread (each call here
+    // is microseconds, so even this many is still a fast test).
     let mut installed = false;
-    for n in 16..1000 {
+    for n in 16..50_000 {
         assert_eq!(
             execute_module_in_state(&module, entry, &[Value::number(n as f32)], &mut state),
             Ok(Value::number((n * 2) as f32)),
@@ -9026,7 +9028,7 @@ fn region_jit_async_compile_installs_a_correct_region_off_the_calling_thread() {
         "the background compile must eventually install a region"
     );
 
-    for n in 1000..1020 {
+    for n in 50_000..50_020 {
         assert_eq!(
             execute_module_in_state(&module, entry, &[Value::number(n as f32)], &mut state),
             Ok(Value::number((n * 2) as f32)),
@@ -22118,6 +22120,408 @@ fn lumcount_field_jit_matches_interpreter_and_queue_action() {
         ]
     );
     assert_eq!(native.2.len(), 1);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn corner_apply_loop_jit_matches_interpreter_and_calls_lumcount_natively() {
+    // Mirrors `/datum/light_source/proc/update_corners`' own
+    // `APPLY_CORNER`/`LAZYADD` inner loop shape exactly (field names,
+    // expression structure, the call into `update_lumcount`) so this
+    // exercises `compile_corner_apply_body`/`try_run_corner_apply_loop_jit`
+    // for real, not a shape that happens to fall back to interpretation.
+    let syntax = parse(concat!(
+        "/datum/lighting_corner/proc/update_lumcount(delta_r, delta_g, delta_b)\n",
+        "\tif(!(delta_r || delta_g || delta_b))\n\t\treturn\n",
+        "\tlum_r += delta_r\n\tlum_g += delta_g\n\tlum_b += delta_b\n",
+        "\tif(!needs_update)\n\t\tneeds_update = 1\n",
+        "\t\tSSlighting.corners_queue += src\n",
+        "/datum/light_source/proc/apply_corners(list/new_corners)\n",
+        "\tvar/_turf_x = pixel_turf.x\n",
+        "\tvar/_turf_y = pixel_turf.y\n",
+        "\tvar/_range_divisor = 1\n",
+        "\tvar/_light_power = light_power\n",
+        "\tvar/_applied_lum_r = applied_lum_r\n",
+        "\tvar/_applied_lum_g = applied_lum_g\n",
+        "\tvar/_applied_lum_b = applied_lum_b\n",
+        "\tvar/_lum_r = lum_r\n",
+        "\tvar/_lum_g = lum_g\n",
+        "\tvar/_lum_b = lum_b\n",
+        "\tfor(var/datum/lighting_corner/corner as anything in new_corners)\n",
+        "\t\t. = clamp(-((((corner.x - _turf_x) ** 2 + (corner.y - _turf_y) ** 2) ** 0.5 - light_outer_range) / _range_divisor), 0, 1) ** light_falloff_curve\n",
+        "\t\t. *= (_light_power ** 2)\n",
+        "\t\t. *= _light_power < 0 ? -1 : 1\n",
+        "\t\tvar/OLD = effect_str[corner]\n",
+        "\t\tcorner.update_lumcount((. * _lum_r) - (OLD * _applied_lum_r), (. * _lum_g) - (OLD * _applied_lum_g), (. * _lum_b) - (OLD * _applied_lum_b))\n",
+        "\t\tif (. != 0)\n",
+        "\t\t\tif (!corner.affecting)\n",
+        "\t\t\t\tcorner.affecting = list()\n",
+        "\t\t\tcorner.affecting += src\n",
+        "\t\t\teffect_str[corner] = .\n",
+    ))
+    .unwrap();
+    let module = compile_module_specs(&[
+        ProcedureSpec {
+            path: "/datum/lighting_corner/proc/update_lumcount".to_owned(),
+            definition: &syntax.definitions[0],
+            parent: None,
+            static_calls: BTreeMap::new(),
+            src_fields: BTreeMap::from([
+                ("lum_r".to_owned(), field("lum_r")),
+                ("lum_g".to_owned(), field("lum_g")),
+                ("lum_b".to_owned(), field("lum_b")),
+                ("needs_update".to_owned(), field("needs_update")),
+            ]),
+            global_fields: BTreeMap::from([("SSlighting".to_owned(), field("SSlighting"))]),
+        },
+        ProcedureSpec {
+            path: "/datum/light_source/proc/apply_corners".to_owned(),
+            definition: &syntax.definitions[1],
+            parent: None,
+            static_calls: BTreeMap::new(),
+            src_fields: BTreeMap::from([
+                ("light_power".to_owned(), field("light_power")),
+                ("applied_lum_r".to_owned(), field("applied_lum_r")),
+                ("applied_lum_g".to_owned(), field("applied_lum_g")),
+                ("applied_lum_b".to_owned(), field("applied_lum_b")),
+                ("lum_r".to_owned(), field("lum_r")),
+                ("lum_g".to_owned(), field("lum_g")),
+                ("lum_b".to_owned(), field("lum_b")),
+                ("light_outer_range".to_owned(), field("light_outer_range")),
+                (
+                    "light_falloff_curve".to_owned(),
+                    field("light_falloff_curve"),
+                ),
+                ("effect_str".to_owned(), field("effect_str")),
+                ("pixel_turf".to_owned(), field("pixel_turf")),
+            ]),
+            global_fields: BTreeMap::new(),
+        },
+    ])
+    .unwrap();
+    let lumcount_entry = module
+        .procedure_id("/datum/lighting_corner/proc/update_lumcount")
+        .unwrap();
+    assert!(
+        crate::compile_lumcount_trace(&module.procedures[lumcount_entry.index()]).is_some(),
+        "the callee must still match the canonical lumcount shape for this test to mean anything"
+    );
+    let entry = module
+        .procedure_id("/datum/light_source/proc/apply_corners")
+        .unwrap();
+    let program = &module.procedures[entry.index()];
+    let corner_loop_pc = program
+        .instructions
+        .iter()
+        .position(|instruction| matches!(instruction, Instruction::NextLocalListIteration { .. }))
+        .expect("the for/in loop compiles to NextLocalListIteration");
+    assert!(
+        crate::compile_corner_apply_body(program, corner_loop_pc).is_some(),
+        "the corner-apply loop must match its own canonical shape for this \
+         test to exercise the native path rather than only proving the \
+         interpreter itself correct: instructions={:#?}",
+        program.instructions
+    );
+
+    let mut reference = module.clone();
+    reference.identity = crate::next_module_identity();
+    Arc::make_mut(&mut reference.procedures[entry.index()])
+        .instructions
+        .push(Instruction::PushNull);
+
+    let run = |module: &Module| {
+        let mut state = ExecutionState::new();
+        let turf = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/turf").unwrap());
+        state
+            .heap_mut()
+            .set_datum_field(turf, field("x"), Value::number(10.0))
+            .unwrap();
+        state
+            .heap_mut()
+            .set_datum_field(turf, field("y"), Value::number(20.0))
+            .unwrap();
+        let light_source = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/light_source").unwrap());
+        for (name, value) in [
+            ("light_power", 3.0),
+            ("applied_lum_r", 0.1),
+            ("applied_lum_g", 0.2),
+            ("applied_lum_b", 0.3),
+            ("lum_r", 1.0),
+            ("lum_g", 2.0),
+            ("lum_b", 3.0),
+            ("light_outer_range", 5.0),
+            ("light_falloff_curve", 1.0),
+        ] {
+            state
+                .heap_mut()
+                .set_datum_field(light_source, field(name), Value::number(value))
+                .unwrap();
+        }
+        state
+            .heap_mut()
+            .set_datum_field(light_source, field("pixel_turf"), Value::Datum(turf))
+            .unwrap();
+        let effect_str = state.heap_mut().allocate_list();
+        state.mark_associative_list(effect_str);
+        state
+            .heap_mut()
+            .set_datum_field(light_source, field("effect_str"), Value::List(effect_str))
+            .unwrap();
+        let lighting = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/controller/subsystem/lighting").unwrap());
+        let queue = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .set_datum_field(lighting, field("corners_queue"), Value::List(queue))
+            .unwrap();
+        state.set_global(field("SSlighting"), Value::Datum(lighting));
+        // Two corners: one close (nonzero falloff, exercises the whole
+        // LAZYADD+effect_str-write branch) and one far outside
+        // `light_outer_range` (zero falloff, exercises the skip branch).
+        let near = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/lighting_corner").unwrap());
+        let far = state
+            .heap_mut()
+            .allocate_datum(TypePath::parse("/datum/lighting_corner").unwrap());
+        for (corner, x, y) in [(near, 11.0, 20.0), (far, 200.0, 200.0)] {
+            state
+                .heap_mut()
+                .set_datum_field(corner, field("x"), Value::number(x))
+                .unwrap();
+            state
+                .heap_mut()
+                .set_datum_field(corner, field("y"), Value::number(y))
+                .unwrap();
+            for name in ["lum_r", "lum_g", "lum_b"] {
+                state
+                    .heap_mut()
+                    .set_datum_field(corner, field(name), Value::number(0.0))
+                    .unwrap();
+            }
+            state
+                .heap_mut()
+                .set_datum_field(corner, field("needs_update"), Value::number(0.0))
+                .unwrap();
+        }
+        let new_corners = state.heap_mut().allocate_list();
+        state
+            .heap_mut()
+            .list_mut(new_corners)
+            .unwrap()
+            .add(Value::Datum(near));
+        state
+            .heap_mut()
+            .list_mut(new_corners)
+            .unwrap()
+            .add(Value::Datum(far));
+        let result = execute_module_in_context(
+            module,
+            entry,
+            &[Value::List(new_corners)],
+            &mut state,
+            &ExecutionContext::new(Value::Datum(light_source), Value::Null),
+        )
+        .unwrap();
+        let near_lum = ["lum_r", "lum_g", "lum_b", "needs_update"]
+            .map(|name| datum_field_or_initial(&state, near, &field(name)).unwrap());
+        let far_lum = ["lum_r", "lum_g", "lum_b", "needs_update"]
+            .map(|name| datum_field_or_initial(&state, far, &field(name)).unwrap());
+        // `update_lumcount`'s own canonical shape always returns exactly
+        // 0.0 (every one of its `Return`s pushes a literal `Constant(0.0)`
+        // first — confirmed by reading its compiled trace directly, not
+        // assumed), so `if (. != 0)` right after the call is unreachable
+        // for *any* corner regardless of falloff — the `LAZYADD`/
+        // `effect_str[corner] = .` block this loop's own canonical shape
+        // carries is genuinely dead code for this exact receiver type, on
+        // real Monkestation as much as here. Confirming that stays true —
+        // not just assumed — is itself part of what this test proves: both
+        // corners' `affecting`/`effect_str` entries must stay exactly as
+        // untouched as they started (never declared, never written).
+        let near_affecting = datum_field_or_initial(&state, near, &field("affecting"));
+        let far_affecting = datum_field_or_initial(&state, far, &field("affecting"));
+        let near_effect = crate::read_list_value(
+            state.heap(),
+            effect_str,
+            &Value::Datum(near),
+            state.is_associative_list(effect_str),
+        );
+        let far_effect = crate::read_list_value(
+            state.heap(),
+            effect_str,
+            &Value::Datum(far),
+            state.is_associative_list(effect_str),
+        );
+        let queued = state
+            .heap()
+            .list(queue)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        (
+            result,
+            near_lum,
+            far_lum,
+            near_affecting.is_ok(),
+            far_affecting.is_ok(),
+            near_effect.is_ok(),
+            far_effect.is_ok(),
+            queued,
+        )
+    };
+    let native = run(&module);
+    let interpreted = run(&reference);
+    assert_eq!(native, interpreted);
+    // The near corner has a real (nonzero) falloff, so `update_lumcount`
+    // must have run its real logic and accumulated real deltas into
+    // lum_r/g/b, flagged needs_update, and queued itself on SSlighting; the
+    // far corner's falloff is exactly zero (outside light_outer_range,
+    // clamped to 0 before the power), so update_lumcount must see all-zero
+    // arguments and its own zero-delta short-circuit must leave every one
+    // of its fields — and the queue — untouched.
+    assert_eq!(
+        native.1,
+        [
+            Value::number(9.0),
+            Value::number(18.0),
+            Value::number(27.0),
+            Value::number(1.0),
+        ]
+    );
+    assert_eq!(
+        native.2,
+        [
+            Value::number(0.0),
+            Value::number(0.0),
+            Value::number(0.0),
+            Value::number(0.0),
+        ]
+    );
+    assert!(
+        !native.3,
+        "affecting must never be declared on either corner"
+    );
+    assert!(
+        !native.4,
+        "affecting must never be declared on either corner"
+    );
+    assert!(
+        !native.5,
+        "effect_str must never gain an entry for either corner"
+    );
+    assert!(
+        !native.6,
+        "effect_str must never gain an entry for either corner"
+    );
+    assert_eq!(
+        native.7.len(),
+        1,
+        "only the near corner (the one whose needs_update flag actually \
+         flipped) must be queued"
+    );
+}
+
+#[test]
+fn corner_apply_loop_jit_declines_rather_than_spin_on_a_starved_budget() {
+    // Regression: a `remaining_steps` too small for even one iteration must
+    // decline (`None`) so the interpreter drains the last of the budget,
+    // not report `Some(0)` — `run.rs`'s caller re-enters unconditionally on
+    // `Some(_)`, so reporting zero progress with an unmet budget spun
+    // forever on a real boot (caught by a hung boot-parity benchmark, not
+    // by any test — this reproduces it at the unit level).
+    let syntax = parse(concat!(
+        "/datum/light_source/proc/apply_corners(list/new_corners)\n",
+        "\tvar/_turf_x = pixel_turf.x\n",
+        "\tvar/_turf_y = pixel_turf.y\n",
+        "\tvar/_range_divisor = 1\n",
+        "\tvar/_light_power = light_power\n",
+        "\tvar/_applied_lum_r = applied_lum_r\n",
+        "\tvar/_applied_lum_g = applied_lum_g\n",
+        "\tvar/_applied_lum_b = applied_lum_b\n",
+        "\tvar/_lum_r = lum_r\n",
+        "\tvar/_lum_g = lum_g\n",
+        "\tvar/_lum_b = lum_b\n",
+        "\tfor(var/datum/lighting_corner/corner as anything in new_corners)\n",
+        "\t\t. = clamp(-((((corner.x - _turf_x) ** 2 + (corner.y - _turf_y) ** 2) ** 0.5 - light_outer_range) / _range_divisor), 0, 1) ** light_falloff_curve\n",
+        "\t\t. *= (_light_power ** 2)\n",
+        "\t\t. *= _light_power < 0 ? -1 : 1\n",
+        "\t\tvar/OLD = effect_str[corner]\n",
+        "\t\tcorner.update_lumcount((. * _lum_r) - (OLD * _applied_lum_r), (. * _lum_g) - (OLD * _applied_lum_g), (. * _lum_b) - (OLD * _applied_lum_b))\n",
+        "\t\tif (. != 0)\n",
+        "\t\t\tif (!corner.affecting)\n",
+        "\t\t\t\tcorner.affecting = list()\n",
+        "\t\t\tcorner.affecting += src\n",
+        "\t\t\teffect_str[corner] = .\n",
+    ))
+    .unwrap();
+    let module = compile_module_specs(&[ProcedureSpec {
+        path: "/datum/light_source/proc/apply_corners".to_owned(),
+        definition: &syntax.definitions[0],
+        parent: None,
+        static_calls: BTreeMap::new(),
+        src_fields: BTreeMap::from([
+            ("light_power".to_owned(), field("light_power")),
+            ("applied_lum_r".to_owned(), field("applied_lum_r")),
+            ("applied_lum_g".to_owned(), field("applied_lum_g")),
+            ("applied_lum_b".to_owned(), field("applied_lum_b")),
+            ("lum_r".to_owned(), field("lum_r")),
+            ("lum_g".to_owned(), field("lum_g")),
+            ("lum_b".to_owned(), field("lum_b")),
+            ("light_outer_range".to_owned(), field("light_outer_range")),
+            (
+                "light_falloff_curve".to_owned(),
+                field("light_falloff_curve"),
+            ),
+            ("effect_str".to_owned(), field("effect_str")),
+            ("pixel_turf".to_owned(), field("pixel_turf")),
+        ]),
+        global_fields: BTreeMap::new(),
+    }])
+    .unwrap();
+    let entry = module
+        .procedure_id("/datum/light_source/proc/apply_corners")
+        .unwrap();
+    let program = &module.procedures[entry.index()];
+    let corner_loop_pc = program
+        .instructions
+        .iter()
+        .position(|instruction| matches!(instruction, Instruction::NextLocalListIteration { .. }))
+        .expect("the for/in loop compiles to NextLocalListIteration");
+    assert!(
+        crate::compile_corner_apply_body(program, corner_loop_pc).is_some(),
+        "the corner-apply loop must match its own canonical shape for this \
+         test to exercise the native path rather than trivially declining \
+         for an unrelated reason"
+    );
+    let mut state = ExecutionState::new();
+    let src = state
+        .heap_mut()
+        .allocate_datum(TypePath::parse("/datum/light_source").unwrap());
+    let new_corners = state.heap_mut().allocate_list();
+    let mut frame = make_frame(
+        entry,
+        program,
+        &[Value::List(new_corners)],
+        &ExecutionContext::new(Value::Datum(src), Value::Null),
+    );
+    frame.instruction = corner_loop_pc;
+    let result =
+        crate::try_run_corner_apply_loop_jit(&module, entry, program, &mut frame, 10, &mut state);
+    assert_eq!(
+        result, None,
+        "a budget under one iteration's headroom must decline, not report \
+         zero progress and risk the caller spinning forever"
+    );
+    assert_eq!(
+        frame.instruction, corner_loop_pc,
+        "declining must not move the frame past its own entry instruction"
+    );
 }
 
 #[test]

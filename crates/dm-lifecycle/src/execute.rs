@@ -1249,6 +1249,30 @@ impl PrecompiledLifecycle {
             })
     }
 
+    /// `DREAM64_PROFILE_PROCEDURE_PCS` accounting: the `limit` instructions
+    /// with the most self-time steps within the one procedure profiling
+    /// locked onto, as `steps=N pct=P.P instruction=PC`. `pct` is of that one
+    /// procedure's own total (not the whole boot), so it answers "where
+    /// within this procedure does the cost concentrate." Empty unless set
+    /// and matched.
+    #[must_use]
+    pub fn pc_profile_lines(&self, limit: usize) -> Vec<String> {
+        self.persistent_state
+            .as_ref()
+            .map_or_else(Vec::new, |state| {
+                let rows = state.pc_profile_top(usize::MAX);
+                let total = rows.iter().map(|(_, steps)| *steps).sum::<u64>().max(1);
+                rows.into_iter()
+                    .take(limit)
+                    .map(|(pc, steps)| {
+                        #[allow(clippy::cast_precision_loss)]
+                        let pct = (steps as f64 / total as f64) * 100.0;
+                        format!("steps={steps} pct={pct:.1} instruction={pc}")
+                    })
+                    .collect()
+            })
+    }
+
     /// Host duration of one current BYOND world tick for persistent pacing.
     #[must_use]
     pub fn persistent_tick_duration(&self) -> std::time::Duration {

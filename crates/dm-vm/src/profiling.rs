@@ -1117,6 +1117,21 @@ pub(crate) fn procedure_argument_trace_filter() -> &'static Option<String> {
     FILTER.get_or_init(|| std::env::var("DREAM64_TRACE_PROC_ARGS").ok())
 }
 
+/// `DREAM64_PROFILE_PROCEDURE_PCS=<path substring>` — when set, accumulates
+/// a per-instruction step count for the first procedure whose path contains
+/// the substring, instead of only the whole-procedure totals
+/// `DREAM64_PROFILE_PROC_STEPS` already gives. Answers "which part of this
+/// one hot procedure is actually expensive" — e.g. whether `update_corners`'
+/// cost concentrates in its `view()`-based turf scan or its corner-apply
+/// loop — without hand-instrumenting the procedure itself. See
+/// `ExecutionState::maybe_start_pc_profile`/`record_pc_sample`/`pc_profile_top`.
+pub(crate) fn procedure_pc_profile_target() -> Option<&'static String> {
+    static FILTER: OnceLock<Option<String>> = OnceLock::new();
+    FILTER
+        .get_or_init(|| std::env::var("DREAM64_PROFILE_PROCEDURE_PCS").ok())
+        .as_ref()
+}
+
 pub(crate) fn mark_boot_trace_frame(
     frame: &mut CallFrame,
     module: &Module,
