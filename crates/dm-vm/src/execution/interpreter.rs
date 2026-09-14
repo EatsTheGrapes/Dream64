@@ -336,10 +336,24 @@ pub(crate) fn dispatch_instruction(
                     // Their collector sees the nested frames, so explicitly
                     // retain this interpreter's frames until initialization
                     // returns (notably InitAtom's reusable arglist list).
+                    let profiled = crate::profiling::datum_alloc_profile_enabled();
+                    let started = profiled.then(std::time::Instant::now);
                     let root_len = preserve_reentrant_frame_roots(state, frames);
+                    if let Some(started) = started {
+                        crate::profiling::DATUM_ALLOC_ROOTS_NS.fetch_add(
+                            started.elapsed().as_nanos() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                     let allocated =
                         allocate_or_replace_engine_datum(state, type_path.clone(), &arguments);
                     state.host_value_roots.truncate(root_len);
+                    if let Some(started) = started {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        crate::profiling::DATUM_ALLOC_TOTAL_NS
+                            .fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+                        crate::profiling::DATUM_ALLOC_COUNT.fetch_add(1, Relaxed);
+                    }
                     allocated.map_err(|message| execution_error(module, frames, message))?
                 };
                 Value::Datum(datum)
