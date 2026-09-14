@@ -326,6 +326,29 @@ fn report_boot_profiles(precompiled: &dm_lifecycle::PrecompiledLifecycle, at: &s
     eprintln!(
         "boot-profile at={at} jit_guarded numeric_compiled={compiled_numeric} numeric_rejected={rejected_numeric} lumcount_compiled={compiled_lumcount} lumcount_rejected={rejected_lumcount} runs={jit_runs} steps={jit_steps}"
     );
+    let (alloc_count, alloc_total_ns, alloc_roots_ns, alloc_init_ns, alloc_init_count) =
+        dm_vm::datum_alloc_telemetry();
+    if alloc_count > 0 {
+        eprintln!(
+            "boot-profile at={at} datum_alloc allocations={alloc_count} total_ms={} per_alloc_ns={} roots_ms={} roots_pct={} initializer_ms={} initializer_pct={} initializer_programs={alloc_init_count} programs_per_alloc={}",
+            alloc_total_ns / 1_000_000,
+            alloc_total_ns.checked_div(alloc_count).unwrap_or(0),
+            alloc_roots_ns / 1_000_000,
+            alloc_roots_ns
+                .saturating_mul(100)
+                .checked_div(alloc_total_ns)
+                .unwrap_or(0),
+            alloc_init_ns / 1_000_000,
+            alloc_init_ns
+                .saturating_mul(100)
+                .checked_div(alloc_total_ns)
+                .unwrap_or(0),
+            alloc_init_count
+                .saturating_mul(100)
+                .checked_div(alloc_count)
+                .unwrap_or(0),
+        );
+    }
     eprintln!(
         "boot-profile at={at} numeric_blocks entries={block_entries} steps={block_steps} avg={} len_1_4={} len_5_16={} len_17_64={} len_65_256={} len_257up={} packed_entries={packed_entries} packed_declines={packed_declines}",
         block_steps.checked_div(block_entries).unwrap_or(0),

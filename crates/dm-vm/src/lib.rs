@@ -111,6 +111,7 @@ pub(crate) use value_ops::{
 };
 
 pub use profiling::StartupInstructionProfile;
+pub use profiling::datum_alloc_telemetry;
 pub(crate) use profiling::{
     AtomsProfile, AtomsProfileInstruction, AtomsProfileProcedure, InstrCategory,
     STARTUP_INSTRUCTION_CATEGORY_COUNT, ShuttleTracePostReturn, TgmProfile, atoms_profile_enabled,

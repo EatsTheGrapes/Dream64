@@ -528,6 +528,8 @@ pub(crate) fn initialize_existing_datum(
                 let module = initializer_module
                     .as_ref()
                     .ok_or_else(|| "runtime instance initializer module is absent".to_owned())?;
+                let started =
+                    crate::profiling::datum_alloc_profile_enabled().then(std::time::Instant::now);
                 let value = execute_module_in_context(
                     module,
                     entry,
@@ -536,6 +538,12 @@ pub(crate) fn initialize_existing_datum(
                     &ExecutionContext::new(Value::Datum(datum), Value::Null),
                 )
                 .map_err(|error| error.to_string())?;
+                if let Some(started) = started {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    crate::profiling::DATUM_ALLOC_INITIALIZER_NS
+                        .fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+                    crate::profiling::DATUM_ALLOC_INITIALIZER_COUNT.fetch_add(1, Relaxed);
+                }
                 (field, value)
             }
         };

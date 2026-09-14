@@ -8,6 +8,7 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use crate::{CallFrame, ExecutionState, Module, ProcedureId};
@@ -536,6 +537,42 @@ pub(crate) fn startup_instruction_profile_enabled() -> bool {
 pub(crate) fn proc_step_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("DREAM64_PROFILE_PROC_STEPS").is_some())
+}
+
+/// Splits `AllocateDatum`'s cost, the instruction profile's most expensive
+/// per-operation category (~35us across ~1.12M allocations on a full boot).
+/// Gated by `DREAM64_PROFILE_DATUM_ALLOC`.
+///
+/// The open question this answers: that instruction re-enters the VM to run
+/// each type's runtime field initializers, so its measured time is an
+/// *envelope* around nested bytecode execution whose own instructions are
+/// already counted under their own categories. This separates the nested
+/// initializer execution from the engine-side allocation work, so the
+/// 39s attributed to this category can be read as either addressable
+/// overhead or double-counted interpretation.
+pub(crate) fn datum_alloc_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DREAM64_PROFILE_DATUM_ALLOC").is_some())
+}
+
+pub(crate) static DATUM_ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DATUM_ALLOC_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DATUM_ALLOC_ROOTS_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DATUM_ALLOC_INITIALIZER_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DATUM_ALLOC_INITIALIZER_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// `(allocations, total_ns, preserve_roots_ns, initializer_program_ns,
+/// initializer_programs_run)` for `DREAM64_PROFILE_DATUM_ALLOC` boots.
+#[must_use]
+pub fn datum_alloc_telemetry() -> (u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        DATUM_ALLOC_COUNT.load(Relaxed),
+        DATUM_ALLOC_TOTAL_NS.load(Relaxed),
+        DATUM_ALLOC_ROOTS_NS.load(Relaxed),
+        DATUM_ALLOC_INITIALIZER_NS.load(Relaxed),
+        DATUM_ALLOC_INITIALIZER_COUNT.load(Relaxed),
+    )
 }
 
 /// Whole-boot instruction-category histogram. Gated by

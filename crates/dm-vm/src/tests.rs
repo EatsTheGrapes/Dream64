@@ -9917,6 +9917,184 @@ fn declared_field_dense_slot_benchmark() {
 }
 
 #[test]
+#[ignore = "release-only datum-allocation phase benchmark"]
+fn datum_allocation_phase_benchmark() {
+    // A full boot spends ~39s across ~1.12M `new` allocations — ~35us each,
+    // the single most expensive per-operation cost in the instruction
+    // profile. `initialize_existing_datum` calls
+    // `ExecutionState::inherited_initial_values` on every non-compact
+    // allocation, and that walks the whole type-parent chain building a
+    // fresh `BTreeMap` (cloning each ancestor's entire defaults map) even
+    // though the result is identical for every instance of a type — unlike
+    // `instance_initializer_plan` right beside it, which caches per type.
+    // This splits the cost so the fix targets whatever actually dominates.
+    const ALLOCATIONS: usize = 20_000;
+
+    // A deliberately SS13-shaped hierarchy: a deep chain, with defaults
+    // declared at every level so inheritance has real work to merge.
+    let chain = [
+        "/datum",
+        "/atom",
+        "/atom/movable",
+        "/obj",
+        "/obj/item",
+        "/obj/item/weapon",
+        "/obj/item/weapon/sword",
+    ];
+    let mut parents = BTreeMap::new();
+    let mut initial_values = BTreeMap::new();
+    for (index, path) in chain.iter().enumerate() {
+        let path = TypePath::parse(path).unwrap();
+        let parent = index
+            .checked_sub(1)
+            .map(|parent| TypePath::parse(chain[parent]).unwrap());
+        parents.insert(path.clone(), parent);
+        // Six declared defaults per level -> 42 inherited fields at the
+        // leaf, inside the 20-40+ range SS13 atom types are documented to
+        // reach during Initialize().
+        let mut values = BTreeMap::new();
+        for slot in 0..6 {
+            values.insert(
+                field(&format!("level{index}_field{slot}")),
+                Value::number((index * 6 + slot) as f32),
+            );
+        }
+        initial_values.insert(path, values);
+    }
+    let leaf = TypePath::parse(chain[chain.len() - 1]).unwrap();
+
+    let mut state = ExecutionState::new();
+    state.set_type_parents(parents);
+    state.set_initial_values(initial_values);
+
+    let inherited_len = state.inherited_initial_values(&leaf).len();
+    let started = Instant::now();
+    for _ in 0..ALLOCATIONS {
+        std::hint::black_box(state.inherited_initial_values(&leaf));
+    }
+    let inherited = started.elapsed();
+
+    let started = Instant::now();
+    for _ in 0..ALLOCATIONS {
+        std::hint::black_box(crate::allocate_initialized_datum(&mut state, leaf.clone()).unwrap());
+    }
+    let full = started.elapsed();
+
+    let per = |total: std::time::Duration| total.as_secs_f64() / ALLOCATIONS as f64 * 1e9;
+    eprintln!(
+        "datum-alloc allocations={ALLOCATIONS} inherited_fields={inherited_len}\n  \
+         inherited_initial_values: per_call_ns={:>9.1} total_ms={:>6}\n  \
+         allocate_initialized_datum: per_call_ns={:>9.1} total_ms={:>6}\n  \
+         inherited share of allocation: {:.1}%",
+        per(inherited),
+        inherited.as_millis(),
+        per(full),
+        full.as_millis(),
+        inherited.as_secs_f64() / full.as_secs_f64() * 100.0,
+    );
+}
+
+#[test]
+#[ignore = "release-only region-entry cost benchmark"]
+fn region_entry_cost_benchmark() {
+    // A real boot performs ~2.17M region entries to retire only ~3.47M
+    // instructions natively — ~1.6 per entry, out of ~910M instructions
+    // total. At that ratio the per-entry cost, not the per-instruction
+    // speedup, decides whether the tier pays for itself, so measure the
+    // entry path directly: guard loop, locals vector, `initial_state_at`,
+    // the native call, and the exit handling.
+    //
+    // Two shapes, same measurement: one whose first dynamic op declines at
+    // runtime (a wasted entry — exactly what a boot does ~2.17M times), and
+    // one that runs to a native `Return` (a productive entry). Frame
+    // construction is timed separately and subtracted, since it happens
+    // whether or not a region exists.
+    const ENTRIES: usize = 200_000;
+
+    let declining_source =
+        parse(concat!("/datum/proc/doubled()\n", "\treturn value * 2\n",)).unwrap();
+    let declining = compile_module_specs(&[ProcedureSpec {
+        path: "/datum/proc/doubled".to_owned(),
+        definition: &declining_source.definitions[0],
+        parent: None,
+        static_calls: BTreeMap::new(),
+        src_fields: BTreeMap::from([("value".to_owned(), field("value"))]),
+        global_fields: BTreeMap::new(),
+    }])
+    .unwrap();
+    let productive_source = parse(concat!("/proc/arith(a, b)\n", "\treturn a * b + 1\n",)).unwrap();
+    let productive = compile_module(&productive_source.definitions).unwrap();
+
+    let mut state = ExecutionState::new();
+    // `value` stays unset, so it reads as null and `LoadFieldDynamic`
+    // declines — the region enters and side-exits having retired ~nothing.
+    let src = state
+        .heap_mut()
+        .allocate_datum(TypePath::parse("/datum/region_entry_cost_fixture").unwrap());
+
+    let measure = |state: &mut ExecutionState,
+                   module: &Module,
+                   path: &str,
+                   arguments: &[Value],
+                   context: &ExecutionContext|
+     -> (std::time::Duration, std::time::Duration, String) {
+        let entry = module.procedure_id(path).unwrap();
+        let program = module.procedure(entry).unwrap();
+        let region = crate::compile_region_trace_at(module, program, 0)
+            .expect("both fixtures must compile a region for this to measure anything");
+        // One untimed call to classify the outcome this shape produces.
+        let mut probe = make_frame(entry, program, arguments, context);
+        let outcome =
+            crate::try_run_region_numeric_jit(&region, program, &mut probe, 1_000, state, 0)
+                .expect("the region must be entered");
+        let shape = format!("{outcome:?}");
+
+        let started = Instant::now();
+        for _ in 0..ENTRIES {
+            let mut frame = make_frame(entry, program, arguments, context);
+            std::hint::black_box(crate::try_run_region_numeric_jit(
+                &region, program, &mut frame, 1_000, state, 0,
+            ));
+        }
+        let with_entry = started.elapsed();
+
+        let started = Instant::now();
+        for _ in 0..ENTRIES {
+            let mut frame = make_frame(entry, program, arguments, context);
+            std::hint::black_box(&mut frame);
+        }
+        let frame_only = started.elapsed();
+        (with_entry, frame_only, shape)
+    };
+
+    let context = ExecutionContext::new(Value::Datum(src), Value::Null);
+    let (wasted, wasted_frame, wasted_shape) =
+        measure(&mut state, &declining, "/datum/proc/doubled", &[], &context);
+    let (useful, useful_frame, useful_shape) = measure(
+        &mut state,
+        &productive,
+        "/proc/arith",
+        &[Value::number(3.0), Value::number(4.0)],
+        &ExecutionContext::default(),
+    );
+
+    let per_entry = |total: std::time::Duration, frame: std::time::Duration| {
+        (total.saturating_sub(frame)).as_secs_f64() / ENTRIES as f64 * 1e9
+    };
+    eprintln!(
+        "region-entry entries={ENTRIES}\n  \
+         wasted:     total_ms={:>6} frame_ms={:>6} per_entry_ns={:>8.1} outcome={wasted_shape}\n  \
+         productive: total_ms={:>6} frame_ms={:>6} per_entry_ns={:>8.1} outcome={useful_shape}",
+        wasted.as_millis(),
+        wasted_frame.as_millis(),
+        per_entry(wasted, wasted_frame),
+        useful.as_millis(),
+        useful_frame.as_millis(),
+        per_entry(useful, useful_frame),
+    );
+}
+
+#[test]
 fn list_gc_roots_materialized_args_across_scheduler_yield() {
     let syntax = parse(concat!(
         "/proc/work(value)\n",
