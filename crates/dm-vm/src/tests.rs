@@ -1669,6 +1669,106 @@ fn heap_gc_roots_engine_post_return_signal_graphs() {
 }
 
 #[test]
+fn heap_gc_roots_region_jit_rooted_operands() {
+    // Empirical proof for docs/performance/baseline-region-jit.md's
+    // "Operand model": a `Value` whose ONLY reference is a region's rooted-
+    // operand slot must survive a REAL collection, not just structurally
+    // "look safe" — this forces one via `next_list_collection = 1` (the
+    // same mechanism every other heap_gc_roots_* test uses) rather than
+    // reasoning about it. A completely unreferenced pair of a datum and a
+    // list act as a negative control: if the collection didn't actually
+    // run, they'd survive too, and this test would pass vacuously.
+    let syntax = parse("/proc/noop()\n\treturn\n").expect("frame fixture should parse");
+    let module = compile_module(&syntax.definitions).expect("frame fixture should compile");
+    let procedure = module.procedure_id("/proc/noop").unwrap();
+    let program = module.procedure(procedure).unwrap();
+    let mut state = ExecutionState::new();
+
+    let rooted_datum = state
+        .heap_mut()
+        .allocate_datum(TypePath::parse("/datum").unwrap());
+    let rooted_list = state.heap_mut().allocate_list();
+    let garbage_datum = state
+        .heap_mut()
+        .allocate_datum(TypePath::parse("/datum").unwrap());
+    let garbage_list = state.heap_mut().allocate_list();
+
+    let mut frame = make_frame(procedure, program, &[], &ExecutionContext::default());
+    assert!(
+        frame.rooted_operands().is_empty(),
+        "a fresh frame must start with no rooted operands"
+    );
+    frame.cold_mut().rooted_operands =
+        vec![Value::Datum(rooted_datum), Value::List(rooted_list)].into();
+
+    state.next_list_collection = 1;
+    state.maybe_collect_unreachable_lists(&[frame]);
+
+    assert!(
+        state.heap().datum(rooted_datum).is_ok(),
+        "a datum referenced only through rooted_operands must survive"
+    );
+    assert!(
+        state.heap().list(rooted_list).is_ok(),
+        "a list referenced only through rooted_operands must survive"
+    );
+    assert!(
+        state.heap().datum(garbage_datum).is_err(),
+        "an unreferenced datum must actually be reclaimed (proves the \
+         collection really ran, not a vacuous pass)"
+    );
+    assert!(
+        state.heap().list(garbage_list).is_err(),
+        "an unreferenced list must actually be reclaimed (proves the \
+         collection really ran, not a vacuous pass)"
+    );
+}
+
+#[test]
+fn heap_gc_roots_region_jit_rooted_operands_survive_a_side_exit() {
+    // The design doc's own safety claim: side-exiting mid-region does not
+    // pop the frame, so a rooted operand set before the side-exit stays
+    // rooted exactly like `locals`/`stack` afterward. Simulates that
+    // sequence directly: set rooted operands, mutate the frame the way a
+    // side-exit does (advance `instruction`, push onto `stack` as
+    // rematerialization would), then collect — the rooted value must still
+    // survive, and clearing the slot (as a completed region would once it
+    // no longer needs the value) must let it be reclaimed on the next pass.
+    let syntax = parse("/proc/noop()\n\treturn\n").expect("frame fixture should parse");
+    let module = compile_module(&syntax.definitions).expect("frame fixture should compile");
+    let procedure = module.procedure_id("/proc/noop").unwrap();
+    let program = module.procedure(procedure).unwrap();
+    let mut state = ExecutionState::new();
+
+    let rooted_datum = state
+        .heap_mut()
+        .allocate_datum(TypePath::parse("/datum").unwrap());
+
+    let mut frame = make_frame(procedure, program, &[], &ExecutionContext::default());
+    frame.cold_mut().rooted_operands = vec![Value::Datum(rooted_datum)].into();
+    frame.instruction = frame.instruction.saturating_add(1);
+    frame.stack.push(Value::number(1.0));
+
+    state.next_list_collection = 1;
+    state.maybe_collect_unreachable_lists(&[frame.clone()]);
+    assert!(
+        state.heap().datum(rooted_datum).is_ok(),
+        "a rooted operand must survive a collection reached after a \
+         simulated side-exit, not just at region entry"
+    );
+
+    frame.cold_mut().rooted_operands.clear();
+    assert!(frame.rooted_operands().is_empty());
+    state.next_list_collection = 1;
+    state.maybe_collect_unreachable_lists(&[frame]);
+    assert!(
+        state.heap().datum(rooted_datum).is_err(),
+        "once cleared and otherwise unreferenced, the value must actually \
+         be reclaimed on the next collection, not linger"
+    );
+}
+
+#[test]
 fn sized_list_construction_supports_gc_and_master_initialization_shapes() {
     let syntax = parse(
             "/proc/build_gc_queues(count)\n\tvar/list/queues = new /list(count)\n\tfor(var/i in 1 to count)\n\t\tqueues[i] = list()\n\treturn queues\n/proc/build_stages(count)\n\tvar/list/stages = new(count)\n\tfor(var/i in 1 to count)\n\t\tstages[i] = list(i)\n\treturn stages\n",

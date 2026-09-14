@@ -150,6 +150,16 @@ pub(crate) struct CallFrameCold {
     // the callee until it returns.
     pub(crate) pending_argument_roots: SmallVec<[Value; 2]>,
     pub(crate) retained_call_roots: SmallVec<[Value; 2]>,
+    // A region-JIT rooted-slot scratch array (docs/performance/
+    // baseline-region-jit.md's "Operand model"). Lives here, not on
+    // `ExecutionState`, so it's automatically covered by the exact same
+    // root-scan pass as `locals`/`stack` for as long as this frame stays in
+    // `frames`/`scheduled_spawns`/`scheduler_inflight` — GC in this engine
+    // only ever runs at a yield boundary where the complete frame set is
+    // already in hand, so a side-exit mid-region never loses rootedness.
+    // Currently unused by any compiled region (no codegen writes to it yet);
+    // this is the safety primitive alone, proven by a dedicated GC test.
+    pub(crate) rooted_operands: SmallVec<[Value; 4]>,
     pub(crate) exception_handlers: Vec<ExceptionHandler>,
     pub(crate) shuttle_trace_target: Option<DatumId>,
     pub(crate) shuttle_trace_post_return: Option<ShuttleTracePostReturn>,
@@ -215,6 +225,7 @@ impl CallFrameCold {
         self.pending_argument_names.is_none()
             && self.pending_argument_roots.is_empty()
             && self.retained_call_roots.is_empty()
+            && self.rooted_operands.is_empty()
             && self.exception_handlers.is_empty()
             && self.shuttle_trace_target.is_none()
             && self.shuttle_trace_post_return.is_none()
@@ -300,6 +311,11 @@ impl CallFrame {
         if !roots.is_empty() || self.cold.is_some() {
             self.cold_mut().retained_call_roots = roots;
         }
+    }
+
+    pub(crate) fn rooted_operands(&self) -> &[Value] {
+        self.cold()
+            .map_or(&[], |cold| cold.rooted_operands.as_slice())
     }
 
     pub(crate) fn exception_handlers(&self) -> &[ExceptionHandler] {

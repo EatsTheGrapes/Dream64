@@ -268,6 +268,7 @@ impl ExecutionState {
                     &mut list_roots,
                     current.retained_call_roots(),
                 );
+                extend_heap_root_ids(&mut datum_roots, &mut list_roots, current.rooted_operands());
                 if let Some(tgm) = current.cold().and_then(|cold| cold.tgm_load.as_ref()) {
                     extend_heap_root_ids(&mut datum_roots, &mut list_roots, tgm.roots());
                 }
