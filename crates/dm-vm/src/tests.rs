@@ -5419,6 +5419,440 @@ fn memoized_packed_run_verdict_matches_an_uncached_dispatch() {
     );
 }
 
+/// Attributes the cost of one instance-initializer invocation.
+///
+/// A full boot performs ~3.43M of these (~3.5 per datum allocation) for a
+/// measured ~21s, i.e. ~6.1us each, which is the single largest identified
+/// boot cost after `#98` corrected the `AllocateDatum` envelope. Each one
+/// evaluates ONE field's initializer expression through its own
+/// `execute_module_in_context` entry.
+///
+/// The question this decides: is that ~6.1us the expression work, or the
+/// per-entry overhead of re-entering the VM once per field? Fusing a type's
+/// initializers into one program only pays if it is the latter.
+///
+/// Measures three things against the same trivial expression:
+///   1. one `execute_module_in_context` entry (what the host pays per field),
+///   2. allocation of a datum whose type has no dynamic initializers,
+///   3. allocation of a datum whose type has four.
+/// (3 - 2) / 4 is the marginal cost of one initializer inside the real path.
+#[test]
+#[ignore = "local release benchmark: instance-initializer entry cost"]
+fn instance_initializer_entry_cost_benchmark() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    const ENTRIES: usize = 200_000;
+    const ALLOCATIONS: usize = 100_000;
+    const INITIALIZERS: usize = 4;
+
+    // Four separate one-expression procedures, exactly the shape
+    // `compile_initializer_program` produces: evaluate, return.
+    let source = parse(concat!(
+        "/proc/init_a()\n\treturn 1 + 1\n",
+        "/proc/init_b()\n\treturn 2 + 2\n",
+        "/proc/init_c()\n\treturn 3 + 3\n",
+        "/proc/init_d()\n\treturn 4 + 4\n",
+    ))
+    .expect("initializer sources parse");
+    let module =
+        Arc::new(compile_module(&source.definitions).expect("initializer module compiles"));
+    let entries = ["a", "b", "c", "d"].map(|suffix| {
+        module
+            .procedure_id(&format!("/proc/init_{suffix}"))
+            .expect("initializer entry exists")
+    });
+
+    let bare = TypePath::parse("/datum/bench_bare").unwrap();
+    let loaded = TypePath::parse("/datum/bench_loaded").unwrap();
+    let mut state = ExecutionState::new();
+    state.set_type_parents(BTreeMap::from([
+        (bare.clone(), None),
+        (loaded.clone(), None),
+    ]));
+    // The same four fields, once as VM programs and once as the specialized
+    // fresh-list form, so the difference isolates the VM entry.
+    let specialized = TypePath::parse("/datum/bench_specialized").unwrap();
+    state.set_type_parents(BTreeMap::from([
+        (bare.clone(), None),
+        (loaded.clone(), None),
+        (specialized.clone(), None),
+    ]));
+    state.set_instance_initializers(
+        Arc::new(BTreeMap::from([
+            (bare.clone(), Vec::new()),
+            (
+                loaded.clone(),
+                (0..INITIALIZERS)
+                    .map(|index| InstanceInitializer::Program {
+                        field: field(&format!("f{index}")),
+                        entry: entries[index],
+                    })
+                    .collect(),
+            ),
+            (
+                specialized.clone(),
+                (0..INITIALIZERS)
+                    .map(|index| InstanceInitializer::FreshList {
+                        field: field(&format!("f{index}")),
+                        values: Vec::new(),
+                    })
+                    .collect(),
+            ),
+        ])),
+        Some(Arc::clone(&module)),
+    );
+
+    // 1. Raw entry cost: what the host pays to evaluate one field.
+    let host = state.heap_mut().allocate_datum(bare.clone());
+    let context = ExecutionContext::new(Value::Datum(host), Value::Null);
+    let started = Instant::now();
+    for index in 0..ENTRIES {
+        let value = crate::execute_module_in_context(
+            &module,
+            entries[index % INITIALIZERS],
+            &[],
+            &mut state,
+            &context,
+        )
+        .expect("initializer entry runs");
+        black_box(value);
+    }
+    let entry_ns = started.elapsed().as_nanos() as f64 / ENTRIES as f64;
+
+    // Scaffolding floor: the per-entry `vec![make_frame(..)]` alone, with no
+    // run loop, no sidecar take/restore and no root push. Whatever this does
+    // NOT account for is the run-loop entry itself.
+    let program = module
+        .resolve_procedure(entries[0])
+        .expect("entry resolves");
+    let started = Instant::now();
+    for _ in 0..ENTRIES {
+        let frames = vec![crate::execution::make_frame(
+            entries[0],
+            program,
+            &[],
+            &context,
+        )];
+        black_box(&frames);
+    }
+    let frame_ns = started.elapsed().as_nanos() as f64 / ENTRIES as f64;
+
+    // 2/3. The real allocation path, with and without dynamic initializers.
+    let mut allocation_ns = [0.0_f64; 3];
+    for (slot, path) in [&bare, &loaded, &specialized].into_iter().enumerate() {
+        // Warm the per-type plan cache so the ancestor walk is not timed.
+        let warm = crate::value_ops::allocate_initialized_datum(&mut state, path.clone())
+            .expect("warm allocation succeeds");
+        black_box(warm);
+        let started = Instant::now();
+        for _ in 0..ALLOCATIONS {
+            let datum = crate::value_ops::allocate_initialized_datum(&mut state, path.clone())
+                .expect("benchmark allocation succeeds");
+            black_box(datum);
+        }
+        allocation_ns[slot] = started.elapsed().as_nanos() as f64 / ALLOCATIONS as f64;
+    }
+    let marginal_ns = (allocation_ns[1] - allocation_ns[0]) / INITIALIZERS as f64;
+
+    let specialized_marginal_ns = (allocation_ns[2] - allocation_ns[0]) / INITIALIZERS as f64;
+    eprintln!(
+        "instance-initializer-cost entry_ns={entry_ns:.0} frame_ns={frame_ns:.0} \
+bare_alloc_ns={:.0} program_alloc_ns={:.0} freshlist_alloc_ns={:.0} \
+marginal_program_ns={marginal_ns:.0} marginal_freshlist_ns={specialized_marginal_ns:.0} \
+host_value_roots={}",
+        allocation_ns[0],
+        allocation_ns[1],
+        allocation_ns[2],
+        state.host_value_root_count(),
+    );
+}
+
+/// The classifier must recognize exactly the closed
+/// `[<constant pushes>, MakeList(n), Return]` shape and nothing else.
+#[test]
+fn constant_list_initializer_shape_is_recognized_precisely() {
+    use crate::bytecode::Program;
+    fn program(instructions: Vec<Instruction>) -> Program {
+        Program {
+            wait_for: true,
+            parameter_count: 0,
+            parameter_names: Vec::new(),
+            verb_parameter_types: Vec::new(),
+            verb_name: None,
+            local_count: 0,
+            source_spans: vec![SourceSpan::new(0, 0); instructions.len()],
+            instructions,
+        }
+    }
+
+    // `list()` — the overwhelmingly common shape.
+    assert_eq!(
+        crate::initializer_constant_list_values(&program(vec![
+            Instruction::MakeListEntries(Vec::new()),
+            Instruction::Return,
+        ])),
+        Some(Vec::new())
+    );
+
+    // `list(1, "a", null)` — constant elements, in order.
+    assert_eq!(
+        crate::initializer_constant_list_values(&program(vec![
+            Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+            Instruction::PushText("a".into()),
+            Instruction::PushNull,
+            Instruction::MakeListEntries(vec![crate::bytecode::ListEntryKind::Positional; 3]),
+            Instruction::Return,
+        ])),
+        Some(vec![Value::number(1.0), Value::text("a"), Value::Null,])
+    );
+
+    // A non-constant element keeps its VM program: reading a field is a
+    // runtime operation, not structure.
+    assert_eq!(
+        crate::initializer_constant_list_values(&program(vec![
+            Instruction::LoadSrc,
+            Instruction::MakeListEntries(vec![crate::bytecode::ListEntryKind::Positional]),
+            Instruction::Return,
+        ])),
+        None
+    );
+
+    // Associative entries consume a key and a value and insert with
+    // `set_key`; that coercion stays in the interpreter.
+    assert_eq!(
+        crate::initializer_constant_list_values(&program(vec![
+            Instruction::PushText("k".into()),
+            Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+            Instruction::MakeListEntries(vec![crate::bytecode::ListEntryKind::Associative]),
+            Instruction::Return,
+        ])),
+        None
+    );
+
+    // Anything left on the stack beneath the list means the expression was
+    // not just this list, so the count guard must reject it.
+    assert_eq!(
+        crate::initializer_constant_list_values(&program(vec![
+            Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+            Instruction::PushNumber(DmNumberBits::from_f32(2.0)),
+            Instruction::MakeListEntries(vec![crate::bytecode::ListEntryKind::Positional]),
+            Instruction::Return,
+        ])),
+        None
+    );
+
+    // Not a list expression at all.
+    assert_eq!(
+        crate::initializer_constant_list_values(&program(vec![
+            Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+            Instruction::Return,
+        ])),
+        None
+    );
+}
+
+/// The whole reason this cannot be an `InstanceInitializer::Constant`: every
+/// instance must get its own list identity, and mutating one must not be
+/// visible through another.
+#[test]
+fn fresh_list_initializers_give_each_instance_its_own_list() {
+    let path = TypePath::parse("/datum/fresh_list_owner").unwrap();
+    let mut state = ExecutionState::new();
+    state.set_type_parents(BTreeMap::from([(path.clone(), None)]));
+    state.set_instance_initializers(
+        Arc::new(BTreeMap::from([(
+            path.clone(),
+            vec![InstanceInitializer::FreshList {
+                field: field("contents_like"),
+                values: vec![Value::number(1.0)],
+            }],
+        )])),
+        None,
+    );
+
+    let first = crate::value_ops::allocate_initialized_datum(&mut state, path.clone()).unwrap();
+    let second = crate::value_ops::allocate_initialized_datum(&mut state, path.clone()).unwrap();
+    let Ok(Value::List(first_list)) = state.heap().datum_field(first, &field("contents_like"))
+    else {
+        panic!("first instance should hold a list");
+    };
+    let Ok(Value::List(second_list)) = state.heap().datum_field(second, &field("contents_like"))
+    else {
+        panic!("second instance should hold a list");
+    };
+    let (first_list, second_list) = (*first_list, *second_list);
+    assert_ne!(
+        first_list, second_list,
+        "each instance must receive a distinct list identity"
+    );
+
+    // The declared constant element is present, in order.
+    assert_eq!(
+        state
+            .heap()
+            .list(first_list)
+            .unwrap()
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>(),
+        vec![Value::number(1.0)]
+    );
+
+    // Mutating one instance's list is invisible to the other.
+    state
+        .heap_mut()
+        .list_mut(first_list)
+        .unwrap()
+        .add(Value::number(99.0));
+    assert_eq!(state.heap().list(first_list).unwrap().len(), 2);
+    assert_eq!(state.heap().list(second_list).unwrap().len(), 1);
+}
+
+/// Specializing an initializer must not move it: parent-before-child and
+/// declaration order are both observable.
+#[test]
+fn fresh_list_initializers_keep_parent_before_child_order() {
+    let parent = TypePath::parse("/datum/order_parent").unwrap();
+    let child = TypePath::parse("/datum/order_parent/child").unwrap();
+    let mut state = ExecutionState::new();
+    state.set_type_parents(BTreeMap::from([
+        (parent.clone(), None),
+        (child.clone(), Some(parent.clone())),
+    ]));
+    state.set_instance_initializers(
+        Arc::new(BTreeMap::from([
+            (
+                parent.clone(),
+                vec![
+                    InstanceInitializer::FreshList {
+                        field: field("parent_list"),
+                        values: Vec::new(),
+                    },
+                    InstanceInitializer::Constant {
+                        field: field("parent_constant"),
+                        value: Value::number(1.0),
+                    },
+                ],
+            ),
+            (
+                child.clone(),
+                vec![InstanceInitializer::FreshList {
+                    field: field("child_list"),
+                    values: Vec::new(),
+                }],
+            ),
+        ])),
+        None,
+    );
+
+    let plan = crate::value_ops::instance_initializer_plan(&mut state, &child);
+    assert_eq!(
+        plan.iter()
+            .map(|initializer| match initializer {
+                InstanceInitializer::Constant { field, .. }
+                | InstanceInitializer::Program { field, .. }
+                | InstanceInitializer::FreshList { field, .. } => field.as_str(),
+            })
+            .collect::<Vec<_>>(),
+        vec!["parent_list", "parent_constant", "child_list"],
+        "a specialized initializer keeps its declared position in the flattened plan"
+    );
+}
+
+/// `initial()` resolution walks the initializer catalogs to decide whether a
+/// field has a runtime default at all. A specialized initializer still writes
+/// its field, so omitting it there would make `initial()` answer null.
+#[test]
+fn fresh_list_initializers_count_as_runtime_defaults() {
+    let path = TypePath::parse("/datum/fresh_list_initial").unwrap();
+    let mut state = ExecutionState::new();
+    state.set_type_parents(BTreeMap::from([(path.clone(), None)]));
+    state.set_instance_initializers(
+        Arc::new(BTreeMap::from([(
+            path.clone(),
+            vec![InstanceInitializer::FreshList {
+                field: field("listy"),
+                values: Vec::new(),
+            }],
+        )])),
+        None,
+    );
+
+    let resolved = crate::runtime_initial_field_value(&mut state, &path, &field("listy"));
+    assert!(
+        matches!(resolved, Ok(Value::List(_))),
+        "a fresh-list field must resolve to a list through initial(), not null: {resolved:?}"
+    );
+}
+
+/// A specialized initializer has to survive the durable artifact intact, and
+/// an artifact written by an engine that predates the variant must be
+/// rejected rather than silently losing the field's initialization.
+#[test]
+fn fresh_list_initializers_round_trip_through_the_runtime_catalog() {
+    let path = TypePath::parse("/datum/catalog_round_trip").unwrap();
+    let mut source = ExecutionState::new();
+    source.set_type_parents(BTreeMap::from([(path.clone(), None)]));
+    source.set_instance_initializers(
+        Arc::new(BTreeMap::from([(
+            path.clone(),
+            vec![
+                InstanceInitializer::FreshList {
+                    field: field("empty"),
+                    values: Vec::new(),
+                },
+                InstanceInitializer::FreshList {
+                    field: field("populated"),
+                    values: vec![Value::number(1.0), Value::text("a"), Value::Null],
+                },
+            ],
+        )])),
+        None,
+    );
+
+    let mut catalog = Vec::new();
+    source
+        .write_runtime_catalog_to(&mut catalog)
+        .expect("catalog writes");
+
+    let mut restored = ExecutionState::new();
+    restored
+        .restore_runtime_catalog_from(&mut catalog.as_slice())
+        .expect("catalog restores");
+    let plan = crate::value_ops::instance_initializer_plan(&mut restored, &path);
+    let restored_lists = plan
+        .iter()
+        .map(|initializer| match initializer {
+            InstanceInitializer::FreshList { field, values } => {
+                (field.as_str().to_owned(), values.clone())
+            }
+            _ => panic!("a FreshList initializer must not decode as another kind"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        restored_lists,
+        vec![
+            ("empty".to_owned(), Vec::new()),
+            (
+                "populated".to_owned(),
+                vec![Value::number(1.0), Value::text("a"), Value::Null],
+            ),
+        ],
+        "element values and their order must survive serialization"
+    );
+
+    // A catalog carrying any other schema version is refused. The variant
+    // changed the on-disk shape, so a stale artifact cannot be reinterpreted.
+    // Layout is an 8-byte magic followed by the little-endian version.
+    let mut stale = catalog.clone();
+    stale[8..12].copy_from_slice(&1_u32.to_le_bytes());
+    let error = ExecutionState::new()
+        .restore_runtime_catalog_from(&mut stale.as_slice())
+        .expect_err("a stale catalog version must be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
 /// BYOND 515 extended its `for(x in ...)` iteration optimization from
 /// `view()`/`block()` to the whole spatial-generator family. Each of these
 /// generators allocates its result list for that one call, so the iteration
@@ -12825,7 +13259,8 @@ fn initializer_plans_cache_parent_order_and_invalidate_with_metadata() {
             .iter()
             .map(|initializer| match initializer {
                 InstanceInitializer::Constant { field, .. }
-                | InstanceInitializer::Program { field, .. } => field.as_str(),
+                | InstanceInitializer::Program { field, .. }
+                | InstanceInitializer::FreshList { field, .. } => field.as_str(),
             })
             .collect::<Vec<_>>(),
         vec!["root_value", "parent_value", "child_value"]

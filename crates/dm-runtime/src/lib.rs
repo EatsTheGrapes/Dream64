@@ -28,7 +28,7 @@ use dm_vm::{
     ExecutionContext, ExecutionState, InitializerBinding, InitializerProgram, InstanceInitializer,
     Module, ProcedureId, RuntimeError, append_initializer_program, compile_initializer,
     compile_initializer_into_module, compile_initializer_program, execute_module_in_context,
-    initializer_compile_context,
+    initializer_compile_context, initializer_constant_list_values,
 };
 
 /// A successfully materialized global or type-static variable.
@@ -1580,6 +1580,8 @@ struct CompiledInstanceInitializer {
 #[derive(Clone)]
 enum CompiledInstanceInitializerAction {
     Constant(Value),
+    /// A fresh per-instance list of compile-time-constant elements.
+    FreshList(Vec<Value>),
     Program(Arc<InitializerProgram>),
     /// An initializer entry point in the restored, shared VM initializer module.
     ///
@@ -3016,6 +3018,9 @@ impl RuntimeImage {
                 for initializer in plan.iter() {
                     let value = match &initializer.action {
                         CompiledInstanceInitializerAction::Constant(value) => value.clone(),
+                        CompiledInstanceInitializerAction::FreshList(values) => {
+                            state.allocate_value_list(values)
+                        }
                         CompiledInstanceInitializerAction::Program(program) => {
                             execute_module_in_context(
                                 program.module(),
@@ -3101,6 +3106,13 @@ impl RuntimeImage {
                         initializer.field.clone(),
                         value.clone(),
                     )?;
+                    continue;
+                }
+                CompiledInstanceInitializerAction::FreshList(values) => {
+                    let list = state.allocate_value_list(values);
+                    state
+                        .heap_mut()
+                        .set_datum_field(datum, initializer.field.clone(), list)?;
                     continue;
                 }
                 CompiledInstanceInitializerAction::Program(program) => {
@@ -3341,6 +3353,13 @@ impl RuntimeImage {
                         field: field.clone(),
                         action: CompiledInstanceInitializerAction::Constant(value.clone()),
                     },
+                    InstanceInitializer::FreshList { field, values } => {
+                        CompiledInstanceInitializer {
+                            path: format!("{owner}::{}", field.as_str()),
+                            field: field.clone(),
+                            action: CompiledInstanceInitializerAction::FreshList(values.clone()),
+                        }
+                    }
                     InstanceInitializer::Program { field, entry } => {
                         let module =
                             self.vm_instance_initializer_module.clone().ok_or_else(|| {
@@ -3496,6 +3515,22 @@ impl RuntimeImage {
                     continue;
                 }
             };
+            // Structural specialization: an initializer whose whole expression
+            // builds a list of compile-time constants needs no VM program. The
+            // host allocates the list itself, so each instance still gets its
+            // own list identity while the per-instance VM entry disappears.
+            // Recognized on compiled bytecode, so a user-defined `list` or a
+            // bound variable simply does not match.
+            if let Some(values) = initializer_constant_list_values(&program) {
+                catalog
+                    .entry(prepared.owner)
+                    .or_default()
+                    .push(InstanceInitializer::FreshList {
+                        field: prepared.field,
+                        values,
+                    });
+                continue;
+            }
             let entry = append_initializer_program(module, program).map_err(|error| {
                 RuntimeImageError::InstanceInitializer {
                     path: prepared
@@ -3512,6 +3547,26 @@ impl RuntimeImage {
                     field: prepared.field,
                     entry,
                 });
+        }
+        if std::env::var_os("DREAM64_PROFILE_DATUM_ALLOC").is_some() {
+            // What fraction of a project's per-instance initializers the
+            // compile-time specialization actually claims. Measured per build
+            // rather than guessed: the benefit is entirely proportional to
+            // this ratio, and it is project-specific.
+            let (mut specialized, mut programs, mut constants) = (0_usize, 0_usize, 0_usize);
+            for initializers in catalog.values() {
+                for initializer in initializers {
+                    match initializer {
+                        InstanceInitializer::FreshList { .. } => specialized += 1,
+                        InstanceInitializer::Program { .. } => programs += 1,
+                        InstanceInitializer::Constant { .. } => constants += 1,
+                    }
+                }
+            }
+            eprintln!(
+                "boot-init: instance-initializers constants={constants} \
+vm_programs={programs} specialized_fresh_list={specialized}"
+            );
         }
         Ok(catalog)
     }
@@ -5078,6 +5133,64 @@ mod tests {
     }
 
     #[test]
+    /// End-to-end proof that the compile-time specialization fires on real DM
+    /// source, and only on the shapes it is allowed to claim.
+    ///
+    /// `list()` and a list of literals are structure the compiler fully knows,
+    /// so they become `FreshList` and cost no VM entry per instance. A list
+    /// whose element is another variable is a runtime read and must keep its
+    /// program.
+    #[test]
+    fn constant_list_initializers_are_specialized_away_from_vm_programs() {
+        let fixture = Fixture::new();
+        fixture.write("world.dme", "#include \"types.dm\"\n");
+        fixture.write(
+            "types.dm",
+            concat!(
+                "/datum/listy\n",
+                "\tvar/seed = 7\n",
+                "\tvar/list/empty = list()\n",
+                "\tvar/list/literals = list(1, \"a\")\n",
+                "\tvar/list/derived = list(seed)\n",
+            ),
+        );
+
+        let image = fixture.image();
+        let kinds = image
+            .vm_instance_initializers
+            .get(&type_path("/datum/listy"))
+            .expect("the type has initializers")
+            .iter()
+            .map(|initializer| match initializer {
+                crate::InstanceInitializer::Constant { field, .. } => {
+                    (field.as_str().to_owned(), "constant")
+                }
+                crate::InstanceInitializer::Program { field, .. } => {
+                    (field.as_str().to_owned(), "program")
+                }
+                crate::InstanceInitializer::FreshList { field, .. } => {
+                    (field.as_str().to_owned(), "fresh-list")
+                }
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(
+            kinds.get("empty").copied(),
+            Some("fresh-list"),
+            "`list()` is pure structure and must not cost a VM entry: {kinds:?}"
+        );
+        assert_eq!(
+            kinds.get("literals").copied(),
+            Some("fresh-list"),
+            "a list of literals is pure structure too: {kinds:?}"
+        );
+        assert_eq!(
+            kinds.get("derived").copied(),
+            Some("program"),
+            "a list built from a variable read is a runtime operation: {kinds:?}"
+        );
+    }
+
     fn instance_initializer_preserves_bare_associative_list_keys_as_text() {
         let fixture = Fixture::new();
         fixture.write("world.dme", "#include \"types.dm\"\n");

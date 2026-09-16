@@ -15,11 +15,12 @@ use std::sync::{Arc, OnceLock};
 use dm_core::SourceSpan;
 use dm_lexer::{SpannedToken, TokenKind};
 use dm_syntax::{Definition, DefinitionKind, SourceLine};
-use dm_value::{FieldName, TypePath};
+use dm_value::{FieldName, TypePath, Value};
 
 use crate::bytecode::{
     DeferredProcedure, InitializerBinding, InitializerCallNameIndex, InitializerCompileContext,
-    InitializerProgram, Instruction, Module, ProcedureId, Program, next_module_identity,
+    InitializerProgram, Instruction, ListEntryKind, Module, ProcedureId, Program,
+    next_module_identity,
 };
 use crate::{CompileError, ProcedureSpec, procedure_type_catalog_from_specs};
 
@@ -143,6 +144,62 @@ pub fn compile_initializer_program(
         source_spans: vec![source_span; instructions.len()],
         instructions,
     })
+}
+
+/// Recognizes an initializer program that only builds a list of compile-time
+/// constants, returning those constants in order.
+///
+/// `compile_initializer_program` emits exactly `<expression>, Return`, so a
+/// whole-expression `list(...)` of constants is the closed instruction
+/// sequence `[<constant pushes>, MakeListEntries(kinds), Return]` with one
+/// positional entry per push. Anything else — a nested call, a variable read,
+/// an associative entry, a non-constant element — does not match and keeps its
+/// VM program.
+///
+/// The match is on the compiled bytecode rather than on source text, so it
+/// cannot be fooled by a user-defined `list` or by binding substitution:
+/// whatever the expression compiled to is what is inspected.
+///
+/// Returning `Some` means the host can build this list itself and skip a VM
+/// entry entirely. Each instance still gets a freshly allocated list, which is
+/// what makes this a runtime operation rather than an
+/// [`InstanceInitializer::Constant`](crate::bytecode::InstanceInitializer::Constant).
+#[must_use]
+pub fn initializer_constant_list_values(program: &Program) -> Option<Vec<Value>> {
+    let [
+        elements @ ..,
+        Instruction::MakeListEntries(kinds),
+        Instruction::Return,
+    ] = program.instructions.as_slice()
+    else {
+        return None;
+    };
+    // Associative entries consume a key *and* a value and are inserted with
+    // `set_key`, whose key coercion is deliberately left to the interpreter.
+    // Only the all-positional form is claimed here, where `MakeListEntries`
+    // does exactly `add(value)` per entry.
+    if !kinds
+        .iter()
+        .all(|kind| matches!(kind, ListEntryKind::Positional))
+    {
+        return None;
+    }
+    if kinds.len() != elements.len() {
+        // Each positional entry consumes exactly one stack value. A mismatch
+        // means something else was left pending beneath this list.
+        return None;
+    }
+    elements
+        .iter()
+        .map(|instruction| match instruction {
+            Instruction::PushNull => Some(Value::Null),
+            Instruction::PushNumber(bits) => Some(Value::Number(*bits)),
+            Instruction::PushText(text) => Some(Value::text(text.as_ref())),
+            Instruction::PushFile(path) => Some(Value::file(path.as_str())),
+            Instruction::PushTypePath(path) => Some(Value::TypePath(path.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Publishes one prepared initializer program in owner-thread source order.
