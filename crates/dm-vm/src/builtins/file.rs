@@ -45,17 +45,42 @@ pub(crate) fn resolved_file_path(
             .canonicalize()
             .map_err(|error| error.to_string())?
     } else {
-        let parent = candidate
-            .parent()
-            .ok_or_else(|| format!("{context} path has no parent"))?;
-        let parent = parent
-            .canonicalize()
-            .map_err(|error| format!("{context} parent directory is unavailable: {error}"))?;
-        parent.join(
-            candidate
-                .file_name()
-                .ok_or_else(|| format!("{context} path is invalid"))?,
-        )
+        // Resolve against the deepest ancestor that actually exists rather
+        // than requiring the immediate parent to.
+        //
+        // BYOND *answers* a path under a directory that was never created --
+        // `fexists` says no, `fdel` reports failure -- it does not raise. A
+        // real Monkestation boot hits this in `/mob/.../corgi/ian/Initialize`,
+        // which `fdel`s a save file before `data/` exists, and the raise
+        // terminated the Master Controller thread.
+        //
+        // Canonicalizing the existing prefix keeps the containment check below
+        // symlink-aware for every component that does exist, and the missing
+        // tail is appended verbatim. Relative paths already had `..`, root and
+        // prefix components rejected above, so the tail cannot walk back out.
+        let mut missing = Vec::new();
+        let mut unresolved = candidate.as_path();
+        let mut resolved = loop {
+            let Some(parent) = unresolved.parent() else {
+                return Err(format!("{context} path has no parent"));
+            };
+            missing.push(
+                unresolved
+                    .file_name()
+                    .ok_or_else(|| format!("{context} path is invalid"))?
+                    .to_owned(),
+            );
+            if parent.exists() {
+                break parent.canonicalize().map_err(|error| {
+                    format!("{context} parent directory is unavailable: {error}")
+                })?;
+            }
+            unresolved = parent;
+        };
+        for name in missing.into_iter().rev() {
+            resolved.push(name);
+        }
+        resolved
     };
     if !existing.starts_with(&root) {
         return Err(format!("{context} path escapes the project root"));

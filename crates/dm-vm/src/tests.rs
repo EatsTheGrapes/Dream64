@@ -5853,6 +5853,120 @@ fn fresh_list_initializers_round_trip_through_the_runtime_catalog() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 }
 
+#[test]
+fn probe_initial_on_typepath_local() {
+    let source = parse("/proc/run(atom/p)\n\treturn initial(p.icon_state)\n").unwrap();
+    let module = compile_module(&source.definitions).unwrap();
+    let entry = module.procedure_id("/proc/run").unwrap();
+    let program = module.procedures[entry.index()].as_ref();
+    eprintln!("PROBE instructions: {:?}", program.instructions);
+
+    let ty = TypePath::parse("/obj/item/clothing/under/color/grey").unwrap();
+    let parent = TypePath::parse("/obj/item/clothing/under").unwrap();
+    let mut state = ExecutionState::new();
+    state.set_type_parents(BTreeMap::from([
+        (parent.clone(), None),
+        (ty.clone(), Some(parent.clone())),
+    ]));
+    state.set_initial_values(BTreeMap::from([(
+        ty.clone(),
+        BTreeMap::from([(field("icon_state"), Value::text("grey"))]),
+    )]));
+    let result =
+        execute_module_in_state(&module, entry, &[Value::TypePath(ty.clone())], &mut state);
+    eprintln!("PROBE typepath receiver -> {result:?}");
+
+    // And with the field declared only on the PARENT, which is the shape the
+    // Monkestation crash actually has.
+    let mut inherited = ExecutionState::new();
+    inherited.set_type_parents(BTreeMap::from([
+        (parent.clone(), None),
+        (ty.clone(), Some(parent.clone())),
+    ]));
+    inherited.set_initial_values(BTreeMap::from([(
+        parent.clone(),
+        BTreeMap::from([(field("icon_state"), Value::text("jumpsuit"))]),
+    )]));
+    let inherited_result =
+        execute_module_in_state(&module, entry, &[Value::TypePath(ty)], &mut inherited);
+    eprintln!("PROBE inherited field -> {inherited_result:?}");
+}
+
+/// BYOND answers a path under a directory that was never created rather than
+/// raising: `fexists` says no, `fdel` reports failure. Dream64 used to require
+/// the immediate parent to exist, which terminated a real Monkestation boot in
+/// `/mob/living/basic/pet/dog/corgi/ian/Initialize` -- it `fdel`s a save file
+/// before `data/` has been created.
+///
+/// The containment guard must survive the fix: a relative path still cannot
+/// walk out of the project root.
+#[test]
+fn file_paths_under_missing_directories_answer_instead_of_raising() {
+    let root = std::env::temp_dir().join(format!("dream64-missing-parent-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+
+    let syntax = parse(
+        "/proc/probe()\n\
+             \treturn list(fdel(\"data/never_created/ian.sav\"), fexists(\"data/never_created/ian.sav\"))\n",
+    )
+    .unwrap();
+    let module = compile_module(&syntax.definitions).unwrap();
+    let mut state = ExecutionState::new();
+    state.set_project_root(root.clone());
+    let result = execute_module_in_state(
+        &module,
+        module.procedure_id("/proc/probe").unwrap(),
+        &[],
+        &mut state,
+    )
+    .expect("a path under a missing directory must not raise");
+    let Value::List(result) = result else {
+        panic!("probe should return a list");
+    };
+    let result = state.heap().list(result).unwrap();
+    assert_eq!(
+        result.get(1),
+        Ok(&Value::number(0.0)),
+        "fdel reports failure rather than raising"
+    );
+    assert_eq!(
+        result.get(2),
+        Ok(&Value::number(0.0)),
+        "fexists says no rather than raising"
+    );
+
+    // Deeply missing chains resolve too, not just one absent level.
+    let deep = parse("/proc/probe()\n\treturn fexists(\"a/b/c/d/e.txt\")\n").unwrap();
+    let deep_module = compile_module(&deep.definitions).unwrap();
+    assert_eq!(
+        execute_module_in_state(
+            &deep_module,
+            deep_module.procedure_id("/proc/probe").unwrap(),
+            &[],
+            &mut state,
+        ),
+        Ok(Value::number(0.0))
+    );
+
+    // The containment guard still rejects an escape attempt.
+    let escape = parse("/proc/probe()\n\treturn fdel(\"../escaped.txt\")\n").unwrap();
+    let escape_module = compile_module(&escape.definitions).unwrap();
+    let error = execute_module_in_state(
+        &escape_module,
+        escape_module.procedure_id("/proc/probe").unwrap(),
+        &[],
+        &mut state,
+    )
+    .expect_err("a relative path must not walk out of the project root");
+    assert!(
+        error.message.contains("escapes the project root"),
+        "unexpected error: {}",
+        error.message
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// BYOND 515 extended its `for(x in ...)` iteration optimization from
 /// `view()`/`block()` to the whole spatial-generator family. Each of these
 /// generators allocates its result list for that one call, so the iteration
