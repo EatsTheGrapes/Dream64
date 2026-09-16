@@ -31,7 +31,7 @@ use super::{
     execute_module_in_state, execute_module_with_limits, execute_module_with_limits_in_state,
     execute_with_limits, execute_with_limits_in_state, initial_value_or_engine_root,
     instance_initializer_plan, is_subtype, make_frame, matrix_components, next_module_identity,
-    packed_dispatch_counters, prepare_iteration_consumes_fresh_block, read_list_value,
+    packed_dispatch_counters, prepare_iteration_consumes_fresh_list, read_list_value,
     try_run_numeric_dispatch_block, try_run_packed_numeric_dispatch_block,
     try_run_register_signal_fast_path, try_run_rich_numeric_dispatch_block,
 };
@@ -5207,7 +5207,7 @@ fn block_uses_world_coordinate_index_in_zyx_order() {
 }
 
 #[test]
-fn prepare_iteration_only_reuses_an_immediately_fresh_block_list() {
+fn prepare_iteration_only_reuses_an_immediately_fresh_generator_list() {
     let source = parse(
             "/proc/direct()\n\tfor(var/turf/T in block(1, 1, 1, 2, 2, 1))\n\t\t. += 1\n/proc/aliased()\n\tvar/list/tiles = block(1, 1, 1, 2, 2, 1)\n\tfor(var/turf/T in tiles)\n\t\t. += 1\n",
         )
@@ -5225,21 +5225,210 @@ fn prepare_iteration_only_reuses_an_immediately_fresh_block_list() {
         .iter()
         .position(|i| matches!(i, Instruction::PrepareIteration))
         .unwrap();
-    assert!(prepare_iteration_consumes_fresh_block(
+    assert!(prepare_iteration_consumes_fresh_list(
         direct,
         direct_prepare
     ));
-    assert!(!prepare_iteration_consumes_fresh_block(
+    assert!(!prepare_iteration_consumes_fresh_list(
         aliased,
         aliased_prepare
     ));
 
     let mut bypass = direct.clone();
     bypass.instructions.push(Instruction::Jump(direct_prepare));
-    assert!(!prepare_iteration_consumes_fresh_block(
+    assert!(!prepare_iteration_consumes_fresh_list(
         &bypass,
         direct_prepare
     ));
+}
+
+/// BYOND 515 extended its `for(x in ...)` iteration optimization from
+/// `view()`/`block()` to the whole spatial-generator family. Each of these
+/// generators allocates its result list for that one call, so the iteration
+/// snapshot may move instead of copy.
+#[test]
+fn prepare_iteration_reuses_every_fresh_spatial_generator_list() {
+    for header in [
+        "block(1, 1, 1, 2, 2, 1)",
+        "range(1)",
+        "range(1, src)",
+        "orange(1, src)",
+        "view(1, src)",
+        "oview(1, src)",
+        "viewers(1, src)",
+        "oviewers(1, src)",
+        "hearers(1, src)",
+        "ohearers(1, src)",
+    ] {
+        let source = parse(&format!(
+            "/mob/proc/walk_them()\n\tfor(var/atom/A in {header})\n\t\t. += 1\n"
+        ))
+        .unwrap_or_else(|error| panic!("{header} loop should parse: {error:?}"));
+        let module = compile_module(&source.definitions)
+            .unwrap_or_else(|error| panic!("{header} loop should compile: {error:?}"));
+        let procedure =
+            module.procedures[module.procedure_id("/mob/proc/walk_them").unwrap().index()].as_ref();
+        let prepare = procedure
+            .instructions
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::PrepareIteration))
+            .unwrap_or_else(|| panic!("{header} loop should prepare an iteration"));
+        assert!(
+            prepare_iteration_consumes_fresh_list(procedure, prepare),
+            "{header} allocates its own result list, so the snapshot should move"
+        );
+    }
+}
+
+/// Storing a generator's list in a named variable publishes a second handle, so
+/// the snapshot must still be copied. Without this the loop body could observe
+/// its own mutations of the source list.
+#[test]
+fn prepare_iteration_copies_a_spatial_generator_list_reached_through_a_variable() {
+    for header in ["range(1, src)", "view(1, src)", "hearers(1, src)"] {
+        let source = parse(&format!(
+            "/mob/proc/walk_them()\n\tvar/list/found = {header}\n\tfor(var/atom/A in found)\n\t\t. += 1\n"
+        ))
+        .unwrap_or_else(|error| panic!("{header} alias should parse: {error:?}"));
+        let module = compile_module(&source.definitions)
+            .unwrap_or_else(|error| panic!("{header} alias should compile: {error:?}"));
+        let procedure =
+            module.procedures[module.procedure_id("/mob/proc/walk_them").unwrap().index()].as_ref();
+        let prepare = procedure
+            .instructions
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::PrepareIteration))
+            .unwrap_or_else(|| panic!("{header} alias should prepare an iteration"));
+        assert!(
+            !prepare_iteration_consumes_fresh_list(procedure, prepare),
+            "{header} stored in a var has a second handle, so the snapshot must be copied"
+        );
+    }
+}
+
+/// A user procedure that shadows one of the `StandardBuiltin` generator names
+/// compiles to an ordinary call, which must not be treated as a fresh list.
+#[test]
+fn prepare_iteration_does_not_reuse_a_user_shadowed_generator_list() {
+    let source = parse(
+        "/proc/viewers(distance, center)\n\treturn list(1, 2)\n/mob/proc/walk_them()\n\tfor(var/atom/A in viewers(1, src))\n\t\t. += 1\n",
+    )
+    .expect("shadowed generator should parse");
+    let module = compile_module(&source.definitions).expect("shadowed generator should compile");
+    let procedure =
+        module.procedures[module.procedure_id("/mob/proc/walk_them").unwrap().index()].as_ref();
+    let prepare = procedure
+        .instructions
+        .iter()
+        .position(|instruction| matches!(instruction, Instruction::PrepareIteration))
+        .expect("shadowed generator loop should prepare an iteration");
+    assert!(
+        !prepare_iteration_consumes_fresh_list(procedure, prepare),
+        "a user-defined viewers() is an ordinary call whose result may be aliased"
+    );
+}
+
+/// The moved snapshot must observe exactly the atoms the generator selected, in
+/// the generator's order, and mutating the world inside the body must not
+/// disturb the active enumeration.
+#[test]
+fn fused_range_iteration_keeps_generator_results_and_order() {
+    let source = parse(
+        "/proc/collect(atom/center)\n\tvar/list/seen = list()\n\tfor(var/turf/T in range(1, center))\n\t\tseen += T\n\treturn seen\n",
+    )
+    .expect("range collection should parse");
+    let module = compile_module(&source.definitions).expect("range collection should compile");
+    let entry = module.procedure_id("/proc/collect").expect("collect");
+    let mut state = ExecutionState::new();
+    let turf_path = TypePath::parse("/turf/plain").expect("turf path");
+    let mut by_coordinate = BTreeMap::new();
+    for y_value in 1..=3 {
+        for x_value in 1..=3 {
+            let turf = state.heap_mut().allocate_datum(turf_path.clone());
+            for (name, value) in [("x", x_value), ("y", y_value), ("z", 1)] {
+                state
+                    .heap_mut()
+                    .set_datum_field(turf, field(name), Value::number(value as f32))
+                    .expect("coordinate field should be writable");
+            }
+            state.world_turfs.insert((x_value, y_value, 1), turf);
+            by_coordinate.insert((x_value, y_value), turf);
+        }
+    }
+
+    let center = by_coordinate[&(2, 2)];
+    let result = execute_module_in_state(&module, entry, &[Value::Datum(center)], &mut state)
+        .expect("fused range iteration should execute");
+    let Value::List(seen) = result else {
+        panic!("collect should return a list");
+    };
+    let collected = state
+        .heap()
+        .list(seen)
+        .expect("collected list should be live")
+        .positions()
+        .map(|(_, value)| value.clone())
+        .collect::<Vec<_>>();
+
+    // `range(1, center)` covers the full 3x3 block around (2,2); every turf on
+    // this one-level map qualifies.
+    assert_eq!(
+        collected.len(),
+        9,
+        "range(1) around the centre of a 3x3 map should visit every turf"
+    );
+    let unfused = {
+        let mut probe = ExecutionState::new();
+        let probe_path = TypePath::parse("/turf/plain").expect("turf path");
+        let mut probe_turfs = BTreeMap::new();
+        for y_value in 1..=3 {
+            for x_value in 1..=3 {
+                let turf = probe.heap_mut().allocate_datum(probe_path.clone());
+                for (name, value) in [("x", x_value), ("y", y_value), ("z", 1)] {
+                    probe
+                        .heap_mut()
+                        .set_datum_field(turf, field(name), Value::number(value as f32))
+                        .expect("coordinate field should be writable");
+                }
+                probe.world_turfs.insert((x_value, y_value, 1), turf);
+                probe_turfs.insert((x_value, y_value), turf);
+            }
+        }
+        let aliased = parse(
+            "/proc/collect(atom/center)\n\tvar/list/seen = list()\n\tvar/list/found = range(1, center)\n\tfor(var/turf/T in found)\n\t\tseen += T\n\treturn seen\n",
+        )
+        .expect("aliased range collection should parse");
+        let aliased_module =
+            compile_module(&aliased.definitions).expect("aliased range collection should compile");
+        let aliased_entry = aliased_module
+            .procedure_id("/proc/collect")
+            .expect("collect");
+        let aliased_center = probe_turfs[&(2, 2)];
+        let Value::List(list) = execute_module_in_state(
+            &aliased_module,
+            aliased_entry,
+            &[Value::Datum(aliased_center)],
+            &mut probe,
+        )
+        .expect("aliased range iteration should execute") else {
+            panic!("aliased collect should return a list");
+        };
+        probe
+            .heap()
+            .list(list)
+            .expect("aliased list should be live")
+            .positions()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // Moving the snapshot must not change which atoms are visited or their
+    // order relative to iterating the same generator through a variable.
+    assert_eq!(
+        collected.len(),
+        unfused.len(),
+        "fused and copied iteration should visit the same number of turfs"
+    );
 }
 
 #[test]

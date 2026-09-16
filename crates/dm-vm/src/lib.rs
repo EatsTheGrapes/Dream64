@@ -600,16 +600,47 @@ struct SimpleIterationFieldAssignment {
     exit_instruction: usize,
 }
 
+/// Global procedures whose every return path is a list allocated for that one
+/// call, so the evaluating stack slot holds its only handle.
+///
+/// `range()` and `block()` have dedicated instructions bound while parsing;
+/// the rest arrive as [`Instruction::StandardBuiltin`], whose emitter resolves a
+/// same-named user procedure to an ordinary call first. Matching on the
+/// instruction rather than on source text is what makes this sound either way:
+/// these instructions exist only where the engine's own generator runs, and each
+/// of those returns a list it allocated for that call on every path.
+const FRESH_LIST_SPATIAL_BUILTINS: [&str; 7] = [
+    "orange", "view", "oview", "viewers", "oviewers", "hearers", "ohearers",
+];
+
+/// Reports whether this instruction can only have produced a list allocated
+/// during its own evaluation.
+fn yields_fresh_unaliased_list(instruction: &Instruction) -> bool {
+    match instruction {
+        Instruction::Block { .. } | Instruction::Range { .. } => true,
+        Instruction::StandardBuiltin { name, .. } => {
+            FRESH_LIST_SPATIAL_BUILTINS.contains(&name.as_str())
+        }
+        _ => false,
+    }
+}
+
 /// Proves that `PrepareIteration` consumes the sole handle to a list just
-/// allocated by `block()`. The adjacent instructions rule out stores and
-/// duplicates; rejecting every non-fallthrough entry to `prepare` prevents a
-/// branch, exception handler, or spawned frame from bypassing the allocation.
-fn prepare_iteration_consumes_fresh_block(program: &Program, prepare: usize) -> bool {
+/// allocated by a spatial generator, which lets the snapshot move instead of
+/// copy. The adjacent instruction rules out stores and duplicates; rejecting
+/// every non-fallthrough entry to `prepare` prevents a branch, exception
+/// handler, or spawned frame from bypassing the allocation.
+///
+/// BYOND documents the same specialization, and documents extending it from
+/// `view()`/`block()` to the whole `range`/`orange`/`viewers`/`oviewers`/
+/// `hearers`/`ohearers` family in 515. See
+/// `docs/reverse-engineering/byond-release-note-archaeology.md` §6.
+fn prepare_iteration_consumes_fresh_list(program: &Program, prepare: usize) -> bool {
     if prepare == 0
-        || !matches!(
-            program.instructions.get(prepare - 1),
-            Some(Instruction::Block { .. })
-        )
+        || !program
+            .instructions
+            .get(prepare - 1)
+            .is_some_and(yields_fresh_unaliased_list)
     {
         return false;
     }
