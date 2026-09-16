@@ -5242,6 +5242,55 @@ fn prepare_iteration_only_reuses_an_immediately_fresh_generator_list() {
     ));
 }
 
+/// `turf_at` answers from the dense lookup array before consulting the sparse
+/// `world_turfs` map, so removing a cell must clear its dense slot. Otherwise
+/// the stale slot keeps returning a destroyed datum.
+#[test]
+fn removing_a_world_cell_clears_its_dense_turf_lookup_slot() {
+    let mut state = ExecutionState::new();
+    let world = state
+        .heap_mut()
+        .allocate_datum(TypePath::parse("/world").expect("world path"));
+    let turf_path = TypePath::parse("/turf/plain").expect("turf path");
+    for (x_value, y_value) in [(1, 1), (2, 1), (1, 2), (2, 2)] {
+        let turf = state.heap_mut().allocate_datum(turf_path.clone());
+        for (name, value) in [("x", x_value), ("y", y_value), ("z", 1)] {
+            state
+                .heap_mut()
+                .set_datum_field(turf, field(name), Value::number(value as f32))
+                .expect("coordinate field should be writable");
+        }
+        state.world_turfs.insert((x_value, y_value, 1), turf);
+    }
+    state.rebuild_world_turf_lookup();
+
+    let doomed = state
+        .turf_at(2, 2, 1)
+        .expect("the dense lookup should answer before removal");
+    state
+        .remove_world_cell(world, (2, 2, 1))
+        .expect("removing a mapped cell should succeed");
+
+    assert_eq!(
+        state.turf_at(2, 2, 1),
+        None,
+        "the dense slot must not keep serving a removed coordinate"
+    );
+    assert!(
+        state.heap().datum(doomed).is_err(),
+        "remove_world_cell destroys the turf, so a retained slot would be a stale handle"
+    );
+    // Neighbours stay reachable, so the clear is scoped to one coordinate.
+    for coordinate in [(1, 1, 1), (2, 1, 1), (1, 2, 1)] {
+        assert!(
+            state
+                .turf_at(coordinate.0, coordinate.1, coordinate.2)
+                .is_some(),
+            "{coordinate:?} should still resolve"
+        );
+    }
+}
+
 /// BYOND 515 extended its `for(x in ...)` iteration optimization from
 /// `view()`/`block()` to the whole spatial-generator family. Each of these
 /// generators allocates its result list for that one call, so the iteration

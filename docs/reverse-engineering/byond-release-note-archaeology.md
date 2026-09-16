@@ -572,13 +572,12 @@ equivalent coverage or performance.
    optimization in the whole archive, and it targets exactly the idiom SS13-family
    code runs constantly. **Verify, then implement.**
 
-2. **Runtime map-cell interning.** `dm-world` already splits a plan into
-   `templates` + `PlannedCell`s with `allocate_template` / `link_cell_locations`,
-   which is plan-level deduplication. What is *not* established is whether the
-   **runtime** map retains interned cell identity the way BYOND's four-byte cell
-   IDs imply, or materializes independent per-turf state. Given that Mapping
-   (~289 s) and SSatoms (~432 s) dominate the measured 830 s boot, this is the
-   highest-value thing in this document to check next.
+2. ~~**Runtime map-cell interning.**~~ **Traced — mostly already held. See
+   §23.1 and the correction below.** This was originally filed as the
+   highest-value open item; the trace showed that both *verified* BYOND lessons
+   behind it are already implemented, and the residue rests on an inference the
+   archive cannot confirm. Do not spend a refactor here on this document's
+   authority.
 
 3. **GC/scheduler coupling.** BYOND's hard-won lessons — bail out of the sweep
    once the expected number of dangling refs is found; scan the *currently
@@ -601,6 +600,45 @@ equivalent coverage or performance.
    shows savefile serialization diffs against the type default. Any Dream64
    savefile writer must key on the same table the sparse-default path serves, or
    it will silently write unchanged vars.
+
+### Correction: the map-representation gap, traced
+
+The first revision of this document filed "runtime map-cell interning" as the
+highest-value open item, reasoning from §10 that Dream64 might be materializing
+independent per-turf state where BYOND interns cells. A trace of the runtime map
+showed that claim was substantially wrong, and it is corrected here rather than
+left to misdirect work.
+
+What the trace found:
+
+| BYOND lesson | Dream64 today | Evidence |
+| --- | --- | --- |
+| Flattened grid index over coordinates (§10, inferred from the four-byte cell ID) | **Already held.** `turf_at()` resolves from a dense `Vec<Option<DatumId>>` indexed `((z-1)*maxy + (y-1))*maxx + (x-1)`, with the `BTreeMap` only as a sparse/out-of-bounds fallback | `dm-vm/src/execution/world_geometry.rs` (`turf_at`, `rebuild_world_turf_lookup`) |
+| Defaults out of per-instance storage (§2, BYOND 512) | **Already held.** Map objects are allocated through `allocate_compact_map_datum` with sparse inherited scalar defaults, reading through the immutable initial-value catalog; per-type `shared_fields` back `datum_shared_storage` | `dm-vm/src/execution/state.rs`, `dm-vm/src/value_ops/mod.rs` |
+| Rebuild cost | **Bounded.** `rebuild_world_turf_lookup` is O(turfs) but runs only at bulk boundaries — geometry rebuild, world resize, snapshot restore, state init — never per turf change, so there is no O(n²) | callers of `rebuild_world_geometry` / `resize_world_geometry` |
+
+The one real structural difference remains that Dream64 allocates **one datum
+per turf eagerly**, where §10's inference suggests BYOND may materialize turfs
+from a shared cell template. That inference is marked **I** for a reason: the
+archive establishes the *identity space* (a four-byte ID per unique
+turf-type/appearance/area combination) but says nothing about when the turf
+object behind a cell is created. DM semantics require every turf to have stable
+identity, `loc`, `contents`, and ref-ability, so lazy materialization is a large
+change resting on an unverified premise. **It needs a differential oracle
+against real BYOND before it justifies a refactor, not this document.**
+
+The practical consequence: map *representation* is not where Dream64's boot cost
+is hiding. That redirects attention back to §4 (init consolidation) and §5
+(opcode specialization), which is also where the measured profile in
+`docs/performance/boot-architecture-research.md` already pointed.
+
+One latent hazard did come out of the trace and is fixed: because `turf_at`
+answers from the dense array and returns without consulting `world_turfs`, a
+coordinate removed from the map had to have its dense slot cleared too.
+`remove_world_cell` did not do so. Its only caller happened to rebuild the whole
+array afterwards, so nothing was broken, but the invariant was invisible to any
+future caller. This is precisely the failure mode §12 predicts for interned
+derived state: never the lookup, always the coherence.
 
 ### Open questions this archive cannot settle
 

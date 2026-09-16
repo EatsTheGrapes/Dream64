@@ -459,8 +459,10 @@ impl ExecutionState {
     ) -> Result<(), String> {
         let Some(turf) = self.world_turfs.remove(&coordinate) else {
             self.world_areas.remove(&coordinate);
+            self.clear_world_turf_lookup_slot(coordinate);
             return Ok(());
         };
+        self.clear_world_turf_lookup_slot(coordinate);
         if let Some(area) = self.world_areas.remove(&coordinate) {
             let contents = self.ensure_contents(area)?;
             self.heap
@@ -673,6 +675,27 @@ impl ExecutionState {
             }
         }
         self.world_turfs.get(&coordinate).copied()
+    }
+
+    /// Drops one coordinate from the dense turf lookup.
+    ///
+    /// [`Self::turf_at`] answers from the dense array and returns without
+    /// consulting `world_turfs`, so a coordinate removed from the map must be
+    /// cleared here as well or the stale slot keeps handing out a destroyed
+    /// datum. `resize_world_geometry` happens to rebuild the whole array after
+    /// its removal loop, but that ordering is not something callers of
+    /// `remove_world_cell` should have to know.
+    fn clear_world_turf_lookup_slot(&mut self, coordinate: (i32, i32, i32)) {
+        let (x, y, z) = coordinate;
+        let (maxx, maxy, maxz) = self.world_turf_lookup_dimensions;
+        if x < 1 || y < 1 || z < 1 || x > maxx || y > maxy || z > maxz {
+            return;
+        }
+        let index = ((z - 1) as usize * maxy as usize + (y - 1) as usize) * maxx as usize
+            + (x - 1) as usize;
+        if let Some(slot) = self.world_turf_lookup.get_mut(index) {
+            *slot = None;
+        }
     }
 
     pub(crate) fn rebuild_world_turf_lookup(&mut self) {
