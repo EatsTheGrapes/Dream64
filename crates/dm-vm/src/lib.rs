@@ -36,7 +36,7 @@ pub use compile::{
     compile_initializer_program, compile_module, compile_module_specs,
     compile_module_specs_selective, compile_module_specs_selective_with_errors,
     compile_module_specs_with_global_types, compile_module_with_global_fields, compile_procedure,
-    initializer_compile_context,
+    initializer_compile_context, initializer_constant_list_values,
 };
 pub use module_codec::ModuleCodecError;
 pub use ready_snapshot::ReadyWorldCoreSnapshot;

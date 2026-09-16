@@ -10,7 +10,7 @@ const READY_WORLD_MAGIC: &[u8; 8] = b"D64READY";
 const READY_WORLD_VERSION: u32 = 1;
 const READY_WORLD_METADATA_LIMIT: u64 = 1024 * 1024 * 1024;
 const RUNTIME_CATALOG_MAGIC: &[u8; 8] = b"D64RCAT\0";
-const RUNTIME_CATALOG_VERSION: u32 = 1;
+const RUNTIME_CATALOG_VERSION: u32 = 2;
 
 #[derive(serde::Deserialize, serde::Serialize)]
 struct RuntimeCatalogSnapshot {
@@ -27,6 +27,7 @@ struct RuntimeCatalogSnapshot {
 enum RuntimeInitializerSnapshot {
     Constant(String, HeapSnapshotValue),
     Program(String, u32),
+    FreshList(String, Vec<HeapSnapshotValue>),
 }
 
 /// Mutable, process-independent runtime state captured at the ready boundary.
@@ -147,6 +148,12 @@ impl ExecutionState {
                                     RuntimeInitializerSnapshot::Program(
                                         field.as_str().to_owned(),
                                         entry.0,
+                                    )
+                                }
+                                InstanceInitializer::FreshList { field, values } => {
+                                    RuntimeInitializerSnapshot::FreshList(
+                                        field.as_str().to_owned(),
+                                        values.iter().map(HeapSnapshotValue::from).collect(),
                                     )
                                 }
                             })
@@ -272,6 +279,19 @@ impl ExecutionState {
                                 Ok(InstanceInitializer::Program {
                                     field: parse_field(field)?,
                                     entry: ProcedureId(entry),
+                                })
+                            }
+                            RuntimeInitializerSnapshot::FreshList(field, values) => {
+                                Ok(InstanceInitializer::FreshList {
+                                    field: parse_field(field)?,
+                                    values: values
+                                        .into_iter()
+                                        .map(|value| {
+                                            value.into_value().map_err(|error| {
+                                                io::Error::new(io::ErrorKind::InvalidData, error)
+                                            })
+                                        })
+                                        .collect::<io::Result<_>>()?,
                                 })
                             }
                         })

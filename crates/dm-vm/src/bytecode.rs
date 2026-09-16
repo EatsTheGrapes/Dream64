@@ -866,6 +866,26 @@ pub enum InstanceInitializer {
         /// Entry in the shared linked initializer module.
         entry: ProcedureId,
     },
+    /// Build one fresh list of compile-time-constant elements per instance.
+    ///
+    /// `var/list/x = list()` and `list("a", "b")` cannot be
+    /// [`InstanceInitializer::Constant`]: every instance must receive its own
+    /// list identity, so the value genuinely has to be produced at runtime.
+    /// Their *structure* is fully known at compile time, though, and the
+    /// program the compiler would otherwise emit is exactly
+    /// `[<constant pushes>, MakeList(n), Return]`.
+    ///
+    /// Recognizing that shape lets the host allocate the list directly and
+    /// skip a VM entry. That entry, not the expression, is the cost: a
+    /// measured ~876ns per `execute_module_in_context` against ~120ns for a
+    /// whole allocation with no dynamic initializers (see
+    /// `instance_initializer_entry_cost_benchmark`).
+    FreshList {
+        /// Destination datum field.
+        field: FieldName,
+        /// Constant elements, in declaration order. Empty for `list()`.
+        values: Vec<Value>,
+    },
 }
 
 impl InitializerProgram {

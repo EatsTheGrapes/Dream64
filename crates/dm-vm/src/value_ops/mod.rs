@@ -302,6 +302,9 @@ pub(crate) fn runtime_initial_field_value(
                     }
                     | InstanceInitializer::Program {
                         field: candidate, ..
+                    }
+                    | InstanceInitializer::FreshList {
+                        field: candidate, ..
                     } => candidate == field,
                 })
             });
@@ -523,6 +526,13 @@ pub(crate) fn initialize_existing_datum(
                     continue;
                 }
                 (field, value)
+            }
+            InstanceInitializer::FreshList { field, values } => {
+                // Mirrors `Instruction::MakeList`: allocate, then append in
+                // order. Every instance still receives its own list identity,
+                // which is what makes this a runtime operation; only the VM
+                // entry that used to produce it is gone.
+                (field, state.allocate_value_list(&values))
             }
             InstanceInitializer::Program { field, entry } => {
                 let module = initializer_module

@@ -123,6 +123,16 @@ impl ExecutionState {
         lines
     }
 
+    /// How many host-entry results are currently retained as GC roots.
+    ///
+    /// Every `execute_module_in_context` completion pushes one, and only a
+    /// `release_host_value_roots` drains them, so this is what a collection
+    /// has to walk. Used by the instance-initializer cost benchmark.
+    #[cfg(test)]
+    pub(crate) fn host_value_root_count(&self) -> usize {
+        self.host_value_roots.len()
+    }
+
     /// Releases values returned across completed host execution calls.
     ///
     /// Callers that have consumed those results can use this before the next

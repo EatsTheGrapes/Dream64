@@ -144,6 +144,26 @@ impl ExecutionState {
         self.program_sidecars.clear();
     }
 
+    /// Allocates one fresh list holding `values`, in order.
+    ///
+    /// The host-side mirror of [`Instruction::MakeList`]: allocate, then
+    /// append. Shared by every site that materializes an
+    /// [`InstanceInitializer::FreshList`](crate::bytecode::InstanceInitializer::FreshList)
+    /// so the three of them cannot drift from each other or from the
+    /// instruction they stand in for.
+    ///
+    /// [`Instruction::MakeList`]: crate::bytecode::Instruction::MakeList
+    pub fn allocate_value_list(&mut self, values: &[Value]) -> Value {
+        let list = self.heap.allocate_list();
+        for value in values {
+            self.heap
+                .list_mut(list)
+                .expect("a newly allocated list handle must be live")
+                .add(value.clone());
+        }
+        Value::List(list)
+    }
+
     /// Installs direct per-type initializer programs used by runtime `new`.
     pub fn set_instance_initializers(
         &mut self,
