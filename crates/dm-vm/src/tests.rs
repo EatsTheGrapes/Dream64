@@ -39,6 +39,7 @@ use super::{
     InstrCategory, StartupInstructionProfile, instr_category, instruction_profile_enabled,
 };
 use super::{atom_contents_iteration_snapshot, world_contents_iteration_snapshot};
+use crate::execution::sidecar::ProcedureSidecar;
 
 #[test]
 fn builtin_mob_sight_flag_family_has_byond_bit_values() {
@@ -2768,7 +2769,13 @@ fn adaptive_packed_entry_declines_short_procedures_and_enters_sustained_loops() 
     let mut short_frame = make_frame(ProcedureId(0), &short, &[], &ExecutionContext::default());
     let (_, declines_before) = packed_dispatch_counters();
     assert_eq!(
-        try_run_numeric_dispatch_block(&short, &mut short_frame, 100, &state),
+        try_run_numeric_dispatch_block(
+            &short,
+            &mut ProcedureSidecar::new(short.instructions.len()),
+            &mut short_frame,
+            100,
+            &state
+        ),
         Some(2)
     );
     let after_short = packed_dispatch_counters();
@@ -2794,7 +2801,13 @@ fn adaptive_packed_entry_declines_short_procedures_and_enters_sustained_loops() 
         &ExecutionContext::default(),
     );
     assert_eq!(
-        try_run_numeric_dispatch_block(&sustained, &mut sustained_frame, 100, &state),
+        try_run_numeric_dispatch_block(
+            &sustained,
+            &mut ProcedureSidecar::new(sustained.instructions.len()),
+            &mut sustained_frame,
+            100,
+            &state
+        ),
         Some(100)
     );
     let after_sustained = packed_dispatch_counters();
@@ -5289,6 +5302,121 @@ fn removing_a_world_cell_clears_its_dense_turf_lookup_slot() {
             "{coordinate:?} should still resolve"
         );
     }
+}
+
+/// The packed-dispatch profitability scan reads only immutable bytecode, so a
+/// PC's verdict cannot change. Boot telemetry measured that scan re-running on
+/// ~207M block entries to decline 220M times against 26k uses; memoizing it per
+/// PC is what collapses those repeats.
+#[test]
+fn packed_run_verdict_is_scanned_once_per_pc() {
+    let mut sidecar = ProcedureSidecar::new(4);
+    let scans = std::cell::Cell::new(0_u32);
+    let count = |scans: &std::cell::Cell<u32>| scans.set(scans.get() + 1);
+
+    assert!(sidecar.packed_run_profitable(1, || {
+        count(&scans);
+        true
+    }));
+    assert_eq!(scans.get(), 1, "the first ask at a PC runs the scan");
+
+    // Repeats answer from the memo. The closure returns the opposite verdict,
+    // so bypassing the memo would be visible in both the value and the count.
+    for _ in 0..1_000 {
+        assert!(sidecar.packed_run_profitable(1, || {
+            count(&scans);
+            false
+        }));
+    }
+    assert_eq!(scans.get(), 1, "a memoized PC never re-scans");
+
+    // The decline is memoized too — that is the 220M case.
+    assert!(!sidecar.packed_run_profitable(2, || {
+        count(&scans);
+        false
+    }));
+    for _ in 0..1_000 {
+        assert!(!sidecar.packed_run_profitable(2, || {
+            count(&scans);
+            true
+        }));
+    }
+    assert_eq!(
+        scans.get(),
+        2,
+        "a declined PC is cached as firmly as an accepted one"
+    );
+
+    // Verdicts are per PC, not per procedure.
+    assert!(sidecar.packed_run_profitable(1, || panic!("PC 1 was already scanned")));
+    assert!(!sidecar.packed_run_profitable(2, || panic!("PC 2 was already scanned")));
+
+    // A PC outside the procedure falls through uncached instead of growing the
+    // array.
+    for _ in 0..2 {
+        assert!(sidecar.packed_run_profitable(99, || {
+            count(&scans);
+            true
+        }));
+    }
+    assert_eq!(
+        scans.get(),
+        4,
+        "an out-of-range PC is answered without caching"
+    );
+}
+
+/// Memoizing the verdict must not change what the dispatcher does. A sidecar
+/// reused across entries has to produce exactly what a fresh one does.
+#[test]
+fn memoized_packed_run_verdict_matches_an_uncached_dispatch() {
+    let sustained = manual_program(
+        vec![
+            Instruction::PushNumber(DmNumberBits::from_f32(1.0)),
+            Instruction::Pop,
+            Instruction::Jump(0),
+        ],
+        0,
+    );
+    let state = ExecutionState::new();
+
+    let mut shared = ProcedureSidecar::new(sustained.instructions.len());
+    let mut shared_results = Vec::new();
+    let mut fresh_results = Vec::new();
+    for _ in 0..4 {
+        let mut frame = make_frame(
+            ProcedureId(0),
+            &sustained,
+            &[],
+            &ExecutionContext::default(),
+        );
+        shared_results.push(try_run_numeric_dispatch_block(
+            &sustained,
+            &mut shared,
+            &mut frame,
+            100,
+            &state,
+        ));
+
+        let mut frame = make_frame(
+            ProcedureId(0),
+            &sustained,
+            &[],
+            &ExecutionContext::default(),
+        );
+        fresh_results.push(try_run_numeric_dispatch_block(
+            &sustained,
+            &mut ProcedureSidecar::new(sustained.instructions.len()),
+            &mut frame,
+            100,
+            &state,
+        ));
+    }
+
+    assert_eq!(
+        shared_results, fresh_results,
+        "a reused sidecar must dispatch identically to a cold one"
+    );
 }
 
 /// BYOND 515 extended its `for(x in ...)` iteration optimization from

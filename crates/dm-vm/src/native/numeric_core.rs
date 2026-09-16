@@ -2,6 +2,7 @@
 //! dispatch/loop fast paths.
 
 use crate::bytecode::{Instruction, Program};
+use crate::execution::sidecar::ProcedureSidecar;
 use crate::value_ops::{
     canonicalize_owned_value, compare_values, datum_field_or_shared, dm_list_length_number,
 };
@@ -311,15 +312,16 @@ pub fn numeric_block_site_report(limit: usize) -> Vec<String> {
 
 pub(crate) fn try_run_numeric_dispatch_block(
     program: &Program,
+    sidecar: &mut ProcedureSidecar,
     frame: &mut CallFrame,
     max_steps: u64,
     state: &ExecutionState,
 ) -> Option<u64> {
     if !numeric_block_profiling() {
-        return try_run_numeric_dispatch_block_inner(program, frame, max_steps, state);
+        return try_run_numeric_dispatch_block_inner(program, sidecar, frame, max_steps, state);
     }
     let site = (frame.procedure.index() as u32, frame.instruction as u32);
-    let accounted = try_run_numeric_dispatch_block_inner(program, frame, max_steps, state);
+    let accounted = try_run_numeric_dispatch_block_inner(program, sidecar, frame, max_steps, state);
     if let Some(steps) = accounted {
         NUMERIC_BLOCK_ENTRIES.fetch_add(1, Ordering::Relaxed);
         NUMERIC_BLOCK_STEPS.fetch_add(steps, Ordering::Relaxed);
@@ -344,6 +346,7 @@ pub(crate) fn try_run_numeric_dispatch_block(
 
 fn try_run_numeric_dispatch_block_inner(
     program: &Program,
+    sidecar: &mut ProcedureSidecar,
     frame: &mut CallFrame,
     max_steps: u64,
     state: &ExecutionState,
@@ -364,7 +367,17 @@ fn try_run_numeric_dispatch_block_inner(
         let retained = frame
             .cold()
             .is_some_and(|cold| cold.packed_numeric_state.is_some());
-        if retained || forced || predicts_profitable_packed_run(program, frame.instruction) {
+        // The scan is a pure function of the bytecode at this PC, so the
+        // sidecar answers every entry after the first. Boot telemetry measured
+        // this forward-scan re-running on ~207M block entries to decline almost
+        // all of them.
+        let entry_pc = frame.instruction;
+        if retained
+            || forced
+            || sidecar.packed_run_profitable(entry_pc, || {
+                predicts_profitable_packed_run(program, entry_pc)
+            })
+        {
             PACKED_ADAPTIVE_ENTRIES.fetch_add(1, Ordering::Relaxed);
             if let Some(steps) =
                 try_run_packed_numeric_dispatch_block(program, frame, max_steps, state)

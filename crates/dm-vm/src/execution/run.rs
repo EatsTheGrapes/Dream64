@@ -896,6 +896,7 @@ fn run_frames_inner(
         .then(|| {
             try_run_numeric_dispatch_block(
                 program,
+                sidecar,
                 &mut frames[frame_index],
                 quick_block_budget,
                 state,
