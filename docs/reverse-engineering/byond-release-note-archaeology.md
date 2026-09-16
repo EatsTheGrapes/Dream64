@@ -640,6 +640,22 @@ array afterwards, so nothing was broken, but the invariant was invisible to any
 future caller. This is precisely the failure mode §12 predicts for interned
 derived state: never the lookup, always the coherence.
 
+### Findings this archaeology turned into fixes
+
+Kept as a running record, because it is the only honest measure of whether
+reading the archive was worth the time.
+
+| Archive finding | What it turned into |
+| --- | --- |
+| §6/§10 — BYOND 515 extended `for(x in …)` generator fusion from `view()`/`block()` to `range`/`orange`/`viewers`/`oviewers`/`hearers`/`ohearers` | Dream64 was in the pre-515 state and narrower still (`block()` only). Fusion extended to all eight generators, removing one list allocation and one full copy per spatial-query loop. |
+| §13 — BYOND 463.1065 "disables Nagle's algorithm but uses some internal queuing to prevent a bunch of tiny packets from swamping the server's bandwidth", framed as a significant win for every action-oriented game | **Predicted a live defect.** `dm-lifecycle`'s IPC `write_frame` emitted the 4-byte length header and the payload as two `write_all` calls, and `TCP_NODELAY` was never set: the textbook write-write-read stall. 100 loopback pings took **8.72 s** (87 ms per round trip — two delayed-ACK stalls). Coalescing the frame into one write took the same 100 pings to **3.1 ms**, ~31 µs each. |
+| §12 — every interned aggregate BYOND built later grew a lifetime bug; "never the cache hit, always the coherence" | Found the same shape in `turf_at`: the dense lookup array answers before the sparse map and returns early, but `remove_world_cell` cleared only the map. Latent rather than live, and now closed. |
+
+The second row is the one that justifies the exercise. It was not found by
+reading Dream64's code looking for bugs; it was found because the archive
+said a 2009-era engine had hit exactly this, which made a failing timing
+test worth reading as a real defect rather than as container noise.
+
 ### Open questions this archive cannot settle
 
 - Whether BYOND's type index is interval-based, bitset-based, or something else,

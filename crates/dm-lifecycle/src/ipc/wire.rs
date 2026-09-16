@@ -384,11 +384,22 @@ pub(super) fn read_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     Ok(p)
 }
 
+/// Writes one length-prefixed frame as a **single** `write_all`.
+///
+/// Emitting the 4-byte header and the payload as two writes is the classic
+/// write-write-read shape: Nagle holds the second small write until the first
+/// is acknowledged, and the peer's delayed ACK sits on that acknowledgement for
+/// tens of milliseconds. On a strict request/response channel like this one
+/// that cost lands on every single exchange. Building the frame once and
+/// writing it once removes the trigger; `set_nodelay` on the accepted socket
+/// (see `serve`) covers what remains.
 pub(super) fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> io::Result<()> {
     let len = u32::try_from(payload.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "IPC frame is too large"))?;
-    stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(payload)
+    let mut frame = Vec::with_capacity(payload.len() + 4);
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(payload);
+    stream.write_all(&frame)
 }
 
 #[cfg(test)]

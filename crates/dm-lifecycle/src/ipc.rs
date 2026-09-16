@@ -800,6 +800,11 @@ impl LoopbackIpc {
 fn serve(listener: TcpListener, sender: &Sender<Request>, startup_gate: Option<&StartupGate>) {
     for connection in listener.incoming() {
         let Ok(mut stream) = connection else { continue };
+        // A control channel trades in single small request/response frames, so
+        // Nagle only ever delays them; there is no bulk stream here for it to
+        // coalesce. Best-effort: a platform that refuses the option should not
+        // cost us the connection.
+        let _ = stream.set_nodelay(true);
         while let Ok(frame) = read_frame(&mut stream) {
             let response = match parse_command(&frame) {
                 Ok(Command::Ping) => "ok ping protocol=1".to_owned(),
