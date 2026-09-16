@@ -31,6 +31,19 @@ use dm_vm::{
     initializer_compile_context, initializer_constant_list_values,
 };
 
+/// Whether `DREAM64_DISABLE_INIT_SPECIALIZATION` turns off compile-time
+/// initializer specialization.
+///
+/// Exists so the benefit can be A/B'd on one binary: build the artifact once
+/// with it set and once without, and boot both. The benefit is entirely
+/// proportional to how many of a project's initializers the specialization
+/// claims, which is project-specific, so it has to be measured rather than
+/// assumed.
+fn initializer_specialization_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("DREAM64_DISABLE_INIT_SPECIALIZATION").is_some())
+}
+
 /// A successfully materialized global or type-static variable.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeVariable {
@@ -3521,7 +3534,9 @@ impl RuntimeImage {
             // own list identity while the per-instance VM entry disappears.
             // Recognized on compiled bytecode, so a user-defined `list` or a
             // bound variable simply does not match.
-            if let Some(values) = initializer_constant_list_values(&program) {
+            if !initializer_specialization_disabled()
+                && let Some(values) = initializer_constant_list_values(&program)
+            {
                 catalog
                     .entry(prepared.owner)
                     .or_default()

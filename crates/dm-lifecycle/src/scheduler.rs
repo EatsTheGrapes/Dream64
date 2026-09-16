@@ -403,6 +403,24 @@ fn drain_persistent_scheduler(
                     eprintln!(
                         "server-runtime: fatal scheduled thread failure — the Master Controller initialization thread was terminated by an uncaught runtime error: {error}"
                     );
+                    // A boot that dies here has already done most of the
+                    // allocation work, and the normal profile emission points
+                    // are all downstream of this return. Without this the whole
+                    // accumulated profile is discarded exactly when a failing
+                    // boot is what you are trying to measure.
+                    let (allocations, total_ns, _roots_ns, initializer_ns, initializer_programs) =
+                        dm_vm::datum_alloc_telemetry();
+                    if allocations > 0 {
+                        eprintln!(
+                            "boot-profile at=fatal-mc-failure datum_alloc allocations={allocations} total_ms={} initializer_ms={} initializer_programs={initializer_programs} programs_per_alloc={}",
+                            total_ns / 1_000_000,
+                            initializer_ns / 1_000_000,
+                            initializer_programs
+                                .saturating_mul(100)
+                                .checked_div(allocations)
+                                .unwrap_or(0),
+                        );
+                    }
                     return Err(error);
                 }
                 // `advance_scheduler` drops only the failing continuation and
