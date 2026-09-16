@@ -697,6 +697,80 @@ hang-inducing regression, with a dedicated test proving the fix and
 reproducing the original failure, so the same class of bug cannot silently
 reappear.
 
+## Rooted operands, slice 1 (follow-on) — the operand kind, its validation,
+and one consumer. Behaviour-inert: no translator emits it yet.
+
+The Risks section below names the real remaining scope as "(i) an
+operand/local representation for a compiled region to hold a rooted slot
+index alongside its existing `f64` registers, plus the Cranelift codegen and
+broadened `RegionCallbacks` surface to actually DO anything with one". The
+GC-scanned side-array itself already landed (`CallFrameCold::rooted_operands`,
+scanned by `heap_gc`). This slice builds the operand representation and proves
+it end to end through one consumer, without yet wiring the VM translator.
+
+**Representation.** A rooted operand is its *slot index*, not a `Value` —
+`dm-jit` still never sees a `Value`, exactly as it never sees a `FieldName`.
+`LoadRootedLocal(slot)` pushes the index as an exact `I32`→`F32` bitcast (a
+bit pattern, not a float conversion, so there is no precision question at any
+magnitude), and `validate` tracks the slot as a third `StackKind::Rooted`
+alongside `Number` and `Src`. The VM owns populating and rooting the array;
+native code never bounds-checks, because `validate` proved the index against
+the region's declared `rooted_count`.
+
+**One consumer.** `ListLength` pops a rooted handle and pushes that list's
+length through a new `RegionCallbacks::list_length(rooted_slot)`, or
+side-exits when the callback declines — the same packed-`u64` convention
+`load_global_dynamic` already uses, so a length of `0.0` is never confused
+with "cannot answer". Its result is an ordinary number, so nothing downstream
+needs to know a rooted value was involved. The callback is **defaulted to
+declining**, so every existing implementor (`RegionDispatch`,
+`NoDynamicFieldAccess`) compiles and behaves unchanged.
+
+**Why it is inert.** `rooted_count` is a new parameter on a new entry point,
+`compile_numeric_rooted_trace_at`; every pre-existing entry point delegates
+with `rooted_count: 0`. With zero declared slots `LoadRootedLocal` can never
+validate, and since `ListLength`'s operand must be `Rooted`, it can never
+validate either. Nothing outside `dm-jit` constructs either instruction — the
+translator is untouched. A test asserts both rejections explicitly through
+both the new and the old entry point.
+
+**A latent trap closed while auditing.** Every consumer of a stack value was
+checked against the new kind. `Return`, `JumpIfFalse`, `StoreLocal`,
+`StoreField`, binary arithmetic and `CallSideExit` all go through
+`pop_number`, which rejects `Rooted` for free; `Negate`/`Not` needed their
+explicit `Src` arm widened; `Duplicate` copies the kind; `Pop` discards any.
+`LoadFieldDynamic` was the one permissive consumer — it deliberately ignores
+its receiver's kind, because codegen discards the placeholder and the real
+receiver is the region's implicit `src` arriving through the callback
+context. That is sound for a `Number` placeholder, which carries no receiver
+at all, but *not* for a rooted handle: a handle names a real, different
+receiver, so a translator emitting one there would mean "read this list's
+field" and silently get `src`'s field instead — a wrong answer rather than a
+harmless discard. Now rejected. This rejects a future mistake, not current
+behaviour: nothing can produce a rooted operand yet.
+
+**Deliberately not done, and needed before any of this executes.** The VM side
+is entirely unbuilt: populating `rooted_operands` before region entry,
+choosing which locals are worth rooting, emitting either instruction from
+`numeric_trace_instructions`, and — the substantive one — the
+**rematerialization contract on a declined `ListLength`**. The other four
+side-exiting instructions rematerialize their own operands onto `frame.stack`
+so the interpreter can resume at that exact instruction; `ListLength`'s
+equivalent has not been designed, which is precisely why `validate` already
+enforces the same isolation rule on it (nothing pending beneath its operand)
+that M5's boot-found stack-underflow bug forced onto the other four. Doing
+that work first, in the same shape, keeps the contract tractable.
+
+**Gating — read before merging.** This slice was verified by the `dm-jit`
+(37) and `dm-vm` (685) lib suites, fmt, and clippy correctness. It was **not**
+gated on `DREAM64_BOOT_MAX_SLICES=1` boot-to-pregame parity or a matched A/B,
+because a production `.dme`/`.dmm` is not available in the environment it was
+written in. Inertness is the argument for merging without that gate — no
+region's compiled output changes, proven by construction and by test — but
+this project's own history is that the boot gate is what catches the real
+bugs in this subsystem (M5's stack underflow, the corner-apply hang), so the
+first slice that actually emits these instructions must not skip it.
+
 ## Risks
 
 - Cranelift compile latency on a cold boot. **Compiling on workers: done**
