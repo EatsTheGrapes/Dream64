@@ -909,13 +909,15 @@ impl<'a> ExpressionParser<'a> {
             }
             TokenKind::Identifier(identifier) if identifier == "null" => Ok(Expression::Null),
             TokenKind::Identifier(identifier)
-                if let Some(value) = dm_builtin_numeric_constant(identifier) =>
+                if dm_builtin_numeric_constant(identifier).is_some() =>
             {
+                let value = dm_builtin_numeric_constant(identifier)
+                    .expect("guard already matched a numeric builtin constant");
                 Ok(Expression::Number(DmNumberBits::from_f32(value)))
             }
-            TokenKind::Identifier(identifier)
-                if let Some(value) = dm_builtin_text_constant(identifier) =>
-            {
+            TokenKind::Identifier(identifier) if dm_builtin_text_constant(identifier).is_some() => {
+                let value = dm_builtin_text_constant(identifier)
+                    .expect("guard already matched a text builtin constant");
                 Ok(Expression::Text(value.to_owned()))
             }
             TokenKind::Operator(operator) if operator == "::" => {

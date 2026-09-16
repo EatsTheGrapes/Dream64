@@ -54,6 +54,28 @@ pub enum NumericInstruction {
     /// Pop a value and write it to one persistent runtime global through the
     /// `store_global_dynamic` slow-path callback.
     StoreGlobalDynamic(u16),
+    /// Push this region's handle to one non-numeric `Value` the VM parked in
+    /// `CallFrameCold::rooted_operands` before entering native code.
+    ///
+    /// The handle is the slot *index*, never the `Value` — this crate never
+    /// sees a `Value`, exactly as it never sees a `FieldName`. Codegen pushes
+    /// the index as an exact `I32`→`F32` bitcast (no float conversion, so no
+    /// precision question), and `validate` tracks the slot as
+    /// [`StackKind::Rooted`] so it can only ever reach an instruction that
+    /// accepts a rooted handle — never arithmetic, never a field receiver.
+    ///
+    /// The VM owns populating and rooting that array; `heap_gc` already scans
+    /// it, so a parked `Value` survives any collection a slow-path callback
+    /// can trigger.
+    LoadRootedLocal(u16),
+    /// Pop a rooted handle and push that list's length, read live through the
+    /// `list_length` slow-path callback, or side-exit when the callback
+    /// declines (the slot does not hold a list, or the VM cannot answer).
+    ///
+    /// The first instruction to consume a rooted handle rather than produce
+    /// one. Its result is an ordinary number, so nothing downstream needs to
+    /// know a rooted value was involved.
+    ListLength,
     /// Set a VM-defined deferred action bit, committed after native exit.
     RaiseAction(u8),
     /// Duplicate the top operand.
@@ -117,6 +139,10 @@ pub enum NumericInstruction {
 pub enum CompileError {
     /// An instruction reads a local outside the declared input vector.
     InvalidLocal(u16),
+    /// An instruction addresses a rooted-operand slot the region never
+    /// declared. Bounds are proven at compile time so native code can index
+    /// the VM's rooted array without a runtime check.
+    InvalidRootedSlot(u16),
     /// A field operation addresses outside the guarded field vector.
     InvalidField(u16),
     /// Dirty writeback currently uses one native mask.
@@ -168,6 +194,9 @@ impl std::fmt::Display for CompileError {
             }
             Self::InvalidField(field) => {
                 write!(formatter, "numeric trace reads invalid field {field}")
+            }
+            Self::InvalidRootedSlot(slot) => {
+                write!(formatter, "numeric trace reads invalid rooted slot {slot}")
             }
             Self::TooManyFields(count) => {
                 write!(formatter, "numeric trace has {count} fields, maximum is 64")
@@ -735,6 +764,16 @@ pub trait RegionCallbacks {
     /// declines — `ExecutionState::set_global` cannot fail — but the ABI
     /// stays symmetric with `store_field` rather than special-casing it).
     fn store_global(&mut self, global_index: u32, value: f32) -> bool;
+    /// Answers a `ListLength` instruction with the length of the list parked
+    /// in the region's rooted slot `rooted_slot`, or `None` to side-exit.
+    ///
+    /// Defaulted to declining so every existing implementor keeps compiling
+    /// and every existing region keeps behaving exactly as before: a trace
+    /// that never lowers `ListLength` never calls this, and one that does
+    /// side-exits until an implementor answers it.
+    fn list_length(&mut self, _rooted_slot: u32) -> Option<f32> {
+        None
+    }
 }
 
 /// A `RegionCallbacks` that declines everything. Fits any trace that never
@@ -801,6 +840,17 @@ unsafe extern "C" fn safe_load_global_dynamic(context: *mut c_void, global_index
     }
 }
 
+/// Trampoline registered as `dream64_list_length`. Same packing convention as
+/// `safe_load_global_dynamic`: the high bit distinguishes a real answer from
+/// a decline, so a length of `0.0` is not confused with "cannot answer".
+unsafe extern "C" fn safe_list_length(context: *mut c_void, rooted_slot: u32) -> u64 {
+    let context = unsafe { &mut *context.cast::<RegionDispatchContext<'_>>() };
+    match context.callbacks.list_length(rooted_slot) {
+        Some(value) => 0x1_0000_0000_u64 | u64::from(value.to_bits()),
+        None => 0,
+    }
+}
+
 /// Trampoline registered as `dream64_store_global_dynamic`. Same convention
 /// as `safe_store_field_dynamic`, minus a receiver — globals have none.
 unsafe extern "C" fn safe_store_global_dynamic(
@@ -850,6 +900,34 @@ pub fn compile_numeric_field_trace_at(
     dynamic_global_count: usize,
     entry_pc: usize,
 ) -> Result<CompiledNumericTrace, CompileError> {
+    compile_numeric_rooted_trace_at(
+        instructions,
+        local_count,
+        field_count,
+        dynamic_field_count,
+        dynamic_global_count,
+        0,
+        entry_pc,
+    )
+}
+
+/// Compiles a trace that may also address `rooted_count` VM-rooted operand
+/// slots, entering at `entry_pc`.
+///
+/// Additive on purpose: every existing entry point delegates here with
+/// `rooted_count: 0`, which makes `LoadRootedLocal` unreachable (its slot
+/// index can never be in range) and leaves every already-compiled trace
+/// byte-identical. Only a caller that opts in by declaring slots can produce
+/// a rooted operand at all.
+pub fn compile_numeric_rooted_trace_at(
+    instructions: &[NumericInstruction],
+    local_count: usize,
+    field_count: usize,
+    dynamic_field_count: usize,
+    dynamic_global_count: usize,
+    rooted_count: usize,
+    entry_pc: usize,
+) -> Result<CompiledNumericTrace, CompileError> {
     if field_count > 64 {
         return Err(CompileError::TooManyFields(field_count));
     }
@@ -862,6 +940,7 @@ pub fn compile_numeric_field_trace_at(
         field_count,
         dynamic_field_count,
         dynamic_global_count,
+        rooted_count,
         entry_pc,
     )?;
 
@@ -883,6 +962,7 @@ pub fn compile_numeric_field_trace_at(
         "dream64_store_global_dynamic",
         safe_store_global_dynamic as *const u8,
     );
+    builder.symbol("dream64_list_length", safe_list_length as *const u8);
     let mut module = JITModule::new(builder);
     let mut load_field_dynamic_signature = module.make_signature();
     load_field_dynamic_signature
@@ -930,6 +1010,19 @@ pub fn compile_numeric_field_trace_at(
             "dream64_load_global_dynamic",
             Linkage::Import,
             &load_global_dynamic_signature,
+        )
+        .map_err(|error| CompileError::Backend(error.to_string()))?;
+    let mut list_length_signature = module.make_signature();
+    list_length_signature.params.push(AbiParam::new(types::I64));
+    list_length_signature.params.push(AbiParam::new(types::I32));
+    list_length_signature
+        .returns
+        .push(AbiParam::new(types::I64));
+    let list_length_id = module
+        .declare_function(
+            "dream64_list_length",
+            Linkage::Import,
+            &list_length_signature,
         )
         .map_err(|error| CompileError::Backend(error.to_string()))?;
     let mut store_global_dynamic_signature = module.make_signature();
@@ -1012,6 +1105,7 @@ pub fn compile_numeric_field_trace_at(
         module.declare_func_in_func(store_field_dynamic_id, &mut context.func);
     let load_global_dynamic_ref =
         module.declare_func_in_func(load_global_dynamic_id, &mut context.func);
+    let list_length_ref = module.declare_func_in_func(list_length_id, &mut context.func);
     let store_global_dynamic_ref =
         module.declare_func_in_func(store_global_dynamic_id, &mut context.func);
 
@@ -1423,6 +1517,57 @@ pub fn compile_numeric_field_trace_at(
                     function_builder.ins().return_(&[side_exit]);
                     continue;
                 }
+                NumericInstruction::LoadRootedLocal(slot) => {
+                    // The handle is the slot index itself, carried as an exact
+                    // I32->F32 bit pattern rather than a float conversion, so
+                    // it round-trips regardless of magnitude. `validate` has
+                    // already proven the index in range, so native code never
+                    // bounds-checks it.
+                    let index = function_builder.ins().iconst(types::I32, i64::from(slot));
+                    let handle = function_builder.ins().bitcast(
+                        types::F32,
+                        cranelift_codegen::ir::MemFlags::new(),
+                        index,
+                    );
+                    memory_push(&mut function_builder, stack_pointer, &mut depth, handle);
+                }
+                NumericInstruction::ListLength => {
+                    let handle = memory_pop(&mut function_builder, stack_pointer, &mut depth);
+                    let slot = function_builder.ins().bitcast(
+                        types::I32,
+                        cranelift_codegen::ir::MemFlags::new(),
+                        handle,
+                    );
+                    let call = function_builder
+                        .ins()
+                        .call(list_length_ref, &[context_pointer, slot]);
+                    let packed = function_builder.inst_results(call)[0];
+                    let failed = function_builder.ins().icmp_imm(
+                        IntCC::UnsignedLessThan,
+                        packed,
+                        0x1_0000_0000_i64,
+                    );
+                    let declined = function_builder.create_block();
+                    let measured = function_builder.create_block();
+                    function_builder
+                        .ins()
+                        .brif(failed, declined, &[], measured, &[]);
+
+                    function_builder.switch_to_block(declined);
+                    function_builder.seal_block(declined);
+                    let side_exit = pack_side_exit(&mut function_builder, pc as u32, steps);
+                    function_builder.ins().return_(&[side_exit]);
+
+                    function_builder.switch_to_block(measured);
+                    function_builder.seal_block(measured);
+                    let value_bits = function_builder.ins().ireduce(types::I32, packed);
+                    let value = function_builder.ins().bitcast(
+                        types::F32,
+                        cranelift_codegen::ir::MemFlags::new(),
+                        value_bits,
+                    );
+                    memory_push(&mut function_builder, stack_pointer, &mut depth, value);
+                }
                 operation => {
                     let right = memory_pop(&mut function_builder, stack_pointer, &mut depth);
                     let left = memory_pop(&mut function_builder, stack_pointer, &mut depth);
@@ -1607,12 +1752,16 @@ struct Validation {
 enum StackKind {
     Number,
     Src,
+    /// A handle to a VM-rooted `Value`, carried as its slot index. Accepted
+    /// only by instructions that explicitly take a rooted handle; arithmetic
+    /// and field receivers both reject it.
+    Rooted,
 }
 
 fn pop_number(pc: usize, stack: &mut SmallVec<[StackKind; 8]>) -> Result<(), CompileError> {
     match stack.pop() {
         Some(StackKind::Number) => Ok(()),
-        Some(StackKind::Src) => Err(CompileError::InvalidOperandKind(pc)),
+        Some(StackKind::Src | StackKind::Rooted) => Err(CompileError::InvalidOperandKind(pc)),
         None => Err(CompileError::StackUnderflow),
     }
 }
@@ -1620,7 +1769,15 @@ fn pop_number(pc: usize, stack: &mut SmallVec<[StackKind; 8]>) -> Result<(), Com
 fn pop_src(pc: usize, stack: &mut SmallVec<[StackKind; 8]>) -> Result<(), CompileError> {
     match stack.pop() {
         Some(StackKind::Src) => Ok(()),
-        Some(StackKind::Number) => Err(CompileError::InvalidOperandKind(pc)),
+        Some(StackKind::Number | StackKind::Rooted) => Err(CompileError::InvalidOperandKind(pc)),
+        None => Err(CompileError::StackUnderflow),
+    }
+}
+
+fn pop_rooted(pc: usize, stack: &mut SmallVec<[StackKind; 8]>) -> Result<(), CompileError> {
+    match stack.pop() {
+        Some(StackKind::Rooted) => Ok(()),
+        Some(StackKind::Number | StackKind::Src) => Err(CompileError::InvalidOperandKind(pc)),
         None => Err(CompileError::StackUnderflow),
     }
 }
@@ -1631,6 +1788,7 @@ fn validate(
     field_count: usize,
     dynamic_field_count: usize,
     dynamic_global_count: usize,
+    rooted_count: usize,
     entry_pc: usize,
 ) -> Result<Validation, CompileError> {
     if instructions.is_empty() || entry_pc >= instructions.len() {
@@ -1688,7 +1846,9 @@ fn validate(
             }
             NumericInstruction::Negate | NumericInstruction::Not => match stack.last() {
                 Some(StackKind::Number) => {}
-                Some(StackKind::Src) => return Err(CompileError::InvalidOperandKind(pc)),
+                Some(StackKind::Src | StackKind::Rooted) => {
+                    return Err(CompileError::InvalidOperandKind(pc));
+                }
                 None => return Err(CompileError::StackUnderflow),
             },
             NumericInstruction::LoadFieldDynamic(field) => {
@@ -1707,12 +1867,26 @@ fn validate(
                 // The popped placeholder is discarded unconditionally by
                 // codegen (the real receiver travels through the callback
                 // context, not this stack), so unlike `StoreFieldDynamic`
-                // below, its kind is never checked here — nothing downstream
-                // ever reads it, so a `Number`-kind placeholder here would be
-                // just as sound; kind tracking's job is only to catch `Src`
-                // reaching somewhere it would matter, and reads don't care.
-                if stack.pop().is_none() {
-                    return Err(CompileError::StackUnderflow);
+                // below, a `Number`-kind placeholder here is just as sound as
+                // a `Src` one — kind tracking's job is to catch a kind
+                // reaching somewhere it would matter, and a discarded
+                // placeholder doesn't matter.
+                //
+                // `Rooted` is the one exception, and it is rejected. A rooted
+                // handle names a real, *different* receiver, so a translator
+                // emitting one here means "read this list's field" — which
+                // this instruction cannot do, since its receiver is always the
+                // region's implicit `src`. Accepting it would silently read
+                // `src`'s field instead: a wrong answer rather than a harmless
+                // discard. Nothing emits that shape today (no existing entry
+                // point declares rooted slots), so this rejects a future
+                // mistake, not current behaviour.
+                match stack.pop() {
+                    Some(StackKind::Rooted) => {
+                        return Err(CompileError::InvalidOperandKind(pc));
+                    }
+                    Some(StackKind::Number | StackKind::Src) => {}
+                    None => return Err(CompileError::StackUnderflow),
                 }
                 stack.push(StackKind::Number);
             }
@@ -1728,6 +1902,24 @@ fn validate(
                 }
                 pop_number(pc, &mut stack)?;
                 pop_src(pc, &mut stack)?;
+            }
+            NumericInstruction::LoadRootedLocal(slot) => {
+                if usize::from(slot) >= rooted_count {
+                    return Err(CompileError::InvalidRootedSlot(slot));
+                }
+                stack.push(StackKind::Rooted);
+            }
+            NumericInstruction::ListLength => {
+                // Same isolation requirement as every other side-exiting
+                // instruction: a decline rematerializes this instruction's own
+                // operand and nothing else, so nothing may be pending beneath
+                // it. `pop_rooted` is what proves the popped slot came from a
+                // `LoadRootedLocal` rather than from arithmetic.
+                if stack.len() != 1 {
+                    return Err(CompileError::DynamicOperandsNotIsolated(pc));
+                }
+                pop_rooted(pc, &mut stack)?;
+                stack.push(StackKind::Number);
             }
             NumericInstruction::LoadGlobalDynamic(global) => {
                 if usize::from(global) >= dynamic_global_count {
@@ -1873,7 +2065,8 @@ fn add_edge(
 mod tests {
     use super::{
         CompileError, NumericInstruction, NumericRunOutcome, RegionCallbacks,
-        compile_numeric_field_trace, compile_numeric_field_trace_at, compile_numeric_trace,
+        compile_numeric_field_trace, compile_numeric_field_trace_at,
+        compile_numeric_rooted_trace_at, compile_numeric_trace,
     };
 
     /// Closure-backed `RegionCallbacks` for tests: each method just calls the
@@ -1904,6 +2097,33 @@ mod tests {
         }
         fn store_global(&mut self, global_index: u32, value: f32) -> bool {
             (self.store_global)(global_index, value)
+        }
+    }
+
+    /// Answers only `list_length`, from a table indexed by rooted slot, and
+    /// records which slots native code actually asked about — the handle's
+    /// round trip through the operand stack is what these tests are proving.
+    struct RootedTestCallbacks {
+        lengths: Vec<Option<f32>>,
+        asked: Vec<u32>,
+    }
+
+    impl RegionCallbacks for RootedTestCallbacks {
+        fn load_field(&mut self, _field_index: u32) -> Option<f32> {
+            None
+        }
+        fn store_field(&mut self, _field_index: u32, _value: f32) -> bool {
+            false
+        }
+        fn load_global(&mut self, _global_index: u32) -> Option<f32> {
+            None
+        }
+        fn store_global(&mut self, _global_index: u32, _value: f32) -> bool {
+            false
+        }
+        fn list_length(&mut self, rooted_slot: u32) -> Option<f32> {
+            self.asked.push(rooted_slot);
+            self.lengths.get(rooted_slot as usize).copied().flatten()
         }
     }
 
@@ -2854,5 +3074,196 @@ mod tests {
             "rooted-block batch calls={CALLS} elapsed={:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn rooted_handle_carries_its_slot_index_to_the_list_length_callback() {
+        let trace = compile_numeric_rooted_trace_at(
+            &[
+                NumericInstruction::LoadRootedLocal(1),
+                NumericInstruction::ListLength,
+                NumericInstruction::Return,
+            ],
+            0,
+            0,
+            0,
+            0,
+            2,
+            0,
+        )
+        .expect("rooted list-length trace compiles");
+        let mut state = trace.initial_state(&[]).unwrap();
+        let mut callbacks = RootedTestCallbacks {
+            // Distinct lengths per slot: answering from slot 0 would return
+            // 7.0, so 3.0 proves the index survived the I32->F32->I32 round
+            // trip through the operand stack rather than being defaulted.
+            lengths: vec![Some(7.0), Some(3.0)],
+            asked: Vec::new(),
+        };
+        let outcome = trace.run_budgeted(&mut state, 10, &mut callbacks).unwrap();
+        assert_eq!(callbacks.asked, vec![1]);
+        assert_eq!(
+            outcome,
+            NumericRunOutcome::Returned {
+                value: 3.0,
+                steps: 3
+            }
+        );
+    }
+
+    #[test]
+    fn list_length_side_exits_when_the_callback_declines() {
+        let trace = compile_numeric_rooted_trace_at(
+            &[
+                NumericInstruction::LoadRootedLocal(0),
+                NumericInstruction::ListLength,
+                NumericInstruction::Return,
+            ],
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+        )
+        .expect("rooted list-length trace compiles");
+        let mut state = trace.initial_state(&[]).unwrap();
+        let mut callbacks = RootedTestCallbacks {
+            lengths: vec![None],
+            asked: Vec::new(),
+        };
+        let outcome = trace.run_budgeted(&mut state, 10, &mut callbacks).unwrap();
+        assert_eq!(callbacks.asked, vec![0]);
+        assert_eq!(
+            outcome,
+            NumericRunOutcome::SideExit {
+                instruction: 1,
+                steps: 1
+            },
+            "a declined length resumes at the ListLength instruction itself, \
+             having retired no steps for it"
+        );
+    }
+
+    /// The trait's defaulted `list_length` declines, so an implementor written
+    /// before rooted operands existed keeps compiling and simply side-exits.
+    #[test]
+    fn list_length_declines_by_default_for_callbacks_that_do_not_answer_it() {
+        let trace = compile_numeric_rooted_trace_at(
+            &[
+                NumericInstruction::LoadRootedLocal(0),
+                NumericInstruction::ListLength,
+                NumericInstruction::Return,
+            ],
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+        )
+        .expect("rooted list-length trace compiles");
+        let mut state = trace.initial_state(&[]).unwrap();
+        let outcome = trace
+            .run_budgeted(&mut state, 10, &mut no_callbacks())
+            .unwrap();
+        assert_eq!(
+            outcome,
+            NumericRunOutcome::SideExit {
+                instruction: 1,
+                steps: 1
+            }
+        );
+    }
+
+    /// The whole point of tracking a separate operand kind: a rooted handle is
+    /// a slot index, and letting arithmetic touch it would compute on that
+    /// index as though it were a number.
+    #[test]
+    fn a_rooted_handle_is_rejected_by_arithmetic() {
+        assert!(matches!(
+            compile_numeric_rooted_trace_at(
+                &[
+                    NumericInstruction::LoadRootedLocal(0),
+                    NumericInstruction::Constant(1.0),
+                    NumericInstruction::Add,
+                    NumericInstruction::Return,
+                ],
+                0,
+                0,
+                0,
+                0,
+                1,
+                0,
+            ),
+            Err(CompileError::InvalidOperandKind(_))
+        ));
+    }
+
+    /// A rooted handle is not a receiver either — `LoadFieldDynamic`'s receiver
+    /// is always the region's implicit `src`.
+    #[test]
+    fn a_rooted_handle_is_rejected_as_a_field_receiver() {
+        assert!(matches!(
+            compile_numeric_rooted_trace_at(
+                &[
+                    NumericInstruction::LoadRootedLocal(0),
+                    NumericInstruction::LoadFieldDynamic(0),
+                    NumericInstruction::Return,
+                ],
+                0,
+                0,
+                1,
+                0,
+                1,
+                0,
+            ),
+            Err(CompileError::InvalidOperandKind(_))
+        ));
+    }
+
+    /// Inertness proof: every pre-existing entry point declares zero rooted
+    /// slots, so no already-compiling trace can produce a rooted operand.
+    #[test]
+    fn rooted_locals_are_unreachable_without_declared_slots() {
+        let rooted_instructions = [
+            NumericInstruction::LoadRootedLocal(0),
+            NumericInstruction::ListLength,
+            NumericInstruction::Return,
+        ];
+        assert!(matches!(
+            compile_numeric_rooted_trace_at(&rooted_instructions, 0, 0, 0, 0, 0, 0),
+            Err(CompileError::InvalidRootedSlot(0))
+        ));
+        // The six-parameter entry point every existing caller uses passes
+        // `rooted_count: 0`, so it rejects the same trace for the same reason.
+        assert!(matches!(
+            compile_numeric_field_trace_at(&rooted_instructions, 0, 0, 0, 0, 0),
+            Err(CompileError::InvalidRootedSlot(0))
+        ));
+    }
+
+    /// Same isolation rule the other side-exiting instructions carry: a decline
+    /// rematerializes only this instruction's own operand, so nothing may be
+    /// pending beneath it.
+    #[test]
+    fn list_length_requires_its_operand_to_be_isolated() {
+        assert!(matches!(
+            compile_numeric_rooted_trace_at(
+                &[
+                    NumericInstruction::Constant(9.0),
+                    NumericInstruction::LoadRootedLocal(0),
+                    NumericInstruction::ListLength,
+                    NumericInstruction::Return,
+                ],
+                0,
+                0,
+                0,
+                0,
+                1,
+                0,
+            ),
+            Err(CompileError::DynamicOperandsNotIsolated(2))
+        ));
     }
 }

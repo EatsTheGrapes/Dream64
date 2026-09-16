@@ -4101,6 +4101,7 @@ impl LocalClient {
                     }
                 }
                 Some("ready") => {
+                    #[cfg(windows)]
                     self.ready_browsers.insert(control.clone());
                     if control != AUDIO_BROWSER_CONTROL {
                         if let Err(error) = self
@@ -4113,16 +4114,22 @@ impl LocalClient {
                     } else {
                         self.readiness.audio_available = true;
                     }
-                    let scripts = self
-                        .pending_browser_scripts
-                        .remove(&control)
-                        .unwrap_or_default();
-                    if let Some(browser) = self.browsers.get(&control) {
-                        for script in scripts {
-                            if let Err(error) = browser.evaluate_script(&script) {
-                                eprintln!(
-                                    "client-browser-script-error: control={control} error={error}"
-                                );
+                    // `pending_browser_scripts`/`browsers` hold WebView2 state
+                    // and are themselves `#[cfg(windows)]`; draining them has to
+                    // carry the same gate or this arm cannot compile off Windows.
+                    #[cfg(windows)]
+                    {
+                        let scripts = self
+                            .pending_browser_scripts
+                            .remove(&control)
+                            .unwrap_or_default();
+                        if let Some(browser) = self.browsers.get(&control) {
+                            for script in scripts {
+                                if let Err(error) = browser.evaluate_script(&script) {
+                                    eprintln!(
+                                        "client-browser-script-error: control={control} error={error}"
+                                    );
+                                }
                             }
                         }
                     }
@@ -4340,10 +4347,12 @@ impl LocalClient {
                 if (self.layout.window_width, self.layout.window_height)
                     != (previous_layout.window_width, previous_layout.window_height)
                 {
-                    let _ = surface.window().request_inner_size(LogicalSize::new(
-                        f64::from(self.layout.window_width),
-                        f64::from(self.layout.window_height),
-                    ));
+                    let _ = surface
+                        .window()
+                        .request_inner_size(winit::dpi::LogicalSize::new(
+                            f64::from(self.layout.window_width),
+                            f64::from(self.layout.window_height),
+                        ));
                 }
                 surface.window().request_redraw();
             }

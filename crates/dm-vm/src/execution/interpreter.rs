@@ -49,7 +49,7 @@ use crate::{
     canonical_type2parent_target, datum_field_or_initial, datum_shared_storage, dcs_trace_enabled,
     dynamic_call_target_named, emit_atoms_profile, emit_tgm_profile, engine_builtin_initial_fields,
     engine_builtin_initial_value, false_tick_check_target, is_atom_type_path, lazy_atom_list_field,
-    local_prompt_spec, mark_boot_trace_frame, prepare_iteration_consumes_fresh_block,
+    local_prompt_spec, mark_boot_trace_frame, prepare_iteration_consumes_fresh_list,
     shuttle_trace_emit_snapshot, shuttle_trace_enabled, shuttle_trace_prepare_call,
     shuttle_trace_slot_from_arguments, simple_iteration_field_assignment,
     startup_instruction_category,
@@ -2112,8 +2112,8 @@ pub(crate) fn dispatch_instruction(
             frames[frame_index].stack.push(Value::number(length));
         }
         Instruction::PrepareIteration => {
-            let consumes_fresh_block =
-                prepare_iteration_consumes_fresh_block(program, instruction_index);
+            let consumes_fresh_list =
+                prepare_iteration_consumes_fresh_list(program, instruction_index);
             let iterable = pop(&mut frames[frame_index].stack)
                 .map_err(|message| execution_error(module, frames, message))?;
             let iterable = canonicalize_owned_value(&state.heap, iterable);
@@ -2175,10 +2175,13 @@ pub(crate) fn dispatch_instruction(
                     )
                     .map_err(|error| execution_error(module, frames, error))?,
                 ),
-                // `block()` has just allocated this list and its only
-                // handle is the stack value consumed here. With no
-                // alternate entry, copying cannot improve isolation.
-                Value::List(list) if consumes_fresh_block => Value::List(list),
+                // A spatial generator (`range`, `orange`, `view`, `oview`,
+                // `viewers`, `oviewers`, `hearers`, `ohearers`, `block`) has
+                // just allocated this list and its only handle is the stack
+                // value consumed here. With no alternate entry, copying cannot
+                // improve isolation, so the snapshot moves instead. This is the
+                // specialization BYOND extended across the same family in 515.
+                Value::List(list) if consumes_fresh_list => Value::List(list),
                 Value::List(list) => Value::List(
                     state
                         .heap

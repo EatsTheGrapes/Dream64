@@ -15,7 +15,7 @@ mod region_compile_worker;
 mod run;
 mod run_support;
 mod scheduler;
-mod sidecar;
+pub(crate) mod sidecar;
 mod state;
 mod support;
 mod type_metadata;

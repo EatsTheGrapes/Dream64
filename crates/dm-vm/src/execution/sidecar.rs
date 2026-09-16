@@ -61,11 +61,43 @@ pub(crate) enum PcCache {
     RegionRejected,
 }
 
+/// The memoized packed-dispatch profitability verdict for one PC.
+///
+/// The prediction scan walks up to 24 instructions forward from a PC, reading
+/// only the immutable bytecode and following static `Jump` targets. It consults
+/// no frame, heap, or scheduler state, so its answer for a given PC is fixed for
+/// the life of the program and one evaluation is enough.
+///
+/// Boot telemetry in `docs/performance/boot-architecture-research.md` measured
+/// ~207M block entries re-running that scan to decline 220M times against 26k
+/// uses, and calls memoizing it "a cache-the-verdict cleanup worth ~10 s on its
+/// own".
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum PackedRunVerdict {
+    /// Not scanned at this PC yet.
+    #[default]
+    Unknown,
+    /// The scan reached its horizon; packed dispatch is worth entering.
+    Profitable,
+    /// The scan bailed out; the rich path handles this PC.
+    Unprofitable,
+}
+
 /// A procedure's PC-indexed sidecar array. Allocated once, on the procedure's
 /// first execution, and retained for the process lifetime; entries are never
 /// removed, so the array's heap address is stable.
 pub(crate) struct ProcedureSidecar {
     pcs: Box<[PcCache]>,
+    /// Packed-dispatch verdicts, parallel to `pcs`.
+    ///
+    /// Kept out of [`PcCache`] deliberately: that array holds one variant per
+    /// PC, and field-read and region bookkeeping already contend for the slot.
+    /// A verdict must not be able to evict a field cache, or vice versa.
+    ///
+    /// Allocated on the first packed-dispatch question for this procedure.
+    /// Only PCs that pass `numeric_dispatch_candidate` ever ask, so procedures
+    /// that never enter a numeric block never pay the byte-per-instruction.
+    packed_run: Option<Box<[PackedRunVerdict]>>,
 }
 
 impl ProcedureSidecar {
@@ -74,6 +106,41 @@ impl ProcedureSidecar {
     pub(crate) fn new(instruction_count: usize) -> Self {
         Self {
             pcs: (0..instruction_count).map(|_| PcCache::Cold).collect(),
+            packed_run: None,
+        }
+    }
+
+    /// The packed-dispatch profitability verdict for one PC, running `compute`
+    /// and memoizing it the first time a PC is asked about.
+    ///
+    /// `compute` must be the pure bytecode scan described on
+    /// [`PackedRunVerdict`]; anything consulting runtime state would be wrong to
+    /// cache here. A PC outside this procedure's range falls through to
+    /// `compute` uncached rather than growing the array.
+    pub(crate) fn packed_run_profitable(
+        &mut self,
+        instruction_index: usize,
+        compute: impl FnOnce() -> bool,
+    ) -> bool {
+        let instruction_count = self.pcs.len();
+        if instruction_index >= instruction_count {
+            return compute();
+        }
+        let verdicts = self.packed_run.get_or_insert_with(|| {
+            vec![PackedRunVerdict::Unknown; instruction_count].into_boxed_slice()
+        });
+        match verdicts[instruction_index] {
+            PackedRunVerdict::Profitable => true,
+            PackedRunVerdict::Unprofitable => false,
+            PackedRunVerdict::Unknown => {
+                let profitable = compute();
+                verdicts[instruction_index] = if profitable {
+                    PackedRunVerdict::Profitable
+                } else {
+                    PackedRunVerdict::Unprofitable
+                };
+                profitable
+            }
         }
     }
 
