@@ -2694,6 +2694,9 @@ pub(crate) fn dispatch_instruction(
             frames[frame_index].stack.push(value);
         }
         Instruction::StoreField(name) | Instruction::StoreFieldKeep(name) => {
+            // Diagnostic: the whole arm, operand pops included, so the arm's own
+            // prologue can be separated from the store it performs.
+            let arm_started = state.instruction_profile.is_some().then(Instant::now);
             let keep = matches!(instruction, Instruction::StoreFieldKeep(_));
             let value = match pop(&mut frames[frame_index].stack) {
                 Ok(value) => value,
@@ -2772,6 +2775,11 @@ pub(crate) fn dispatch_instruction(
             }
             if keep {
                 frames[frame_index].stack.push(value);
+            }
+            if let Some(started) = arm_started
+                && let Some(profile) = state.instruction_profile.as_mut()
+            {
+                profile.record_field_write_arm(started.elapsed());
             }
         }
         Instruction::LoadGlobal(name) => {

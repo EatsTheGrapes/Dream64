@@ -859,6 +859,11 @@ pub struct StartupInstructionProfile {
     /// beside it and left out of the totals.
     field_write_ordinary: [CategoryBucket; 2],
     field_write_special: [CategoryBucket; 2],
+    /// Whole-arm cost of `StoreField`/`StoreFieldKeep`, measured from before
+    /// the operand pops. Subtracting the two buckets above isolates the arm's
+    /// own prologue; subtracting this from `field-write` isolates the other
+    /// opcodes in that category.
+    field_write_arm: [CategoryBucket; 2],
 }
 
 impl Default for StartupInstructionProfile {
@@ -872,6 +877,7 @@ impl Default for StartupInstructionProfile {
             gc_steady: CategoryBucket::default(),
             field_write_ordinary: [CategoryBucket::default(); 2],
             field_write_special: [CategoryBucket::default(); 2],
+            field_write_arm: [CategoryBucket::default(); 2],
         }
     }
 }
@@ -895,6 +901,13 @@ impl StartupInstructionProfile {
         } else {
             &mut self.field_write_ordinary[phase]
         };
+        bucket.count = bucket.count.saturating_add(1);
+        bucket.wall_nanos = bucket.wall_nanos.saturating_add(elapsed.as_nanos());
+    }
+
+    /// Records one whole `StoreField` arm, operand pops included.
+    pub(crate) fn record_field_write_arm(&mut self, elapsed: Duration) {
+        let bucket = &mut self.field_write_arm[usize::from(self.steady)];
         bucket.count = bucket.count.saturating_add(1);
         bucket.wall_nanos = bucket.wall_nanos.saturating_add(elapsed.as_nanos());
     }
