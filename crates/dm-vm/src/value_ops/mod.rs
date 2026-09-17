@@ -679,6 +679,27 @@ pub(crate) fn datum_field_requires_special_read(
         )
 }
 
+/// Whether writing `field` on a `runtime_type` receiver reaches one of
+/// [`assign_datum_field`]'s engine paths instead of the ordinary datum-slot
+/// store at its tail.
+///
+/// This is the write-side counterpart to [`datum_field_requires_special_read`]
+/// and must stay conservative in the same direction: a field listed here only
+/// costs the rich path, while a special field wrongly omitted would skip real
+/// engine work (a `loc` write that never moves the atom). `mob` is listed
+/// unconditionally because whether it is special depends on the receiver
+/// holding a live client session, which is not a property of its type.
+pub(crate) fn datum_field_requires_special_write(
+    runtime_type: &TypePath,
+    field: &FieldName,
+) -> bool {
+    let path = runtime_type.as_str();
+    path == "/world"
+        || path == "/savefile"
+        || path.starts_with("/savefile/")
+        || matches!(field.as_str(), "vis_contents" | "vis_locs" | "loc" | "mob")
+}
+
 pub(crate) fn lazy_atom_list_field(
     state: &mut ExecutionState,
     datum: DatumId,

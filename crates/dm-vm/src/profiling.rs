@@ -852,6 +852,13 @@ pub struct StartupInstructionProfile {
     steady_state: [CategoryBucket; INSTR_CATEGORY_COUNT],
     gc_startup: CategoryBucket,
     gc_steady: CategoryBucket,
+    /// Breakdown of the `field-write` category into writes that reach an
+    /// ordinary datum-slot store and writes the engine has to interpret
+    /// (`loc` moves, `vis_contents`, `world` geometry, `client.mob`). These are
+    /// a view of `FieldWrite`, not additional buckets, so they are reported
+    /// beside it and left out of the totals.
+    field_write_ordinary: [CategoryBucket; 2],
+    field_write_special: [CategoryBucket; 2],
 }
 
 impl Default for StartupInstructionProfile {
@@ -863,6 +870,8 @@ impl Default for StartupInstructionProfile {
             steady_state: [CategoryBucket::default(); INSTR_CATEGORY_COUNT],
             gc_startup: CategoryBucket::default(),
             gc_steady: CategoryBucket::default(),
+            field_write_ordinary: [CategoryBucket::default(); 2],
+            field_write_special: [CategoryBucket::default(); 2],
         }
     }
 }
@@ -875,6 +884,18 @@ impl StartupInstructionProfile {
             &mut self.startup[category as usize]
         };
         bucket.count = bucket.count.saturating_add(count);
+        bucket.wall_nanos = bucket.wall_nanos.saturating_add(elapsed.as_nanos());
+    }
+
+    /// Splits one `StoreField` by whether it reached the ordinary slot store.
+    pub(crate) fn record_field_write_split(&mut self, special: bool, elapsed: Duration) {
+        let phase = usize::from(self.steady);
+        let bucket = if special {
+            &mut self.field_write_special[phase]
+        } else {
+            &mut self.field_write_ordinary[phase]
+        };
+        bucket.count = bucket.count.saturating_add(1);
         bucket.wall_nanos = bucket.wall_nanos.saturating_add(elapsed.as_nanos());
     }
 
@@ -918,6 +939,20 @@ impl StartupInstructionProfile {
         let total_instr: u64 = buckets.iter().map(|bucket| bucket.count).sum();
         let total_nanos: u128 =
             buckets.iter().map(|bucket| bucket.wall_nanos).sum::<u128>() + gc.wall_nanos;
+        // Appended after the totals: these subdivide `field-write` rather than
+        // adding to it, so counting them again would inflate every percentage.
+        let phase_index = usize::from(phase_steady);
+        for (label, bucket) in [
+            (
+                "field-write-ordinary",
+                self.field_write_ordinary[phase_index],
+            ),
+            ("field-write-special", self.field_write_special[phase_index]),
+        ] {
+            if bucket.count > 0 || bucket.wall_nanos > 0 {
+                rows.push((label, bucket));
+            }
+        }
         let total_secs = total_nanos as f64 / 1e9;
         let elapsed = self.started.elapsed();
 

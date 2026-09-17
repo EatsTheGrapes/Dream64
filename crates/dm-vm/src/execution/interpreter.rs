@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use crate::builtins;
 use crate::builtins::{
@@ -24,10 +25,10 @@ use crate::value_ops::{
     assign_datum_or_shared_field, atom_contents_iteration_snapshot, block_builtin, builtin_length,
     canonicalize_owned_value, canonicalize_value, compare_values, construct_matrix,
     construct_sized_list, construct_vector, constructor_target_if_present, copy_text_builtin,
-    datum_field_or_shared, datum_field_requires_special_read, deterministic_unit,
-    direction_towards_builtin, dm_list_length_number, dm_list_resize_length, dynamic_call_target,
-    dynamic_call_target_named_at_callsite, engine_root_initial_field_maps, engine_root_paths,
-    execute_animate, execute_del, execute_icon_method, execute_matrix_binary,
+    datum_field_or_shared, datum_field_requires_special_read, datum_field_requires_special_write,
+    deterministic_unit, direction_towards_builtin, dm_list_length_number, dm_list_resize_length,
+    dynamic_call_target, dynamic_call_target_named_at_callsite, engine_root_initial_field_maps,
+    engine_root_paths, execute_animate, execute_del, execute_icon_method, execute_matrix_binary,
     execute_matrix_compound, execute_matrix_method, execute_scalar_add,
     execute_scalar_compound_assignment, execute_vector_binary, execute_vector_compound,
     execute_vector_method, get_step_builtin, hascall_builtin, indexed_text_character,
@@ -2705,8 +2706,23 @@ pub(crate) fn dispatch_instruction(
             let receiver = canonicalize_owned_value(&state.heap, receiver);
             match receiver {
                 Value::Datum(datum) => {
+                    // Diagnostic: under `DREAM64_PROFILE_INSTRUCTIONS`, split the
+                    // `field-write` category by whether this write reaches the
+                    // ordinary datum-slot store or one of the engine paths, so the
+                    // category's cost can be attributed before specializing it.
+                    let split = state.instruction_profile.is_some().then(|| {
+                        let special = state.heap.datum(datum).is_ok_and(|record| {
+                            datum_field_requires_special_write(record.type_path(), name)
+                        });
+                        (special, Instant::now())
+                    });
                     assign_datum_or_shared_field(state, datum, name.clone(), value.clone())
                         .map_err(|message| execution_error(module, frames, message))?;
+                    if let Some((special, started)) = split
+                        && let Some(profile) = state.instruction_profile.as_mut()
+                    {
+                        profile.record_field_write_split(special, started.elapsed());
+                    }
                 }
                 Value::List(list) if name.as_str() == "len" => {
                     let visibility_before = state
