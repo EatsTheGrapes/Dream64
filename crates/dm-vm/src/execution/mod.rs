@@ -42,6 +42,8 @@ pub(crate) use heap_gc::{
     MAXIMUM_MODERATE_YIELD_COLLECTION_GROWTH, MINIMUM_HEAP_COLLECTION_GROWTH,
     bulk_init_aware_collection_growth, collection_counts_toward_bulk_init_streak,
 };
+#[cfg(test)]
+pub(crate) use interpreter::{RuntimeSiteReport, report_runtime_site};
 pub(crate) use run::run_frames;
 pub(crate) use run_support::trace;
 pub(crate) use scheduler::schedule_frames;

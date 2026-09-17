@@ -31,8 +31,8 @@ use dm_value::Value;
 use crate::execution::frame::CallFrame;
 use crate::execution::frame::FrameRunOutcome;
 use crate::execution::frame::StepBudgetBehavior;
-use crate::execution::interpreter::{DispatchFlow, dispatch_instruction};
-use crate::execution::run_support::execution_error;
+use crate::execution::interpreter::{DispatchFlow, dispatch_instruction, unwind_runtime_failure};
+use crate::execution::run_support::{execution_error, execution_limit_error};
 use crate::execution::scheduler::account_scheduler_tick_usage;
 use crate::execution::sidecar::{ProcedureSidecar, ProgramSidecars};
 use crate::execution::state::ExecutionState;
@@ -963,7 +963,7 @@ fn run_frames_inner(
                 state.maybe_collect_unreachable_lists(&frames);
                 return Ok(FrameRunOutcome::Yielded { frames, delay: 0.0 });
             }
-            return Err(execution_error(
+            return Err(execution_limit_error(
                 module,
                 &frames,
                 format!("instruction budget of {} exhausted", limits.max_steps),
@@ -1174,7 +1174,7 @@ fn run_frames_inner(
         let instr_profile_started = instr_profiling.then(Instant::now);
         let instr_profile_category = instr_profiling.then(|| instr_category(instruction));
         let steps_before_dispatch = executed_steps;
-        let dispatch_flow = dispatch_instruction(
+        let dispatch_flow = match dispatch_instruction(
             module,
             state,
             sidecar,
@@ -1189,7 +1189,27 @@ fn run_frames_inner(
             &mut executed_steps,
             &mut remaining_steps,
             ordinary_field_fast_path_enabled,
-        )?;
+        ) {
+            Ok(flow) => flow,
+            // Every failure an instruction can raise is a DM runtime, so it gets
+            // BYOND's handling: an enclosing `try` claims it, otherwise it ends
+            // only the failing procedure. `Throw`/`Crash` route themselves, so
+            // what arrives here is the intrinsic kind — a bad field read, an
+            // unusable list index, a builtin rejecting its arguments. An engine
+            // invariant surfaces the same way; `DREAM64_STRICT_RUNTIMES` keeps
+            // those fatal while debugging.
+            Err(error) => {
+                let caught = Value::text(error.message.clone());
+                unwind_runtime_failure(
+                    module,
+                    state,
+                    &mut frames,
+                    &mut executed_steps,
+                    caught,
+                    error,
+                )?
+            }
+        };
         if let (Some(started), Some(category)) = (instr_profile_started, instr_profile_category)
             && let Some(profile) = state.instruction_profile.as_mut()
         {

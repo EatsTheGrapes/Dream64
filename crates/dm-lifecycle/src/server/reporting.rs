@@ -241,6 +241,7 @@ pub(crate) fn print_boot_summary(
     println!("allocation_movables={}", stats.movables);
     println!("allocation_deferred={}", allocation.work_items().len());
     println!("lifecycle_executed={}", execution.executed_events);
+    println!("uncaught_runtimes={}", dm_vm::uncaught_runtime_count());
     println!("lifecycle_duplicates={}", execution.duplicate_map_events);
     println!("world_allocated={}", usize::from(execution.world.is_some()));
     println!("scheduler_tick={}", execution.scheduler.final_tick);

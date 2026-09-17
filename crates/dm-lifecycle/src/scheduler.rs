@@ -467,6 +467,7 @@ mod tests {
                     source_span: None,
                 })
                 .collect(),
+            recoverable: true,
         }
     }
 
@@ -497,12 +498,14 @@ mod tests {
     /// an identically shaped background thread must still be isolated.
     #[test]
     fn persistent_drain_is_fatal_only_when_master_initialize_unwinds() {
+        // Both CRASH in the detached continuation's own frame, so there is no
+        // caller left to resume and each failure escapes its thread. A runtime
+        // one call deeper is absorbed instead -- see
+        // `master_initialize_survives_a_runtime_in_a_subsystem_it_called`.
         const SOURCE: &str = concat!(
             "/datum/controller/master/proc/Initialize()\n",
             "\tset waitfor = 0\n",
             "\tsleep(1)\n",
-            "\tboom_helper()\n",
-            "/proc/boom_helper()\n",
             "\tCRASH(\"mc boom\")\n",
             "/proc/background_thread()\n",
             "\tset waitfor = 0\n",
@@ -545,5 +548,57 @@ mod tests {
             drain_persistent_scheduler(&module, &mut bg_state, limits, ExecutionLimits::default())
                 .expect("an ordinary background thread failure stays isolated");
         assert_eq!(bg_drain.failed_tasks, 1);
+    }
+
+    /// A runtime inside a procedure `Master.Initialize` called ends that
+    /// procedure, not the thread: `Initialize` resumes with `null` and the drain
+    /// completes. This is the real boot shape -- one subsystem's `Initialize`
+    /// raising a runtime must not take the Master Controller down with it.
+    #[test]
+    fn master_initialize_survives_a_runtime_in_a_subsystem_it_called() {
+        // The second `sleep` is the probe: reaching it means `Initialize` kept
+        // running past the call that raised, so the drain has to schedule it
+        // again for a later tick instead of ending at the first one.
+        const SOURCE: &str = concat!(
+            "/datum/controller/master/proc/Initialize()\n",
+            "\tset waitfor = 0\n",
+            "\tsleep(1)\n",
+            "\tinit_subsystem()\n",
+            "\tsleep(1)\n",
+            "/proc/init_subsystem()\n",
+            "\tCRASH(\"subsystem boom\")\n",
+            "/proc/boot_master()\n",
+            "\tvar/datum/controller/master/controller = new /datum/controller/master\n",
+            "\tcontroller.Initialize()\n",
+        );
+        let syntax = parse(SOURCE).expect("scheduler fixture should parse");
+        let module = compile_module(&syntax.definitions).expect("scheduler fixture should compile");
+
+        let mut state = ExecutionState::new();
+        let boot_master = module
+            .procedure_id("/proc/boot_master")
+            .expect("boot_master entry");
+        execute_module_in_state(&module, boot_master, &[], &mut state)
+            .expect("boot detaches the waitfor=0 Master.Initialize continuation");
+        assert_eq!(state.scheduled_task_count(), 1);
+
+        let drain = drain_persistent_scheduler(
+            &module,
+            &mut state,
+            SchedulerDrainLimits {
+                max_ticks: 10,
+                max_rounds: 10,
+            },
+            ExecutionLimits::default(),
+        )
+        .expect("a runtime below Master.Initialize must not abort the drain");
+        assert_eq!(drain.failed_tasks, 0);
+        assert_eq!(drain.completed_tasks, 1);
+        assert!(
+            drain.final_tick >= 2,
+            "Initialize should resume past the failed call and reach its second \
+             sleep, leaving the drain past tick 1; got {}",
+            drain.final_tick,
+        );
     }
 }

@@ -495,7 +495,7 @@ fn engine_owned_client_click_dispatches_the_addressed_atom() {
 }
 
 #[test]
-fn parent_failure_preserves_both_source_mapped_frames() {
+fn parent_failure_is_source_mapped_and_ends_only_the_parent_implementation() {
     let compilation = TestProject::compile(
         "/datum/base\n\tproc/run()\n\t\treturn \"text\" + 1\n/datum/base/child\n\trun()\n\t\treturn ..()\n",
     );
@@ -508,20 +508,22 @@ fn parent_failure_preserves_both_source_mapped_frames() {
         .definitions[base_implementation.definition_index]
         .body[0]
         .span;
-    let error = execute_effective(&compilation, "/datum/base/child/proc/run", &[])
-        .expect_err("parent numeric failure should propagate");
 
+    // Called directly the parent is the outermost frame, so its failure has no
+    // caller to resume and escapes, carrying the parent body's span.
+    let error = execute_effective(&compilation, "/datum/base/proc/run", &[])
+        .expect_err("a numeric failure with no caller left must escape");
     assert_eq!(error.source_span, Some(expected_span));
-    assert_eq!(error.call_stack.len(), 2);
-    assert!(
-        error.call_stack[0]
-            .procedure
-            .contains("/datum/base/child/proc/run")
+    assert_eq!(error.call_stack.len(), 1);
+    assert!(error.call_stack[0].procedure.contains("/datum/base/proc/run"));
+    assert_eq!(error.call_stack[0].source_span, Some(expected_span));
+
+    // Reached through `..()` it has one: BYOND ends just the parent and resumes
+    // the child with null, so `..()` evaluates to null rather than unwinding.
+    // (Multi-frame source-mapped stacks are covered by dm-vm's
+    // `maps_callee_runtime_errors_and_preserves_caller_context`.)
+    assert_eq!(
+        execute_effective(&compilation, "/datum/base/child/proc/run", &[]),
+        Ok(Value::Null),
     );
-    assert!(
-        error.call_stack[1]
-            .procedure
-            .contains("/datum/base/proc/run")
-    );
-    assert_eq!(error.call_stack[1].source_span, Some(expected_span));
 }

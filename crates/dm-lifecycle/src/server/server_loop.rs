@@ -502,8 +502,13 @@ fn activate_lobby_generation(
         if is_ready(precompiled) {
             let (gc_count, gc_ms, exec_steps) = precompiled.boot_execution_totals();
             eprintln!(
-                "boot-progress: generation activation complete slices={slice} tick={} completed={} pending={} lobby=pregame gc_count={gc_count} gc_ms={gc_ms} exec_steps={exec_steps}",
-                scheduler.final_tick, scheduler.completed_tasks, scheduler.pending_tasks,
+                "boot-progress: generation activation complete slices={slice} tick={} completed={} pending={} lobby=pregame gc_count={gc_count} gc_ms={gc_ms} exec_steps={exec_steps} uncaught_runtimes={}",
+                scheduler.final_tick,
+                scheduler.completed_tasks,
+                scheduler.pending_tasks,
+                // Per-site reporting goes quiet after a few examples, so this is
+                // the only place the real total for the activation phase shows up.
+                dm_vm::uncaught_runtime_count(),
             );
             report_boot_profiles(precompiled, "activation-complete");
             return Ok(());

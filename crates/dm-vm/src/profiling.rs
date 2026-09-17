@@ -490,6 +490,31 @@ pub(crate) fn dcs_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("DREAM64_TRACE_DCS").is_some())
 }
 
+/// Whether an uncaught DM runtime error stays fatal to the whole call chain.
+///
+/// BYOND ends only the procedure the error occurred in and resumes its caller
+/// with `null`, which is what the interpreter does by default. That fallback
+/// also turns an *engine* bug into a silent `null`, so `DREAM64_STRICT_RUNTIMES`
+/// restores the strict behaviour for debugging. Diagnostic only.
+pub(crate) fn strict_runtimes_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DREAM64_STRICT_RUNTIMES").is_some())
+}
+
+/// Uncaught runtime errors that ended one procedure and resumed its caller with
+/// `null`, rather than propagating out of the run loop.
+pub(crate) static UNCAUGHT_RUNTIME_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// How many uncaught runtime errors DM error handling has absorbed so far.
+///
+/// Each one is also reported to stderr as it happens; this is the running total
+/// for a boot summary, where a jump is the signal that something regressed even
+/// though the world still came up.
+#[must_use]
+pub fn uncaught_runtime_count() -> u64 {
+    UNCAUGHT_RUNTIME_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Wall-time threshold, if any, above which a single interpreter instruction is
 /// reported to stderr. Gated by `DREAM64_TRACE_SLOW_INSTRUCTION`: unset disables
 /// it, a bare/truthy value uses a 5 ms threshold, and a positive integer sets an
