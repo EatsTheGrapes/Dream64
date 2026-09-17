@@ -12,6 +12,8 @@ git clone --depth 1 https://github.com/Monkestation/monkestation2.0
 cd monkestation2.0
 touch libauxlua.so libdreamluau.so librust_g.so
 
+(cd tgui && bun install --frozen-lockfile && bun run tgui:build)   # ~25s
+
 dream64-compiler -DCBT tgstation.dme          # ~105-155s, ~955MB artifact
 HOME="$PWD" dream64-server boot tgstation.d64  # artifact carries its own map
 ```
@@ -43,6 +45,17 @@ an absolute path outside the project root, which the engine's file guard
 refuses. Both probes sit behind `world.system_type == UNIX`, so a Windows dev
 box never reaches them. Pointing `HOME` at the project makes the probe legal;
 it then simply finds nothing and falls through.
+
+**TGUI must be built.** `/datum/asset/simple/tgui` registers
+`file("tgui/public/tgui.bundle.js")` and its siblings, which are gitignored
+build artifacts -- a fresh clone has only four hand-written files in
+`tgui/public/`. Without them `SSassets` reaches `md5asfile()`, whose
+`fcopy(file, "tmp/...")` silently copies nothing, and the following
+`rustg_hash_file` raises on the file that was never written. That raise
+unwinds the Master Controller thread, so the boot dies in SSassets rather
+than reporting which asset was missing. `tgui/package.json` pins
+`bun@1.3.6`; `bun install --frozen-lockfile && bun run tgui:build` produces
+the real bundles in about 25 seconds.
 
 **The three `.so` stubs** stop `__detect_auxtools` from `CRASH`ing when a
 native library is absent. They are empty files: nothing is loaded from them.
