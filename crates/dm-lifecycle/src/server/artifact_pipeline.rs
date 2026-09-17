@@ -242,6 +242,7 @@ pub(crate) fn run_standalone_linked_boot(
                 runtime.restore_execution_state(state);
                 drop(world);
 
+                let mut temp_persistent_state = None;
                 let execution = execute_precomputed_lifecycle_hooks(
                     &lifecycle,
                     &pre_state,
@@ -249,9 +250,12 @@ pub(crate) fn run_standalone_linked_boot(
                     startup_scheduler_limits(),
                     readiness.as_ref(),
                     precompiled.executable_mut(),
-                    None,
+                    Some(&mut temp_persistent_state),
                     None,
                 );
+                if let Some(state) = temp_persistent_state {
+                    precompiled.install_persistent_state(state);
+                }
                 match execution {
                     Ok(execution) => {
                         let empty_allocation = dm_world::WorldAllocation::empty();
