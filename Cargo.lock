@@ -982,7 +982,6 @@ dependencies = [
  "dm-value",
  "dm-vm",
  "dm-world",
- "flate2",
  "md5",
  "serde",
 ]

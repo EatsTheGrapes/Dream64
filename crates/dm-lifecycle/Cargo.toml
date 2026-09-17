@@ -29,7 +29,6 @@ dm-syntax = { path = "../dm-syntax" }
 dm-value = { path = "../dm-value" }
 dm-vm = { path = "../dm-vm" }
 dm-world = { path = "../dm-world" }
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 md5 = "0.7"
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"

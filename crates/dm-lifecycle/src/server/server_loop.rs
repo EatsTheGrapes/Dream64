@@ -1,23 +1,20 @@
 //! The persistent headless scheduler loop and its entry paths: public-endpoint
-//! discovery, per-launch random seeding, prewarmed-standby activation handoff,
-//! lobby-generation activation, and the startup scheduler drain limits.
+//! discovery, per-launch random seeding, lobby-generation activation, and the
+//! startup scheduler drain limits.
 
 use std::collections::hash_map::RandomState;
 use std::env;
 use std::hash::{BuildHasher, Hasher};
-use std::io::{BufRead as _, BufReader, Read as _};
-use std::net::{IpAddr, TcpListener};
+use std::net::IpAddr;
 use std::process::{Command as ProcessCommand, ExitCode};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use dm_lifecycle::ipc::{BootPhase, LoopbackIpc, parse_loopback_address};
+use dm_lifecycle::ipc::{BootPhase, LoopbackIpc};
 use dm_lifecycle::{
     HeadlessReadinessProbe, HostSliceBudget, SchedulerDrainLimits,
     advance_persistent_scheduler_responsive, readiness_probe_matches,
 };
 use dm_runtime::RuntimeImage;
-
-use super::cli::ProductionReadyWorldIdentity;
 
 pub(crate) fn report_public_endpoint(port: u16) {
     let _ = std::thread::Builder::new()
@@ -45,104 +42,6 @@ pub(crate) fn report_public_endpoint(port: u16) {
                 Err(_) => eprintln!("server-network: public IP discovery unavailable"),
             }
         });
-}
-
-pub(crate) fn run_prewarmed_standby(
-    runtime: &mut RuntimeImage,
-    precompiled: &mut dm_lifecycle::PrecompiledLifecycle,
-    identity: &ProductionReadyWorldIdentity,
-    control_address: &str,
-    lobby_readiness: Option<&HeadlessReadinessProbe>,
-) -> ExitCode {
-    let control_address = match parse_loopback_address(control_address) {
-        Ok(address) => address,
-        Err(error) => {
-            eprintln!("prewarm standby address: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let listener = match TcpListener::bind(control_address) {
-        Ok(listener) => listener,
-        Err(error) => {
-            eprintln!("prewarm standby bind {control_address}: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    eprintln!(
-        "boot-progress: prewarmed standby ready control={} deployment={:?} seed={}",
-        control_address, identity.deployment_id, identity.random_seed,
-    );
-    let expected = format!("ACTIVATE {}", identity.deployment_id);
-    loop {
-        let (stream, peer) = match listener.accept() {
-            Ok(connection) => connection,
-            Err(error) => {
-                eprintln!("prewarm standby accept: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-        let mut command = String::new();
-        match BufReader::new(stream).take(4_096).read_line(&mut command) {
-            Ok(_) if command.trim() == expected => {
-                eprintln!(
-                    "boot-progress: prewarmed standby activation accepted peer={peer} deployment={:?}",
-                    identity.deployment_id,
-                );
-                break;
-            }
-            Ok(_) if command.trim() == format!("CANCEL {}", identity.deployment_id) => {
-                eprintln!(
-                    "boot-progress: prewarmed standby cancelled deployment={:?}",
-                    identity.deployment_id,
-                );
-                return ExitCode::SUCCESS;
-            }
-            Ok(_) => eprintln!("prewarm standby rejected command from {peer}"),
-            Err(error) => eprintln!("prewarm standby read from {peer}: {error}"),
-        }
-    }
-    drop(listener);
-
-    let ipc_address = env::var("DREAM64_IPC_ADDR").unwrap_or_else(|_| "0.0.0.0:51664".to_owned());
-    let ipc_address = match parse_loopback_address(&ipc_address) {
-        Ok(address) => address,
-        Err(error) => {
-            eprintln!("loopback IPC: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let timeout = env::var("DREAM64_HANDOFF_TIMEOUT_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map_or(Duration::from_secs(30), Duration::from_millis);
-    let deadline = Instant::now() + timeout;
-    let ipc = loop {
-        match LoopbackIpc::bind_starting(ipc_address, "Activating prepared world") {
-            Ok(ipc) => break ipc,
-            Err(error) if Instant::now() < deadline => {
-                eprintln!(
-                    "boot-progress: handoff waiting for ipc={} reason={error}",
-                    ipc_address
-                );
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(error) => {
-                eprintln!(
-                    "boot-progress: handoff failed ipc={} reason={error}",
-                    ipc_address
-                );
-                return ExitCode::FAILURE;
-            }
-        }
-    };
-    report_public_endpoint(ipc.local_addr().port());
-    eprintln!(
-        "boot-progress: prewarmed handoff complete ipc={} deployment={:?}",
-        ipc.local_addr(),
-        identity.deployment_id,
-    );
-    run_persistent_server_loop(runtime, precompiled, Some(ipc), lobby_readiness)
 }
 
 pub(crate) fn launch_random_seed() -> (u64, &'static str) {

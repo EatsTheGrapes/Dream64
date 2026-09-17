@@ -1,6 +1,5 @@
 use std::env;
 use std::ffi::OsStr;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -24,21 +23,15 @@ use server::artifact_pipeline::{
     PreparedCacheStats, cached_world_plan, executable_artifact_file, prepare_compiled_executable,
     prepare_standalone_artifact, project_cache_file, run_standalone_linked_boot,
 };
-use server::cli::{
-    Command, ReadyWorldMode, parse_trailing_arguments, progress_label,
-    ready_world_mode_from_environment,
-};
+use server::cli::{Command, parse_trailing_arguments, progress_label};
 use server::lobby_preflight::run_lobby_preflight;
-use server::ready_world::{
-    ready_world_cache_file, restore_ready_world_cache, write_ready_world_cache,
-};
 use server::reporting::{
     format_runtime_diagnostic, inspect_ready_globals, load_map, lobby_pregame_readiness,
     master_controller_readiness, print_boot_summary, print_compatibility_sweep, print_plan_summary,
 };
 use server::server_loop::{
-    fresh_launch_random_seed, launch_random_seed, report_public_endpoint,
-    run_persistent_server_loop, run_prewarmed_standby, startup_scheduler_limits,
+    launch_random_seed, report_public_endpoint,
+    run_persistent_server_loop, startup_scheduler_limits,
 };
 
 fn main() -> ExitCode {
@@ -126,23 +119,9 @@ fn run_main() -> ExitCode {
         eprintln!("usage: dm-lifecycle {} <world.dme>", "compile");
         return ExitCode::from(2);
     }
-    let ready_world_mode = if command == Command::Boot {
-        match ready_world_mode_from_environment() {
-            Ok(mode) => mode,
-            Err(error) => {
-                eprintln!("ready-world mode: {error}");
-                return ExitCode::from(2);
-            }
-        }
-    } else {
-        ReadyWorldMode::Disabled
-    };
     let audit_runtime =
         command == Command::Boot && env::var_os("DREAM64_BOOT_AUDIT_RUNTIME").is_some();
-    let mut boot_startup_ipc = if command == Command::Boot
-        && !audit_runtime
-        && !matches!(&ready_world_mode, ReadyWorldMode::Prewarm(_))
-    {
+    let mut boot_startup_ipc = if command == Command::Boot && !audit_runtime {
         let ipc_address =
             env::var("DREAM64_IPC_ADDR").unwrap_or_else(|_| "0.0.0.0:51664".to_owned());
         let ipc = match parse_loopback_address(&ipc_address)
@@ -332,7 +311,6 @@ fn run_main() -> ExitCode {
             .flatten();
         let (map_path, map_source) = match linked_map {
             Some((map_path, world)) => {
-                let ready_cache = cache_file.with_extension("linked-map.ready");
                 let compile_index = cached_lifecycle_index.clone().unwrap_or_else(|| {
                     LifecycleIndex::build_compile_only(&compilation, &procedures)
                 });
@@ -357,7 +335,7 @@ fn run_main() -> ExitCode {
                         }
                     },
                 };
-                prepared_boot = Some((map_path, world, precompiled, ready_cache));
+                prepared_boot = Some((map_path, world, precompiled));
                 (String::new(), String::new())
             }
             None => match load_map(&compilation, requested_map.as_deref()) {
@@ -372,12 +350,6 @@ fn run_main() -> ExitCode {
             // The linked map already supplied the complete world/precompile tuple.
         } else {
             eprintln!("boot-progress: preparing map plan {map_path}");
-            let ready_cache = ready_world_cache_file(
-                &cache_file,
-                &map_source,
-                &compilation,
-                ready_world_mode.production_identity(),
-            );
             let world = match cached_world_plan(&cache_file, &map_source, &compilation) {
                 Ok(world) => world,
                 Err(error) => {
@@ -429,7 +401,7 @@ fn run_main() -> ExitCode {
                 precompiled.module_procedures(),
                 precompiled.deferred_procedures(),
             );
-            prepared_boot = Some((map_path, world, precompiled, ready_cache));
+            prepared_boot = Some((map_path, world, precompiled));
         }
     }
     if command == Command::Boot {
@@ -465,7 +437,7 @@ fn run_main() -> ExitCode {
     };
     let runtime_result = if let Some(runtime) = cached_linked_runtime.take() {
         Ok(runtime)
-    } else if let Some((_, _, precompiled, _)) = prepared_boot.as_mut() {
+    } else if let Some((_, _, precompiled)) = prepared_boot.as_mut() {
         match cached_structural_seed.take() {
             Some(seed) => RuntimeImage::from_compilation_with_prelinked_module_and_seed(
                 &compilation,
@@ -497,21 +469,11 @@ fn run_main() -> ExitCode {
         }
     };
     if command == Command::Boot {
-        if let ReadyWorldMode::Activate(identity) = &ready_world_mode {
-            eprintln!(
-                "boot-progress: random stream preserved from ready-world snapshot deployment={:?} seed={}",
-                identity.deployment_id, identity.random_seed,
-            );
-        } else {
-            let (launch_random_seed, random_seed_source) = match &ready_world_mode {
-                ReadyWorldMode::Prewarm(identity) => (identity.random_seed, "production-identity"),
-                _ => launch_random_seed(),
-            };
-            runtime.set_launch_random_seed(launch_random_seed);
-            eprintln!(
-                "boot-progress: random stream seeded for this launch source={random_seed_source} seed={launch_random_seed}"
-            );
-        }
+        let (seed, _) = launch_random_seed();
+        runtime.set_launch_random_seed(seed);
+        eprintln!(
+            "boot-progress: random stream seeded for this launch seed={seed}"
+        );
         let stats = runtime.stats();
         eprintln!(
             "boot-progress: initializer frontier selectors={} typed_constructors={} dynamic_constructor_fallback={} complete_inventory_fallback={} module_procedures={} deferred={} materialized={} direct_initial_values={} shared_reflection_entries={}",
@@ -568,11 +530,9 @@ fn run_main() -> ExitCode {
         .take()
         .unwrap_or_else(|| LifecycleIndex::build(&compilation, &procedures, &runtime));
     let mut boot_precompiled = None;
-    let mut ready_world_cache = None;
     let (map_path, world) =
-        if let Some((map_path, world, precompiled, ready_cache)) = prepared_boot.take() {
+        if let Some((map_path, world, precompiled)) = prepared_boot.take() {
             boot_precompiled = Some(precompiled);
-            ready_world_cache = Some(ready_cache);
             (map_path, world)
         } else {
             let (map_path, map_source) = match load_map(&compilation, requested_map.as_deref()) {
@@ -629,89 +589,6 @@ fn run_main() -> ExitCode {
         drop(procedures);
         drop(compilation);
         let mut startup_ipc = boot_startup_ipc.take();
-        let ready_cache = ready_world_cache
-            .as_deref()
-            .expect("production boot prepared a ready-world cache identity");
-        let restore_snapshot = matches!(
-            &ready_world_mode,
-            ReadyWorldMode::Development | ReadyWorldMode::Activate(_)
-        );
-        if restore_snapshot && ready_cache.is_file() {
-            if let Some(ipc) = &startup_ipc {
-                ipc.commit_boot_phase(
-                    ipc.startup_generation(),
-                    BootPhase::WorldPlan,
-                    "Restoring ready world",
-                )
-                .expect("boot phase advances monotonically");
-            }
-            let restore_started = Instant::now();
-            let mut state = runtime.take_execution_state();
-            let precompiled = boot_precompiled.as_mut().expect("boot precompile exists");
-            match restore_ready_world_cache(ready_cache, &mut state, precompiled.module()) {
-                Ok(bytes) => {
-                    if matches!(&ready_world_mode, ReadyWorldMode::Development) {
-                        // Development reuse intentionally starts a fresh random
-                        // stream. Production activation instead continues the
-                        // exact stream captured by its matching prewarm image.
-                        state.reseed_random(fresh_launch_random_seed());
-                    }
-                    precompiled.install_persistent_state(state);
-                    eprintln!(
-                        "boot-progress: ready-world-cache cache=hit artifact={} bytes={} restore_ms={}",
-                        ready_cache.display(),
-                        bytes,
-                        restore_started.elapsed().as_millis(),
-                    );
-                    eprintln!(
-                        "boot-progress: headless ready from snapshot; entering persistent scheduler loop ready_elapsed_ms={}",
-                        process_started.elapsed().as_millis()
-                    );
-                    return run_persistent_server_loop(
-                        &mut runtime,
-                        precompiled,
-                        startup_ipc,
-                        lobby_readiness.as_ref(),
-                    );
-                }
-                Err(error) => {
-                    runtime.restore_execution_state(state);
-                    if matches!(&ready_world_mode, ReadyWorldMode::Activate(_)) {
-                        eprintln!(
-                            "boot-progress: ready-world activation failed closed artifact={} reason={error:?}",
-                            ready_cache.display(),
-                        );
-                        return ExitCode::FAILURE;
-                    }
-                    eprintln!(
-                        "boot-progress: ready-world-cache cache=miss artifact={} reason={error:?}",
-                        ready_cache.display(),
-                    );
-                    if let Err(remove_error) = fs::remove_file(ready_cache) {
-                        eprintln!(
-                            "boot-progress: ready-world-cache corrupt-artifact-retained error={remove_error}"
-                        );
-                    }
-                }
-            }
-        } else {
-            if matches!(&ready_world_mode, ReadyWorldMode::Activate(_)) {
-                eprintln!(
-                    "boot-progress: ready-world activation failed closed artifact={} reason=not-found",
-                    ready_cache.display(),
-                );
-                return ExitCode::FAILURE;
-            }
-            eprintln!(
-                "boot-progress: ready-world-cache cache=miss artifact={} reason={:?}",
-                ready_cache.display(),
-                match &ready_world_mode {
-                    ReadyWorldMode::Disabled => "disabled",
-                    ReadyWorldMode::Prewarm(_) => "production prewarm requested",
-                    ReadyWorldMode::Development | ReadyWorldMode::Activate(_) => "not found",
-                },
-            );
-        }
         if let Some(ipc) = &startup_ipc {
             ipc.commit_boot_phase(
                 ipc.startup_generation(),
@@ -862,62 +739,6 @@ fn run_main() -> ExitCode {
             "boot-progress: headless ready; entering persistent scheduler loop ready_elapsed_ms={}",
             process_started.elapsed().as_millis()
         );
-        let mut snapshot_written = false;
-        if ready_world_mode.writes_snapshot()
-            && let Some(state) = precompiled.persistent_state_mut()
-        {
-            let snapshot_started = Instant::now();
-            match write_ready_world_cache(ready_cache, state) {
-                Ok(bytes) => {
-                    snapshot_written = true;
-                    eprintln!(
-                        "boot-progress: ready-world-cache cache=stored artifact={} bytes={} write_ms={}",
-                        ready_cache.display(),
-                        bytes,
-                        snapshot_started.elapsed().as_millis(),
-                    );
-                }
-                Err(error) => {
-                    eprintln!(
-                        "boot-progress: ready-world-cache store-failed artifact={} error={error:?}",
-                        ready_cache.display(),
-                    );
-                    if matches!(&ready_world_mode, ReadyWorldMode::Prewarm(_)) {
-                        return ExitCode::FAILURE;
-                    }
-                }
-            }
-        }
-        if let ReadyWorldMode::Prewarm(identity) = &ready_world_mode {
-            if !snapshot_written {
-                eprintln!(
-                    "boot-progress: ready-world prewarm failed artifact={} reason=persistent-state-unavailable",
-                    ready_cache.display(),
-                );
-                return ExitCode::FAILURE;
-            }
-            eprintln!(
-                "boot-progress: ready-world prewarm complete artifact={} deployment={:?} seed={} elapsed_ms={}",
-                ready_cache.display(),
-                identity.deployment_id,
-                identity.random_seed,
-                process_started.elapsed().as_millis(),
-            );
-            if let Some(control_address) = env::var_os("DREAM64_PREWARM_STANDBY_ADDR") {
-                let Some(control_address) = control_address.to_str() else {
-                    eprintln!("DREAM64_PREWARM_STANDBY_ADDR is not valid Unicode");
-                    return ExitCode::FAILURE;
-                };
-                return run_prewarmed_standby(
-                    &mut runtime,
-                    precompiled,
-                    identity,
-                    control_address,
-                    lobby_readiness.as_ref(),
-                );
-            }
-            return ExitCode::SUCCESS;
-        }
         return run_persistent_server_loop(
             &mut runtime,
             precompiled,

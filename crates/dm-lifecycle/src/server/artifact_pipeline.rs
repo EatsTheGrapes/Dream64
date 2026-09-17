@@ -1184,11 +1184,6 @@ mod tests {
     use dm_value::{FieldName, TypePath, Value};
     use dm_vm::{ExecutionState, execute_module_in_state};
 
-    use crate::server::cli::ProductionReadyWorldIdentity;
-    use crate::server::ready_world::{
-        ready_world_cache_file, restore_ready_world_cache, write_ready_world_cache,
-    };
-
     use super::{
         ArtifactSection, COMPACT_WORDCODE_ARTIFACT_SECTION, CompiledArtifact,
         decode_compiled_executable, executable_artifact_file, lobby_pregame_readiness,
@@ -1401,68 +1396,6 @@ mod tests {
             )
             .unwrap();
         assert!(readiness_probe_matches(&state, &probe));
-    }
-
-    #[test]
-    fn ready_world_identity_changes_with_map_content_and_compressed_state_roundtrips() {
-        let fixture = Fixture::new();
-        let prepared = fixture.prepare();
-        let first = ready_world_cache_file(
-            &fixture.cache,
-            "(1,1,1) = {\"a\"}",
-            &prepared.compilation,
-            None,
-        );
-        let second = ready_world_cache_file(
-            &fixture.cache,
-            "(1,1,1) = {\"b\"}",
-            &prepared.compilation,
-            None,
-        );
-        assert_ne!(first, second);
-        let deployment = |random_seed, deployment_id: &str| ProductionReadyWorldIdentity {
-            random_seed,
-            deployment_id: deployment_id.to_owned(),
-        };
-        let production = ready_world_cache_file(
-            &fixture.cache,
-            "(1,1,1) = {\"a\"}",
-            &prepared.compilation,
-            Some(&deployment(41, "blue")),
-        );
-        assert_ne!(production, first);
-        assert_ne!(
-            production,
-            ready_world_cache_file(
-                &fixture.cache,
-                "(1,1,1) = {\"a\"}",
-                &prepared.compilation,
-                Some(&deployment(42, "blue")),
-            )
-        );
-        assert_ne!(
-            production,
-            ready_world_cache_file(
-                &fixture.cache,
-                "(1,1,1) = {\"a\"}",
-                &prepared.compilation,
-                Some(&deployment(41, "green")),
-            )
-        );
-
-        let mut state = ExecutionState::new();
-        state.set_global(FieldName::parse("answer").unwrap(), Value::number(42.0));
-        let bytes = write_ready_world_cache(&first, &state).unwrap();
-        assert!(bytes > 0);
-        let mut restored = ExecutionState::new();
-        assert_eq!(
-            restore_ready_world_cache(&first, &mut restored, prepared.executable.module()).unwrap(),
-            bytes
-        );
-        assert_eq!(
-            restored.global(&FieldName::parse("answer").unwrap()),
-            Some(&Value::number(42.0))
-        );
     }
 
     #[test]
