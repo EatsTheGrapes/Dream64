@@ -113,6 +113,55 @@ Primary source:
 - https://github.com/space-wizards/RobustToolbox/blob/master/Robust.Shared/EntitySerialization/EntityDeserializer.cs
 - https://github.com/space-wizards/RobustToolbox/blob/master/Robust.Serialization.Generator/Generator.cs
 
+## Instance-initializer cost, measured inside SSatoms (2026-09-17)
+
+The first Linux Monkestation boots (see `monkestation-boot-on-linux.md`) put
+real numbers on the ~3.43M nested initializer invocations this document
+attributes ~21s to.
+
+**Per-entry cost is mostly VM entry, not expression work.**
+`instance_initializer_entry_cost_benchmark` measures one
+`execute_module_in_context` on a trivial expression at **~0.88us**, against
+**~0.12us** for a whole datum allocation with no dynamic initializers.
+`vec![make_frame(..)]` is only ~0.07us of that, so reusing the frame vector
+buys nothing -- the run-loop entry is the cost.
+
+**Compile-time specialization of constant-list initializers** (`list()`,
+`list(1,"a")` -> a host-side allocation, no program) claims 11,505 of 43,813
+dynamic initializers, 26.3% of declaration sites. Measured A/B on a boot
+reaching SSatoms:
+
+| | baseline | specialized | delta |
+| --- | ---: | ---: | ---: |
+| initializer programs per allocation | 5.335 | 4.796 | **-10.1%** |
+| initializer time per allocation | 8.82us | 8.51us | **-3.4%** |
+
+Both runs stopped at the same failure (`md5asfile`) but at different points
+(626,507 vs 682,742 allocations), because `DREAM64_BOOT_MAX_SLICES` bounds
+wall-clock slices rather than work -- `exec_steps` at slice 100 differs by 16%
+between the two builds. Only the per-allocation ratios above are comparable;
+the absolute counts and millisecond totals are not.
+
+**The gap between -10.1% of entries and -3.4% of time is the finding.** The
+eliminated entries were the cheapest ones, which is exactly what an empty-list
+program is. Specializing further declaration shapes therefore has a low
+ceiling: what remains is genuinely dynamic (`new`, proc calls, expressions over
+globals).
+
+**Where the remaining time actually is.** The surviving entries average
+**1.77us** each. A trivial entry costs ~0.88us of pure scaffolding, so roughly
+half of every remaining initializer invocation is still VM-entry overhead
+rather than evaluating the expression. At 4.8 entries per allocation that is
+~3.4us of overhead per allocation, against 8.51us total.
+
+That points at **fusing a type's per-field initializer programs into one
+program per type** rather than one per field: it would take entries per
+allocation from ~4.8 to ~1 and reclaim the overhead half, which specialization
+structurally cannot touch. The semantics to preserve are the hard part --
+declaration order interleaved with `Constant` writes, per-initializer side
+effects, and the fact that the host currently performs each `set_datum_field`
+after its program returns rather than the program storing it.
+
 ## Ranked changes
 
 ### 1. Build a real adaptive Tier 1 and broad baseline JIT
