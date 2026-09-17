@@ -369,6 +369,7 @@ fn report_boot_profiles(precompiled: &dm_lifecycle::PrecompiledLifecycle, at: &s
     eprintln!(
         "boot-profile at={at} locate_scans type_scans={loc_ty} type_scan_datums={loc_ty_datums} tag_scans={loc_tag} tag_scan_datums={loc_tag_datums} type_instances_scans={ti_scans} type_instances_scan_datums={ti_datums}"
     );
+    report_native_quickening(at);
     for line in precompiled.instruction_profile_lines(false) {
         eprintln!("boot-profile at={at} {line}");
     }
@@ -616,13 +617,15 @@ fn activate_lobby_generation(
     ))
 }
 
-/// Dumps the native-quickening counters and the parked DM frames after the
-/// activation loop gives up, so a stuck controller tail is diagnosable from the
-/// boot log alone.
-fn report_activation_timeout_diagnostics(precompiled: &mut dm_lifecycle::PrecompiledLifecycle) {
-    for line in precompiled.bounded_scheduler_progress() {
-        eprintln!("boot-progress: activation-timeout-dm-frame {line}");
-    }
+/// Formats the native fast-path engagement counters under one `at` tag.
+///
+/// These are the only signal that a guarded native drive (the TGM map loader
+/// and its ruin/build_coordinate siblings) actually engaged. Each guard is an
+/// exact-match pin, so a drifted pin turns the specialization off silently and
+/// the whole map falls back to the reference interpreter. Reporting this on the
+/// success path as well as the timeout path means a zeroed counter shows up in
+/// an ordinary boot profile instead of only in a boot that already failed.
+fn native_quickening_line(at: &str) -> String {
     let (ruin_batches, ruin_steps) = dm_vm::native_ruin_batch_metrics();
     let (ruin_scan_activations, ruin_scan_cells, ruin_scan_rejections, ruin_scan_successes) =
         dm_vm::native_ruin_scan_metrics();
@@ -633,8 +636,8 @@ fn report_activation_timeout_diagnostics(precompiled: &mut dm_lifecycle::Precomp
         dm_vm::native_tgm_build_cache_metrics();
     let (build_coordinate_prefixes, build_coordinate_fallbacks) =
         dm_vm::native_build_coordinate_prefix_metrics();
-    eprintln!(
-        "boot-progress: native-quickening tgm_load_activations={} tgm_cells={} tgm_safepoints={} tgm_commits={} tgm_target_resolutions={} tgm_target_cache_hits={} tgm_build_cache_members={} tgm_build_cache_logical_steps={} build_coordinate_prefixes={} build_coordinate_fallbacks={} discover_offset_activations={} ruin_batches={} ruin_logical_steps={} ruin_scan_activations={} ruin_scan_cells={} ruin_scan_rejections={} ruin_scan_successes={} ruin_flag_rejections={} ruin_area_rejections={} ruin_rejection_cache_hits={}",
+    format!(
+        "boot-profile at={at} native_quickening tgm_load_activations={} tgm_cells={} tgm_safepoints={} tgm_commits={} tgm_target_resolutions={} tgm_target_cache_hits={} tgm_build_cache_members={} tgm_build_cache_logical_steps={} build_coordinate_prefixes={} build_coordinate_fallbacks={} discover_offset_activations={} ruin_batches={} ruin_logical_steps={} ruin_scan_activations={} ruin_scan_cells={} ruin_scan_rejections={} ruin_scan_successes={} ruin_flag_rejections={} ruin_area_rejections={} ruin_rejection_cache_hits={}",
         dm_vm::native_tgm_load_activations(),
         tgm_cells,
         tgm_safepoints,
@@ -655,7 +658,22 @@ fn report_activation_timeout_diagnostics(precompiled: &mut dm_lifecycle::Precomp
         ruin_flag_rejections,
         ruin_area_rejections,
         dm_vm::native_ruin_rejection_cache_hits(),
-    );
+    )
+}
+
+/// Prints [`native_quickening_line`] to the boot log.
+fn report_native_quickening(at: &str) {
+    eprintln!("{}", native_quickening_line(at));
+}
+
+/// Dumps the native-quickening counters and the parked DM frames after the
+/// activation loop gives up, so a stuck controller tail is diagnosable from the
+/// boot log alone.
+fn report_activation_timeout_diagnostics(precompiled: &mut dm_lifecycle::PrecompiledLifecycle) {
+    for line in precompiled.bounded_scheduler_progress() {
+        eprintln!("boot-progress: activation-timeout-dm-frame {line}");
+    }
+    report_native_quickening("activation-timeout");
     for sample in dm_vm::native_tgm_commit_samples() {
         eprintln!("boot-progress: tgm-commit {sample}");
     }
@@ -686,6 +704,7 @@ pub(crate) fn startup_scheduler_limits() -> SchedulerDrainLimits {
 
 #[cfg(test)]
 mod tests {
+    use super::native_quickening_line;
     use super::{
         DEFAULT_ACTIVATION_MAX_SLICES, DEFAULT_ACTIVATION_WALL_BUDGET_MS,
         activation_max_slices_from, activation_wall_budget_ms_from, fresh_launch_random_seed,
@@ -729,5 +748,39 @@ mod tests {
             launch_random_seed_from(Some("8675309")),
             (8_675_309, "environment")
         );
+    }
+
+    #[test]
+    fn native_quickening_line_carries_every_guarded_drive_counter() {
+        // The boot log is the only place a drifted native guard shows up, and it
+        // shows up as one of these counters reading zero. Pin the `at` tag and
+        // every key name so a rename cannot silently drop a drive from the
+        // report and leave a disabled fast path looking like an absent one.
+        let line = native_quickening_line("unit-test");
+        assert!(line.starts_with("boot-profile at=unit-test native_quickening "));
+        for key in [
+            "tgm_load_activations=",
+            "tgm_cells=",
+            "tgm_safepoints=",
+            "tgm_commits=",
+            "tgm_target_resolutions=",
+            "tgm_target_cache_hits=",
+            "tgm_build_cache_members=",
+            "tgm_build_cache_logical_steps=",
+            "build_coordinate_prefixes=",
+            "build_coordinate_fallbacks=",
+            "discover_offset_activations=",
+            "ruin_batches=",
+            "ruin_logical_steps=",
+            "ruin_scan_activations=",
+            "ruin_scan_cells=",
+            "ruin_scan_rejections=",
+            "ruin_scan_successes=",
+            "ruin_flag_rejections=",
+            "ruin_area_rejections=",
+            "ruin_rejection_cache_hits=",
+        ] {
+            assert!(line.contains(key), "{key} is missing from {line}");
+        }
     }
 }
