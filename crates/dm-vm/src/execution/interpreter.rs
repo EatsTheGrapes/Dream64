@@ -3367,7 +3367,48 @@ pub(crate) fn dispatch_instruction(
                 caller.instruction += 1;
                 return Ok(DispatchFlow::Continue);
             }
-            return Err(execution_error(module, frames, format!("CRASH: {message}")));
+            // BYOND treats CRASH() as catchable: it unwinds through active
+            // try/catch handlers just like throw.  Only an truly uncaught
+            // CRASH propagates as a fatal error.
+            let mut handler = None;
+            for candidate_frame in (0..frames.len()).rev() {
+                let current = frames[candidate_frame].instruction;
+                if let Some(position) = frames[candidate_frame]
+                    .exception_handlers()
+                    .iter()
+                    .rposition(|handler| handler.start <= current && current <= handler.end)
+                {
+                    handler = Some((candidate_frame, position));
+                    break;
+                }
+            }
+            let Some((handler_frame, handler_position)) = handler else {
+                return Err(execution_error(
+                    module,
+                    frames,
+                    format!("CRASH: {message}"),
+                ));
+            };
+            frames.truncate(handler_frame + 1);
+            let handler = frames[handler_frame]
+                .exception_handlers_mut()
+                .remove(handler_position);
+            frames[handler_frame]
+                .exception_handlers_mut()
+                .truncate(handler_position);
+            frames[handler_frame].stack.truncate(handler.stack_depth);
+            if let Some(slot) = handler.local {
+                let Some(local) = frames[handler_frame].locals.get_mut(usize::from(slot)) else {
+                    return Err(execution_error(
+                        module,
+                        frames,
+                        format!("invalid catch local {slot}"),
+                    ));
+                };
+                *local = message;
+            }
+            frames[handler_frame].instruction = handler.catch;
+            return Ok(DispatchFlow::Continue);
         }
         Instruction::BeginTry { catch, end, local } => {
             let (catch, end, local) = (*catch, *end, *local);

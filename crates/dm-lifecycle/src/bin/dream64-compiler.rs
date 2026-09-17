@@ -424,8 +424,8 @@ fn write_artifact(
         fs::create_dir_all(parent)
             .map_err(|error| format!("create artifact directory: {error}"))?;
     }
-    let executable_payload = executable.encode_compiled_artifact()?;
-    let procedure_semantics = encode_procedure_semantics(executable.module())?;
+    let mut executable_payload = executable.encode_compiled_artifact()?;
+    let mut procedure_semantics = encode_procedure_semantics(executable.module())?;
     let compilation_payload = compilation.encode_compiled_artifact();
     // Emit the semantic digest of every procedure guarding a native fast-path so
     // the six `CANONICAL_MONKE_*_DIGEST` pins can be re-measured from one compile
@@ -570,6 +570,10 @@ fn write_artifact(
     } else {
         None
     };
+    if pre_lifecycle_payload.is_some() {
+        executable_payload = executable.encode_compiled_artifact()?;
+        procedure_semantics = encode_procedure_semantics(executable.module())?;
+    }
     let compact = env::var_os("DREAM64_DISABLE_COMPACT_WORDCODE")
         .is_none()
         .then(|| {
