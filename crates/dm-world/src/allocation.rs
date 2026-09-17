@@ -100,6 +100,17 @@ pub struct WorldAllocation {
 }
 
 impl WorldAllocation {
+    /// Creates an empty allocation for pre-lifecycle boot paths.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            snapshots: Vec::new(),
+            allocation_order: Vec::new(),
+            work_items: Vec::new(),
+            stats: WorldAllocationStats::default(),
+        }
+    }
+
     /// Returns coordinate snapshots in plan source order.
     #[must_use]
     pub fn snapshots(&self) -> &[CoordinateDatumSnapshot] {

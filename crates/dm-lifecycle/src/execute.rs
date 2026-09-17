@@ -1160,6 +1160,219 @@ fn map_datum_bindings(
         .collect()
 }
 
+/// Result of compile-time precomputation of all deterministic lifecycle state.
+///
+/// Contains everything the server needs to skip world allocation,
+/// `materialize_world_map_state`, and `apply_dynamic_map_overrides` at boot,
+/// jumping straight to lifecycle hook execution.
+pub struct PrecomputedLifecycleState {
+    /// Live datum for `/world`, if allocated.
+    pub world: Option<DatumId>,
+    /// Atom bindings from the initialization plan.
+    pub atom_bindings: Vec<Option<DatumId>>,
+    /// The prepared initialization plan (events in execution order).
+    pub plan: InitializationPlan,
+}
+
+/// Runs all deterministic boot-time work at compile time and returns the
+/// resulting state suitable for section 13 embedding.
+///
+/// This performs world allocation, map state materialization, dynamic map
+/// override evaluation, and captures the execution state without touching
+/// lifecycle hook execution.
+#[allow(clippy::too_many_arguments)]
+pub fn precompute_lifecycle_state(
+    plan: &InitializationPlan,
+    allocation: &WorldAllocation,
+    runtime: &mut RuntimeImage,
+    module: &mut dm_vm::Module,
+) -> Result<(PrecomputedLifecycleState, dm_vm::ExecutionState), InitializationExecutionError> {
+    let bindings = map_datum_bindings(plan, allocation, runtime);
+    let world = if plan.world_type.is_some() {
+        let world = if let Some(world) = runtime.canonical_world() {
+            world
+        } else {
+            runtime
+                .allocate_datum(
+                    &TypePath::parse("/world").map_err(InitializationExecutionError::WorldPath)?,
+                )
+                .map_err(InitializationExecutionError::WorldAllocation)?
+        };
+        materialize_world_map_state(allocation, runtime, world)
+            .map_err(InitializationExecutionError::WorldMapState)?;
+        Some(world)
+    } else {
+        None
+    };
+
+    let mut state = runtime.take_execution_state();
+    if let Some(world) = world {
+        state.set_global(
+            FieldName::parse("world").expect("built-in world global name is valid"),
+            Value::Datum(world),
+        );
+    }
+    apply_dynamic_map_overrides(plan, allocation, &bindings, runtime, &mut state, module)?;
+    runtime.release_transferred_metadata();
+
+    let computed = PrecomputedLifecycleState {
+        world,
+        atom_bindings: bindings,
+        plan: plan.clone(),
+    };
+    Ok((computed, state))
+}
+
+/// Executes lifecycle hooks from a precomputed pre-lifecycle state.
+///
+/// This skips all deterministic work (world allocation, materialization,
+/// dynamic map overrides) and runs only the lifecycle event loop and
+/// scheduler drain using the atom bindings and events captured at compile time.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_precomputed_lifecycle_hooks(
+    index: &LifecycleIndex,
+    pre_state: &crate::pre_lifecycle::PreLifecycleState,
+    runtime: &mut RuntimeImage,
+    scheduler_limits: SchedulerDrainLimits,
+    readiness: Option<&HeadlessReadinessProbe>,
+    executable: &mut ExecutableProcedures,
+    persistent_state: Option<&mut Option<dm_vm::ExecutionState>>,
+    startup_service: Option<&mut dyn FnMut(&ExecutableProcedures, &mut dm_vm::ExecutionState)>,
+) -> Result<InitializationExecution, InitializationExecutionError> {
+    let mut state = runtime.take_execution_state();
+    let execution = (|| {
+        let mut result = InitializationExecution {
+            world: pre_state.world,
+            ..InitializationExecution::default()
+        };
+        let mut seen = BTreeSet::new();
+        let mut initialized_during_new = BTreeSet::new();
+        for event in &pre_state.events {
+            let InitializationEvent::Lifecycle { subject, .. } = *event else {
+                continue;
+            };
+            let datum = match subject {
+                EventSubject::World => {
+                    pre_state.world.ok_or(InitializationExecutionError::MissingWorldDatum)?
+                }
+                EventSubject::MapAtom(atom_index) => pre_state
+                    .atom_bindings
+                    .get(atom_index)
+                    .and_then(|datum| *datum)
+                    .ok_or_else(|| InitializationExecutionError::MissingMapDatum {
+                        atom_index,
+                        path: pre_state
+                            .map_atom_type_paths
+                            .get(atom_index)
+                            .cloned()
+                            .unwrap_or_default(),
+                    })?,
+                EventSubject::Globals => continue,
+            };
+            if matches!(subject, EventSubject::MapAtom(_))
+                && !seen.insert((datum, event_kind(*event)))
+            {
+                result.duplicate_map_events += 1;
+                continue;
+            }
+            if matches!(subject, EventSubject::MapAtom(_))
+                && matches!(
+                    event_kind(*event),
+                    LifecycleKind::Initialize | LifecycleKind::LateInitialize
+                )
+                && initialized_during_new.contains(&datum)
+            {
+                // Monk/tg's INITIALIZE_IMMEDIATE macro temporarily enables
+                // SSatoms from inside New(), which runs Initialize and queues
+                // any LateInitialize itself. Do not synthesize those hooks a
+                // second time for datums carrying INITIALIZED_1 afterward.
+                continue;
+            }
+            let target = event_target(*event, index).ok_or_else(|| {
+                InitializationExecutionError::MissingTarget {
+                    type_index: event_type_index(*event),
+                    kind: event_kind(*event),
+                }
+            })?;
+            let entry = executable
+                .implementation(target.implementation)
+                .ok_or_else(|| InitializationExecutionError::MissingVmTarget {
+                    procedure_path: target.procedure_path.clone(),
+                })?;
+            let arguments = if matches!(subject, EventSubject::MapAtom(_))
+                && event_kind(*event) == LifecycleKind::New
+            {
+                vec![
+                    state
+                        .heap()
+                        .datum_field(
+                            datum,
+                            &FieldName::parse("loc")
+                                .expect("built-in atom loc field name is valid"),
+                        )
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                ]
+            } else {
+                Vec::new()
+            };
+            let _value = match execute_module_in_context(
+                executable.module(),
+                entry,
+                &arguments,
+                &mut state,
+                &ExecutionContext::new(Value::Datum(datum), Value::Null),
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    return Err(InitializationExecutionError::Runtime {
+                        event: *event,
+                        target: Box::new(target.clone()),
+                        error: Box::new(error),
+                    });
+                }
+            };
+            if matches!(subject, EventSubject::MapAtom(_))
+                && event_kind(*event) == LifecycleKind::New
+                && state
+                    .heap()
+                    .datum_field(
+                        datum,
+                        &FieldName::parse("flags_1")
+                            .expect("project atom initialization flag field is valid"),
+                    )
+                    .ok()
+                    .and_then(Value::as_number)
+                    .is_some_and(|flags| (flags as i32) & (1 << 7) != 0)
+            {
+                initialized_during_new.insert(datum);
+            }
+            result.executed_events += 1;
+            *result
+                .executed_event_counts
+                .entry(event_kind(*event))
+                .or_default() += 1;
+        }
+        let _released = state.release_host_value_roots();
+        result.scheduler = drain_startup_scheduler(
+            executable,
+            &mut state,
+            scheduler_limits,
+            readiness,
+            startup_service,
+        )?;
+        Ok(result)
+    })();
+    if execution.is_ok()
+        && let Some(persistent_state) = persistent_state
+    {
+        *persistent_state = Some(state);
+    } else {
+        runtime.restore_execution_state(state);
+    }
+    execution
+}
+
 // ── PrecompiledLifecycle runtime/execution methods ───────────────────────────
 
 impl PrecompiledLifecycle {

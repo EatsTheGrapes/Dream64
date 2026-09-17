@@ -31,6 +31,7 @@ const BOOT_MANIFEST_SECTION: u32 = 9;
 const DMM_MEASUREMENT_SECTION: u32 = 10;
 const PARSED_DMM_SECTION: u32 = 11;
 const PROCEDURE_SEMANTICS_SECTION: u32 = 12;
+const PRE_LIFECYCLE_STATE_SECTION: u32 = 13;
 const MAX_EAGER_DIAGNOSTICS: usize = 32;
 
 fn main() -> ExitCode {
@@ -262,7 +263,7 @@ fn compile(
         .find(|section| section.section_id == PERSISTENT_EXECUTABLE_SECTION)
         .filter(|section| section.content_digest == procedure_digest)
         .and_then(|_| persistent_database.section_payload(PERSISTENT_EXECUTABLE_SECTION));
-    let (executable, executable_cache_hit) = cached_payload
+    let (mut executable, executable_cache_hit) = cached_payload
         .as_deref()
         .and_then(|payload| ExecutableProcedures::decode_compiled_artifact(payload).ok())
         .map_or_else(
@@ -315,7 +316,7 @@ fn compile(
     write_artifact(
         &artifact_file,
         &compilation,
-        &executable,
+        &mut executable,
         &procedures,
         &persistent_database,
         &type_ids,
@@ -401,6 +402,7 @@ fn artifact_has_current_sections(artifact: &CompiledArtifact) -> bool {
                     | DMM_MEASUREMENT_SECTION
                     | PARSED_DMM_SECTION
                     | PROCEDURE_SEMANTICS_SECTION
+                    | PRE_LIFECYCLE_STATE_SECTION
             )
         })
 }
@@ -413,7 +415,7 @@ fn strict_source_hash_enabled() -> bool {
 fn write_artifact(
     path: &Path,
     compilation: &dm_compiler::Compilation,
-    executable: &ExecutableProcedures,
+    executable: &mut ExecutableProcedures,
     procedures: &ProcedureRegistry,
     persistent_database: &PersistentCompilerDatabase,
     type_ids: &BTreeMap<String, u64>,
@@ -481,10 +483,7 @@ fn write_artifact(
     let runtime_linked = runtime
         .encode_linked_artifact(executable.module())
         .map_err(|error| format!("linked runtime image: {error}"))?;
-    let lifecycle_directory = LifecycleIndex::build_compile_only(compilation, procedures)
-        .encode_portable()
-        .map_err(|error| format!("lifecycle directory: {error}"))?;
-    let default_map = compilation
+    let default_map_info = compilation
         .project()
         .files
         .iter()
@@ -497,10 +496,80 @@ fn write_artifact(
             let source = file.text().map_err(|error| error.to_string())?;
             let map = dm_map::parse(source).map_err(|error| error.to_string())?;
             let plan = dm_world::build_plan(&map, compilation);
-            dm_world::encode_named_portable_plan(&file.relative_path.display().to_string(), &plan)
-                .map_err(|error| error.to_string())
+            let encoded = dm_world::encode_named_portable_plan(
+                &file.relative_path.display().to_string(),
+                &plan,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok::<_, String>((file.relative_path.display().to_string(), plan, encoded))
         })
         .transpose()?;
+    let default_map = default_map_info.as_ref().map(|(_, _, encoded)| encoded.clone());
+    let lifecycle_directory = LifecycleIndex::build_compile_only(compilation, procedures)
+        .encode_portable()
+        .map_err(|error| format!("lifecycle directory: {error}"))?;
+    let pre_lifecycle_payload = if let Some((ref map_path, ref world_plan, _)) = default_map_info {
+        let started = Instant::now();
+        let full_index = LifecycleIndex::build(compilation, procedures, &runtime);
+        let plan = dm_lifecycle::build_initialization_plan(&runtime, &full_index, world_plan, map_path);
+        let map_types = world_plan
+            .templates()
+            .values()
+            .flat_map(|template| template.initializers.iter())
+            .filter_map(|initializer| {
+                matches!(
+                    initializer.resolution,
+                    dm_world::InitializerResolution::Resolved { .. }
+                )
+                .then(|| dm_value::TypePath::parse(&initializer.path).ok())
+                .flatten()
+            })
+            .collect::<Vec<_>>();
+        match runtime.preflight_instance_initializers(map_types) {
+            Ok(_) => {
+                dm_world::allocate_world(world_plan, &mut runtime)
+                    .map_err(|error| format!("world allocation: {error}"))
+                    .ok()
+                    .and_then(|allocation| {
+                        dm_lifecycle::precompute_lifecycle_state(
+                            &plan,
+                            &allocation,
+                            &mut runtime,
+                            executable.module_mut(),
+                        )
+                        .map_err(|error| format!("precompute lifecycle: {error}"))
+                        .ok()
+                        .and_then(|(computed, state)| {
+                            dm_lifecycle::encode_pre_lifecycle_state(
+                                &computed.plan,
+                                &computed.atom_bindings,
+                                computed.world,
+                                &state,
+                            )
+                            .map_err(|error| format!("encode pre-lifecycle: {error}"))
+                            .ok()
+                            .map(|payload| {
+                                eprintln!(
+                                    "compile-progress: pre-lifecycle-state bytes={} elapsed_ms={}",
+                                    payload.len(),
+                                    started.elapsed().as_millis()
+                                );
+                                payload
+                            })
+                        })
+                    })
+            }
+            Err(errors) => {
+                eprintln!(
+                    "compile-progress: initializer preflight failed: {} error(s) (skipping pre-lifecycle)",
+                    errors.len()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let compact = env::var_os("DREAM64_DISABLE_COMPACT_WORDCODE")
         .is_none()
         .then(|| {
@@ -547,6 +616,9 @@ fn write_artifact(
         PROCEDURE_SEMANTICS_SECTION,
         procedure_semantics,
     ));
+    if let Some(payload) = pre_lifecycle_payload {
+        sections.push(ArtifactSection::new(PRE_LIFECYCLE_STATE_SECTION, payload));
+    }
     let artifact = CompiledArtifact::new(fingerprint, sections)
         .map_err(|error| format!("build runtime artifact: {error}"))?;
     let stats = artifact

@@ -23,6 +23,8 @@ pub mod lifecycle_index;
 pub mod map_catalog;
 /// Procedure semantic-identity directory.
 pub mod procedure_semantics;
+/// Pre-lifecycle state serialization for compile-time deterministic boot.
+pub mod pre_lifecycle;
 /// Headless boot readiness probe.
 pub mod readiness;
 /// Deterministic scheduler draining for post-initialization and persistent
@@ -57,13 +59,18 @@ pub use scheduler::{
 
 pub use execute::{
     ConstructionError, DeletionError, ExecutedLifecycleEvent, InitializationExecution,
-    InitializationExecutionError, audit_initialization_plan_with_precompiled, construct_datum,
-    delete_datum, execute_boot_initialization_plan_with_precompiled,
+    InitializationExecutionError, PrecomputedLifecycleState, audit_initialization_plan_with_precompiled,
+    construct_datum, delete_datum, execute_boot_initialization_plan_with_precompiled,
     execute_boot_initialization_plan_with_precompiled_and_startup_service,
     execute_initialization_plan, execute_initialization_plan_with_precompiled,
     execute_initialization_plan_with_scheduler_limits,
-    execute_initialization_plan_with_scheduler_policy, sweep_lifecycle_compatibility,
+    execute_initialization_plan_with_scheduler_policy, execute_precomputed_lifecycle_hooks,
+    precompute_lifecycle_state, sweep_lifecycle_compatibility,
     sweep_lifecycle_compatibility_with_closures,
+};
+
+pub use pre_lifecycle::{
+    PreLifecycleState, decode_pre_lifecycle_state, encode_pre_lifecycle_state,
 };
 
 use dm_vm::Module;

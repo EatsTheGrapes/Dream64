@@ -69,6 +69,13 @@ impl PrecompiledLifecycle {
     pub fn deferred_procedures(&self) -> usize {
         self.executable.module().deferred_procedure_count()
     }
+
+    /// Returns a mutable reference to the underlying executable procedures.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn executable_mut(&mut self) -> &mut dm_semantics::ExecutableProcedures {
+        &mut self.executable
+    }
 }
 
 /// Selects and symbolically links the exact world/map lifecycle roots without

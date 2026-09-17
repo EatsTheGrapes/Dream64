@@ -28,7 +28,7 @@ use dm_lifecycle::{
     decode_and_attach_procedure_semantics, decode_dmm_measurements, decode_parsed_dmm_cache,
     dmm_measurements_from_parsed, encode_dmm_measurements, encode_parsed_dmm_cache,
     encode_procedure_semantics, execute_boot_initialization_plan_with_precompiled,
-    precompile_portable_lifecycle_for_world,
+    execute_precomputed_lifecycle_hooks, precompile_portable_lifecycle_for_world,
 };
 use dm_project::{Project, ProjectDefines};
 use dm_runtime::{RuntimeImage, RuntimeStructuralSeed};
@@ -53,6 +53,7 @@ pub(crate) const BOOT_MANIFEST_ARTIFACT_SECTION: u32 = 9;
 pub(crate) const DMM_MEASUREMENT_ARTIFACT_SECTION: u32 = 10;
 pub(crate) const PARSED_DMM_ARTIFACT_SECTION: u32 = 11;
 pub(crate) const PROCEDURE_SEMANTICS_ARTIFACT_SECTION: u32 = 12;
+pub(crate) const PRE_LIFECYCLE_STATE_ARTIFACT_SECTION: u32 = 13;
 
 pub(crate) struct PreparedStandaloneRuntime {
     pub(crate) executable: ExecutableProcedures,
@@ -63,6 +64,7 @@ pub(crate) struct PreparedStandaloneRuntime {
     pub(crate) readiness: Option<HeadlessReadinessProbe>,
     pub(crate) dmm_measurements: BTreeMap<String, dm_lifecycle::PortableDmmMeasurement>,
     pub(crate) _parsed_dmm_cache: BTreeMap<String, dm_lifecycle::PortableParsedDmm>,
+    pub(crate) pre_lifecycle_payload: Option<Vec<u8>>,
 }
 
 pub(crate) fn prepare_standalone_runtime(path: &Path) -> Result<PreparedStandaloneRuntime, String> {
@@ -156,6 +158,9 @@ pub(crate) fn prepare_standalone_runtime(path: &Path) -> Result<PreparedStandalo
     if has_ticker && readiness.is_none() {
         return Err("standalone ticker runtime is missing its boot readiness manifest".to_owned());
     }
+    let pre_lifecycle_payload = artifact
+        .section(PRE_LIFECYCLE_STATE_ARTIFACT_SECTION)
+        .map(|section| section.payload().to_vec());
     Ok(PreparedStandaloneRuntime {
         executable,
         runtime,
@@ -165,6 +170,7 @@ pub(crate) fn prepare_standalone_runtime(path: &Path) -> Result<PreparedStandalo
         readiness,
         dmm_measurements,
         _parsed_dmm_cache: parsed_dmm_cache,
+        pre_lifecycle_payload,
     })
 }
 
@@ -183,6 +189,7 @@ pub(crate) fn run_standalone_linked_boot(
         readiness,
         dmm_measurements,
         _parsed_dmm_cache: parsed_dmm_cache,
+        pre_lifecycle_payload,
     } = match prepare_standalone_runtime(path) {
         Ok(value) => value,
         Err(error) => {
@@ -224,6 +231,62 @@ pub(crate) fn run_standalone_linked_boot(
             })
             .collect(),
     ));
+
+    let mut precompiled =
+        precompile_portable_lifecycle_for_world(&lifecycle, &world, executable);
+
+    if let Some(payload) = pre_lifecycle_payload {
+        let mut state = runtime.take_execution_state();
+        match dm_lifecycle::decode_pre_lifecycle_state(&payload, &mut state, precompiled.module()) {
+            Ok(pre_state) => {
+                runtime.restore_execution_state(state);
+                drop(world);
+
+                let execution = execute_precomputed_lifecycle_hooks(
+                    &lifecycle,
+                    &pre_state,
+                    &mut runtime,
+                    startup_scheduler_limits(),
+                    readiness.as_ref(),
+                    precompiled.executable_mut(),
+                    None,
+                    None,
+                );
+                match execution {
+                    Ok(execution) => {
+                        let empty_allocation = dm_world::WorldAllocation::empty();
+                        print_boot_summary(&empty_allocation, &execution);
+                        if audit {
+                            eprintln!(
+                                "boot-progress: standalone linked audit complete elapsed_ms={}",
+                                process_started.elapsed().as_millis()
+                            );
+                            return ExitCode::SUCCESS;
+                        }
+                        eprintln!(
+                            "boot-progress: standalone linked runtime ready elapsed_ms={}",
+                            process_started.elapsed().as_millis()
+                        );
+                        return run_persistent_server_loop(
+                            &mut runtime,
+                            &mut precompiled,
+                            startup_ipc,
+                            readiness.as_ref(),
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!("initialization: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            Err(error) => {
+                runtime.restore_execution_state(state);
+                eprintln!("boot-progress: pre-lifecycle restore failed: {error}");
+            }
+        }
+    }
+
     let plan = build_initialization_plan(&runtime, &lifecycle, &world, map_path.clone());
     if let Err(errors) = runtime.preflight_instance_initializers(
         world
@@ -242,7 +305,6 @@ pub(crate) fn run_standalone_linked_boot(
             return ExitCode::FAILURE;
         }
     };
-    let mut precompiled = precompile_portable_lifecycle_for_world(&lifecycle, &world, executable);
     let execution = if audit {
         audit_initialization_plan_with_precompiled(
             &lifecycle,
