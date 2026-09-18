@@ -7571,7 +7571,21 @@ fn single_listener_signal_graph_survives_forced_quiescent_gc() {
 }
 
 #[test]
-fn register_signal_fast_path_uses_runtime_override_truthiness() {
+fn register_signal_fast_path_leaves_every_re_registration_to_the_interpreter() {
+    // DM `RegisterSignal` on an existing registration updates the callback and
+    // returns without touching `_listen_lookup` -- override or not; the flag
+    // only decides whether it warns first. So the native path runs only first
+    // registrations and side-exits on every re-registration, whatever the
+    // override's runtime truthiness.
+    //
+    // This test used to expect the override case to run natively and leave a
+    // two-entry lookup. That was the `_SendSignal` desync, pinned as intended:
+    // the native path appended `src` a second time (`list(E, E)`). Decals
+    // re-register with override on every Attach, so a turf carrying the same
+    // decal twice got that duplicate; `UnregisterSignal` removed one copy, the
+    // target kept naming a listener whose `_signal_procs[target]` was gone, and
+    // the next SEND_SIGNAL hit "call procedure selector must be text or a type
+    // path, received null".
     REGISTER_SIGNAL_FAST_CACHE.with(|cache| cache.borrow_mut().clear());
     let module = production_register_signal_fixture();
     let mut state = ExecutionState::new();
@@ -7589,37 +7603,29 @@ fn register_signal_fast_path_uses_runtime_override_truthiness() {
             Value::text("original"),
             None,
         ),
-        Some(56)
+        Some(56),
+        "a first registration stays on the native path"
     );
-    assert_eq!(
-        run_signal_fixture(
-            &module,
-            &mut state,
-            listener,
-            target,
-            &signal,
-            Value::text("ignored"),
-            Some(Value::number(0.0)),
-        ),
-        None,
-        "a supplied false override must preserve the warning bytecode path"
-    );
-    assert_eq!(
-        run_signal_fixture(
-            &module,
-            &mut state,
-            listener,
-            target,
-            &signal,
-            Value::text("replacement"),
-            Some(Value::number(1.0)),
-        ),
-        Some(54)
-    );
-    let Value::List(listeners) = signal_fixture_lookup(&state, target, &signal) else {
-        panic!("override should preserve the listener relationship")
-    };
-    assert_eq!(state.heap().list(listeners).unwrap().len(), 2);
+    for (label, override_value) in [("false", Value::number(0.0)), ("true", Value::number(1.0))] {
+        assert_eq!(
+            run_signal_fixture(
+                &module,
+                &mut state,
+                listener,
+                target,
+                &signal,
+                Value::text("replacement"),
+                Some(override_value),
+            ),
+            None,
+            "a re-registration with a {label} override must side-exit before mutating"
+        );
+        assert_eq!(
+            signal_fixture_lookup(&state, target, &signal),
+            Value::Datum(listener),
+            "after a {label}-override re-registration the listener must appear exactly once"
+        );
+    }
 }
 
 #[test]
