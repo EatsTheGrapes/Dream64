@@ -1588,16 +1588,27 @@ fn compile_project(project: Project) -> Compilation {
 }
 
 fn parse_project_syntax(project: &Project) -> (Vec<Option<SyntaxFile>>, Vec<Diagnostic>) {
-    let mut syntax_files = Vec::with_capacity(project.files.len());
+    use rayon::prelude::*;
+
+    let results: Vec<(usize, Option<SyntaxFile>, Vec<Diagnostic>)> = project
+        .files
+        .par_iter()
+        .enumerate()
+        .filter_map(|(index, file)| {
+            if !matches!(file.kind, FileKind::Environment | FileKind::Source) {
+                return Some((index, None, Vec::new()));
+            }
+            let mut file_diagnostics = Vec::new();
+            let syntax = parse_one_syntax_file(file, &mut file_diagnostics);
+            Some((index, syntax, file_diagnostics))
+        })
+        .collect();
+
+    let mut syntax_files = vec![None; project.files.len()];
     let mut diagnostics = Vec::new();
-
-    for file in &project.files {
-        if !matches!(file.kind, FileKind::Environment | FileKind::Source) {
-            syntax_files.push(None);
-            continue;
-        }
-
-        syntax_files.push(parse_one_syntax_file(file, &mut diagnostics));
+    for (index, syntax, file_diagnostics) in results {
+        syntax_files[index] = syntax;
+        diagnostics.extend(file_diagnostics);
     }
     (syntax_files, diagnostics)
 }
@@ -1683,23 +1694,33 @@ fn compile_project_from_syntax(
         &syntax_files,
         &tree,
     ));
-    for (index, syntax) in syntax_files.iter().enumerate() {
-        let Some(syntax) = syntax else { continue };
-        let file = &project.files[index];
-        diagnostics.extend(preprocessed_source_diagnostics(file));
-        diagnostics.extend(matrix_lint_diagnostics(file, syntax));
-        diagnostics.extend(proc_argument_diagnostics(file, syntax));
-        diagnostics.extend(numeric_builtin_diagnostics(file, syntax));
-        diagnostics.extend(builtin_arity_diagnostics(file, syntax));
-        diagnostics.extend(string_interpolation_diagnostics(file, syntax));
-        diagnostics.extend(readonly_member_diagnostics(file, syntax));
-        diagnostics.extend(const_write_diagnostics(file, syntax));
-        diagnostics.extend(reference_operator_diagnostics(file, syntax));
-        diagnostics.extend(variable_type_diagnostics(file, syntax));
-        diagnostics.extend(undefined_local_type_diagnostics(file, syntax, &tree));
-        diagnostics.extend(nameof_diagnostics(file, syntax));
-        diagnostics.extend(constant_initializer_diagnostics(file, syntax));
-        diagnostics.extend(resource_and_weighted_pick_diagnostics(file, syntax));
+    use rayon::prelude::*;
+    let lint_results: Vec<Vec<Diagnostic>> = syntax_files
+        .par_iter()
+        .enumerate()
+        .filter_map(|(index, syntax)| {
+            let syntax = syntax.as_ref()?;
+            let file = &project.files[index];
+            let mut file_diag = Vec::new();
+            file_diag.extend(preprocessed_source_diagnostics(file));
+            file_diag.extend(matrix_lint_diagnostics(file, syntax));
+            file_diag.extend(proc_argument_diagnostics(file, syntax));
+            file_diag.extend(numeric_builtin_diagnostics(file, syntax));
+            file_diag.extend(builtin_arity_diagnostics(file, syntax));
+            file_diag.extend(string_interpolation_diagnostics(file, syntax));
+            file_diag.extend(readonly_member_diagnostics(file, syntax));
+            file_diag.extend(const_write_diagnostics(file, syntax));
+            file_diag.extend(reference_operator_diagnostics(file, syntax));
+            file_diag.extend(variable_type_diagnostics(file, syntax));
+            file_diag.extend(undefined_local_type_diagnostics(file, syntax, &tree));
+            file_diag.extend(nameof_diagnostics(file, syntax));
+            file_diag.extend(constant_initializer_diagnostics(file, syntax));
+            file_diag.extend(resource_and_weighted_pick_diagnostics(file, syntax));
+            Some(file_diag)
+        })
+        .collect();
+    for file_diag in lint_results {
+        diagnostics.extend(file_diag);
     }
     diagnostics.retain_mut(|diagnostic| {
         let Some(severity) = project.diagnostic_severity(diagnostic_pragma_name(diagnostic)) else {

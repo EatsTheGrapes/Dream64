@@ -901,6 +901,7 @@ dependencies = [
  "dm-project",
  "dm-syntax",
  "md5",
+ "rayon",
 ]
 
 [[package]]
@@ -983,6 +984,7 @@ dependencies = [
  "dm-vm",
  "dm-world",
  "md5",
+ "rayon",
  "serde",
 ]
 
