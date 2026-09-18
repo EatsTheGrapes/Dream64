@@ -18623,6 +18623,78 @@ fn icon_icon_states_method_dispatches_natively_against_backing_dmi() {
 }
 
 #[test]
+fn file_builtins_treat_a_missing_parent_directory_as_absent_not_as_an_error() {
+    // tgstation's `realize_spritesheets` clears a cross-round cache file with an
+    // unguarded `fdel` on every cache miss -- including on a fresh checkout,
+    // where the cache directory has never been created. A runtime there ends
+    // the proc before it generates anything, silently losing the spritesheet.
+    let root = std::env::temp_dir().join(format!("dream64-missing-parent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("present.txt"), "here").unwrap();
+
+    let syntax = parse(concat!(
+        "/proc/probe()\n",
+        "\treturn list(",
+        "fdel(\"never/made/cache.json\"), ",
+        "fdel(\"never/made/\"), ",
+        "call_ext(\"rust_g\", \"file_exists\")(\"never/made/cache.json\"), ",
+        "call_ext(\"rust_g\", \"file_read\")(\"never/made/cache.json\"), ",
+        "fdel(\"present.txt\"))\n",
+        "/proc/escape()\n",
+        "\treturn fdel(\"../outside.txt\")\n",
+    ))
+    .expect("missing-parent probe should parse");
+    let module = compile_module(&syntax.definitions).expect("missing-parent probe should compile");
+    let mut state = ExecutionState::new();
+    state.set_project_root(root.clone());
+
+    let Value::List(result) = execute_module_in_state(
+        &module,
+        module.procedure_id("/proc/probe").unwrap(),
+        &[],
+        &mut state,
+    )
+    .expect("a missing parent directory must not raise a runtime") else {
+        panic!("probe should return a list");
+    };
+    let result = state.heap().list(result).unwrap();
+    assert_eq!(result.get(1), Ok(&Value::number(0.0)), "fdel of a file");
+    assert_eq!(
+        result.get(2),
+        Ok(&Value::number(0.0)),
+        "fdel of a directory"
+    );
+    assert_eq!(
+        result.get(3),
+        Ok(&Value::text("false")),
+        "rustg_file_exists"
+    );
+    assert_eq!(result.get(4), Ok(&Value::Null), "rustg_file_read");
+    assert_eq!(
+        result.get(5),
+        Ok(&Value::number(1.0)),
+        "fdel of a present file"
+    );
+    assert!(!root.join("present.txt").exists());
+
+    // Relaxing the parent requirement must not relax containment.
+    let escape = execute_module_in_state(
+        &module,
+        module.procedure_id("/proc/escape").unwrap(),
+        &[],
+        &mut state,
+    )
+    .expect_err("fdel outside the project root must still be refused");
+    assert!(
+        escape.message.contains("escapes the project root"),
+        "{}",
+        escape.message
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn icon_copy_constructor_preserves_render_state_and_mutates_independently() {
     // Exact constructor shape at the start of Monkestation's getFlatIcon:
     // `flat_template = icon(file, state); flat = icon(flat_template)`.
