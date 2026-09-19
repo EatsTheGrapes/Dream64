@@ -348,6 +348,7 @@ impl CodeTree {
     /// Returns a descriptive error for a corrupt, truncated, oversized, or
     /// internally inconsistent tree payload.
     #[doc(hidden)]
+    #[allow(clippy::too_many_lines)]
     pub fn decode_compiled_artifact(bytes: &[u8]) -> Result<Self, String> {
         let mut input = Cursor::new(bytes);
         let mut magic = vec![0; CODE_TREE_ARTIFACT_MAGIC.len()];
@@ -593,6 +594,7 @@ impl CodeTree {
     /// Unresolved input is retained, and replacements preserve the original
     /// complete expression span for diagnostics.
     #[must_use]
+    #[allow(clippy::missing_panics_doc)]
     pub fn normalize_upward_paths(
         &self,
         contextual_anchor: Option<&DefinitionPath>,

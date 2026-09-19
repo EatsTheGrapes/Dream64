@@ -113,7 +113,7 @@ impl<'source> Lexer<'source> {
                 // BYOND accepts @'...' as a raw text literal as well. Unlike a
                 // plain single-quoted literal this is text, not a resource.
                 '@' if self.remaining().starts_with("@'") => {
-                    self.lex_at_single_quoted_raw_string()?
+                    self.lex_at_single_quoted_raw_string()?;
                 }
                 '"' => self.lex_quoted('"', false)?,
                 '\'' => self.lex_quoted('\'', true)?,

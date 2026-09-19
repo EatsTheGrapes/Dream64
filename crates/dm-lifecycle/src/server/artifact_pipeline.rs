@@ -232,8 +232,7 @@ pub(crate) fn run_standalone_linked_boot(
             .collect(),
     ));
 
-    let mut precompiled =
-        precompile_portable_lifecycle_for_world(&lifecycle, &world, executable);
+    let mut precompiled = precompile_portable_lifecycle_for_world(&lifecycle, &world, executable);
 
     if let Some(payload) = pre_lifecycle_payload {
         let mut state = runtime.take_execution_state();

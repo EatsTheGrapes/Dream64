@@ -781,6 +781,7 @@ fn encode_cached_project(project: &Project) -> Vec<u8> {
     output
 }
 
+#[allow(clippy::too_many_lines)]
 fn decode_cached_project(bytes: &[u8]) -> Option<Project> {
     let mut input = Cursor::new(bytes);
     let mut magic = vec![0; PROJECT_CACHE_MAGIC.len()];
@@ -906,6 +907,7 @@ fn write_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
     output.extend_from_slice(bytes);
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn read_bytes(input: &mut Cursor<&[u8]>) -> Option<Vec<u8>> {
     let length = read_len(input)?;
     let remaining = input
@@ -1336,12 +1338,8 @@ impl Loader {
         let object_macros = self
             .macros
             .iter()
-            .filter_map(|(name, definition)| {
-                definition
-                    .parameters
-                    .is_none()
-                    .then(|| (name.clone(), definition.replacement.clone()))
-            })
+            .filter(|&(_, definition)| definition.parameters.is_none())
+            .map(|(name, definition)| (name.clone(), definition.replacement.clone()))
             .collect();
         Ok(Project {
             root_directory: self.root_directory,
@@ -2355,6 +2353,7 @@ fn expand_quoted_macro_interpolations(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn substitute_function_macro(
     name: &str,
     definition: &MacroDefinition,

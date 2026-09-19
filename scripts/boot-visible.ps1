@@ -8,6 +8,8 @@ param(
     [string] $Map,
     [string] $Skin,
     [string] $IpcAddress = "127.0.0.1:51664",
+    [string[]] $CompilerDefines,
+    [string[]] $ServerArgs,
     [switch] $SkipCompile,
     [switch] $ReuseInitializedWorld
 )
@@ -112,8 +114,13 @@ Write-Host ""
 if (-not $SkipCompile) {
     Write-Host "  Checking compiler artifacts in a separate compiler process..." -ForegroundColor Cyan
     $quotedDme = '"' + $Dme + '"'
+    $compilerArgumentList = @($quotedDme)
+    foreach ($define in $CompilerDefines) {
+        $compilerArgumentList += "-D"
+        $compilerArgumentList += $define
+    }
     $compiler = Start-Process -FilePath $CompilerExecutable `
-        -ArgumentList @($quotedDme) `
+        -ArgumentList $compilerArgumentList `
         -WorkingDirectory $workspace `
         -RedirectStandardError $compilerLog `
         -WindowStyle Hidden `
@@ -141,8 +148,15 @@ $server = $null
 $client = $null
 
 try {
+    $serverArgs = @("boot", $quotedArtifact)
+    if ($Artifact -notmatch '\.d64$') {
+        $serverArgs += $quotedMap
+    }
+    if ($ServerArgs) {
+        $serverArgs += $ServerArgs
+    }
     $server = Start-Process -FilePath $ServerExecutable `
-        -ArgumentList @("boot", $quotedArtifact, $quotedMap) `
+        -ArgumentList $serverArgs `
         -WorkingDirectory $workspace `
         -RedirectStandardError $serverLog `
         -WindowStyle Hidden `

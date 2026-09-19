@@ -3368,8 +3368,10 @@ pub(crate) fn dispatch_instruction(
                 return Ok(DispatchFlow::Continue);
             }
             // BYOND treats CRASH() as catchable: it unwinds through active
-            // try/catch handlers just like throw.  Only an truly uncaught
-            // CRASH propagates as a fatal error.
+            // try/catch handlers just like throw.  When no handler is found
+            // and there is a calling frame, the current proc terminates and
+            // returns null to its caller — only a CRASH in a top-level proc
+            // (no caller) is fatal.
             let mut handler = None;
             for candidate_frame in (0..frames.len()).rev() {
                 let current = frames[candidate_frame].instruction;
@@ -3383,11 +3385,25 @@ pub(crate) fn dispatch_instruction(
                 }
             }
             let Some((handler_frame, handler_position)) = handler else {
-                return Err(execution_error(
-                    module,
-                    frames,
-                    format!("CRASH: {message}"),
-                ));
+                if frames.len() <= 1 {
+                    return Err(execution_error(
+                        module,
+                        frames,
+                        format!("CRASH: {message}"),
+                    ));
+                }
+                eprintln!("dream64: uncaught CRASH: {message}");
+                frames.pop().expect("crashing frame exists");
+                let Some(caller) = frames.last_mut() else {
+                    return Err(execution_error(
+                        module,
+                        frames,
+                        format!("CRASH: {message}"),
+                    ));
+                };
+                caller.stack.push(Value::Null);
+                caller.instruction += 1;
+                return Ok(DispatchFlow::Continue);
             };
             frames.truncate(handler_frame + 1);
             let handler = frames[handler_frame]

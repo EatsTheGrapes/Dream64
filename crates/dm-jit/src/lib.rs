@@ -382,6 +382,7 @@ impl CompiledRootedBlock {
     /// this backend crate. The VM sees only rooted slot slices and a fixed
     /// stack buffer plus its initialized length, so dispatch cannot reallocate
     /// storage behind the native entry's pointer.
+    #[allow(clippy::type_complexity)]
     pub fn run_with<'a>(
         &self,
         roots: &mut [u32],
