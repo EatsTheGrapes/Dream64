@@ -802,6 +802,109 @@ fn catch_without_binding_consumes_the_exception_and_uncaught_throw_errors() {
 }
 
 #[test]
+fn crash_in_a_called_procedure_unwinds_into_an_enclosing_catch() {
+    let syntax = parse(
+            "/proc/run()\n\ttry\n\t\thelper()\n\tcatch(var/reason)\n\t\treturn reason\n\treturn \"fell through\"\n/proc/helper()\n\tCRASH(\"boom\")\n",
+        )
+        .expect("source should parse");
+    let module = compile_module(&syntax.definitions).expect("CRASH under try should compile");
+    let entry = module.procedure_id("/proc/run").expect("entry");
+
+    assert_eq!(execute_module(&module, entry, &[]), Ok(Value::text("boom")));
+}
+
+#[test]
+fn an_uncaught_crash_ends_only_the_procedure_that_raised_it() {
+    // BYOND reports the runtime and resumes the caller with null instead of
+    // tearing the chain down. Monkestation's `stack_trace()` is built out of
+    // this, and without it a single bad GAGS icon_state ends the whole boot.
+    let syntax = parse(
+            "/proc/run()\n\tvar/result = helper()\n\tif(result)\n\t\treturn 9\n\treturn 7\n/proc/helper()\n\tCRASH(\"boom\")\n",
+        )
+        .expect("source should parse");
+    let module = compile_module(&syntax.definitions).expect("CRASH should compile");
+    let entry = module.procedure_id("/proc/run").expect("entry");
+
+    assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(7.0)));
+}
+
+#[test]
+fn an_intrinsic_runtime_error_unwinds_into_an_enclosing_catch() {
+    // Neither a CRASH nor a throw: an arithmetic type mismatch. BYOND's
+    // try/catch catches ordinary runtime errors, which is what `try new
+    // /savefile(...)` and `try json_decode(...)` in Monkestation rely on.
+    let syntax = parse(
+            "/proc/run()\n\ttry\n\t\thelper()\n\tcatch(var/reason)\n\t\treturn reason\n\treturn \"fell through\"\n/proc/helper()\n\treturn \"text\" + 1\n",
+        )
+        .expect("source should parse");
+    let module = compile_module(&syntax.definitions).expect("module should compile");
+    let entry = module.procedure_id("/proc/run").expect("entry");
+
+    let caught = execute_module(&module, entry, &[]).expect("catch should absorb the runtime");
+    let Value::Text(message) = caught else {
+        panic!("catch should bind the runtime message, got {caught:?}");
+    };
+    assert!(
+        message.contains("addition requires compatible DM values"),
+        "{message}"
+    );
+}
+
+#[test]
+fn an_uncaught_intrinsic_runtime_error_ends_only_the_procedure_that_raised_it() {
+    let syntax = parse(
+            "/proc/run()\n\tvar/result = helper()\n\tif(result)\n\t\treturn 9\n\treturn 7\n/proc/helper()\n\tvar/datum/logger = null\n\treturn logger.Log(4)\n/proc/Log(value)\n\treturn value + 3\n",
+        )
+        .expect("source should parse");
+    let module = compile_module(&syntax.definitions).expect("module should compile");
+    let entry = module.procedure_id("/proc/run").expect("entry");
+
+    assert_eq!(execute_module(&module, entry, &[]), Ok(Value::number(7.0)));
+}
+
+#[test]
+fn a_repeating_runtime_site_stops_reporting_but_each_site_is_counted_separately() {
+    use crate::execution::{RuntimeSiteReport, report_runtime_site};
+
+    // Site identity is `(procedure, instruction)`; these indices are not used by
+    // any other test, so the process-global tally starts clean for both.
+    let site = ProcedureId(909_001);
+    let other = ProcedureId(909_002);
+
+    assert_eq!(report_runtime_site(site, 7), RuntimeSiteReport::Report);
+    assert_eq!(report_runtime_site(site, 7), RuntimeSiteReport::Report);
+    assert_eq!(
+        report_runtime_site(site, 7),
+        RuntimeSiteReport::LastBeforeSuppression
+    );
+    assert_eq!(report_runtime_site(site, 7), RuntimeSiteReport::Suppressed);
+    assert_eq!(report_runtime_site(site, 7), RuntimeSiteReport::Suppressed);
+
+    // A different instruction in the same procedure, and the same instruction in
+    // a different procedure, each keep their own budget.
+    assert_eq!(report_runtime_site(site, 8), RuntimeSiteReport::Report);
+    assert_eq!(report_runtime_site(other, 7), RuntimeSiteReport::Report);
+}
+
+#[test]
+fn a_runtime_error_in_the_outermost_frame_still_escapes_the_run_loop() {
+    // The frame-abort fallback needs a caller to resume; with none left the
+    // failure has to reach the scheduler as it always did.
+    let syntax = parse("/proc/run()\n\tvar/datum/logger = null\n\treturn logger.Log(4)\n")
+        .expect("source should parse");
+    let module = compile_module(&syntax.definitions).expect("module should compile");
+    let entry = module.procedure_id("/proc/run").expect("entry");
+
+    let error = execute_module(&module, entry, &[])
+        .expect_err("a runtime with no caller left must stay fatal");
+    assert!(
+        error.message.contains("procedure on null"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
 fn absolute_type_path_expressions_lower_to_type_path_values() {
     let syntax =
         parse("/proc/type_path()\n\treturn /obj/item/tool\n").expect("source should parse");
@@ -11668,20 +11771,32 @@ fn bounds_recursion_and_reports_the_source_mapped_call_stack() {
 
 #[test]
 fn maps_callee_runtime_errors_and_preserves_caller_context() {
-    let source = "/proc/main()\n\treturn broken()\n/proc/broken()\n\treturn \"text\" + 1\n";
+    // An execution-limit breach is the failure that still escapes the run loop
+    // from a nested frame, so it is what carries a multi-frame source-mapped
+    // chain out to the scheduler. An ordinary callee runtime no longer does --
+    // see `an_uncaught_intrinsic_runtime_error_ends_only_the_procedure_that_raised_it`.
+    let source = "/proc/main()\n\treturn broken()\n/proc/broken()\n\treturn broken()\n";
     let syntax = parse(source).expect("source should parse");
     let expected_span = syntax.definitions[1].body[0].span;
     let module = compile_module(&syntax.definitions).expect("module should compile");
     let entry = module
         .procedure_id("/proc/main")
         .expect("entry procedure should exist");
-    let error =
-        execute_module(&module, entry, &[]).expect_err("numeric operation on text should fail");
+    let error = execute_module_with_limits(
+        &module,
+        entry,
+        &[],
+        ExecutionLimits {
+            max_call_depth: 2,
+            ..ExecutionLimits::default()
+        },
+    )
+    .expect_err("the second nested call should reach the depth limit");
 
     assert!(
-        error
-            .message
-            .contains("addition requires compatible DM values")
+        error.message.contains("maximum call depth 2"),
+        "{}",
+        error.message
     );
     assert_eq!(error.source_span, Some(expected_span));
     assert_eq!(error.call_stack.len(), 2);

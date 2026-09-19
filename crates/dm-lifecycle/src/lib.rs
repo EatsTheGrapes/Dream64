@@ -1817,14 +1817,18 @@ mod tests {
 
     #[test]
     fn persistent_scheduler_isolates_a_failed_thread_and_runs_later_due_work() {
+        // The CRASH sits in the scheduled frame itself, so nothing is left to
+        // resume and the failure escapes as the thread's own. A CRASH one call
+        // deeper is absorbed instead -- see
+        // `a_scheduled_thread_survives_a_runtime_in_a_procedure_it_called`.
         let source = concat!(
             "var/global/ready = 0\n",
             "var/global/trace = \"\"\n",
-            "/proc/fail_later()\n\tCRASH(\"isolated\")\n",
+            "/proc/fail_later()\n\tset waitfor = 0\n\tsleep(1)\n\tCRASH(\"isolated\")\n",
             "/proc/finish_later()\n\tglobal.trace += \"L\"\n",
             "/world/New()\n",
             "\tglobal.ready = 1\n",
-            "\tspawn(1) fail_later()\n",
+            "\tfail_later()\n",
             "\tspawn(1) finish_later()\n",
             "/area/test\n/turf/test\n",
         );

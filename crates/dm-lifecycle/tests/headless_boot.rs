@@ -242,15 +242,17 @@ fn headless_boot_drains_spawned_startup_work_to_stable_idle() {
 
 #[test]
 fn headless_boot_continues_on_startup_scheduler_failure() {
+    // The CRASH is in the spawned block itself, so the whole startup thread
+    // unwinds. A CRASH inside a procedure the block *calls* ends only that
+    // procedure and the block carries on -- BYOND's rule, and what keeps one bad
+    // subsystem from taking down a boot.
     let types = concat!(
         "var/global/trace = 0\n",
-        "/proc/fail_startup()\n",
-        "\tCRASH(\"isolated\")\n",
         "/proc/finish_startup()\n",
         "\tglobal.trace = 7\n",
         "/world/New()\n",
         "\tspawn(1)\n",
-        "\t\tfail_startup()\n",
+        "\t\tCRASH(\"isolated\")\n",
         "\tspawn(2)\n",
         "\t\tfinish_startup()\n",
         "/turf/boot\n/area/boot\n",

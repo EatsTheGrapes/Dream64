@@ -26,6 +26,8 @@ pub struct Project {
     pub includes: Vec<IncludeEdge>,
     /// Active compiler diagnostic policies in source encounter order.
     pub diagnostic_pragmas: Vec<DiagnosticPragma>,
+    /// Surviving `#warn` directives in source encounter order.
+    pub warning_directives: Vec<WarningDirective>,
     object_macros: HashMap<String, String>,
     defines: ProjectDefines,
 }
@@ -584,7 +586,9 @@ fn normalized_identity_path(path: &Path) -> String {
     }
 }
 
-const PROJECT_CACHE_MAGIC: &[u8] = b"DREAM64-PROJECT-CACHE\0\x02";
+// \x03 adds the retained `#warn` directives; an older cache decodes to a
+// project that would silently drop them, so the bump forces one recompile.
+const PROJECT_CACHE_MAGIC: &[u8] = b"DREAM64-PROJECT-CACHE\0\x03";
 const PROJECT_CACHE_MANIFEST_MAGIC: &[u8] = b"DREAM64-PROJECT-MANIFEST\0\x01";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -766,6 +770,12 @@ fn encode_cached_project(project: &Project) -> Vec<u8> {
         write_len(&mut output, pragma.source.index());
         write_span(&mut output, pragma.span);
     }
+    write_len(&mut output, project.warning_directives.len());
+    for warning in &project.warning_directives {
+        write_string(&mut output, &warning.message);
+        write_len(&mut output, warning.source.index());
+        write_span(&mut output, warning.span);
+    }
     let mut macros = project.object_macros.iter().collect::<Vec<_>>();
     macros.sort_by(|left, right| left.0.cmp(right.0));
     write_len(&mut output, macros.len());
@@ -861,6 +871,15 @@ fn decode_cached_project(bytes: &[u8]) -> Option<Project> {
             span: read_span(&mut input)?,
         });
     }
+    let warning_count = read_len(&mut input)?;
+    let mut warning_directives = Vec::with_capacity(warning_count);
+    for _ in 0..warning_count {
+        warning_directives.push(WarningDirective {
+            message: read_string(&mut input)?,
+            source: FileId::from_index(read_len(&mut input)?),
+            span: read_span(&mut input)?,
+        });
+    }
     let macro_count = read_len(&mut input)?;
     let mut object_macros = HashMap::with_capacity(macro_count);
     for _ in 0..macro_count {
@@ -887,6 +906,7 @@ fn decode_cached_project(bytes: &[u8]) -> Option<Project> {
         files,
         includes,
         diagnostic_pragmas,
+        warning_directives,
         object_macros,
         defines,
     })
@@ -975,6 +995,23 @@ pub struct DiagnosticPragma {
     pub name: String,
     /// Configured severity.
     pub severity: PragmaSeverity,
+    /// File containing the directive.
+    pub source: FileId,
+    /// Complete directive range.
+    pub span: SourceSpan,
+}
+
+/// One `#warn` directive that survived preprocessing.
+///
+/// A codebase uses these to state build requirements — Monkestation's
+/// `_compile_options.dm` warns when `CBT` is undefined, which silently changes
+/// what `SETUP_MAP_ICONS` writes into `icon_state`. Dropping them on the floor
+/// hides exactly the misconfiguration they exist to report, so they are carried
+/// in the project for the compiler to print.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WarningDirective {
+    /// Message text as written, with the `#warn` keyword removed.
+    pub message: String,
     /// File containing the directive.
     pub source: FileId,
     /// Complete directive range.
@@ -1295,6 +1332,7 @@ struct Loader {
     warning_directive_is_error: bool,
     duplicate_include_is_error: bool,
     diagnostic_pragmas: Vec<DiagnosticPragma>,
+    warning_directives: Vec<WarningDirective>,
     defines: ProjectDefines,
 }
 
@@ -1327,6 +1365,7 @@ impl Loader {
             warning_directive_is_error: false,
             duplicate_include_is_error: false,
             diagnostic_pragmas: Vec::new(),
+            warning_directives: Vec::new(),
             defines: defines.clone(),
         })
     }
@@ -1346,6 +1385,7 @@ impl Loader {
             files: self.files,
             includes: self.includes.into_iter().map(|(_, edge)| edge).collect(),
             diagnostic_pragmas: self.diagnostic_pragmas,
+            warning_directives: self.warning_directives,
             object_macros,
             defines: self.defines,
         })
@@ -1618,6 +1658,13 @@ impl Loader {
                     offset,
                     format!("#warn{}", directive_message_suffix(&message)),
                 ));
+            }
+            DirectiveKind::Warning(message) if active => {
+                self.warning_directives.push(WarningDirective {
+                    message: message.trim().to_owned(),
+                    source,
+                    span: directive.span,
+                });
             }
             DirectiveKind::Pragma(value) if active => {
                 self.apply_pragma(source, directive.span, &value);
@@ -4459,6 +4506,67 @@ mod tests {
         assert!(!compiler_source.contains("#warn"));
         assert!(!compiler_source.contains("#pragma"));
         assert!(compiler_source.contains("/datum/after_warning"));
+        assert_eq!(
+            project
+                .warning_directives
+                .iter()
+                .map(|warning| warning.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["this is a warning, not DM source"],
+        );
+    }
+
+    #[test]
+    fn retains_only_reachable_warning_directives_and_survives_the_cache() {
+        // A codebase states build requirements through `#warn`; an inactive
+        // branch's warning is not one, and neither is a warning the project
+        // dropped on the way through its own cache.
+        let scratch = ScratchDirectory::new();
+        let source = concat!(
+            "#ifdef CBT\n",
+            "#warn compiled with the build tool\n",
+            "#else\n",
+            "#warn building without CBT is not supported\n",
+            "#endif\n",
+            "/datum/thing\n",
+        );
+        fs::write(scratch.path().join("world.dme"), source).expect("environment should be written");
+
+        let project = Project::load(scratch.path().join("world.dme")).expect("project should load");
+        assert_eq!(
+            project
+                .warning_directives
+                .iter()
+                .map(|warning| warning.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["building without CBT is not supported"],
+        );
+
+        // The cache is the path that matters: a build-requirement warning that
+        // only prints on a cold compile is one the next compile hides again.
+        let cache = scratch.path().join("cache/project.bin");
+        let (cold, cold_hit) = Project::load_cached_exact(scratch.path().join("world.dme"), &cache)
+            .expect("cold cached load should succeed");
+        assert!(!cold_hit);
+        let (warm, warm_hit) = Project::load_cached_exact(scratch.path().join("world.dme"), &cache)
+            .expect("warm cached load should succeed");
+        assert!(warm_hit);
+        assert_eq!(warm.warning_directives, cold.warning_directives);
+        assert_eq!(warm.warning_directives, project.warning_directives);
+
+        let defined = Project::load_with_defines(
+            scratch.path().join("world.dme"),
+            &ProjectDefines::from_specs(["CBT"]).expect("valid defines"),
+        )
+        .expect("project should load with CBT");
+        assert_eq!(
+            defined
+                .warning_directives
+                .iter()
+                .map(|warning| warning.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["compiled with the build tool"],
+        );
     }
 
     #[test]

@@ -2647,6 +2647,7 @@ pub(crate) fn execute_del(
             instruction: 0,
             source_span: None,
             call_stack: Vec::new(),
+            recoverable: true,
         });
     };
 

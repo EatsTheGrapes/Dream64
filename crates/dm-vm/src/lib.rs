@@ -112,17 +112,18 @@ pub(crate) use value_ops::{
 
 pub use profiling::StartupInstructionProfile;
 pub use profiling::datum_alloc_telemetry;
+pub use profiling::uncaught_runtime_count;
 pub(crate) use profiling::{
     AtomsProfile, AtomsProfileInstruction, AtomsProfileProcedure, InstrCategory,
-    STARTUP_INSTRUCTION_CATEGORY_COUNT, ShuttleTracePostReturn, TgmProfile, atoms_profile_enabled,
-    atoms_profile_snapshot_lines_if_due, boot_dashboard_enabled, boot_trace_enabled,
-    dcs_trace_enabled, emit_atoms_profile, emit_tgm_profile, instr_category,
+    STARTUP_INSTRUCTION_CATEGORY_COUNT, ShuttleTracePostReturn, TgmProfile, UNCAUGHT_RUNTIME_COUNT,
+    atoms_profile_enabled, atoms_profile_snapshot_lines_if_due, boot_dashboard_enabled,
+    boot_trace_enabled, dcs_trace_enabled, emit_atoms_profile, emit_tgm_profile, instr_category,
     instruction_profile_enabled, is_atoms_initialize_path, is_subsystem_initialize_path,
     mark_boot_trace_frame, proc_step_profile_enabled, procedure_pc_profile_target,
     shuttle_trace_emit_snapshot, shuttle_trace_enabled, shuttle_trace_prepare_call,
     shuttle_trace_slot_from_arguments, slow_instruction_trace_threshold,
     startup_instruction_category, startup_instruction_profile_enabled, startup_profile_enabled,
-    tgm_profiling_enabled,
+    strict_runtimes_enabled, tgm_profiling_enabled,
 };
 
 #[cfg(test)]
@@ -351,6 +352,13 @@ pub struct RuntimeError {
     pub source_span: Option<SourceSpan>,
     /// Active procedures from the entry point through the failing frame.
     pub call_stack: Vec<CallTrace>,
+    /// Whether DM error handling is allowed to absorb this failure.
+    ///
+    /// Ordinary runtimes are: an enclosing `try` claims one, and an uncaught one
+    /// ends only the procedure that raised it. Execution-limit breaches are not
+    /// — call depth and the instruction budget exist to stop a runaway chain,
+    /// and handing the caller `null` would simply let it run away again.
+    pub recoverable: bool,
 }
 
 /// One source-mapped procedure in a runtime error's call stack.
@@ -963,6 +971,7 @@ pub fn execute_module_with_limits_in_context(
             instruction: 0,
             source_span: None,
             call_stack: Vec::new(),
+            recoverable: false,
         })?;
     if limits.max_call_depth == 0 {
         return Err(RuntimeError {
@@ -970,6 +979,7 @@ pub fn execute_module_with_limits_in_context(
             instruction: 0,
             source_span: program.source_spans.first().copied(),
             call_stack: vec![trace(module, entry, 0)],
+            recoverable: false,
         });
     }
 

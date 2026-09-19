@@ -32,6 +32,7 @@ pub(crate) fn execution_error(
             .iter()
             .map(|frame| trace(module, frame.procedure, frame.instruction))
             .collect(),
+        recoverable: true,
     }
 }
 
@@ -116,5 +117,21 @@ pub(crate) fn compound_assignment_from_list_index(
         CompoundListIndexOperator::BitXor => CompoundAssignmentOperator::BitXor,
         CompoundListIndexOperator::ShiftLeft => CompoundAssignmentOperator::ShiftLeft,
         CompoundListIndexOperator::ShiftRight => CompoundAssignmentOperator::ShiftRight,
+    }
+}
+
+/// Builds a runtime failure that DM error handling must not absorb.
+///
+/// Execution limits exist to stop a runaway call chain. Letting a `try` swallow
+/// one — or ending a single frame and resuming its caller, which is what an
+/// uncaught runtime otherwise does — would only let the chain run away again.
+pub(crate) fn execution_limit_error(
+    module: &Module,
+    frames: &[CallFrame],
+    message: impl Into<String>,
+) -> RuntimeError {
+    RuntimeError {
+        recoverable: false,
+        ..execution_error(module, frames, message)
     }
 }

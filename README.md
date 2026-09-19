@@ -185,6 +185,21 @@ one sibling `.d64`; `dream64-server` can load that artifact without compiler
 sources or private caches. The compiler reuses the whole artifact when the DME
 graph is unchanged and reuses unchanged per-file syntax units after edits.
 
+Pass the same `-D` defines the codebase's own build tool passes. A tgstation
+family codebase needs `-D CBT`, which its build script supplies
+(`tools/build/build.ts`: `defines: ['CBT', ...]`):
+
+```powershell
+dream64-compiler compile path\to\tgstation.dme -D CBT
+```
+
+Without it `MAP_SWITCH` takes its non-compile branch, so the 450-odd
+`SETUP_MAP_ICONS` sites write a map-editor type-path marker into `icon_state`
+instead of the real state — which surfaces much later as several hundred GAGS
+runtimes during asset generation, not as a compile failure. The codebase says so
+itself with a `#warn`, and `dream64-compiler` prints those as `compile-warning:`
+lines.
+
 For an immutable deployment artifact, choose an explicit output path:
 
 ```powershell

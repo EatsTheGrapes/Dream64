@@ -247,6 +247,38 @@ fn compile(
         cache_stats.invalidated_sections,
         compiler_database_file.display(),
     );
+    // A codebase states its build requirements through `#warn`. Monkestation
+    // warns when `CBT` is undefined, which silently redirects `SETUP_MAP_ICONS`
+    // into writing a map-editor type-path marker into `icon_state` -- several
+    // hundred runtimes on a boot, with nothing in the compile output to explain
+    // them. Report the directives the project kept rather than discarding them.
+    for warning in &compilation.project().warning_directives {
+        // `span.start` is a byte offset; a line number is what someone reading
+        // compile output can act on, so resolve it against the source.
+        let location = compilation
+            .project()
+            .files
+            .get(warning.source.index())
+            .map_or_else(
+                || "<unknown source>".to_owned(),
+                |file| {
+                    let path = file.relative_path.display();
+                    file.text().map_or_else(
+                        |_| format!("{path}"),
+                        |text| {
+                            let line = 1 + text
+                                .get(..warning.span.start)
+                                .unwrap_or(&text)
+                                .bytes()
+                                .filter(|byte| *byte == b'\n')
+                                .count();
+                            format!("{path}:{line}")
+                        },
+                    )
+                },
+            );
+        eprintln!("compile-warning: {location} #warn {}", warning.message);
+    }
     let mut persistent_database = PersistentCompilerDatabase::read(&compiler_database_file)
         .map_err(|error| format!("read persistent compiler database: {error}"))?;
     let procedure_ids = stable_ids_for_namespace(&persistent_database, "procedure");

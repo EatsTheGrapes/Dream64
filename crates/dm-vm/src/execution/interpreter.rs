@@ -4,8 +4,11 @@
 //! Each instruction arm runs entirely against the dispatch parameters and
 //! returns [`DispatchFlow`] to either re-enter the loop or end the run.
 
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::BTreeSet;
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::builtins;
 use crate::builtins::{
@@ -44,15 +47,16 @@ use crate::value_ops::{
 };
 use crate::{
     ExceptionHandler, ExecutionLimits, PendingLocalPrompt, PendingPromptContinuation, RuntimeError,
-    ShuttleTracePostReturn, SimpleIterationValue, allocate_initialized_datum, assign_datum_field,
-    canonical_istext, canonical_static_native_builtin, canonical_type2parent,
-    canonical_type2parent_target, datum_field_or_initial, datum_shared_storage, dcs_trace_enabled,
-    dynamic_call_target_named, emit_atoms_profile, emit_tgm_profile, engine_builtin_initial_fields,
+    ShuttleTracePostReturn, SimpleIterationValue, UNCAUGHT_RUNTIME_COUNT,
+    allocate_initialized_datum, assign_datum_field, canonical_istext,
+    canonical_static_native_builtin, canonical_type2parent, canonical_type2parent_target,
+    datum_field_or_initial, datum_shared_storage, dcs_trace_enabled, dynamic_call_target_named,
+    emit_atoms_profile, emit_tgm_profile, engine_builtin_initial_fields,
     engine_builtin_initial_value, false_tick_check_target, is_atom_type_path, lazy_atom_list_field,
     local_prompt_spec, mark_boot_trace_frame, prepare_iteration_consumes_fresh_list,
     shuttle_trace_emit_snapshot, shuttle_trace_enabled, shuttle_trace_prepare_call,
     shuttle_trace_slot_from_arguments, simple_iteration_field_assignment,
-    startup_instruction_category,
+    startup_instruction_category, strict_runtimes_enabled,
 };
 use dm_value::{FieldName, ModifiedTypePath, TypePath, Value, ValueError};
 use smallvec::SmallVec;
@@ -72,7 +76,7 @@ use crate::execution::frame::synchronize_frame_argument_write;
 use crate::execution::run::run_frames;
 use crate::execution::run_support::{
     compound_assignment_from_list_index, execute_compound_list_index_operation,
-    execute_numeric_binary, execution_error,
+    execute_numeric_binary, execution_error, execution_limit_error,
 };
 use crate::execution::scheduler::account_scheduler_tick_usage;
 use crate::execution::scheduler::materialize_callee_chain;
@@ -87,6 +91,236 @@ pub(crate) enum DispatchFlow {
     Continue,
     /// End the run with the given outcome (or a runtime error).
     Exit(Box<Result<FrameRunOutcome, RuntimeError>>),
+}
+
+/// Completes the innermost frame with `result` and resumes its caller.
+///
+/// Shared by `Instruction::Return` and by the uncaught-runtime fallback in
+/// [`unwind_runtime_failure`], which ends a frame the same way BYOND does but
+/// hands the caller `null`. Everything a return owes the frame it pops —
+/// profile finalization, shuttle tracing, an engine post-return continuation —
+/// belongs here so neither path can forget a piece of it.
+fn finish_frame(
+    module: &Module,
+    state: &mut ExecutionState,
+    frames: &mut Vec<CallFrame>,
+    executed_steps: &mut u64,
+    result: Value,
+) -> DispatchFlow {
+    let mut finished = frames.pop().expect("returning frame exists");
+    let finish_atoms_profile = finished.atoms_profile_root;
+    let finish_tgm_profile = finished.tgm_profile_root;
+    let result = finished.caller_result_override().cloned().unwrap_or(result);
+    if dcs_trace_enabled()
+        && module
+            .procedure_path(finished.procedure)
+            .is_some_and(|path| path.contains("/subsystem/processing/dcs/proc/GetElement@"))
+    {
+        eprintln!("boot-vm: dcs-get-element-result value={result}");
+    }
+    if let Some(cold) = finished.cold()
+        && let Some(started) = cold.boot_trace_started
+    {
+        let (datum_delta, list_delta, deferred_delta) =
+            cold.boot_trace_heap
+                .map_or((0, 0, 0), |(datums, lists, deferred)| {
+                    (
+                        state.heap.live_datum_count() as i128 - datums as i128,
+                        state.heap.live_list_count() as i128 - lists as i128,
+                        module.materialized_deferred_procedure_count() as i128 - deferred as i128,
+                    )
+                });
+        eprintln!(
+            "boot-vm: initializer-end path={} elapsed_ms={} steps={} datum_delta={} list_delta={} deferred_delta={}",
+            module
+                .paths
+                .get(finished.procedure.index())
+                .map_or("<missing>", String::as_str),
+            started.elapsed().as_millis(),
+            (*executed_steps).saturating_sub(cold.boot_trace_step),
+            datum_delta,
+            list_delta,
+            deferred_delta,
+        );
+    }
+    if finish_atoms_profile && let Some(profile) = state.atoms_profile.take() {
+        emit_atoms_profile(&profile);
+    }
+    if finish_tgm_profile && let Some(profile) = state.tgm_profile.take() {
+        emit_tgm_profile(&profile);
+    }
+    if let Some(post_return) = finished.take_shuttle_trace_post_return() {
+        if let Value::Datum(component) = finished.src {
+            match post_return {
+                ShuttleTracePostReturn::NullifyNode { slot } => {
+                    shuttle_trace_emit_snapshot(state, component, "nullify-node-after", slot);
+                }
+                ShuttleTracePostReturn::AtmosInit => {
+                    shuttle_trace_emit_snapshot(state, component, "atmos-init-after", None);
+                }
+            }
+        }
+    }
+    if let Some(post_return) = finished.take_engine_post_return() {
+        let mut post_return = *post_return;
+        post_return.set_caller_result_override(Some(result));
+        frames.push(post_return);
+        return DispatchFlow::Continue;
+    }
+    let Some(caller) = frames.last_mut() else {
+        return DispatchFlow::Exit(Box::new(Ok(FrameRunOutcome::Complete(result))));
+    };
+    caller.stack.push(result);
+    caller.instruction += 1;
+    DispatchFlow::Continue
+}
+
+/// Locates the innermost `catch` whose protected range covers its own frame's
+/// active instruction, searching from the failing frame outwards.
+///
+/// A caller frame's `instruction` still points at the call site while the
+/// callee runs, so the same range test selects handlers across the whole chain.
+fn find_active_exception_handler(frames: &[CallFrame]) -> Option<(usize, usize)> {
+    frames.iter().enumerate().rev().find_map(|(index, frame)| {
+        let current = frame.instruction;
+        frame
+            .exception_handlers()
+            .iter()
+            .rposition(|handler| handler.start <= current && current <= handler.end)
+            .map(|position| (index, position))
+    })
+}
+
+/// Transfers control to the handler [`find_active_exception_handler`] selected,
+/// abandoning every frame it unwound past and binding `value` to the catch local.
+///
+/// Handlers nested inside the selected one are dropped with it: a `catch` that
+/// is entered can no longer be re-entered by a failure raised from its body.
+fn deliver_to_exception_handler(
+    frames: &mut Vec<CallFrame>,
+    (handler_frame, handler_position): (usize, usize),
+    value: Value,
+) -> Result<(), String> {
+    frames.truncate(handler_frame + 1);
+    let handler = frames[handler_frame]
+        .exception_handlers_mut()
+        .remove(handler_position);
+    frames[handler_frame]
+        .exception_handlers_mut()
+        .truncate(handler_position);
+    frames[handler_frame].stack.truncate(handler.stack_depth);
+    if let Some(slot) = handler.local {
+        let Some(local) = frames[handler_frame].locals.get_mut(usize::from(slot)) else {
+            return Err(format!("invalid catch local {slot}"));
+        };
+        *local = value;
+    }
+    frames[handler_frame].instruction = handler.catch;
+    Ok(())
+}
+
+/// Whether a runtime failure at one bytecode site should still be printed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeSiteReport {
+    /// Print it in full.
+    Report,
+    /// Print it in full and say that the site goes quiet after this one.
+    LastBeforeSuppression,
+    /// Already reported often enough; stay silent.
+    Suppressed,
+}
+
+/// How many runtimes one bytecode site reports before it goes quiet.
+///
+/// A few examples from a site are worth having — the failing values usually
+/// differ, and that difference is the diagnosis. Hundreds are not.
+const RUNTIME_SITE_REPORT_LIMIT: u32 = 3;
+
+/// Counts runtimes per `(procedure, instruction)` and decides when to stop
+/// printing one site.
+pub(crate) fn report_runtime_site(procedure: ProcedureId, instruction: usize) -> RuntimeSiteReport {
+    static SITES: OnceLock<Mutex<HashMap<(ProcedureId, usize), u32>>> = OnceLock::new();
+    let mut sites = match SITES.get_or_init(Mutex::default).lock() {
+        Ok(sites) => sites,
+        // A panic while reporting a runtime must not turn into a second one.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let seen = sites.entry((procedure, instruction)).or_insert(0);
+    // Saturating: a wrap would silently un-suppress a site that had already
+    // proven it has nothing new to say.
+    *seen = seen.saturating_add(1);
+    match (*seen).cmp(&RUNTIME_SITE_REPORT_LIMIT) {
+        CmpOrdering::Less => RuntimeSiteReport::Report,
+        CmpOrdering::Equal => RuntimeSiteReport::LastBeforeSuppression,
+        CmpOrdering::Greater => RuntimeSiteReport::Suppressed,
+    }
+}
+
+/// Routes a runtime failure through BYOND's two-stage error model.
+///
+/// An active `try` anywhere in the call chain claims the failure first, binding
+/// `caught` to its `catch` local. With no handler in range BYOND does *not* tear
+/// the chain down: it reports the runtime, ends only the procedure that raised
+/// it, and resumes that procedure's caller with `null`. Monkestation is built on
+/// that — `stack_trace()` is a helper proc whose whole job is to CRASH so the
+/// caller survives (`code/__HELPERS/stack_trace.dm`), and one bad GAGS
+/// `icon_state` would otherwise end the Master Controller's init thread.
+///
+/// Only a failure in the outermost frame escapes as `fatal`, since there is no
+/// caller left to resume. `DREAM64_STRICT_RUNTIMES` makes every uncaught failure
+/// fatal again, because this fallback otherwise turns an engine bug into a
+/// silent `null` return.
+pub(crate) fn unwind_runtime_failure(
+    module: &Module,
+    state: &mut ExecutionState,
+    frames: &mut Vec<CallFrame>,
+    executed_steps: &mut u64,
+    caught: Value,
+    fatal: RuntimeError,
+) -> Result<DispatchFlow, RuntimeError> {
+    if fatal.recoverable
+        && let Some(location) = find_active_exception_handler(frames)
+    {
+        return match deliver_to_exception_handler(frames, location, caught) {
+            Ok(()) => Ok(DispatchFlow::Continue),
+            Err(message) => Err(execution_error(module, frames, message)),
+        };
+    }
+    if !fatal.recoverable || strict_runtimes_enabled() || frames.len() < 2 {
+        return Err(fatal);
+    }
+    UNCAUGHT_RUNTIME_COUNT.fetch_add(1, Ordering::Relaxed);
+    let failing = &frames[frames.len() - 1];
+    let path = |frame: &CallFrame| {
+        module
+            .procedure_path(frame.procedure)
+            .unwrap_or("<unknown procedure>")
+    };
+    // One misconfigured define produced 786 runtimes from two sites on a single
+    // boot. Report a site until its examples stop being informative, then say so
+    // once and go quiet -- `uncaught_runtime_count()` still carries the total.
+    match report_runtime_site(failing.procedure, failing.instruction) {
+        RuntimeSiteReport::Report => eprintln!(
+            "dream64 runtime: {} — ended {}, {} resumed with null",
+            fatal.message,
+            path(failing),
+            path(&frames[frames.len() - 2]),
+        ),
+        RuntimeSiteReport::LastBeforeSuppression => eprintln!(
+            "dream64 runtime: {} — ended {}, {} resumed with null (further runtimes at this site suppressed)",
+            fatal.message,
+            path(failing),
+            path(&frames[frames.len() - 2]),
+        ),
+        RuntimeSiteReport::Suppressed => (),
+    }
+    Ok(finish_frame(
+        module,
+        state,
+        frames,
+        executed_steps,
+        Value::Null,
+    ))
 }
 
 /// Execute one bytecode instruction against the active frame.
@@ -384,7 +618,7 @@ pub(crate) fn dispatch_instruction(
                     &frame_context(&frames[frame_index]),
                 ) {
                     if frames.len() >= limits.max_call_depth {
-                        return Err(execution_error(
+                        return Err(execution_limit_error(
                             module,
                             frames,
                             format!("maximum call depth {} exceeded", limits.max_call_depth),
@@ -473,7 +707,7 @@ pub(crate) fn dispatch_instruction(
                 &frame_context(&frames[frame_index]),
             ) {
                 if frames.len() >= limits.max_call_depth {
-                    return Err(execution_error(
+                    return Err(execution_limit_error(
                         module,
                         frames,
                         format!("maximum call depth {} exceeded", limits.max_call_depth),
@@ -758,7 +992,7 @@ pub(crate) fn dispatch_instruction(
                 false,
             ) {
                 if frames.len() >= limits.max_call_depth {
-                    return Err(execution_error(
+                    return Err(execution_limit_error(
                         module,
                         frames,
                         format!("maximum call depth {} exceeded", limits.max_call_depth),
@@ -3345,11 +3579,11 @@ pub(crate) fn dispatch_instruction(
                 Ok(value) => value,
                 Err(message) => return Err(execution_error(module, frames, message)),
             };
-            // Monkestation's `stack_trace()` deliberately calls CRASH in
-            // a tiny helper proc to make BYOND print a stack without
-            // aborting the caller. A runtime in the nested helper ends
-            // that helper and yields null to its caller; it does not tear
-            // down the entire execution chain. Keep direct CRASH strict.
+            // Monkestation's `stack_trace()` is a helper proc whose entire body
+            // is a CRASH, used to log a stack without ending the caller. It is
+            // pure diagnostics, so unlike every other CRASH it must not be
+            // claimed by a `try` further up: ending the helper is the whole
+            // contract. Skip the handler search and end just this frame.
             if module
                 .procedure_path(frames[frame_index].procedure)
                 .is_some_and(|path| {
@@ -3357,74 +3591,18 @@ pub(crate) fn dispatch_instruction(
                 })
             {
                 eprintln!("dream64 stack trace: {message}");
-                frames.pop().expect("stack-trace helper frame exists");
-                let Some(caller) = frames.last_mut() else {
-                    return Ok(DispatchFlow::Exit(Box::new(Ok(FrameRunOutcome::Complete(
-                        Value::Null,
-                    )))));
-                };
-                caller.stack.push(Value::Null);
-                caller.instruction += 1;
-                return Ok(DispatchFlow::Continue);
+                return Ok(finish_frame(
+                    module,
+                    state,
+                    frames,
+                    executed_steps,
+                    Value::Null,
+                ));
             }
-            // BYOND treats CRASH() as catchable: it unwinds through active
-            // try/catch handlers just like throw.  When no handler is found
-            // and there is a calling frame, the current proc terminates and
-            // returns null to its caller — only a CRASH in a top-level proc
-            // (no caller) is fatal.
-            let mut handler = None;
-            for candidate_frame in (0..frames.len()).rev() {
-                let current = frames[candidate_frame].instruction;
-                if let Some(position) = frames[candidate_frame]
-                    .exception_handlers()
-                    .iter()
-                    .rposition(|handler| handler.start <= current && current <= handler.end)
-                {
-                    handler = Some((candidate_frame, position));
-                    break;
-                }
-            }
-            let Some((handler_frame, handler_position)) = handler else {
-                if frames.len() <= 1 {
-                    return Err(execution_error(
-                        module,
-                        frames,
-                        format!("CRASH: {message}"),
-                    ));
-                }
-                eprintln!("dream64: uncaught CRASH: {message}");
-                frames.pop().expect("crashing frame exists");
-                let Some(caller) = frames.last_mut() else {
-                    return Err(execution_error(
-                        module,
-                        frames,
-                        format!("CRASH: {message}"),
-                    ));
-                };
-                caller.stack.push(Value::Null);
-                caller.instruction += 1;
-                return Ok(DispatchFlow::Continue);
-            };
-            frames.truncate(handler_frame + 1);
-            let handler = frames[handler_frame]
-                .exception_handlers_mut()
-                .remove(handler_position);
-            frames[handler_frame]
-                .exception_handlers_mut()
-                .truncate(handler_position);
-            frames[handler_frame].stack.truncate(handler.stack_depth);
-            if let Some(slot) = handler.local {
-                let Some(local) = frames[handler_frame].locals.get_mut(usize::from(slot)) else {
-                    return Err(execution_error(
-                        module,
-                        frames,
-                        format!("invalid catch local {slot}"),
-                    ));
-                };
-                *local = message;
-            }
-            frames[handler_frame].instruction = handler.catch;
-            return Ok(DispatchFlow::Continue);
+            // CRASH() raises an ordinary DM runtime: catchable by an enclosing
+            // try, and otherwise fatal only to the procedure that raised it.
+            let fatal = execution_error(module, frames, format!("CRASH: {message}"));
+            return unwind_runtime_failure(module, state, frames, executed_steps, message, fatal);
         }
         Instruction::BeginTry { catch, end, local } => {
             let (catch, end, local) = (*catch, *end, *local);
@@ -3458,45 +3636,8 @@ pub(crate) fn dispatch_instruction(
         Instruction::Throw => {
             let thrown = pop(&mut frames[frame_index].stack)
                 .map_err(|message| execution_error(module, frames, message))?;
-            let mut handler = None;
-            for candidate_frame in (0..frames.len()).rev() {
-                let current = frames[candidate_frame].instruction;
-                if let Some(position) = frames[candidate_frame]
-                    .exception_handlers()
-                    .iter()
-                    .rposition(|handler| handler.start <= current && current <= handler.end)
-                {
-                    handler = Some((candidate_frame, position));
-                    break;
-                }
-            }
-            let Some((handler_frame, handler_position)) = handler else {
-                return Err(execution_error(
-                    module,
-                    frames,
-                    format!("uncaught exception: {thrown}"),
-                ));
-            };
-            frames.truncate(handler_frame + 1);
-            let handler = frames[handler_frame]
-                .exception_handlers_mut()
-                .remove(handler_position);
-            frames[handler_frame]
-                .exception_handlers_mut()
-                .truncate(handler_position);
-            frames[handler_frame].stack.truncate(handler.stack_depth);
-            if let Some(slot) = handler.local {
-                let Some(local) = frames[handler_frame].locals.get_mut(usize::from(slot)) else {
-                    return Err(execution_error(
-                        module,
-                        frames,
-                        format!("invalid catch local {slot}"),
-                    ));
-                };
-                *local = thrown;
-            }
-            frames[handler_frame].instruction = handler.catch;
-            return Ok(DispatchFlow::Continue);
+            let fatal = execution_error(module, frames, format!("uncaught exception: {thrown}"));
+            return unwind_runtime_failure(module, state, frames, executed_steps, thrown, fatal);
         }
         Instruction::Locate { argument_count } => {
             let count = usize::from(*argument_count);
@@ -3931,7 +4072,7 @@ pub(crate) fn dispatch_instruction(
             let mut target = *target;
             let argument_count = *argument_count;
             if frames.len() >= limits.max_call_depth {
-                return Err(execution_error(
+                return Err(execution_limit_error(
                     module,
                     frames,
                     format!("maximum call depth {} exceeded", limits.max_call_depth),
@@ -4035,7 +4176,7 @@ pub(crate) fn dispatch_instruction(
         Instruction::CallCurrent { argument_count } => {
             let argument_count = *argument_count;
             if frames.len() >= limits.max_call_depth {
-                return Err(execution_error(
+                return Err(execution_limit_error(
                     module,
                     frames,
                     format!("maximum call depth {} exceeded", limits.max_call_depth),
@@ -4098,7 +4239,7 @@ pub(crate) fn dispatch_instruction(
             let mut target = *target;
             let argument_count = *argument_count;
             if frames.len() >= limits.max_call_depth {
-                return Err(execution_error(
+                return Err(execution_limit_error(
                     module,
                     frames,
                     format!("maximum call depth {} exceeded", limits.max_call_depth),
@@ -4311,7 +4452,7 @@ pub(crate) fn dispatch_instruction(
                 )
             {
                 if frames.len() >= limits.max_call_depth {
-                    return Err(execution_error(
+                    return Err(execution_limit_error(
                         module,
                         frames,
                         format!("maximum call depth {} exceeded", limits.max_call_depth),
@@ -4459,7 +4600,7 @@ pub(crate) fn dispatch_instruction(
                 frames[frame_index].stack.push(result);
             } else {
                 if frames.len() >= limits.max_call_depth {
-                    return Err(execution_error(
+                    return Err(execution_limit_error(
                         module,
                         frames,
                         format!("maximum call depth {} exceeded", limits.max_call_depth),
@@ -4552,80 +4693,7 @@ pub(crate) fn dispatch_instruction(
                 Ok(value) => value,
                 Err(message) => return Err(execution_error(module, frames, message)),
             };
-            let mut finished = frames.pop().expect("returning frame exists");
-            let finish_atoms_profile = finished.atoms_profile_root;
-            let finish_tgm_profile = finished.tgm_profile_root;
-            let result = finished.caller_result_override().cloned().unwrap_or(result);
-            if dcs_trace_enabled()
-                && module
-                    .procedure_path(finished.procedure)
-                    .is_some_and(|path| path.contains("/subsystem/processing/dcs/proc/GetElement@"))
-            {
-                eprintln!("boot-vm: dcs-get-element-result value={result}");
-            }
-            if let Some(cold) = finished.cold()
-                && let Some(started) = cold.boot_trace_started
-            {
-                let (datum_delta, list_delta, deferred_delta) =
-                    cold.boot_trace_heap
-                        .map_or((0, 0, 0), |(datums, lists, deferred)| {
-                            (
-                                state.heap.live_datum_count() as i128 - datums as i128,
-                                state.heap.live_list_count() as i128 - lists as i128,
-                                module.materialized_deferred_procedure_count() as i128
-                                    - deferred as i128,
-                            )
-                        });
-                eprintln!(
-                    "boot-vm: initializer-end path={} elapsed_ms={} steps={} datum_delta={} list_delta={} deferred_delta={}",
-                    module
-                        .paths
-                        .get(finished.procedure.index())
-                        .map_or("<missing>", String::as_str),
-                    started.elapsed().as_millis(),
-                    (*executed_steps).saturating_sub(cold.boot_trace_step),
-                    datum_delta,
-                    list_delta,
-                    deferred_delta,
-                );
-            }
-            if finish_atoms_profile && let Some(profile) = state.atoms_profile.take() {
-                emit_atoms_profile(&profile);
-            }
-            if finish_tgm_profile && let Some(profile) = state.tgm_profile.take() {
-                emit_tgm_profile(&profile);
-            }
-            if let Some(post_return) = finished.take_shuttle_trace_post_return() {
-                if let Value::Datum(component) = finished.src {
-                    match post_return {
-                        ShuttleTracePostReturn::NullifyNode { slot } => {
-                            shuttle_trace_emit_snapshot(
-                                state,
-                                component,
-                                "nullify-node-after",
-                                slot,
-                            );
-                        }
-                        ShuttleTracePostReturn::AtmosInit => {
-                            shuttle_trace_emit_snapshot(state, component, "atmos-init-after", None);
-                        }
-                    }
-                }
-            }
-            if let Some(post_return) = finished.take_engine_post_return() {
-                let mut post_return = *post_return;
-                post_return.set_caller_result_override(Some(result));
-                frames.push(post_return);
-                return Ok(DispatchFlow::Continue);
-            }
-            let Some(caller) = frames.last_mut() else {
-                return Ok(DispatchFlow::Exit(Box::new(Ok(FrameRunOutcome::Complete(
-                    result,
-                )))));
-            };
-            caller.stack.push(result);
-            caller.instruction += 1;
-            return Ok(DispatchFlow::Continue);
+            return Ok(finish_frame(module, state, frames, executed_steps, result));
         }
     }
 
