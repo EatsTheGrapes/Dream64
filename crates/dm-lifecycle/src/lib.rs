@@ -21,10 +21,10 @@ pub mod ipc;
 pub mod lifecycle_index;
 /// Artifact-time DMM catalog products.
 pub mod map_catalog;
-/// Procedure semantic-identity directory.
-pub mod procedure_semantics;
 /// Pre-lifecycle state serialization for compile-time deterministic boot.
 pub mod pre_lifecycle;
+/// Procedure semantic-identity directory.
+pub mod procedure_semantics;
 /// Headless boot readiness probe.
 pub mod readiness;
 /// Deterministic scheduler draining for post-initialization and persistent
@@ -59,8 +59,9 @@ pub use scheduler::{
 
 pub use execute::{
     ConstructionError, DeletionError, ExecutedLifecycleEvent, InitializationExecution,
-    InitializationExecutionError, PrecomputedLifecycleState, audit_initialization_plan_with_precompiled,
-    construct_datum, delete_datum, execute_boot_initialization_plan_with_precompiled,
+    InitializationExecutionError, PrecomputedLifecycleState,
+    audit_initialization_plan_with_precompiled, construct_datum, delete_datum,
+    execute_boot_initialization_plan_with_precompiled,
     execute_boot_initialization_plan_with_precompiled_and_startup_service,
     execute_initialization_plan, execute_initialization_plan_with_precompiled,
     execute_initialization_plan_with_scheduler_limits,

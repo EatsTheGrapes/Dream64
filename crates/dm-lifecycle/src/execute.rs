@@ -1252,9 +1252,9 @@ pub fn execute_precomputed_lifecycle_hooks(
                 continue;
             };
             let datum = match subject {
-                EventSubject::World => {
-                    pre_state.world.ok_or(InitializationExecutionError::MissingWorldDatum)?
-                }
+                EventSubject::World => pre_state
+                    .world
+                    .ok_or(InitializationExecutionError::MissingWorldDatum)?,
                 EventSubject::MapAtom(atom_index) => pre_state
                     .atom_bindings
                     .get(atom_index)

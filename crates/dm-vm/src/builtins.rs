@@ -578,12 +578,16 @@ pub(super) fn execute_external_call(
             // rust-g's void file helpers yield BYOND null on success.
             Ok(Value::Null)
         }
+        // rust-g answers these with `Path::exists` and `read(..).ok()`, so a
+        // missing parent directory is just "false" / null, never an error. The
+        // relaxed resolver still holds the nearest existing ancestor to the
+        // project root.
         "file_exists" if arguments.len() == 1 => {
-            let path = resolved_file_path(arguments, state, "file_exists")?;
+            let path = relaxed_resolved_file_path(arguments, state, "file_exists")?;
             Ok(Value::text(if path.exists() { "true" } else { "false" }))
         }
         "file_read" if arguments.len() == 1 => {
-            let path = resolved_file_path(arguments, state, "file_read")?;
+            let path = relaxed_resolved_file_path(arguments, state, "file_read")?;
             match fs::read_to_string(path) {
                 Ok(text) => Ok(Value::text(text)),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),

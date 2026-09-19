@@ -770,8 +770,6 @@ pub(crate) fn try_run_register_signal_fast_path(
     };
     let signal_type = frame.locals.get(1)?.clone();
     let proctype = frame.locals.get(2)?.clone();
-    let override_enabled =
-        runtime_truthy(&state.heap, frame.locals.get(3).unwrap_or(&Value::Null)).ok()?;
     // Signals are canonically text. Restricting the native path here retains
     // the interpreter's exact coercion/error behavior for every odd key type.
     if !matches!(signal_type, Value::Text(_)) {
@@ -860,9 +858,21 @@ pub(crate) fn try_run_register_signal_fast_path(
         } else {
             Value::Null
         };
-        // Formatting the warning and collecting its DM stack trace are
-        // observable. Side-exit before mutation so bytecode performs it once.
-        if runtime_truthy(&state.heap, &existing).ok()? && !override_enabled {
+        // Only a first registration is native. On an existing one, DM updates
+        // the callback and returns without touching `_listen_lookup` --
+        // `override` merely decides whether it warns first, and the warning's
+        // formatting and stack trace are observable. Side-exit before mutation
+        // for both, so bytecode runs them exactly once.
+        //
+        // Gating this on `!override` let an override re-registration fall
+        // through and append `src` to the lookup a second time. Decals
+        // re-register with override on every Attach, so a turf carrying the
+        // same decal twice got `lookup[signal] = list(E, E)`; `UnregisterSignal`
+        // removed one copy, the target kept naming a listener whose
+        // `_signal_procs[target]` was gone, and the next SEND_SIGNAL called a
+        // null proc -- the intermittent `_SendSignal` desync, which depended on
+        // map generation, not on GC.
+        if runtime_truthy(&state.heap, &existing).ok()? {
             return None;
         }
         let looked_up = if let Some(lookup) = lookup {

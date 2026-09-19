@@ -13,6 +13,7 @@ dm-object-tree = { path = "../dm-object-tree" }
 dm-project = { path = "../dm-project" }
 dm-syntax = { path = "../dm-syntax" }
 md5 = "0.7"
+rayon.workspace = true
 
 [lints]
 workspace = true

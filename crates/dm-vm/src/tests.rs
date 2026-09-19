@@ -7674,7 +7674,21 @@ fn single_listener_signal_graph_survives_forced_quiescent_gc() {
 }
 
 #[test]
-fn register_signal_fast_path_uses_runtime_override_truthiness() {
+fn register_signal_fast_path_leaves_every_re_registration_to_the_interpreter() {
+    // DM `RegisterSignal` on an existing registration updates the callback and
+    // returns without touching `_listen_lookup` -- override or not; the flag
+    // only decides whether it warns first. So the native path runs only first
+    // registrations and side-exits on every re-registration, whatever the
+    // override's runtime truthiness.
+    //
+    // This test used to expect the override case to run natively and leave a
+    // two-entry lookup. That was the `_SendSignal` desync, pinned as intended:
+    // the native path appended `src` a second time (`list(E, E)`). Decals
+    // re-register with override on every Attach, so a turf carrying the same
+    // decal twice got that duplicate; `UnregisterSignal` removed one copy, the
+    // target kept naming a listener whose `_signal_procs[target]` was gone, and
+    // the next SEND_SIGNAL hit "call procedure selector must be text or a type
+    // path, received null".
     REGISTER_SIGNAL_FAST_CACHE.with(|cache| cache.borrow_mut().clear());
     let module = production_register_signal_fixture();
     let mut state = ExecutionState::new();
@@ -7692,37 +7706,29 @@ fn register_signal_fast_path_uses_runtime_override_truthiness() {
             Value::text("original"),
             None,
         ),
-        Some(56)
+        Some(56),
+        "a first registration stays on the native path"
     );
-    assert_eq!(
-        run_signal_fixture(
-            &module,
-            &mut state,
-            listener,
-            target,
-            &signal,
-            Value::text("ignored"),
-            Some(Value::number(0.0)),
-        ),
-        None,
-        "a supplied false override must preserve the warning bytecode path"
-    );
-    assert_eq!(
-        run_signal_fixture(
-            &module,
-            &mut state,
-            listener,
-            target,
-            &signal,
-            Value::text("replacement"),
-            Some(Value::number(1.0)),
-        ),
-        Some(54)
-    );
-    let Value::List(listeners) = signal_fixture_lookup(&state, target, &signal) else {
-        panic!("override should preserve the listener relationship")
-    };
-    assert_eq!(state.heap().list(listeners).unwrap().len(), 2);
+    for (label, override_value) in [("false", Value::number(0.0)), ("true", Value::number(1.0))] {
+        assert_eq!(
+            run_signal_fixture(
+                &module,
+                &mut state,
+                listener,
+                target,
+                &signal,
+                Value::text("replacement"),
+                Some(override_value),
+            ),
+            None,
+            "a re-registration with a {label} override must side-exit before mutating"
+        );
+        assert_eq!(
+            signal_fixture_lookup(&state, target, &signal),
+            Value::Datum(listener),
+            "after a {label}-override re-registration the listener must appear exactly once"
+        );
+    }
 }
 
 #[test]
@@ -18734,6 +18740,78 @@ fn icon_icon_states_method_dispatches_natively_against_backing_dmi() {
     let result = state.heap().list(result).unwrap();
     assert_eq!(result.get(1), Ok(&Value::number(1.0)));
     assert_eq!(result.get(2), Ok(&Value::number(0.0)));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn file_builtins_treat_a_missing_parent_directory_as_absent_not_as_an_error() {
+    // tgstation's `realize_spritesheets` clears a cross-round cache file with an
+    // unguarded `fdel` on every cache miss -- including on a fresh checkout,
+    // where the cache directory has never been created. A runtime there ends
+    // the proc before it generates anything, silently losing the spritesheet.
+    let root = std::env::temp_dir().join(format!("dream64-missing-parent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("present.txt"), "here").unwrap();
+
+    let syntax = parse(concat!(
+        "/proc/probe()\n",
+        "\treturn list(",
+        "fdel(\"never/made/cache.json\"), ",
+        "fdel(\"never/made/\"), ",
+        "call_ext(\"rust_g\", \"file_exists\")(\"never/made/cache.json\"), ",
+        "call_ext(\"rust_g\", \"file_read\")(\"never/made/cache.json\"), ",
+        "fdel(\"present.txt\"))\n",
+        "/proc/escape()\n",
+        "\treturn fdel(\"../outside.txt\")\n",
+    ))
+    .expect("missing-parent probe should parse");
+    let module = compile_module(&syntax.definitions).expect("missing-parent probe should compile");
+    let mut state = ExecutionState::new();
+    state.set_project_root(root.clone());
+
+    let Value::List(result) = execute_module_in_state(
+        &module,
+        module.procedure_id("/proc/probe").unwrap(),
+        &[],
+        &mut state,
+    )
+    .expect("a missing parent directory must not raise a runtime") else {
+        panic!("probe should return a list");
+    };
+    let result = state.heap().list(result).unwrap();
+    assert_eq!(result.get(1), Ok(&Value::number(0.0)), "fdel of a file");
+    assert_eq!(
+        result.get(2),
+        Ok(&Value::number(0.0)),
+        "fdel of a directory"
+    );
+    assert_eq!(
+        result.get(3),
+        Ok(&Value::text("false")),
+        "rustg_file_exists"
+    );
+    assert_eq!(result.get(4), Ok(&Value::Null), "rustg_file_read");
+    assert_eq!(
+        result.get(5),
+        Ok(&Value::number(1.0)),
+        "fdel of a present file"
+    );
+    assert!(!root.join("present.txt").exists());
+
+    // Relaxing the parent requirement must not relax containment.
+    let escape = execute_module_in_state(
+        &module,
+        module.procedure_id("/proc/escape").unwrap(),
+        &[],
+        &mut state,
+    )
+    .expect_err("fdel outside the project root must still be refused");
+    assert!(
+        escape.message.contains("escapes the project root"),
+        "{}",
+        escape.message
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 

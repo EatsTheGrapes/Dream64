@@ -536,14 +536,17 @@ fn write_artifact(
             Ok::<_, String>((file.relative_path.display().to_string(), plan, encoded))
         })
         .transpose()?;
-    let default_map = default_map_info.as_ref().map(|(_, _, encoded)| encoded.clone());
+    let default_map = default_map_info
+        .as_ref()
+        .map(|(_, _, encoded)| encoded.clone());
     let lifecycle_directory = LifecycleIndex::build_compile_only(compilation, procedures)
         .encode_portable()
         .map_err(|error| format!("lifecycle directory: {error}"))?;
     let pre_lifecycle_payload = if let Some((ref map_path, ref world_plan, _)) = default_map_info {
         let started = Instant::now();
         let full_index = LifecycleIndex::build(compilation, procedures, &runtime);
-        let plan = dm_lifecycle::build_initialization_plan(&runtime, &full_index, world_plan, map_path);
+        let plan =
+            dm_lifecycle::build_initialization_plan(&runtime, &full_index, world_plan, map_path);
         let map_types = world_plan
             .templates()
             .values()
@@ -558,39 +561,37 @@ fn write_artifact(
             })
             .collect::<Vec<_>>();
         match runtime.preflight_instance_initializers(map_types) {
-            Ok(_) => {
-                dm_world::allocate_world(world_plan, &mut runtime)
-                    .map_err(|error| format!("world allocation: {error}"))
+            Ok(_) => dm_world::allocate_world(world_plan, &mut runtime)
+                .map_err(|error| format!("world allocation: {error}"))
+                .ok()
+                .and_then(|allocation| {
+                    dm_lifecycle::precompute_lifecycle_state(
+                        &plan,
+                        &allocation,
+                        &mut runtime,
+                        executable.module_mut(),
+                    )
+                    .map_err(|error| format!("precompute lifecycle: {error}"))
                     .ok()
-                    .and_then(|allocation| {
-                        dm_lifecycle::precompute_lifecycle_state(
-                            &plan,
-                            &allocation,
-                            &mut runtime,
-                            executable.module_mut(),
+                    .and_then(|(computed, state)| {
+                        dm_lifecycle::encode_pre_lifecycle_state(
+                            &computed.plan,
+                            &computed.atom_bindings,
+                            computed.world,
+                            &state,
                         )
-                        .map_err(|error| format!("precompute lifecycle: {error}"))
+                        .map_err(|error| format!("encode pre-lifecycle: {error}"))
                         .ok()
-                        .and_then(|(computed, state)| {
-                            dm_lifecycle::encode_pre_lifecycle_state(
-                                &computed.plan,
-                                &computed.atom_bindings,
-                                computed.world,
-                                &state,
-                            )
-                            .map_err(|error| format!("encode pre-lifecycle: {error}"))
-                            .ok()
-                            .map(|payload| {
-                                eprintln!(
-                                    "compile-progress: pre-lifecycle-state bytes={} elapsed_ms={}",
-                                    payload.len(),
-                                    started.elapsed().as_millis()
-                                );
-                                payload
-                            })
+                        .map(|payload| {
+                            eprintln!(
+                                "compile-progress: pre-lifecycle-state bytes={} elapsed_ms={}",
+                                payload.len(),
+                                started.elapsed().as_millis()
+                            );
+                            payload
                         })
                     })
-            }
+                }),
             Err(errors) => {
                 eprintln!(
                     "compile-progress: initializer preflight failed: {} error(s) (skipping pre-lifecycle)",

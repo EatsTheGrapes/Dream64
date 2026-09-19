@@ -101,6 +101,8 @@ pub fn dmm_measurements_from_parsed(
 pub fn build_parsed_dmm_cache(
     compilation: &Compilation,
 ) -> Result<BTreeMap<String, PortableParsedDmm>, String> {
+    use rayon::prelude::*;
+
     let root = fs::canonicalize(&compilation.project().root_directory)
         .map_err(|error| format!("canonicalize DMM project root: {error}"))?;
     let mut paths = Vec::new();
@@ -109,10 +111,12 @@ pub fn build_parsed_dmm_cache(
     if paths.len() > MAX_DMM_MEASUREMENT_ENTRIES {
         return Err("project contains too many DMM resources".to_owned());
     }
+    // Sequential validation pass: metadata checks and byte accounting are cheap
+    // but must run in order to enforce aggregate limits correctly.
     let mut total_bytes = 0u64;
-    let mut parsed_cache = BTreeMap::new();
-    for path in paths {
-        let metadata = fs::metadata(&path)
+    let mut validated_paths: Vec<(PathBuf, String)> = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let metadata = fs::metadata(path)
             .map_err(|error| format!("inspect DMM resource {}: {error}", path.display()))?;
         if metadata.len() > MAX_DMM_SOURCE_BYTES {
             return Err(format!(
@@ -131,91 +135,103 @@ pub fn build_parsed_dmm_cache(
             .map_err(|_| format!("DMM resource escapes project root: {}", path.display()))?;
         let portable = normalize_portable_dmm_path(&relative.to_string_lossy())
             .ok_or_else(|| format!("invalid project-relative DMM path: {}", relative.display()))?;
-        let bytes = fs::read(&path)
-            .map_err(|error| format!("read DMM resource {}: {error}", path.display()))?;
-        let source = std::str::from_utf8(&bytes)
-            .map_err(|_| format!("DMM resource is not UTF-8: {}", path.display()))?;
-        let Ok(map) = dm_map::parse(source) else {
-            // Invalid/non-map `.dmm` resources retain the runtime DM parser fallback.
-            continue;
-        };
-        let Some(measurement) = measure_parsed_dmm(source, &map) else {
-            continue;
-        };
-        let digest = md5::compute(&bytes).0;
-        let mut definitions = map.keys.values().collect::<Vec<_>>();
-        definitions.sort_unstable_by_key(|definition| definition.span.start);
-        let mut models = Vec::with_capacity(definitions.len());
-        let mut tgm = false;
-        for (index, definition) in definitions.into_iter().enumerate() {
-            let raw = source
-                .get(definition.span.start..definition.span.end)
-                .ok_or_else(|| format!("invalid DMM definition span in {portable:?}"))?;
-            let equals = raw
-                .find('=')
-                .ok_or_else(|| format!("missing DMM model assignment in {portable:?}"))?;
-            let open = raw[equals + 1..]
-                .find('(')
-                .map(|offset| equals + 1 + offset)
-                .ok_or_else(|| format!("missing DMM model opener in {portable:?}"))?;
-            let mut body = raw
-                .get(open + 1..raw.len().saturating_sub(1))
-                .ok_or_else(|| format!("invalid DMM model body in {portable:?}"))?;
-            if body.starts_with('\n') {
-                if index == 0 {
-                    tgm = true;
+        validated_paths.push((path.clone(), portable));
+    }
+    // Parallel parsing pass: read, parse, measure, and build each DMM entry
+    // concurrently. Each file is fully independent once validation passes.
+    let results = validated_paths
+        .par_iter()
+        .filter_map(|(path, portable)| {
+            let result = (|| -> Result<Option<(String, PortableParsedDmm)>, String> {
+                let bytes = fs::read(path)
+                    .map_err(|error| format!("read DMM resource {}: {error}", path.display()))?;
+                let source = std::str::from_utf8(&bytes)
+                    .map_err(|_| format!("DMM resource is not UTF-8: {}", path.display()))?;
+                let Ok(map) = dm_map::parse(source) else {
+                    return Ok(None);
+                };
+                let Some(measurement) = measure_parsed_dmm(source, &map) else {
+                    return Ok(None);
+                };
+                let digest = md5::compute(&bytes).0;
+                let mut definitions = map.keys.values().collect::<Vec<_>>();
+                definitions.sort_unstable_by_key(|definition| definition.span.start);
+                let mut models = Vec::with_capacity(definitions.len());
+                let mut tgm = false;
+                for (index, definition) in definitions.into_iter().enumerate() {
+                    let raw = source
+                        .get(definition.span.start..definition.span.end)
+                        .ok_or_else(|| format!("invalid DMM definition span in {portable:?}"))?;
+                    let equals = raw
+                        .find('=')
+                        .ok_or_else(|| format!("missing DMM model assignment in {portable:?}"))?;
+                    let open = raw[equals + 1..]
+                        .find('(')
+                        .map(|offset| equals + 1 + offset)
+                        .ok_or_else(|| format!("missing DMM model opener in {portable:?}"))?;
+                    let mut body = raw
+                        .get(open + 1..raw.len().saturating_sub(1))
+                        .ok_or_else(|| format!("invalid DMM model body in {portable:?}"))?;
+                    if body.starts_with('\n') {
+                        if index == 0 {
+                            tgm = true;
+                        }
+                        body = &body[1..];
+                    }
+                    models.push((definition.key.clone(), body.to_owned()));
                 }
-                body = &body[1..];
-            }
-            models.push((definition.key.clone(), body.to_owned()));
-        }
-        let grids = map
-            .blocks
-            .iter()
-            .map(|block| PortableDmmGrid {
-                x: block.x,
-                // reader.dm stores TGM columns from top to bottom. After
-                // splitting the block it advances ycrd by line_count - 1 so
-                // `_tgm_load` can decrement Y for each subsequent key. DMM
-                // blocks retain their original lower-left Y coordinate.
-                y: if tgm {
-                    block.y.saturating_add(
-                        i32::try_from(block.rows.len().saturating_sub(1)).unwrap_or(i32::MAX),
-                    )
-                } else {
-                    block.y
-                },
-                z: block.z,
-                lines: block
-                    .rows
+                let grids = map
+                    .blocks
                     .iter()
-                    .map(|row| row.concat())
-                    .collect::<Vec<_>>(),
-            })
-            .collect::<Vec<_>>();
-        let line_len = grids
-            .first()
-            .and_then(|grid| grid.lines.first())
-            .map_or(0, String::len);
-        let key_len = u32::try_from(map.key_width)
-            .map_err(|_| format!("DMM key width exceeds u32 in {portable:?}"))?;
-        let line_len = u32::try_from(line_len)
-            .map_err(|_| format!("DMM line length exceeds u32 in {portable:?}"))?;
-        if parsed_cache
-            .insert(
-                portable.clone(),
-                PortableParsedDmm {
-                    digest,
-                    tgm,
-                    key_len,
-                    line_len,
-                    bounds: measurement.bounds,
-                    models,
-                    grids,
-                },
-            )
-            .is_some()
-        {
+                    .map(|block| PortableDmmGrid {
+                        x: block.x,
+                        y: if tgm {
+                            block.y.saturating_add(
+                                i32::try_from(block.rows.len().saturating_sub(1))
+                                    .unwrap_or(i32::MAX),
+                            )
+                        } else {
+                            block.y
+                        },
+                        z: block.z,
+                        lines: block
+                            .rows
+                            .iter()
+                            .map(|row| row.concat())
+                            .collect::<Vec<_>>(),
+                    })
+                    .collect::<Vec<_>>();
+                let line_len = grids
+                    .first()
+                    .and_then(|grid| grid.lines.first())
+                    .map_or(0, String::len);
+                let key_len = u32::try_from(map.key_width)
+                    .map_err(|_| format!("DMM key width exceeds u32 in {portable:?}"))?;
+                let line_len = u32::try_from(line_len)
+                    .map_err(|_| format!("DMM line length exceeds u32 in {portable:?}"))?;
+                Ok(Some((
+                    portable.clone(),
+                    PortableParsedDmm {
+                        digest,
+                        tgm,
+                        key_len,
+                        line_len,
+                        bounds: measurement.bounds,
+                        models,
+                        grids,
+                    },
+                )))
+            })();
+            match result {
+                Ok(Some(item)) => Some(Ok(item)),
+                Ok(None) => None,
+                Err(e) => Some(Err(e)),
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut parsed_cache = BTreeMap::new();
+    for (portable, entry) in results {
+        if parsed_cache.insert(portable.clone(), entry).is_some() {
             return Err(format!(
                 "duplicate normalized DMM resource path {portable:?}"
             ));

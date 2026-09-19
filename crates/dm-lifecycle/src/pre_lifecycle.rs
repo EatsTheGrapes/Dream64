@@ -11,8 +11,8 @@ use dm_value::DatumId;
 use dm_vm::ExecutionState;
 use serde::{Deserialize, Serialize};
 
-use crate::initialization_plan::{EventSubject, InitializationEvent, InitializationPlan};
 use crate::LifecycleKind;
+use crate::initialization_plan::{EventSubject, InitializationEvent, InitializationPlan};
 
 const PRE_LIFECYCLE_MAGIC: &[u8; 8] = b"D64PRELF";
 const PRE_LIFECYCLE_VERSION: u32 = 1;
