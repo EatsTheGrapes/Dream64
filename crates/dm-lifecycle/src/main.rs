@@ -30,8 +30,8 @@ use server::reporting::{
     master_controller_readiness, print_boot_summary, print_compatibility_sweep, print_plan_summary,
 };
 use server::server_loop::{
-    launch_random_seed, report_public_endpoint,
-    run_persistent_server_loop, startup_scheduler_limits,
+    launch_random_seed, report_public_endpoint, run_persistent_server_loop,
+    startup_scheduler_limits,
 };
 
 fn main() -> ExitCode {
@@ -471,9 +471,7 @@ fn run_main() -> ExitCode {
     if command == Command::Boot {
         let (seed, _) = launch_random_seed();
         runtime.set_launch_random_seed(seed);
-        eprintln!(
-            "boot-progress: random stream seeded for this launch seed={seed}"
-        );
+        eprintln!("boot-progress: random stream seeded for this launch seed={seed}");
         let stats = runtime.stats();
         eprintln!(
             "boot-progress: initializer frontier selectors={} typed_constructors={} dynamic_constructor_fallback={} complete_inventory_fallback={} module_procedures={} deferred={} materialized={} direct_initial_values={} shared_reflection_entries={}",
@@ -530,27 +528,26 @@ fn run_main() -> ExitCode {
         .take()
         .unwrap_or_else(|| LifecycleIndex::build(&compilation, &procedures, &runtime));
     let mut boot_precompiled = None;
-    let (map_path, world) =
-        if let Some((map_path, world, precompiled)) = prepared_boot.take() {
-            boot_precompiled = Some(precompiled);
-            (map_path, world)
-        } else {
-            let (map_path, map_source) = match load_map(&compilation, requested_map.as_deref()) {
-                Ok(map) => map,
-                Err(error) => {
-                    eprintln!("{error}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let world = match cached_world_plan(&cache_file, &map_source, &compilation) {
-                Ok(world) => world,
-                Err(error) => {
-                    eprintln!("{map_path}: {error}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            (map_path, world)
+    let (map_path, world) = if let Some((map_path, world, precompiled)) = prepared_boot.take() {
+        boot_precompiled = Some(precompiled);
+        (map_path, world)
+    } else {
+        let (map_path, map_source) = match load_map(&compilation, requested_map.as_deref()) {
+            Ok(map) => map,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::FAILURE;
+            }
         };
+        let world = match cached_world_plan(&cache_file, &map_source, &compilation) {
+            Ok(world) => world,
+            Err(error) => {
+                eprintln!("{map_path}: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        (map_path, world)
+    };
     let plan = build_initialization_plan(&runtime, &index, &world, map_path.clone());
 
     print_plan_summary(&map_path, &index, &procedures, &plan);

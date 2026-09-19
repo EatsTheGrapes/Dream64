@@ -809,6 +809,7 @@ impl UiState {
     /// Returns addressable control identifiers in a window/menu/macro section,
     /// including controls created at runtime with `winset(parent=...)`.
     /// Source order and runtime insertion order are preserved.
+    #[allow(clippy::missing_errors_doc)]
     pub fn section_control_ids(&self, namespace: &str) -> Result<Vec<String>, UiStateError> {
         if let Some(clone) = self
             .cloned_windows
@@ -927,9 +928,9 @@ impl UiState {
                 .cloned()
                 .collect::<Vec<_>>();
             for mut override_ in copied {
-                override_.window_id = destination.to_owned();
+                destination.clone_into(&mut override_.window_id);
                 if override_.control_id == source_id {
-                    override_.control_id = destination.to_owned();
+                    destination.clone_into(&mut override_.control_id);
                 }
                 let target = self.overrides_mut(&override_.window_id, &override_.control_id);
                 target.properties = override_.properties;
@@ -950,6 +951,7 @@ impl UiState {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn resolve_control(&self, address: &str) -> Result<(String, String), UiStateError> {
         if let Some(selector) = address.strip_prefix(':') {
             let expected = ControlType::from_dmf(selector);

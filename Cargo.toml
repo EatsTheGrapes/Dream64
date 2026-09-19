@@ -25,6 +25,9 @@ members = [
 ]
 resolver = "2"
 
+[workspace.dependencies]
+rayon = "1.11"
+
 [workspace.package]
 edition = "2024"
 license = "MIT"

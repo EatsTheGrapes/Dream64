@@ -30,6 +30,7 @@ dm-value = { path = "../dm-value" }
 dm-vm = { path = "../dm-vm" }
 dm-world = { path = "../dm-world" }
 md5 = "0.7"
+rayon.workspace = true
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
 
