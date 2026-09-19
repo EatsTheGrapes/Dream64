@@ -224,7 +224,15 @@ pub(super) fn file2text(arguments: &[Value], state: &ExecutionState) -> Result<V
 pub(super) fn fdel(arguments: &[Value], state: &ExecutionState) -> Result<Value, String> {
     let raw = strict_text(&arguments[0], state, "fdel")?;
     let directory = raw.ends_with('/') || raw.ends_with('\\');
-    let path = resolved_file_path(arguments, state, "fdel")?;
+    // Deleting something that is not there is an ordinary failed deletion in
+    // BYOND -- `fdel()` returns 0 -- whether the file alone is missing or its
+    // whole parent directory is. tgstation depends on that: `realize_spritesheets`
+    // clears a cross-round cache file with an unguarded `fdel` on every cache
+    // miss, including on a fresh checkout where the cache directory has never
+    // been created. Resolve relaxed, as `fexists`/`file2text` do, so the nearest
+    // existing ancestor still has to sit inside the project root but a missing
+    // parent reaches `remove_file` and fails there as a plain 0.
+    let path = relaxed_resolved_file_path(arguments, state, "fdel")?;
     let result = if directory {
         // BYOND treats a trailing slash as explicit authorization to remove
         // the entire directory tree, including nested files/directories.
